@@ -8,6 +8,7 @@ members = [
     "crates/mlake-wal",
     "crates/mlake-ivf",
     "crates/mlake-fts",
+    "crates/mlake-graph",
 ]
 
 [workspace.package]

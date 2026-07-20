@@ -1054,6 +1054,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "mlake-graph"
+version = "0.1.0"
+dependencies = [
+ "mlake-core",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "mlake-ivf"
 version = "0.1.0"
 dependencies = [
