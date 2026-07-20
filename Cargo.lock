@@ -1064,6 +1064,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "mlake-index"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "mlake-core",
+ "mlake-fts",
+ "mlake-graph",
+ "mlake-ivf",
+ "mlake-store",
+ "mlake-wal",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "mlake-ivf"
 version = "0.1.0"
 dependencies = [
