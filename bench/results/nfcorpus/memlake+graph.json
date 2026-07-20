@@ -1,0 +1,62 @@
+{
+  "engine": "memlake+graph",
+  "config": {
+    "note": "in-process IVF vector + hand-rolled BM25 + weighted RRF, same cached bge-small vectors as qdrant",
+    "nprobe": 64,
+    "rrf_k": 60.0,
+    "vector_weight": 1.0,
+    "fts_weight": 1.0,
+    "arm_depth": 200,
+    "bm25_k1": 1.2,
+    "bm25_b": 0.75,
+    "model": "BAAI/bge-small-en-v1.5",
+    "dim": 384
+  },
+  "corpus_size": 3633,
+  "n_queries": 323,
+  "index_seconds": 2.266,
+  "arms": {
+    "sparse": {
+      "ndcg@10": 0.3244,
+      "recall@100": 0.24811,
+      "mrr@10": 0.52803,
+      "latency": {
+        "mean_ms": 0.085,
+        "p50_ms": 0.068,
+        "p90_ms": 0.177,
+        "p99_ms": 0.322,
+        "max_ms": 0.382,
+        "n_queries": 323
+      }
+    },
+    "dense": {
+      "ndcg@10": 0.31753,
+      "recall@100": 0.32332,
+      "mrr@10": 0.5106,
+      "latency": {
+        "mean_ms": 6.86,
+        "p50_ms": 5.923,
+        "p90_ms": 6.969,
+        "p99_ms": 14.871,
+        "max_ms": 204.973,
+        "n_queries": 323
+      }
+    },
+    "hybrid": {
+      "ndcg@10": 0.36447,
+      "recall@100": 0.33042,
+      "mrr@10": 0.56771,
+      "latency": {
+        "mean_ms": 6.942,
+        "p50_ms": 5.956,
+        "p90_ms": 6.842,
+        "p99_ms": 22.039,
+        "max_ms": 136.397,
+        "n_queries": 323
+      }
+    }
+  },
+  "dataset": "nfcorpus",
+  "generated_at": "2026-07-20T20:37:28+00:00",
+  "platform": "Darwin arm64 py3.13.2"
+}

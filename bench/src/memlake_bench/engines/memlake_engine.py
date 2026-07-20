@@ -32,11 +32,11 @@ def _cargo_build() -> Path:
     return binary
 
 
-def run(beir: Beir, *, env: dict | None = None) -> dict:
+def run(beir: Beir, *, env: dict | None = None, engine_name: str = "memlake") -> dict:
     """Run memlake over a dataset and return a scored results payload."""
     root = repo_root()
     binary = _cargo_build()
-    run_path = results_dir(beir.name) / "memlake.run.json"
+    run_path = results_dir(beir.name) / f"{engine_name}.run.json"
     run_path.parent.mkdir(parents=True, exist_ok=True)
 
     proc_env = None
@@ -61,7 +61,7 @@ def run(beir: Beir, *, env: dict | None = None) -> dict:
         )
 
     return {
-        "engine": "memlake",
+        "engine": engine_name,
         "config": {
             "note": "in-process IVF vector + hand-rolled BM25 + weighted RRF, "
             "same cached bge-small vectors as qdrant",

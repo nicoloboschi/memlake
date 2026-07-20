@@ -76,7 +76,7 @@ fn main() -> Result<()> {
         rrf_k: env_f32("MEMLAKE_RRF_K", 60.0),
         vector_weight: env_f32("MEMLAKE_VEC_WEIGHT", 1.0),
         fts_weight: env_f32("MEMLAKE_FTS_WEIGHT", 1.0),
-        graph_weight: 1.0,
+        graph_weight: env_f32("MEMLAKE_GRAPH_WEIGHT", 0.25),
         arm_depth: env_usize("MEMLAKE_ARM_DEPTH", 200),
         bm25: Bm25Params {
             k1: env_f32("MEMLAKE_BM25_K1", 1.2),
@@ -119,6 +119,16 @@ fn main() -> Result<()> {
             semantic_out: vec![],
             causal_out: vec![],
         });
+    }
+
+    // Optionally synthesize the semantic kNN link graph the indexer would derive
+    // (SPEC §5.2: each item linked to its top-5 neighbours with cosine ≥ 0.7). BEIR ships
+    // no links, so this is how the graph arm gets something to expand — turning the kNN
+    // graph into query expansion that Qdrant has no equivalent of.
+    let graph_enabled = env_usize("MEMLAKE_GRAPH", 0) == 1;
+    if graph_enabled {
+        eprintln!("[mlake-bench] deriving semantic kNN links");
+        derive_semantic_links(&mut items);
     }
 
     eprintln!("[mlake-bench] building index over {} docs", items.len());
@@ -205,6 +215,42 @@ fn run_arm(
         .filter_map(|h| id_to_ext.get(&h.id).cloned())
         .collect();
     arm.run.insert(qid.to_string(), ranked);
+}
+
+/// Derive each item's top-5 semantic kNN links with cosine ≥ 0.7, exactly as the indexer
+/// would (SPEC §5.2). Vectors are unit-normalized, so cosine is a dot product.
+///
+/// Brute force O(N²): fine at BEIR scale (a few seconds), and the indexer would use the
+/// warm IVF index for this in production. Written to keep the accuracy demonstration
+/// self-contained rather than to be fast.
+fn derive_semantic_links(items: &mut [StoredItem]) {
+    use mlake_core::item::{SemanticEdge, Weight, MAX_SEMANTIC_OUT, SEMANTIC_LINK_THRESHOLD};
+
+    let vectors: Vec<Vec<f32>> = items.iter().map(|i| i.vector.clone()).collect();
+    let ids: Vec<ItemId> = items.iter().map(|i| i.id).collect();
+
+    for (i, item) in items.iter_mut().enumerate() {
+        let mut neighbours: Vec<(usize, f32)> = Vec::new();
+        for (j, v) in vectors.iter().enumerate() {
+            if j == i {
+                continue;
+            }
+            let sim = mlake_core::dot(&vectors[i], v);
+            if sim >= SEMANTIC_LINK_THRESHOLD {
+                neighbours.push((j, sim));
+            }
+        }
+        // Keep the strongest MAX_SEMANTIC_OUT.
+        neighbours.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        neighbours.truncate(MAX_SEMANTIC_OUT);
+        item.semantic_out = neighbours
+            .into_iter()
+            .map(|(j, sim)| SemanticEdge {
+                target: ids[j],
+                weight: Weight::from_f32(sim),
+            })
+            .collect();
+    }
 }
 
 fn read_json_array(path: &Path) -> Result<Vec<String>> {

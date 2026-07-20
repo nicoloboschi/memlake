@@ -80,8 +80,15 @@ def cmd_baseline_memlake(args) -> int:
         env["MEMLAKE_BM25_K1"] = args.bm25_k1
     if args.bm25_b is not None:
         env["MEMLAKE_BM25_B"] = args.bm25_b
-    payload = memlake_engine.run(beir, env=env or None)
-    results.save(args.dataset, "memlake", payload)
+    if getattr(args, "graph", False):
+        # Synthesize the semantic kNN link graph and add the graph arm to fusion. Saved as
+        # a distinct engine so the report shows the graph arm's effect side by side.
+        env["MEMLAKE_GRAPH"] = 1
+        payload = memlake_engine.run(beir, env=env, engine_name="memlake+graph")
+        results.save(args.dataset, "memlake+graph", payload)
+    else:
+        payload = memlake_engine.run(beir, env=env or None)
+        results.save(args.dataset, "memlake", payload)
     _print_summary(payload)
     return 0
 
@@ -161,6 +168,11 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--fts-weight", default=None, help="RRF weight for the FTS arm")
         sp.add_argument("--bm25-k1", default=None)
         sp.add_argument("--bm25-b", default=None)
+        sp.add_argument(
+            "--graph",
+            action="store_true",
+            help="synthesize kNN links and add the graph-expansion arm to fusion",
+        )
 
     e = bsub.add_parser("memlake", help="in-process memlake IVF + BM25 + RRF over the shared cache")
     add_common(e)
@@ -175,6 +187,7 @@ def build_parser() -> argparse.ArgumentParser:
     # memlake tuning knobs default to None so `all` uses the binary's built-in defaults.
     sp.set_defaults(
         func=cmd_all,
+        graph=False,
         nprobe=None,
         vec_weight=None,
         fts_weight=None,
