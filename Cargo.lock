@@ -833,6 +833,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "mlake-ivf"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "mlake-core",
+ "mlake-store",
+ "rand 0.8.7",
+ "rand_chacha",
+ "rkyv 0.7.46",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "mlake-store"
 version = "0.1.0"
 dependencies = [

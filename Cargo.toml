@@ -6,6 +6,7 @@ members = [
     "crates/mlake-core",
     "crates/mlake-store",
     "crates/mlake-wal",
+    "crates/mlake-ivf",
 ]
 
 [workspace.package]
