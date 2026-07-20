@@ -852,6 +852,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "mlake-wal"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "futures",
+ "mlake-core",
+ "mlake-store",
+ "object_store",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "munge"
 version = "0.4.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"

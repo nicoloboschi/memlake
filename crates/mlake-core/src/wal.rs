@@ -9,6 +9,9 @@ use rkyv::{Archive, Deserialize, Serialize};
 use crate::id::ItemId;
 use crate::item::Item;
 
+/// Alignment rkyv requires to read an archived `WalEntry` in place.
+const ARCHIVE_ALIGNMENT: usize = 8;
+
 /// A commutative delta. Read-modify-write is forbidden on the write path (SPEC §4), so
 /// mutations that would otherwise need a read are expressed as deltas that fold to the
 /// same result regardless of the order they are applied in.
@@ -49,6 +52,21 @@ impl WalEntry {
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, crate::Error> {
+        // rkyv reads the buffer in place, so it must satisfy the archive's alignment.
+        // Bytes handed back by an HTTP response body carry no alignment guarantee — this
+        // is why the in-memory store worked while S3 failed — so realign by copying when
+        // needed. The copy only happens on the WAL tail path, which is bounded and small;
+        // the warm path reads mmapped generation files, which are page-aligned already.
+        if bytes.as_ptr() as usize % ARCHIVE_ALIGNMENT == 0 {
+            Self::from_aligned_bytes(bytes)
+        } else {
+            let mut aligned = rkyv::AlignedVec::with_capacity(bytes.len());
+            aligned.extend_from_slice(bytes);
+            Self::from_aligned_bytes(&aligned)
+        }
+    }
+
+    fn from_aligned_bytes(bytes: &[u8]) -> Result<Self, crate::Error> {
         let archived = rkyv::check_archived_root::<WalEntry>(bytes)
             .map_err(|e| crate::Error::Decode(e.to_string()))?;
         Deserialize::<WalEntry, _>::deserialize(archived, &mut rkyv::Infallible)
@@ -102,6 +120,26 @@ mod tests {
         );
         let bytes = entry.to_bytes().unwrap();
         assert_eq!(WalEntry::from_bytes(&bytes).unwrap(), entry);
+    }
+
+    #[test]
+    fn decodes_from_a_misaligned_buffer() {
+        // Reproduces the S3 path: response bodies are not alignment-guaranteed, and an
+        // underaligned buffer made rkyv reject an otherwise valid entry.
+        let entry = WalEntry::new(1, vec![Op::Upsert(item("a"))]);
+        let encoded = entry.to_bytes().unwrap();
+
+        // Force a deliberately misaligned view of the same bytes.
+        let mut padded = vec![0u8; encoded.len() + 1];
+        padded[1..].copy_from_slice(&encoded);
+        let misaligned = &padded[1..];
+        assert_ne!(
+            misaligned.as_ptr() as usize % ARCHIVE_ALIGNMENT,
+            0,
+            "test setup must actually produce a misaligned slice"
+        );
+
+        assert_eq!(WalEntry::from_bytes(misaligned).unwrap(), entry);
     }
 
     #[test]

@@ -5,6 +5,7 @@ resolver = "2"
 members = [
     "crates/mlake-core",
     "crates/mlake-store",
+    "crates/mlake-wal",
 ]
 
 [workspace.package]
