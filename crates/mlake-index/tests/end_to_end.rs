@@ -403,3 +403,47 @@ async fn crash_before_manifest_swap_leaves_the_old_generation_serving() {
     assert!(outcome.published);
     assert_eq!(outcome.doc_count, 2);
 }
+
+// ---------------------------------------------------------------- roundtrip budget (INV-7, speed)
+
+use mlake_store::COLD_ROUNDTRIP_BUDGET;
+
+/// INV-7: the number of roundtrips to load a generation is bounded and independent of
+/// data size and cluster count. This is the property the whole storage layout exists to
+/// guarantee — query cost must not scale with the corpus.
+#[tokio::test]
+async fn generation_load_roundtrips_are_constant_regardless_of_size() {
+    async fn load_roundtrips_for(n: usize) -> usize {
+        let store = Store::in_memory();
+        let ns = namespace(store, "ns").await;
+        let mut writer = Writer::new(ns.clone());
+        // Distinct vectors so k-means produces many clusters (~sqrt(n)).
+        for i in 0..n {
+            let angle = i as f32;
+            writer
+                .commit(vec![Op::Upsert(item(
+                    &format!("item-{i}"),
+                    vec![angle.sin(), angle.cos(), (angle * 0.5).sin()],
+                    &format!("document {i}"),
+                ))])
+                .await
+                .unwrap();
+        }
+        index(&ns, &Tokenizer::default(), IndexOptions::default()).await.unwrap();
+
+        let node = QueryNode::open(&ns, Tokenizer::default(), Consistency::Strong).await.unwrap();
+        node.load_roundtrips
+    }
+
+    // Growing the corpus 30x (and the cluster count ~5x) must not grow the roundtrip count.
+    let small = load_roundtrips_for(30).await;
+    let large = load_roundtrips_for(900).await;
+    assert_eq!(
+        small, large,
+        "roundtrips must be independent of data size (INV-7): {small} vs {large}"
+    );
+    assert!(
+        large <= COLD_ROUNDTRIP_BUDGET,
+        "generation load must stay within the {COLD_ROUNDTRIP_BUDGET}-roundtrip budget, was {large}"
+    );
+}

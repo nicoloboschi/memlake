@@ -138,23 +138,30 @@ pub async fn read_generation(
     generation: u64,
     metrics: Option<&QueryMetrics>,
 ) -> Result<Generation> {
-    let centroids_bytes = store.get(&files.centroids, metrics.map(|m| (m, 2))).await?;
+    // RT2: the small metadata files — centroids, FTS split, reverse adjacency, pk index —
+    // fetched concurrently, so they cost one roundtrip of latency, not four (INV-7).
+    let (centroids_bytes, fts_bytes, radj_bytes, pk_bytes) = futures::try_join!(
+        store.get(&files.centroids, metrics.map(|m| (m, 2))),
+        store.get(&files.fts_split, metrics.map(|m| (m, 2))),
+        store.get(&files.radj_csr, metrics.map(|m| (m, 2))),
+        store.get(&files.pk, metrics.map(|m| (m, 2))),
+    )?;
     let centroids = Centroids::from_bytes(&centroids_bytes.bytes)?;
-
-    let mut clusters = Vec::with_capacity(files.clusters.len());
-    for path in &files.clusters {
-        let bytes = store.get(path, metrics.map(|m| (m, 3))).await?;
-        clusters.push(ClusterFile::from_bytes(&bytes.bytes)?.items);
-    }
-
-    let fts_bytes = store.get(&files.fts_split, metrics.map(|m| (m, 2))).await?;
     let fts: FtsIndex = serde_json::from_slice(&fts_bytes.bytes)?;
-
-    let radj_bytes = store.get(&files.radj_csr, metrics.map(|m| (m, 2))).await?;
     let radj = ReverseAdjacency::from_bytes(&radj_bytes.bytes)?;
-
-    let pk_bytes = store.get(&files.pk, metrics.map(|m| (m, 2))).await?;
     let pk: PkIndex = serde_json::from_slice(&pk_bytes.bytes)?;
+
+    // RT3: the cluster files, all fetched concurrently — the spec's "parallel ranged GETs"
+    // step, which is one roundtrip regardless of how many clusters are selected.
+    let cluster_futures = files
+        .clusters
+        .iter()
+        .map(|path| store.get(path, metrics.map(|m| (m, 3))));
+    let cluster_objects = futures::future::try_join_all(cluster_futures).await?;
+    let mut clusters = Vec::with_capacity(cluster_objects.len());
+    for obj in &cluster_objects {
+        clusters.push(ClusterFile::from_bytes(&obj.bytes)?.items);
+    }
 
     Ok(Generation {
         generation,
