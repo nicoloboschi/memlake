@@ -10,6 +10,7 @@ members = [
     "crates/mlake-fts",
     "crates/mlake-graph",
     "crates/mlake-index",
+    "crates/mlake-bench",
 ]
 
 [workspace.package]

@@ -1023,6 +1023,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "mlake-bench"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "mlake-core",
+ "mlake-fts",
+ "mlake-graph",
+ "mlake-index",
+ "mlake-ivf",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "mlake-core"
 version = "0.1.0"
 dependencies = [

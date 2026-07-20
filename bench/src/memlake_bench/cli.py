@@ -63,12 +63,36 @@ def cmd_baseline_qdrant(args) -> int:
     return 0
 
 
+def cmd_baseline_memlake(args) -> int:
+    from .engines import memlake_engine
+
+    beir = _load(args.dataset, args.split)
+    # Ensure embeddings exist; memlake reads the same cache as every other engine.
+    embed.load(args.dataset)
+    env = {}
+    if args.nprobe is not None:
+        env["MEMLAKE_NPROBE"] = args.nprobe
+    if args.vec_weight is not None:
+        env["MEMLAKE_VEC_WEIGHT"] = args.vec_weight
+    if args.fts_weight is not None:
+        env["MEMLAKE_FTS_WEIGHT"] = args.fts_weight
+    if args.bm25_k1 is not None:
+        env["MEMLAKE_BM25_K1"] = args.bm25_k1
+    if args.bm25_b is not None:
+        env["MEMLAKE_BM25_B"] = args.bm25_b
+    payload = memlake_engine.run(beir, env=env or None)
+    results.save(args.dataset, "memlake", payload)
+    _print_summary(payload)
+    return 0
+
+
 def cmd_all(args) -> int:
     datasets.download(args.dataset)
     beir = _load(args.dataset, args.split)
     embed.build(beir, model_name=args.model, batch_size=args.batch_size)
     cmd_baseline_exact(args)
     cmd_baseline_qdrant(args)
+    cmd_baseline_memlake(args)
     report.write()
     return 0
 
@@ -131,12 +155,32 @@ def build_parser() -> argparse.ArgumentParser:
     e.add_argument("--recreate", action="store_true", help="drop and rebuild the collection")
     e.set_defaults(func=cmd_baseline_qdrant)
 
-    sp = sub.add_parser("all", help="download -> embed -> exact -> qdrant -> report")
+    def add_memlake_tuning(sp):
+        sp.add_argument("--nprobe", default=None, help="IVF clusters probed per query")
+        sp.add_argument("--vec-weight", default=None, help="RRF weight for the vector arm")
+        sp.add_argument("--fts-weight", default=None, help="RRF weight for the FTS arm")
+        sp.add_argument("--bm25-k1", default=None)
+        sp.add_argument("--bm25-b", default=None)
+
+    e = bsub.add_parser("memlake", help="in-process memlake IVF + BM25 + RRF over the shared cache")
+    add_common(e)
+    add_memlake_tuning(e)
+    e.set_defaults(func=cmd_baseline_memlake)
+
+    sp = sub.add_parser("all", help="download -> embed -> exact -> qdrant -> memlake -> report")
     add_common(sp, model=True, batch=True)
     sp.add_argument("--top-k", type=int, default=100)
     sp.add_argument("--rrf-k", type=int, default=60)
     sp.add_argument("--recreate", action="store_true")
-    sp.set_defaults(func=cmd_all)
+    # memlake tuning knobs default to None so `all` uses the binary's built-in defaults.
+    sp.set_defaults(
+        func=cmd_all,
+        nprobe=None,
+        vec_weight=None,
+        fts_weight=None,
+        bm25_k1=None,
+        bm25_b=None,
+    )
 
     sp = sub.add_parser("report", help="render bench/results/report.md")
     sp.set_defaults(func=cmd_report)
