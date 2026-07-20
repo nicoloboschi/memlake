@@ -1089,6 +1089,7 @@ dependencies = [
  "mlake-ivf",
  "mlake-store",
  "mlake-wal",
+ "object_store",
  "serde",
  "serde_json",
  "tempfile",

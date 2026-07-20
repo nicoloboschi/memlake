@@ -37,6 +37,14 @@ pub enum Error {
     NoManifest(String),
 }
 
+impl Error {
+    /// True when the failure was a lost CAS race (a create or swap conflict), which the
+    /// caller should treat as "someone else got there first" rather than a hard error.
+    pub fn is_conflict(&self) -> bool {
+        matches!(self, Error::Store(e) if e.is_conflict())
+    }
+}
+
 /// A namespace handle: the manifest plus the WAL that extends it.
 #[derive(Clone)]
 pub struct Namespace {
