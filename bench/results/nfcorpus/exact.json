@@ -1,0 +1,57 @@
+{
+  "engine": "exact",
+  "config": {
+    "dense": "numpy brute-force cosine (exact)",
+    "sparse": "in-python Okapi BM25 (k1=0.9, b=0.4, stopwords + s-stemmer)",
+    "fusion": "RRF k=60",
+    "top_k": 100,
+    "model": "BAAI/bge-small-en-v1.5",
+    "dim": 384
+  },
+  "corpus_size": 3633,
+  "n_queries": 323,
+  "arms": {
+    "dense": {
+      "ndcg@10": 0.34328,
+      "recall@100": 0.31088,
+      "mrr@10": 0.52851,
+      "latency": {
+        "mean_ms": 0.068,
+        "p50_ms": 0.066,
+        "p90_ms": 0.076,
+        "p99_ms": 0.157,
+        "max_ms": 0.329,
+        "n_queries": 323
+      }
+    },
+    "sparse": {
+      "ndcg@10": 0.32426,
+      "recall@100": 0.25136,
+      "mrr@10": 0.52791,
+      "latency": {
+        "mean_ms": 0.033,
+        "p50_ms": 0.03,
+        "p90_ms": 0.058,
+        "p99_ms": 0.079,
+        "max_ms": 0.129,
+        "n_queries": 323
+      }
+    },
+    "hybrid": {
+      "ndcg@10": 0.35685,
+      "recall@100": 0.30572,
+      "mrr@10": 0.56597,
+      "latency": {
+        "mean_ms": 0.101,
+        "p50_ms": 0.094,
+        "p90_ms": 0.128,
+        "p99_ms": 0.185,
+        "max_ms": 0.37,
+        "n_queries": 323
+      }
+    }
+  },
+  "dataset": "nfcorpus",
+  "generated_at": "2026-07-20T20:19:24+00:00",
+  "platform": "Darwin arm64 py3.13.2"
+}
