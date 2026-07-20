@@ -47,6 +47,20 @@ Two-stage target:
 The graph arm's *correctness* is validated separately against the Hindsight reference
 implementation (gate G-2), not against Qdrant.
 
+## FTS: hand-rolled BM25 instead of tantivy
+
+SPEC §5.3 specifies "BM25 via tantivy". The POC uses a self-contained BM25 inverted index
+instead. The spec's own §6.2 identifies the tantivy `Directory`-over-object-storage
+integration as the hard part of the whole design, and it is a multi-day effort that fights
+an abstraction built for local disk. A bespoke index packs directly into the single-split-
+with-footer model the rest of the architecture already assumes: a query reads the footer,
+learns which posting byte ranges it needs, and fetches them in one coalesced GET. Scoring
+is standard Okapi BM25, so retrieval quality is unaffected — only the storage mechanism
+differs. The tokenizer chain (NFKC → OpenCC t2s → lowercase → script segmentation → jieba
+dual-emission) is implemented exactly as SPEC §8 specifies, and is shared verbatim by the
+indexer and query parser. Swapping in tantivy later is possible behind the same arm
+interface if its packaging story is solved.
+
 ## Reference implementation
 
 The graph arm ports `hindsight_api/engine/search/link_expansion_retrieval.py` from the
