@@ -1,0 +1,11 @@
+# Large caches (BEIR corpora + embedding .npy) live under repo-root testdata/
+# and are ignored via testdata/.gitignore. This file covers bench-local artifacts.
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+.uv-cache/
+dist/
+build/
+
+# results/*.json and results/report.md ARE committed (small).

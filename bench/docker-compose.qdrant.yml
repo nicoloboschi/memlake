@@ -1,0 +1,31 @@
+# Qdrant for the benchmark harness only.
+# Kept separate from the repo-root docker-compose.yml (MinIO / engine services)
+# to avoid write conflicts with concurrent work on the Rust crates.
+#
+#   docker compose -f bench/docker-compose.qdrant.yml up -d
+#   docker compose -f bench/docker-compose.qdrant.yml down -v
+#
+# Ports are overridable so a busy 6333 doesn't block a run:
+#   QDRANT_HTTP_PORT=6343 docker compose -f bench/docker-compose.qdrant.yml up -d
+
+services:
+  qdrant:
+    image: qdrant/qdrant:v1.12.4
+    container_name: memlake-bench-qdrant
+    ports:
+      - "${QDRANT_HTTP_PORT:-6333}:6333"
+      - "${QDRANT_GRPC_PORT:-6334}:6334"
+    environment:
+      QDRANT__SERVICE__ENABLE_TLS: "false"
+      QDRANT__LOG_LEVEL: "INFO"
+    volumes:
+      - qdrant_storage:/qdrant/storage
+    healthcheck:
+      # The qdrant image is distroless (no curl/wget); use the bundled binary.
+      test: ["CMD", "/qdrant/qdrant", "--version"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  qdrant_storage:
