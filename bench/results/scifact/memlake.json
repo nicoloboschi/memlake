@@ -2,11 +2,11 @@
   "engine": "memlake",
   "config": {
     "note": "in-process IVF vector + hand-rolled BM25 + weighted RRF, same cached bge-small vectors as qdrant",
-    "nprobe": 32,
+    "nprobe": 64,
     "rrf_k": 60.0,
     "vector_weight": 1.0,
     "fts_weight": 1.0,
-    "arm_depth": 100,
+    "arm_depth": 200,
     "bm25_k1": 1.2,
     "bm25_b": 0.75,
     "model": "BAAI/bge-small-en-v1.5",
@@ -14,49 +14,49 @@
   },
   "corpus_size": 5183,
   "n_queries": 300,
-  "index_seconds": 2.95,
+  "index_seconds": 2.994,
   "arms": {
-    "dense": {
-      "ndcg@10": 0.70954,
-      "recall@100": 0.935,
-      "mrr@10": 0.67903,
-      "latency": {
-        "mean_ms": 2.007,
-        "p50_ms": 1.726,
-        "p90_ms": 2.301,
-        "p99_ms": 5.273,
-        "max_ms": 34.082,
-        "n_queries": 300
-      }
-    },
     "sparse": {
-      "ndcg@10": 0.66168,
-      "recall@100": 0.88589,
-      "mrr@10": 0.62762,
+      "ndcg@10": 0.69072,
+      "recall@100": 0.92089,
+      "mrr@10": 0.65773,
       "latency": {
-        "mean_ms": 0.643,
-        "p50_ms": 0.639,
-        "p90_ms": 0.833,
-        "p99_ms": 1.393,
-        "max_ms": 2.221,
+        "mean_ms": 0.32,
+        "p50_ms": 0.321,
+        "p90_ms": 0.492,
+        "p99_ms": 0.599,
+        "max_ms": 0.666,
         "n_queries": 300
       }
     },
     "hybrid": {
-      "ndcg@10": 0.70772,
-      "recall@100": 0.96167,
-      "mrr@10": 0.67743,
+      "ndcg@10": 0.73248,
+      "recall@100": 0.965,
+      "mrr@10": 0.69939,
       "latency": {
-        "mean_ms": 2.509,
-        "p50_ms": 2.298,
-        "p90_ms": 2.958,
-        "p99_ms": 5.404,
-        "max_ms": 19.213,
+        "mean_ms": 4.08,
+        "p50_ms": 4.014,
+        "p90_ms": 4.637,
+        "p99_ms": 5.101,
+        "max_ms": 5.345,
+        "n_queries": 300
+      }
+    },
+    "dense": {
+      "ndcg@10": 0.71271,
+      "recall@100": 0.94167,
+      "mrr@10": 0.68219,
+      "latency": {
+        "mean_ms": 3.738,
+        "p50_ms": 3.692,
+        "p90_ms": 4.174,
+        "p99_ms": 4.685,
+        "max_ms": 4.831,
         "n_queries": 300
       }
     }
   },
   "dataset": "scifact",
-  "generated_at": "2026-07-20T20:26:49+00:00",
+  "generated_at": "2026-07-20T20:32:01+00:00",
   "platform": "Darwin arm64 py3.13.2"
 }

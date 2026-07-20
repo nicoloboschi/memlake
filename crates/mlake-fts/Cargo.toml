@@ -17,6 +17,7 @@ character_converter = "2"
 unicode-normalization = "0.1"
 unicode-script = "0.5"
 once_cell = "1"
+rust-stemmers = "1"
 
 [dev-dependencies]
 tempfile = "3"

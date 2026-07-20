@@ -68,13 +68,16 @@ fn main() -> Result<()> {
 
     // Tuning knobs are overridable from the environment so the accuracy sweep can drive
     // this binary without a recompile.
+    // Defaults chosen against the BEIR accuracy gate (see docs/DECISIONS.md): nprobe=64
+    // reaches full dense parity with Qdrant HNSW on these corpora, and arm_depth=200
+    // matches Qdrant's per-arm prefetch so fusion sees the same candidate pool.
     let config = QueryConfig {
-        nprobe: env_usize("MEMLAKE_NPROBE", 32),
+        nprobe: env_usize("MEMLAKE_NPROBE", 64),
         rrf_k: env_f32("MEMLAKE_RRF_K", 60.0),
         vector_weight: env_f32("MEMLAKE_VEC_WEIGHT", 1.0),
         fts_weight: env_f32("MEMLAKE_FTS_WEIGHT", 1.0),
         graph_weight: 1.0,
-        arm_depth: env_usize("MEMLAKE_ARM_DEPTH", 100),
+        arm_depth: env_usize("MEMLAKE_ARM_DEPTH", 200),
         bm25: Bm25Params {
             k1: env_f32("MEMLAKE_BM25_K1", 1.2),
             b: env_f32("MEMLAKE_BM25_B", 0.75),

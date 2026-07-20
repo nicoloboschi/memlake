@@ -47,6 +47,24 @@ impl Token {
 
 static JIEBA: Lazy<jieba_rs::Jieba> = Lazy::new(jieba_rs::Jieba::new);
 
+static STEMMER: Lazy<rust_stemmers::Stemmer> =
+    Lazy::new(|| rust_stemmers::Stemmer::create(rust_stemmers::Algorithm::English));
+
+/// A small English stopword set. Kept short deliberately: aggressive stopping hurts
+/// phrase-like queries, but the highest-frequency function words carry almost no
+/// discriminative signal and inflate document lengths, weakening BM25 normalization.
+static STOPWORDS: Lazy<std::collections::HashSet<&'static str>> = Lazy::new(|| {
+    [
+        "a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "has", "he", "in",
+        "is", "it", "its", "of", "on", "that", "the", "to", "was", "were", "will", "with",
+        "this", "these", "those", "or", "but", "not", "have", "had", "which", "we", "they",
+        "their", "them", "our", "you", "your", "can", "could", "would", "should", "than",
+        "then", "there", "here", "into", "over", "under", "such", "been", "being", "also",
+    ]
+    .into_iter()
+    .collect()
+});
+
 /// Configuration that affects tokenization output. Its hash is stored in the manifest so
 /// a segment built under one configuration is never queried under another.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -54,12 +72,18 @@ pub struct TokenizerConfig {
     /// Whether to fold traditional Chinese to simplified. On by default so a
     /// traditional-script query retrieves simplified documents (SPEC G-4).
     pub traditional_to_simplified: bool,
+    /// Apply the Snowball English stemmer and drop stopwords on the Latin path. On by
+    /// default: it measurably lifts English BM25 by conflating morphological variants and
+    /// keeping high-frequency function words from distorting length normalization. SPEC §8
+    /// makes the light stemmer a config option.
+    pub english_stemming: bool,
 }
 
 impl Default for TokenizerConfig {
     fn default() -> Self {
         Self {
             traditional_to_simplified: true,
+            english_stemming: true,
         }
     }
 }
@@ -70,7 +94,11 @@ impl TokenizerConfig {
         // Version prefix so a change to the chain's *code* (not just its config) can be
         // forced to invalidate segments by bumping it.
         let mut hash: u64 = 0xcbf29ce484222325;
-        for byte in format!("v1:t2s={}", self.traditional_to_simplified).bytes() {
+        let repr = format!(
+            "v2:t2s={}:stem={}",
+            self.traditional_to_simplified, self.english_stemming
+        );
+        for byte in repr.bytes() {
             hash ^= byte as u64;
             hash = hash.wrapping_mul(0x100000001b3);
         }
@@ -149,6 +177,16 @@ impl Tokenizer {
             }
             RunKind::Latin => {
                 for word in latin_tokens(run.text) {
+                    let word = if self.config.english_stemming {
+                        // Drop stopwords before stemming; the stopword list is unstemmed
+                        // surface forms.
+                        if STOPWORDS.contains(word.as_str()) {
+                            continue;
+                        }
+                        STEMMER.stem(&word).into_owned()
+                    } else {
+                        word
+                    };
                     // Latin tokens hit both fields so a query term matches whichever field
                     // a mixed-script document happened to place it in.
                     out.push(Token::words(word.clone()));
@@ -316,6 +354,7 @@ mod tests {
     fn disabling_t2s_keeps_scripts_distinct() {
         let t = Tokenizer::new(TokenizerConfig {
             traditional_to_simplified: false,
+            english_stemming: false,
         });
         assert_ne!(words(&t.tokenize("漢語")), words(&t.tokenize("汉语")));
     }
@@ -358,6 +397,7 @@ mod tests {
         assert_eq!(a, b);
         let c = TokenizerConfig {
             traditional_to_simplified: false,
+            english_stemming: false,
         }
         .config_hash();
         assert_ne!(a, c, "different config must hash differently");

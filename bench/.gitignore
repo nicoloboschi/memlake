@@ -9,3 +9,4 @@ dist/
 build/
 
 # results/*.json and results/report.md ARE committed (small).
+results/*/*.run.json

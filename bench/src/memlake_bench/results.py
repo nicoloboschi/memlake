@@ -31,5 +31,9 @@ def load_all() -> dict[str, dict[str, dict]]:
         return out
     for ds_dir in sorted(p for p in base.iterdir() if p.is_dir()):
         for f in sorted(ds_dir.glob("*.json")):
+            # `*.run.json` are raw per-query rankings emitted by the memlake binary, not
+            # scored engine payloads; the scored result lands in `memlake.json`.
+            if f.name.endswith(".run.json"):
+                continue
             out.setdefault(ds_dir.name, {})[f.stem] = json.loads(f.read_text(encoding="utf-8"))
     return out
