@@ -1,0 +1,40 @@
+[workspace]
+resolver = "2"
+# Crates join the workspace as each milestone lands, so `cargo test` always covers
+# everything that exists rather than a wall of empty stubs.
+members = [
+    "crates/mlake-core",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/nicoloboschi/memlake"
+
+[workspace.dependencies]
+mlake-core = { path = "crates/mlake-core" }
+mlake-store = { path = "crates/mlake-store" }
+mlake-wal = { path = "crates/mlake-wal" }
+mlake-ivf = { path = "crates/mlake-ivf" }
+mlake-fts = { path = "crates/mlake-fts" }
+mlake-graph = { path = "crates/mlake-graph" }
+mlake-index = { path = "crates/mlake-index" }
+
+anyhow = "1"
+async-trait = "0.1"
+bytes = "1"
+futures = "0.3"
+object_store = { version = "0.11", features = ["aws"] }
+rkyv = { version = "0.7", features = ["validation"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4", "v5", "serde"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
