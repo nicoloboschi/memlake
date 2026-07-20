@@ -146,7 +146,10 @@ def build(
 
 def _atomic_npy(path: Path, arr: np.ndarray) -> None:
     tmp = path.with_suffix(".npy.tmp")
-    np.save(tmp, arr, allow_pickle=False)
+    # Write through a file handle: np.save(path_like) would append a second
+    # ".npy" to the temp name and the rename would miss it.
+    with open(tmp, "wb") as f:
+        np.save(f, arr, allow_pickle=False)
     tmp.rename(path)
 
 

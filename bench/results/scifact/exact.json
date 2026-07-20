@@ -1,0 +1,57 @@
+{
+  "engine": "exact",
+  "config": {
+    "dense": "numpy brute-force cosine (exact)",
+    "sparse": "in-python Okapi BM25 (k1=0.9, b=0.4, stopwords + s-stemmer)",
+    "fusion": "RRF k=60",
+    "top_k": 100,
+    "model": "BAAI/bge-small-en-v1.5",
+    "dim": 384
+  },
+  "corpus_size": 5183,
+  "n_queries": 300,
+  "arms": {
+    "dense": {
+      "ndcg@10": 0.71266,
+      "recall@100": 0.94167,
+      "mrr@10": 0.68215,
+      "latency": {
+        "mean_ms": 0.081,
+        "p50_ms": 0.079,
+        "p90_ms": 0.094,
+        "p99_ms": 0.134,
+        "max_ms": 1.03,
+        "n_queries": 300
+      }
+    },
+    "sparse": {
+      "ndcg@10": 0.66624,
+      "recall@100": 0.897,
+      "mrr@10": 0.63128,
+      "latency": {
+        "mean_ms": 0.09,
+        "p50_ms": 0.089,
+        "p90_ms": 0.131,
+        "p99_ms": 0.154,
+        "max_ms": 0.185,
+        "n_queries": 300
+      }
+    },
+    "hybrid": {
+      "ndcg@10": 0.70347,
+      "recall@100": 0.96833,
+      "mrr@10": 0.66973,
+      "latency": {
+        "mean_ms": 0.171,
+        "p50_ms": 0.167,
+        "p90_ms": 0.213,
+        "p99_ms": 0.268,
+        "max_ms": 1.206,
+        "n_queries": 300
+      }
+    }
+  },
+  "dataset": "scifact",
+  "generated_at": "2026-07-20T20:13:29+00:00",
+  "platform": "Darwin arm64 py3.13.2"
+}

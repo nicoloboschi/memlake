@@ -1,0 +1,61 @@
+{
+  "engine": "qdrant",
+  "config": {
+    "dense": "Qdrant HNSW, cosine, vectors from the shared embedding cache",
+    "sparse": "fastembed Qdrant/bm25 sparse vectors, IDF applied server-side",
+    "fusion": "Qdrant native RRF (FusionQuery) over both prefetch arms",
+    "top_k": 100,
+    "prefetch_limit": 200,
+    "model": "BAAI/bge-small-en-v1.5",
+    "dim": 384,
+    "url": "http://localhost:6333",
+    "collection": "memlake_bench_scifact"
+  },
+  "corpus_size": 5183,
+  "n_queries": 300,
+  "index_seconds": 3.95,
+  "arms": {
+    "dense": {
+      "ndcg@10": 0.71266,
+      "recall@100": 0.94167,
+      "mrr@10": 0.68215,
+      "latency": {
+        "mean_ms": 2.587,
+        "p50_ms": 1.863,
+        "p90_ms": 3.371,
+        "p99_ms": 9.151,
+        "max_ms": 61.912,
+        "n_queries": 300
+      }
+    },
+    "sparse": {
+      "ndcg@10": 0.683,
+      "recall@100": 0.92133,
+      "mrr@10": 0.64704,
+      "latency": {
+        "mean_ms": 1.963,
+        "p50_ms": 1.583,
+        "p90_ms": 2.703,
+        "p99_ms": 8.715,
+        "max_ms": 27.586,
+        "n_queries": 300
+      }
+    },
+    "hybrid": {
+      "ndcg@10": 0.73454,
+      "recall@100": 0.965,
+      "mrr@10": 0.70154,
+      "latency": {
+        "mean_ms": 3.364,
+        "p50_ms": 2.814,
+        "p90_ms": 4.49,
+        "p99_ms": 12.58,
+        "max_ms": 22.463,
+        "n_queries": 300
+      }
+    }
+  },
+  "dataset": "scifact",
+  "generated_at": "2026-07-20T20:14:01+00:00",
+  "platform": "Darwin arm64 py3.13.2"
+}
