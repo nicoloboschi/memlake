@@ -91,6 +91,29 @@ The `nprobe=64` default is near-exhaustive for these small corpora (~72 / ~60 ce
 at `mem-1m` scale, `sqrt(N)` centroids keep nprobe a small fraction of the index. The knob
 is environment-overridable (`MEMLAKE_NPROBE`) for the speed/recall trade-off study.
 
+## Speed results
+
+Warm-path micro-benchmarks (criterion, `crates/mlake-index/benches/query.rs`) and the
+roundtrip-budget integration test:
+
+| Gate (SPEC §10.4)            | Target            | Measured                | Status |
+|------------------------------|-------------------|-------------------------|--------|
+| Warm vector arm p50          | ≤ 5 ms            | 1.55 ms (100k corpus)   | pass   |
+| Index throughput             | ≥ 5k items/s/core | ~11,500 items/s         | pass   |
+| Cold-load roundtrips         | ≤ 4, size-independent | constant as corpus 30× | pass   |
+| Warm fused p50               | ≤ 15 ms           | 23 ms (synthetic) / 2–4 ms (BEIR) | see note |
+
+The synthetic fused-query number is inflated by an adversarial micro-bench corpus: its
+text is drawn from an 8-word vocabulary, so every document shares every query term and the
+BM25 posting lists are maximal. On the real BEIR corpora — where query terms are selective
+— the benchmark harness measured hybrid p50 at 2–4 ms (see `bench/results/report.md`),
+comfortably inside the gate. The synthetic case is kept as a worst-case stress, not a
+representative one.
+
+The roundtrip test (`generation_load_roundtrips_are_constant_regardless_of_size`) is the
+important one architecturally: it proves query cost is independent of data size (INV-7),
+which is the entire justification for the storage layout.
+
 ## Build order
 
 Functionality first across all milestones, then quality (accuracy parity), then speed
