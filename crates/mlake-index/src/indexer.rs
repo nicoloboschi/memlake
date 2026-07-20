@@ -49,20 +49,55 @@ pub struct IndexOutcome {
 pub async fn index(ns: &Namespace, tokenizer: &Tokenizer, opts: IndexOptions) -> Result<IndexOutcome> {
     let (manifest, etag) = ns.read_manifest().await?;
 
-    // Fold the whole log up to head: for the POC the indexer reindexes from empty each
-    // run, which keeps it simple and still exercises the full pipeline. (Incremental
-    // assign-only builds are the §5.1 optimization, deferred.)
+    // Incremental build: start from the previous generation's live items, then apply only
+    // the WAL slice `(cursor, head]`. This is what makes WAL GC safe — once an entry is
+    // folded into a generation, the generation carries it and the entry can be reclaimed
+    // (SPEC §5). The first run has no previous generation and folds from an empty base.
     let head = ns.wal_head().await?;
-    let scan = WalTail::new(ns).scan(0, Some(head)).await?;
 
-    // Materialize the live item set: upserts, minus tombstones, patches folded.
-    let mut items: Vec<StoredItem> = scan
-        .upserts
-        .into_values()
-        .filter(|item| !scan.tombstones.contains(&item.id))
-        .collect();
-    // Deterministic order so the build is replayable (G-6).
-    items.sort_by(|a, b| a.id.cmp(&b.id));
+    let mut by_id: std::collections::BTreeMap<[u8; 16], StoredItem> =
+        std::collections::BTreeMap::new();
+    if !manifest.is_empty() {
+        let prev = crate::generation::read_generation(
+            &ns.store,
+            &manifest.files,
+            manifest.generation,
+            None,
+        )
+        .await?;
+        for item in prev.clusters.into_iter().flatten() {
+            by_id.insert(item.id.0, item);
+        }
+    }
+
+    // Apply the tail: upserts replace, tombstones remove, patches were folded by the scan.
+    let scan = WalTail::new(ns)
+        .scan(manifest.wal_index_cursor, Some(head))
+        .await?;
+    for id in &scan.tombstones {
+        by_id.remove(&id.0);
+    }
+    for (id, item) in scan.upserts {
+        by_id.insert(id.0, item);
+    }
+    // Deferred patches apply to items carried from the previous generation.
+    for item in by_id.values_mut() {
+        scan.pending_patches
+            .get(&ItemId(item.id.0))
+            .map(|deltas| {
+                item.proof_count =
+                    mlake_core::wal::fold_proof_count(item.proof_count, deltas.iter().copied());
+            });
+    }
+
+    // BTreeMap iteration is id-sorted, so the item order — and thus the build — is
+    // deterministic and replayable (G-6).
+    let mut items: Vec<StoredItem> = by_id.into_values().collect();
+    // semantic_out is derived, not carried: recompute it if requested, else clear stale
+    // links from the previous generation so they cannot dangle.
+    for item in items.iter_mut() {
+        item.semantic_out.clear();
+    }
 
     if opts.derive_links {
         derive_semantic_links(&mut items);

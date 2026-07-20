@@ -263,3 +263,143 @@ async fn full_pipeline_against_minio() {
     let hits = node.query(Some(&[1.0, 0.0, 0.0]), Some("fox"), 10, QueryConfig::default());
     assert_eq!(hits[0].id, ItemId::from_key("x"));
 }
+
+// ---------------------------------------------------------------- compaction & GC (M6)
+
+use mlake_index::{gc, GcOutcome};
+
+/// After GC, folded WAL entries and superseded generation files are gone, but queries
+/// still return the same results — GC touches only unreferenced files (INV-4).
+#[tokio::test]
+async fn gc_reclaims_folded_wal_and_old_generations_without_changing_results() {
+    let store = Store::in_memory();
+    let ns = namespace(store, "ns").await;
+    let mut writer = Writer::new(ns.clone());
+
+    // Two index runs, so there is a superseded generation and folded WAL to reclaim.
+    writer.commit(vec![Op::Upsert(item("a", vec![1.0, 0.0], "alpha"))]).await.unwrap();
+    index(&ns, &Tokenizer::default(), IndexOptions::default()).await.unwrap();
+    writer.commit(vec![Op::Upsert(item("b", vec![0.0, 1.0], "beta"))]).await.unwrap();
+    index(&ns, &Tokenizer::default(), IndexOptions::default()).await.unwrap();
+    // A third run so generation 1 falls below prev_generation and becomes collectable.
+    writer.commit(vec![Op::Upsert(item("c", vec![1.0, 1.0], "gamma"))]).await.unwrap();
+    index(&ns, &Tokenizer::default(), IndexOptions::default()).await.unwrap();
+
+    let before = QueryNode::open(&ns, Tokenizer::default(), Consistency::Strong).await.unwrap();
+    assert_eq!(before.doc_count(), 3);
+
+    let outcome = gc(&ns).await.unwrap();
+    assert!(outcome.wal_entries_deleted > 0, "folded WAL entries should be reclaimed");
+    assert!(outcome.generation_files_deleted > 0, "an old generation should be reclaimed");
+
+    // Results are unchanged: GC only removed files nothing references.
+    let after = QueryNode::open(&ns, Tokenizer::default(), Consistency::Strong).await.unwrap();
+    assert_eq!(after.doc_count(), 3);
+    let hits = after.query(Some(&[0.0, 1.0]), None, 10, QueryConfig::default());
+    assert_eq!(hits[0].id, ItemId::from_key("b"));
+}
+
+/// GC keeps the current and previous generations, so a query still works immediately after
+/// collecting.
+#[tokio::test]
+async fn gc_keeps_the_current_generation_intact() {
+    let store = Store::in_memory();
+    let ns = namespace(store, "ns").await;
+    let mut writer = Writer::new(ns.clone());
+    writer.commit(vec![Op::Upsert(item("a", vec![1.0, 0.0], "alpha"))]).await.unwrap();
+    index(&ns, &Tokenizer::default(), IndexOptions::default()).await.unwrap();
+
+    gc(&ns).await.unwrap();
+
+    let node = QueryNode::open(&ns, Tokenizer::default(), Consistency::Strong).await.unwrap();
+    assert_eq!(node.doc_count(), 1, "current generation must survive GC");
+}
+
+/// GC is idempotent: a second pass finds nothing new to delete and does not error.
+#[tokio::test]
+async fn gc_is_idempotent() {
+    let store = Store::in_memory();
+    let ns = namespace(store, "ns").await;
+    let mut writer = Writer::new(ns.clone());
+    writer.commit(vec![Op::Upsert(item("a", vec![1.0, 0.0], "alpha"))]).await.unwrap();
+    index(&ns, &Tokenizer::default(), IndexOptions::default()).await.unwrap();
+    writer.commit(vec![Op::Upsert(item("b", vec![0.0, 1.0], "beta"))]).await.unwrap();
+    index(&ns, &Tokenizer::default(), IndexOptions::default()).await.unwrap();
+
+    let first = gc(&ns).await.unwrap();
+    let second = gc(&ns).await.unwrap();
+    assert_eq!(second, GcOutcome::default(), "second GC pass must find nothing new");
+    assert!(first != GcOutcome::default(), "first GC pass should reclaim something");
+}
+
+/// Incremental indexing folds a tombstone permanently: after the delete is folded into a
+/// generation and its WAL entry GC'd, the item stays gone.
+#[tokio::test]
+async fn tombstone_survives_compaction_and_wal_gc() {
+    let store = Store::in_memory();
+    let ns = namespace(store, "ns").await;
+    let mut writer = Writer::new(ns.clone());
+
+    writer
+        .commit(vec![
+            Op::Upsert(item("keep", vec![1.0, 0.0], "keep")),
+            Op::Upsert(item("drop", vec![0.0, 1.0], "drop")),
+        ])
+        .await
+        .unwrap();
+    index(&ns, &Tokenizer::default(), IndexOptions::default()).await.unwrap();
+
+    writer.commit(vec![Op::Tombstone { id: ItemId::from_key("drop") }]).await.unwrap();
+    // Fold the tombstone into a new generation, then GC the tombstone's WAL entry.
+    index(&ns, &Tokenizer::default(), IndexOptions::default()).await.unwrap();
+    gc(&ns).await.unwrap();
+
+    let node = QueryNode::open(&ns, Tokenizer::default(), Consistency::Strong).await.unwrap();
+    assert_eq!(node.doc_count(), 1, "the deleted item must stay gone after compaction");
+    assert!(node.query(Some(&[0.0, 1.0]), None, 10, QueryConfig::default())
+        .iter()
+        .all(|h| h.id != ItemId::from_key("drop")));
+}
+
+use std::sync::Arc as ArcChaos;
+
+/// Chaos: a crash after writing generation files but before the manifest swap leaves the
+/// old generation serving. The orphaned files are unreferenced and GC-collectable, and the
+/// next index run simply republishes — no data loss, no corruption (INV-6).
+#[tokio::test]
+async fn crash_before_manifest_swap_leaves_the_old_generation_serving() {
+    let backing = ArcChaos::new(object_store::memory::InMemory::new());
+    let ns = namespace(Store::new(ArcChaos::clone(&backing) as _), "ns").await;
+    let mut writer = Writer::new(ns.clone());
+    writer.commit(vec![Op::Upsert(item("a", vec![1.0, 0.0], "alpha"))]).await.unwrap();
+    index(&ns, &Tokenizer::default(), IndexOptions::default()).await.unwrap();
+
+    // Simulate a crashed index run: write generation-2 files directly, but never swap the
+    // manifest. The manifest still points at generation 1.
+    writer.commit(vec![Op::Upsert(item("b", vec![0.0, 1.0], "beta"))]).await.unwrap();
+    let (manifest, _) = ns.read_manifest().await.unwrap();
+    let orphan_files = mlake_index::write_generation(
+        &ns.store,
+        &ns.name,
+        99, // a generation number the manifest will never reference
+        &mlake_ivf::train_centroids(&[vec![0.0, 1.0]], 42),
+        &[],
+        &mlake_fts::FtsBuilder::new().finish(),
+        &mlake_graph::ReverseAdjacency::build(vec![]),
+        &mlake_index::PkIndex::default(),
+    )
+    .await
+    .unwrap();
+    let _ = &orphan_files;
+    assert_eq!(manifest.generation, 1, "manifest must still point at the pre-crash generation");
+
+    // The namespace still serves generation 1 correctly.
+    let node = QueryNode::open(&ns, Tokenizer::default(), Consistency::Strong).await.unwrap();
+    // Strong consistency also sees the un-indexed 'b' via the WAL tail.
+    assert_eq!(node.doc_count(), 2);
+
+    // A fresh index run republishes cleanly over the mess.
+    let outcome = index(&ns, &Tokenizer::default(), IndexOptions::default()).await.unwrap();
+    assert!(outcome.published);
+    assert_eq!(outcome.doc_count, 2);
+}

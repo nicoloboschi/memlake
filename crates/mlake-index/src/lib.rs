@@ -5,12 +5,14 @@
 
 pub mod engine;
 pub mod fusion;
+pub mod gc;
 pub mod generation;
 pub mod indexer;
 pub mod query_node;
 
 pub use engine::{Engine, QueryConfig};
 pub use fusion::{rrf, weighted_rrf, FusedHit, RankedArm, DEFAULT_RRF_K};
+pub use gc::{gc, GcOutcome};
 pub use generation::{read_generation, write_generation, Generation, PkIndex};
 pub use indexer::{index, IndexOptions, IndexOutcome};
 pub use query_node::{Consistency, QueryNode};
