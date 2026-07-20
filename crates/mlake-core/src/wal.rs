@@ -57,7 +57,7 @@ impl WalEntry {
         // is why the in-memory store worked while S3 failed — so realign by copying when
         // needed. The copy only happens on the WAL tail path, which is bounded and small;
         // the warm path reads mmapped generation files, which are page-aligned already.
-        if bytes.as_ptr() as usize % ARCHIVE_ALIGNMENT == 0 {
+        if (bytes.as_ptr() as usize).is_multiple_of(ARCHIVE_ALIGNMENT) {
             Self::from_aligned_bytes(bytes)
         } else {
             let mut aligned = rkyv::AlignedVec::with_capacity(bytes.len());

@@ -75,7 +75,7 @@ impl<'a> WalTail<'a> {
             .into_iter()
             .filter_map(|p| parse_wal_seq(&p).map(|s| (s, p)))
             .filter(|(seq, _)| *seq > after_seq)
-            .filter(|(seq, _)| through_seq.map_or(true, |t| *seq <= t))
+            .filter(|(seq, _)| through_seq.is_none_or(|t| *seq <= t))
             .collect();
         // Ops must be folded in sequence order: a later tombstone has to win over an
         // earlier upsert of the same id.

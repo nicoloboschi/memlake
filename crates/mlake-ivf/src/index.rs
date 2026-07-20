@@ -34,7 +34,7 @@ impl ClusterFile {
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, mlake_core::Error> {
         // Same alignment concern as the WAL: bytes off the network are not aligned.
-        if bytes.as_ptr() as usize % 8 == 0 {
+        if (bytes.as_ptr() as usize).is_multiple_of(8) {
             Self::from_aligned(bytes)
         } else {
             let mut aligned = rkyv::AlignedVec::with_capacity(bytes.len());

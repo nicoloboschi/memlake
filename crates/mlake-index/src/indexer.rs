@@ -82,12 +82,9 @@ pub async fn index(ns: &Namespace, tokenizer: &Tokenizer, opts: IndexOptions) ->
     }
     // Deferred patches apply to items carried from the previous generation.
     for item in by_id.values_mut() {
-        scan.pending_patches
-            .get(&ItemId(item.id.0))
-            .map(|deltas| {
-                item.proof_count =
-                    mlake_core::wal::fold_proof_count(item.proof_count, deltas.iter().copied());
-            });
+        if let Some(deltas) = scan.pending_patches
+            .get(&ItemId(item.id.0)) { item.proof_count =
+                    mlake_core::wal::fold_proof_count(item.proof_count, deltas.iter().copied()); }
     }
 
     // BTreeMap iteration is id-sorted, so the item order — and thus the build — is
@@ -118,7 +115,7 @@ pub async fn index(ns: &Namespace, tokenizer: &Tokenizer, opts: IndexOptions) ->
             pk_entries.push((item.id, ci as u32));
         }
     }
-    pk_entries.sort_by(|a, b| a.0.cmp(&b.0));
+    pk_entries.sort_by_key(|a| a.0);
     let pk = PkIndex { entries: pk_entries };
 
     // Build the FTS split.
