@@ -4,6 +4,7 @@ resolver = "2"
 # everything that exists rather than a wall of empty stubs.
 members = [
     "crates/mlake-core",
+    "crates/mlake-store",
 ]
 
 [workspace.package]

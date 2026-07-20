@@ -1,0 +1,22 @@
+[package]
+name = "mlake-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+mlake-core.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+futures.workspace = true
+object_store.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+url = "2"
+
+[dev-dependencies]
+tempfile = "3"
