@@ -104,6 +104,9 @@ Deliberately deferred (recorded in [`docs/DECISIONS.md`](docs/DECISIONS.md)):
   API; the HTTP wrapper over them is not built.
 * **The full G-2 differential** against live Hindsight Postgres — the graph arm is a
   behavioural port validated arm-by-arm and against the spec's scorer goldens (G-3).
-* **tantivy** — FTS is a hand-rolled BM25 that packs into the single-split model; the
-  tokenizer chain follows SPEC §8 exactly. See `docs/DECISIONS.md` for why.
 * **Quantization, sharding, multi-region, auth** — all v1 non-goals per the spec.
+
+The FTS arm **is tantivy** (SPEC §5.3), packaged the S3-native way: a whole tantivy index
+is packed into one `split.bin` object and materialized into the local NVMe/mmap tier to
+serve reads. The Chinese-capable tokenizer chain (§8) drives what gets indexed via
+pre-tokenized streams. See `docs/DECISIONS.md`.

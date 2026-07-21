@@ -14,31 +14,18 @@
   },
   "corpus_size": 5183,
   "n_queries": 300,
-  "index_seconds": 2.994,
+  "index_seconds": 3.101,
   "arms": {
-    "sparse": {
-      "ndcg@10": 0.69072,
-      "recall@100": 0.92089,
-      "mrr@10": 0.65773,
-      "latency": {
-        "mean_ms": 0.32,
-        "p50_ms": 0.321,
-        "p90_ms": 0.492,
-        "p99_ms": 0.599,
-        "max_ms": 0.666,
-        "n_queries": 300
-      }
-    },
     "hybrid": {
-      "ndcg@10": 0.73248,
+      "ndcg@10": 0.73245,
       "recall@100": 0.965,
-      "mrr@10": 0.69939,
+      "mrr@10": 0.6996,
       "latency": {
-        "mean_ms": 4.08,
-        "p50_ms": 4.014,
-        "p90_ms": 4.637,
-        "p99_ms": 5.101,
-        "max_ms": 5.345,
+        "mean_ms": 4.432,
+        "p50_ms": 4.201,
+        "p90_ms": 4.774,
+        "p99_ms": 10.387,
+        "max_ms": 26.477,
         "n_queries": 300
       }
     },
@@ -47,16 +34,29 @@
       "recall@100": 0.94167,
       "mrr@10": 0.68219,
       "latency": {
-        "mean_ms": 3.738,
-        "p50_ms": 3.692,
-        "p90_ms": 4.174,
-        "p99_ms": 4.685,
-        "max_ms": 4.831,
+        "mean_ms": 4.035,
+        "p50_ms": 3.789,
+        "p90_ms": 4.323,
+        "p99_ms": 7.104,
+        "max_ms": 38.406,
+        "n_queries": 300
+      }
+    },
+    "sparse": {
+      "ndcg@10": 0.69059,
+      "recall@100": 0.92089,
+      "mrr@10": 0.65756,
+      "latency": {
+        "mean_ms": 0.503,
+        "p50_ms": 0.433,
+        "p90_ms": 0.806,
+        "p99_ms": 1.386,
+        "max_ms": 3.511,
         "n_queries": 300
       }
     }
   },
   "dataset": "scifact",
-  "generated_at": "2026-07-20T20:32:01+00:00",
+  "generated_at": "2026-07-21T07:58:35+00:00",
   "platform": "Darwin arm64 py3.13.2"
 }

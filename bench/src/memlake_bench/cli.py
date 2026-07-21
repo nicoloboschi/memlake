@@ -76,10 +76,6 @@ def cmd_baseline_memlake(args) -> int:
         env["MEMLAKE_VEC_WEIGHT"] = args.vec_weight
     if args.fts_weight is not None:
         env["MEMLAKE_FTS_WEIGHT"] = args.fts_weight
-    if args.bm25_k1 is not None:
-        env["MEMLAKE_BM25_K1"] = args.bm25_k1
-    if args.bm25_b is not None:
-        env["MEMLAKE_BM25_B"] = args.bm25_b
     if getattr(args, "graph", False):
         # Synthesize the semantic kNN link graph and add the graph arm to fusion. Saved as
         # a distinct engine so the report shows the graph arm's effect side by side.
@@ -166,8 +162,6 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--nprobe", default=None, help="IVF clusters probed per query")
         sp.add_argument("--vec-weight", default=None, help="RRF weight for the vector arm")
         sp.add_argument("--fts-weight", default=None, help="RRF weight for the FTS arm")
-        sp.add_argument("--bm25-k1", default=None)
-        sp.add_argument("--bm25-b", default=None)
         sp.add_argument(
             "--graph",
             action="store_true",
@@ -191,8 +185,6 @@ def build_parser() -> argparse.ArgumentParser:
         nprobe=None,
         vec_weight=None,
         fts_weight=None,
-        bm25_k1=None,
-        bm25_b=None,
     )
 
     sp = sub.add_parser("report", help="render bench/results/report.md")

@@ -58,19 +58,39 @@ Two-stage target:
 The graph arm's *correctness* is validated separately against the Hindsight reference
 implementation (gate G-2), not against Qdrant.
 
-## FTS: hand-rolled BM25 instead of tantivy
+## FTS: tantivy, packaged S3-native
 
-SPEC §5.3 specifies "BM25 via tantivy". The POC uses a self-contained BM25 inverted index
-instead. The spec's own §6.2 identifies the tantivy `Directory`-over-object-storage
-integration as the hard part of the whole design, and it is a multi-day effort that fights
-an abstraction built for local disk. A bespoke index packs directly into the single-split-
-with-footer model the rest of the architecture already assumes: a query reads the footer,
-learns which posting byte ranges it needs, and fetches them in one coalesced GET. Scoring
-is standard Okapi BM25, so retrieval quality is unaffected — only the storage mechanism
-differs. The tokenizer chain (NFKC → OpenCC t2s → lowercase → script segmentation → jieba
-dual-emission) is implemented exactly as SPEC §8 specifies, and is shared verbatim by the
-indexer and query parser. Swapping in tantivy later is possible behind the same arm
-interface if its packaging story is solved.
+SPEC §5.3 specifies "BM25 via tantivy", and the FTS arm uses tantivy — the real engine,
+with block-WAND scoring, compressed posting blocks, and mature segment handling.
+
+The initial overnight build shipped a hand-rolled BM25 to get to measured numbers faster;
+that was a time shortcut, not the right call, and it is now replaced. tantivy is also the
+*more* S3-optimal choice: its term dictionary + compressed postings mean a query reads far
+fewer bytes, which is exactly what the S3 interface rewards.
+
+Packaging follows the Quickwit split pattern, adapted to `mlake-store`:
+
+- a whole tantivy index is built into a temp `MmapDirectory`, then packed into one
+  immutable `split.bin` object (`[count][name,data]…`);
+- a query node fetches that one object and materializes it into the local NVMe/mmap tier
+  to serve reads — the "warm query served from NVMe/mmap" path of §6.1;
+- the custom Chinese-capable tokenization (§8) is preserved by feeding tantivy
+  *pre-tokenized* streams, so jieba dual-emission and the OpenCC fold still decide what
+  gets indexed while tantivy owns storage and scoring.
+
+Accuracy is unchanged from the hand-rolled version (scifact sparse 0.6906 vs 0.6907,
+hybrid 0.7325 identical; nfcorpus hybrid 0.3638, still beating Qdrant), so parity holds
+with the battle-tested engine now in place.
+
+**One property is genuinely lost:** tantivy stamps each segment with a random id, so the
+FTS split bytes are *not* byte-identical across index replays — the strong form of G-6
+does not hold for the FTS file (the vector, pk and radj files still are byte-identical).
+Retrieval *results* remain deterministic, so query behaviour is reproducible; only the
+physical split bytes vary. Test: `retrieval_is_deterministic_across_rebuilds`.
+
+The `Bm25Params` knob (and the `MEMLAKE_BM25_*` bench env vars) were removed: tantivy uses
+its own standard BM25 (k1=1.2, b=0.75), so a memlake-side parameter would silently do
+nothing — a trap worth deleting rather than keeping.
 
 ## Reference implementation
 

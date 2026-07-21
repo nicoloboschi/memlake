@@ -7,7 +7,7 @@
 
 use mlake_core::manifest::generation_prefix;
 use mlake_core::{GenerationFiles, ItemId, StoredItem};
-use mlake_fts::FtsIndex;
+use mlake_fts::{TantivyFts, Tokenizer};
 use mlake_graph::ReverseAdjacency;
 use mlake_ivf::{Centroids, ClusterFile};
 use mlake_store::{QueryMetrics, Store};
@@ -34,14 +34,16 @@ impl PkIndex {
     }
 }
 
-/// All the in-memory state of one generation. The query node materializes this (in full
-/// for the POC; lazily per-probed-cluster for the roundtrip-budget path) and answers from
-/// it plus the WAL tail.
+/// The structural state of one generation loaded from storage: the vector index, the
+/// items, the graph adjacency, and the pk index.
+///
+/// The FTS split is *not* loaded here — it is a self-contained tantivy artifact loaded on
+/// demand via [`read_fts_split`], so callers that only need items (the incremental
+/// indexer) do not pay to materialize it.
 pub struct Generation {
     pub generation: u64,
     pub centroids: Centroids,
     pub clusters: Vec<Vec<StoredItem>>,
-    pub fts: FtsIndex,
     pub radj: ReverseAdjacency,
     pub pk: PkIndex,
 }
@@ -82,7 +84,7 @@ pub async fn write_generation(
     generation: u64,
     centroids: &Centroids,
     clusters: &[ClusterFile],
-    fts: &FtsIndex,
+    fts_split: &[u8],
     radj: &ReverseAdjacency,
     pk: &PkIndex,
 ) -> Result<GenerationFiles> {
@@ -97,8 +99,10 @@ pub async fn write_generation(
         cluster_paths.push(key);
     }
 
+    // The FTS file is the packed tantivy split — a self-contained index a query node
+    // materializes into its NVMe/mmap tier (SPEC §6.1).
     store
-        .put(&fts_key(namespace, generation), serde_json::to_vec(fts)?)
+        .put(&fts_key(namespace, generation), fts_split.to_vec())
         .await?;
     store
         .put(&radj_key(namespace, generation), radj.to_bytes()?)
@@ -138,16 +142,16 @@ pub async fn read_generation(
     generation: u64,
     metrics: Option<&QueryMetrics>,
 ) -> Result<Generation> {
-    // RT2: the small metadata files — centroids, FTS split, reverse adjacency, pk index —
-    // fetched concurrently, so they cost one roundtrip of latency, not four (INV-7).
-    let (centroids_bytes, fts_bytes, radj_bytes, pk_bytes) = futures::try_join!(
+    // RT2: the small metadata files — centroids, reverse adjacency, pk index — fetched
+    // concurrently, so they cost one roundtrip of latency (INV-7). The FTS split is not
+    // fetched here; it is loaded on demand via `read_fts_split` only when the FTS arm is
+    // needed, so the incremental indexer (which only wants items) does not pay for it.
+    let (centroids_bytes, radj_bytes, pk_bytes) = futures::try_join!(
         store.get(&files.centroids, metrics.map(|m| (m, 2))),
-        store.get(&files.fts_split, metrics.map(|m| (m, 2))),
         store.get(&files.radj_csr, metrics.map(|m| (m, 2))),
         store.get(&files.pk, metrics.map(|m| (m, 2))),
     )?;
     let centroids = Centroids::from_bytes(&centroids_bytes.bytes)?;
-    let fts: FtsIndex = serde_json::from_slice(&fts_bytes.bytes)?;
     let radj = ReverseAdjacency::from_bytes(&radj_bytes.bytes)?;
     let pk: PkIndex = serde_json::from_slice(&pk_bytes.bytes)?;
 
@@ -167,8 +171,20 @@ pub async fn read_generation(
         generation,
         centroids,
         clusters,
-        fts,
         radj,
         pk,
     })
+}
+
+/// Load the generation's tantivy FTS split from storage and materialize it into the local
+/// NVMe/mmap tier, ready to serve BM25 queries. One ranged GET (SPEC §6.1).
+pub async fn read_fts_split(
+    store: &Store,
+    files: &GenerationFiles,
+    tokenizer: Tokenizer,
+    metrics: Option<&QueryMetrics>,
+) -> Result<TantivyFts> {
+    let bytes = store.get(&files.fts_split, metrics.map(|m| (m, 3))).await?;
+    TantivyFts::from_split(&bytes.bytes, tokenizer)
+        .map_err(|e| crate::Error::Core(mlake_core::Error::Decode(e.to_string())))
 }

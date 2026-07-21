@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 
 use mlake_core::{ItemId, StoredItem};
-use mlake_fts::{Bm25Params, FtsBuilder, FtsIndex, Tokenizer};
+use mlake_fts::{TantivyFts, Tokenizer, TokenizerConfig};
 use mlake_graph::radj::{EdgeKind, InEdge, LinkTypeTag, ReverseAdjacency};
 use mlake_graph::{GraphParams, GraphSource};
 use mlake_ivf::{build_clusters, exact_search, train_centroids, Centroids};
@@ -27,7 +27,6 @@ pub struct QueryConfig {
     pub graph_weight: f32,
     /// How many candidates each arm contributes to fusion before truncation.
     pub arm_depth: usize,
-    pub bm25: Bm25Params,
 }
 
 impl Default for QueryConfig {
@@ -39,7 +38,6 @@ impl Default for QueryConfig {
             fts_weight: 1.0,
             graph_weight: 1.0,
             arm_depth: 100,
-            bm25: Bm25Params::default(),
         }
     }
 }
@@ -51,8 +49,7 @@ pub struct Engine {
     clusters: Vec<Vec<StoredItem>>,
     /// All items by id, for graph materialization and result hydration.
     items: HashMap<ItemId, StoredItem>,
-    fts: FtsIndex,
-    tokenizer: Tokenizer,
+    fts: TantivyFts,
     radj: ReverseAdjacency,
     entity_index: HashMap<u64, Vec<ItemId>>,
 }
@@ -69,13 +66,20 @@ impl Engine {
             .map(|c| c.items)
             .collect();
 
-        let mut fts = FtsBuilder::new();
+        // The FTS arm is tantivy: build the index from the same tokens the shared chain
+        // produces (SPEC §5.3). Uses the default tokenizer config, matching the query side.
+        let fts = TantivyFts::build(
+            items.iter().map(|i| (i.id, i.text.as_str())),
+            Tokenizer::new(TokenizerConfig::default()),
+        )
+        .expect("build tantivy FTS index");
+        let _ = tokenizer;
+
         let mut map = HashMap::new();
         let mut entity_index: HashMap<u64, Vec<ItemId>> = HashMap::new();
         let mut radj_pairs: Vec<(ItemId, InEdge)> = Vec::new();
 
         for item in &items {
-            fts.add(item.id, &tokenizer.tokenize(&item.text));
             for e in &item.entity_ids {
                 entity_index.entry(*e).or_default().push(item.id);
             }
@@ -110,8 +114,7 @@ impl Engine {
             centroids,
             clusters,
             items: map,
-            fts: fts.finish(),
-            tokenizer,
+            fts,
             radj: ReverseAdjacency::build(radj_pairs),
             entity_index,
         }
@@ -141,10 +144,10 @@ impl Engine {
             .collect()
     }
 
-    /// The FTS arm: BM25 over the split.
-    pub fn fts_arm(&self, query_text: &str, depth: usize, params: Bm25Params) -> Vec<ItemId> {
+    /// The FTS arm: tantivy BM25 over the split (standard k1=1.2, b=0.75).
+    pub fn fts_arm(&self, query_text: &str, depth: usize) -> Vec<ItemId> {
         self.fts
-            .search(&self.tokenizer, query_text, depth, params)
+            .search(query_text, depth)
             .into_iter()
             .map(|h| h.id)
             .collect()
@@ -191,7 +194,7 @@ impl Engine {
             .unwrap_or_default();
         let fts = text
             .filter(|t| !t.is_empty())
-            .map(|t| self.fts_arm(t, config.arm_depth, config.bm25))
+            .map(|t| self.fts_arm(t, config.arm_depth))
             .unwrap_or_default();
         let graph = if self.radj.edge_count() > 0 {
             query
@@ -295,7 +298,7 @@ mod tests {
     #[test]
     fn fts_arm_matches_text() {
         let e = engine();
-        let hits = e.fts_arm("loyal canine", 10, Bm25Params::default());
+        let hits = e.fts_arm("loyal canine", 10);
         assert_eq!(hits[0], ItemId::from_key("dogs"));
     }
 

@@ -378,13 +378,18 @@ async fn crash_before_manifest_swap_leaves_the_old_generation_serving() {
     // manifest. The manifest still points at generation 1.
     writer.commit(vec![Op::Upsert(item("b", vec![0.0, 1.0], "beta"))]).await.unwrap();
     let (manifest, _) = ns.read_manifest().await.unwrap();
+    let empty_split = mlake_fts::TantivyFts::build(
+        std::iter::empty::<(ItemId, &str)>(),
+        mlake_fts::Tokenizer::default(),
+    )
+    .unwrap();
     let orphan_files = mlake_index::write_generation(
         &ns.store,
         &ns.name,
         99, // a generation number the manifest will never reference
         &mlake_ivf::train_centroids(&[vec![0.0, 1.0]], 42),
         &[],
-        &mlake_fts::FtsBuilder::new().finish(),
+        empty_split.split_bytes(),
         &mlake_graph::ReverseAdjacency::build(vec![]),
         &mlake_index::PkIndex::default(),
     )
@@ -446,4 +451,35 @@ async fn generation_load_roundtrips_are_constant_regardless_of_size() {
         large <= COLD_ROUNDTRIP_BUDGET,
         "generation load must stay within the {COLD_ROUNDTRIP_BUDGET}-roundtrip budget, was {large}"
     );
+}
+
+/// The tantivy FTS split persists to object storage and answers queries after a full
+/// round-trip through the store — the warm-path FTS load (SPEC §6.1), proven end to end.
+#[tokio::test]
+async fn tantivy_fts_split_loads_from_storage_and_serves_queries() {
+    let store = Store::in_memory();
+    let ns = namespace(store, "ns").await;
+    let mut writer = Writer::new(ns.clone());
+    writer
+        .commit(vec![
+            Op::Upsert(item("fox", vec![1.0, 0.0], "the quick brown fox jumps")),
+            Op::Upsert(item("dog", vec![0.0, 1.0], "a lazy sleeping dog")),
+            Op::Upsert(item("cn", vec![0.5, 0.5], "北京大学的研究")),
+        ])
+        .await
+        .unwrap();
+    index(&ns, &Tokenizer::default(), IndexOptions::default()).await.unwrap();
+
+    // Load only the FTS split from the manifest's file map — the warm FTS path.
+    let (manifest, _) = ns.read_manifest().await.unwrap();
+    let fts = mlake_index::read_fts_split(&ns.store, &manifest.files, Tokenizer::default(), None)
+        .await
+        .unwrap();
+
+    let en = fts.search("brown fox", 10);
+    assert_eq!(en[0].id, ItemId::from_key("fox"), "English BM25 over the loaded split");
+
+    // Chinese query works through the same persisted split (tokenizer chain preserved).
+    let cn = fts.search("北京大学", 10);
+    assert_eq!(cn[0].id, ItemId::from_key("cn"), "CJK retrieval over the loaded split");
 }

@@ -1,15 +1,19 @@
 //! The indexer: fold a WAL slice into a new generation (SPEC §5).
 //!
-//! Idempotent and coordination-free: any node may run it, and two nodes racing produce
-//! byte-identical generations from the same input, so the CAS-swap that publishes the
-//! result is safe to lose (INV-6). A crash mid-run leaves only unreferenced files, which
-//! GC later reclaims.
+//! Idempotent and coordination-free: any node may run it, and two nodes racing from the
+//! same input produce *equivalent* generations, so the CAS-swap that publishes the result
+//! is safe to lose (INV-6). A crash mid-run leaves only unreferenced files, which GC later
+//! reclaims.
+//!
+//! Note on determinism (G-6): the vector, pk and radj files are byte-identical across
+//! replays. The tantivy FTS split is not — tantivy stamps each segment with a random id —
+//! but its *retrieval results* are identical, so query behaviour is still reproducible.
 
 use std::collections::BTreeMap;
 
 use mlake_core::item::{SemanticEdge, Weight, MAX_SEMANTIC_OUT, SEMANTIC_LINK_THRESHOLD};
 use mlake_core::{ItemId, StoredItem};
-use mlake_fts::{FtsBuilder, Tokenizer};
+use mlake_fts::Tokenizer;
 use mlake_graph::radj::{EdgeKind, InEdge, LinkTypeTag, ReverseAdjacency};
 use mlake_ivf::{build_clusters, train_centroids, ClusterFile};
 use mlake_wal::{Namespace, WalTail};
@@ -118,12 +122,13 @@ pub async fn index(ns: &Namespace, tokenizer: &Tokenizer, opts: IndexOptions) ->
     pk_entries.sort_by_key(|a| a.0);
     let pk = PkIndex { entries: pk_entries };
 
-    // Build the FTS split.
-    let mut fts = FtsBuilder::new();
-    for item in &items {
-        fts.add(item.id, &tokenizer.tokenize(&item.text));
-    }
-    let fts = fts.finish();
+    // Build the tantivy FTS split, packed into one object for storage (SPEC §5.3).
+    let fts = mlake_fts::TantivyFts::build(
+        items.iter().map(|i| (i.id, i.text.as_str())),
+        mlake_fts::Tokenizer::new(mlake_fts::TokenizerConfig::default()),
+    )
+    .map_err(|e| crate::Error::Core(mlake_core::Error::Encode(e.to_string())))?;
+    let fts_split = fts.split_bytes().to_vec();
 
     // Build reverse adjacency from inline outgoing links.
     let mut radj_pairs: Vec<(ItemId, InEdge)> = Vec::new();
@@ -153,7 +158,7 @@ pub async fn index(ns: &Namespace, tokenizer: &Tokenizer, opts: IndexOptions) ->
 
     // Write the generation files, then publish by CAS-swapping the manifest.
     let files = write_generation(
-        &ns.store, &ns.name, generation, &centroids, &clusters, &fts, &radj, &pk,
+        &ns.store, &ns.name, generation, &centroids, &clusters, &fts_split, &radj, &pk,
     )
     .await?;
 

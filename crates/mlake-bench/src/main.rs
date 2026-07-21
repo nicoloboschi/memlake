@@ -18,7 +18,7 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use mlake_core::item::Timestamps;
 use mlake_core::{ItemId, StoredItem};
-use mlake_fts::{Bm25Params, Tokenizer};
+use mlake_fts::Tokenizer;
 use mlake_index::{Engine, QueryConfig};
 use serde::Serialize;
 
@@ -47,8 +47,6 @@ struct BenchConfig {
     vector_weight: f32,
     fts_weight: f32,
     arm_depth: usize,
-    bm25_k1: f32,
-    bm25_b: f32,
     model: String,
     dim: usize,
 }
@@ -78,10 +76,6 @@ fn main() -> Result<()> {
         fts_weight: env_f32("MEMLAKE_FTS_WEIGHT", 1.0),
         graph_weight: env_f32("MEMLAKE_GRAPH_WEIGHT", 0.25),
         arm_depth: env_usize("MEMLAKE_ARM_DEPTH", 200),
-        bm25: Bm25Params {
-            k1: env_f32("MEMLAKE_BM25_K1", 1.2),
-            b: env_f32("MEMLAKE_BM25_B", 0.75),
-        },
     };
 
     let emb_dir = testdata.join("embeddings").join(dataset);
@@ -181,8 +175,6 @@ fn main() -> Result<()> {
             vector_weight: config.vector_weight,
             fts_weight: config.fts_weight,
             arm_depth: config.arm_depth,
-            bm25_k1: config.bm25.k1,
-            bm25_b: config.bm25.b,
             model: "BAAI/bge-small-en-v1.5".into(),
             dim: corpus_vecs.cols,
         },

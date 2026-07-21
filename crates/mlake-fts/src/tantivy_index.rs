@@ -1,0 +1,372 @@
+//! tantivy-backed BM25, packaged as an S3-native split.
+//!
+//! This is the FTS arm the spec asks for (§5.3, "BM25 via tantivy"), implemented so it
+//! fits the object-storage model: a whole tantivy index is packed into one immutable
+//! `split.bin` object, and a query node materializes it into the local NVMe/mmap tier to
+//! serve reads — the "warm query served from NVMe/mmap" path of §6.1.
+//!
+//! Reusing tantivy buys real block-WAND scoring, compressed posting blocks, and mature
+//! segment handling; the custom Chinese-capable tokenization (§8) is preserved by feeding
+//! tantivy *pre-tokenized* streams, so jieba dual-emission and the OpenCC fold still drive
+//! what gets indexed while tantivy owns storage and scoring.
+
+use std::path::Path;
+
+use mlake_core::ItemId;
+use tantivy::collector::TopDocs;
+use tantivy::query::{BooleanQuery, Occur, Query, TermQuery};
+use tantivy::schema::{
+    IndexRecordOption, Schema, TextFieldIndexing, TextOptions, Value, STORED,
+};
+use tantivy::tokenizer::{PreTokenizedString, Token as TantivyToken};
+use tantivy::{doc, Index, IndexReader, ReloadPolicy, TantivyDocument, Term};
+use uuid::Uuid;
+
+use crate::tokenizer::{Field, Tokenizer};
+
+/// A BM25 hit: the item and its score. Same shape as the rest of the FTS arm returns, so
+/// fusion and the benchmark are unaffected by which backend produced it.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct FtsHit {
+    pub id: ItemId,
+    pub score: f32,
+}
+
+/// The two indexed text fields, mirroring the dual-emission scheme: jieba/Latin word
+/// tokens in one, CJK character bigrams in the other. A query term hits whichever field it
+/// was emitted into, and tantivy sums the per-field BM25 contributions.
+struct Fields {
+    words: tantivy::schema::Field,
+    bigrams: tantivy::schema::Field,
+    id: tantivy::schema::Field,
+}
+
+fn build_schema() -> (Schema, Fields) {
+    let mut sb = Schema::builder();
+    // "raw" tokenizer: tantivy stores our tokens verbatim, since we tokenize upstream.
+    let indexing = TextFieldIndexing::default()
+        .set_tokenizer("raw")
+        .set_index_option(IndexRecordOption::WithFreqs);
+    let opts = TextOptions::default().set_indexing_options(indexing);
+    let words = sb.add_text_field("words", opts.clone());
+    let bigrams = sb.add_text_field("bigrams", opts);
+    // The item id, stored so a hit can be mapped back. Hyphenated UUID round-trips cleanly.
+    let id = sb.add_text_field("id", STORED);
+    let schema = sb.build();
+    (schema, Fields { words, bigrams, id })
+}
+
+/// Turn a list of token texts into a tantivy pre-tokenized value. Offsets are synthetic
+/// (we index with freqs, not positions), so only `position` and `text` matter.
+fn pretokenized(tokens: &[String]) -> PreTokenizedString {
+    let mut offset = 0;
+    let toks: Vec<TantivyToken> = tokens
+        .iter()
+        .enumerate()
+        .map(|(pos, t)| {
+            let tok = TantivyToken {
+                offset_from: offset,
+                offset_to: offset + t.len(),
+                position: pos,
+                text: t.clone(),
+                position_length: 1,
+            };
+            offset += t.len() + 1;
+            tok
+        })
+        .collect();
+    PreTokenizedString {
+        text: tokens.join(" "),
+        tokens: toks,
+    }
+}
+
+/// A built, queryable tantivy FTS index.
+///
+/// Holds the open index plus the temp directory it was materialized into (the NVMe/mmap
+/// tier). `split_bytes` is the packed form for persistence to object storage.
+pub struct TantivyFts {
+    _dir: tempfile::TempDir,
+    reader: IndexReader,
+    schema_fields: Fields,
+    tokenizer: Tokenizer,
+    split_bytes: Vec<u8>,
+    doc_count: usize,
+}
+
+impl TantivyFts {
+    /// Build an index over `(id, text)` documents, tokenizing each with the shared chain.
+    pub fn build<'a>(
+        docs: impl IntoIterator<Item = (ItemId, &'a str)>,
+        tokenizer: Tokenizer,
+    ) -> tantivy::Result<Self> {
+        let (schema, fields) = build_schema();
+        let dir = tempfile::tempdir().expect("create temp dir for tantivy split");
+        let index = Index::create_in_dir(dir.path(), schema)?;
+
+        let mut doc_count = 0;
+        {
+            let mut writer: tantivy::IndexWriter = index.writer(50_000_000)?;
+            for (id, text) in docs {
+                let tokens = tokenizer.tokenize(text);
+                let mut words = Vec::new();
+                let mut bigrams = Vec::new();
+                for t in tokens {
+                    match t.field {
+                        Field::Words => words.push(t.text),
+                        Field::Bigrams => bigrams.push(t.text),
+                    }
+                }
+                writer.add_document(doc!(
+                    fields.words => pretokenized(&words),
+                    fields.bigrams => pretokenized(&bigrams),
+                    fields.id => id.as_uuid().to_string(),
+                ))?;
+                doc_count += 1;
+            }
+            writer.commit()?;
+        }
+
+        let split_bytes = pack_dir(dir.path());
+        let reader = index
+            .reader_builder()
+            .reload_policy(ReloadPolicy::Manual)
+            .try_into()?;
+
+        Ok(Self {
+            _dir: dir,
+            reader,
+            schema_fields: fields,
+            tokenizer,
+            split_bytes,
+            doc_count,
+        })
+    }
+
+    /// Load an index from a packed split, materializing it into the local NVMe/mmap tier.
+    pub fn from_split(split: &[u8], tokenizer: Tokenizer) -> tantivy::Result<Self> {
+        let dir = tempfile::tempdir().expect("create temp dir for tantivy split");
+        unpack_dir(split, dir.path());
+        let index = Index::open_in_dir(dir.path())?;
+        let schema = index.schema();
+        let fields = Fields {
+            words: schema.get_field("words").unwrap(),
+            bigrams: schema.get_field("bigrams").unwrap(),
+            id: schema.get_field("id").unwrap(),
+        };
+        let reader = index
+            .reader_builder()
+            .reload_policy(ReloadPolicy::Manual)
+            .try_into()?;
+        let doc_count = reader.searcher().num_docs() as usize;
+        Ok(Self {
+            _dir: dir,
+            reader,
+            schema_fields: fields,
+            tokenizer,
+            split_bytes: split.to_vec(),
+            doc_count,
+        })
+    }
+
+    /// The packed split bytes, for writing to object storage.
+    pub fn split_bytes(&self) -> &[u8] {
+        &self.split_bytes
+    }
+
+    pub fn doc_count(&self) -> usize {
+        self.doc_count
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.doc_count == 0
+    }
+
+    /// BM25 search. The query is tokenized with the same chain the documents were, and each
+    /// query term becomes a `Should` clause on its field, so a term in the words field and
+    /// the same term in the bigrams field both contribute — the dual-emission scoring of
+    /// SPEC §8 step 4, now over tantivy's BM25.
+    pub fn search(&self, query: &str, k: usize) -> Vec<FtsHit> {
+        let terms = self.tokenizer.query_terms(query);
+        if terms.is_empty() {
+            return Vec::new();
+        }
+
+        let clauses: Vec<(Occur, Box<dyn Query>)> = terms
+            .iter()
+            .map(|t| {
+                let field = match t.field {
+                    Field::Words => self.schema_fields.words,
+                    Field::Bigrams => self.schema_fields.bigrams,
+                };
+                let term = Term::from_field_text(field, &t.text);
+                let q: Box<dyn Query> =
+                    Box::new(TermQuery::new(term, IndexRecordOption::WithFreqs));
+                (Occur::Should, q)
+            })
+            .collect();
+        let query = BooleanQuery::new(clauses);
+
+        let searcher = self.reader.searcher();
+        let Ok(top) = searcher.search(&query, &TopDocs::with_limit(k)) else {
+            return Vec::new();
+        };
+
+        let mut hits = Vec::with_capacity(top.len());
+        for (score, addr) in top {
+            let Ok(doc) = searcher.doc::<TantivyDocument>(addr) else {
+                continue;
+            };
+            if let Some(id_str) = doc.get_first(self.schema_fields.id).and_then(|v| v.as_str()) {
+                if let Ok(uuid) = Uuid::parse_str(id_str) {
+                    hits.push(FtsHit {
+                        id: ItemId::from(uuid),
+                        score,
+                    });
+                }
+            }
+        }
+        hits
+    }
+}
+
+/// Pack every file in a tantivy index directory into one blob:
+/// `[u32 file_count]` then per file `[u32 name_len][name][u64 data_len][data]`.
+/// File order is sorted, so the packed bytes are deterministic (supports G-6).
+fn pack_dir(dir: &Path) -> Vec<u8> {
+    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+        .expect("read tantivy dir")
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.is_file())
+        .collect();
+    files.sort();
+
+    let mut out = Vec::new();
+    out.extend((files.len() as u32).to_le_bytes());
+    for f in files {
+        let name = f.file_name().unwrap().to_string_lossy().into_owned();
+        let data = std::fs::read(&f).expect("read tantivy file");
+        out.extend((name.len() as u32).to_le_bytes());
+        out.extend(name.as_bytes());
+        out.extend((data.len() as u64).to_le_bytes());
+        out.extend(&data);
+    }
+    out
+}
+
+/// Reverse of [`pack_dir`]: write the split's files into a directory.
+fn unpack_dir(bytes: &[u8], dir: &Path) {
+    let mut p = 0usize;
+    let read_u32 = |bytes: &[u8], p: &mut usize| {
+        let v = u32::from_le_bytes(bytes[*p..*p + 4].try_into().unwrap());
+        *p += 4;
+        v
+    };
+    let read_u64 = |bytes: &[u8], p: &mut usize| {
+        let v = u64::from_le_bytes(bytes[*p..*p + 8].try_into().unwrap());
+        *p += 8;
+        v
+    };
+    let count = read_u32(bytes, &mut p);
+    for _ in 0..count {
+        let nl = read_u32(bytes, &mut p) as usize;
+        let name = std::str::from_utf8(&bytes[p..p + nl]).unwrap().to_string();
+        p += nl;
+        let dl = read_u64(bytes, &mut p) as usize;
+        std::fs::write(dir.join(name), &bytes[p..p + dl]).expect("write tantivy file");
+        p += dl;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tokenizer::Tokenizer;
+
+    fn build(docs: &[(&str, &str)]) -> TantivyFts {
+        let items: Vec<(ItemId, &str)> =
+            docs.iter().map(|(id, text)| (ItemId::from_key(id), *text)).collect();
+        TantivyFts::build(items, Tokenizer::default()).unwrap()
+    }
+
+    #[test]
+    fn finds_documents_by_term() {
+        let idx = build(&[
+            ("a", "the quick brown fox"),
+            ("b", "a lazy dog sleeps"),
+            ("c", "the fox and the dog"),
+        ]);
+        let ids: Vec<_> = idx.search("fox", 10).into_iter().map(|h| h.id).collect();
+        assert!(ids.contains(&ItemId::from_key("a")));
+        assert!(ids.contains(&ItemId::from_key("c")));
+        assert!(!ids.contains(&ItemId::from_key("b")));
+    }
+
+    #[test]
+    fn rarer_terms_score_higher() {
+        let idx = build(&[("common", "the the the the"), ("rare", "the unicorn")]);
+        let hits = idx.search("the unicorn", 10);
+        assert_eq!(hits[0].id, ItemId::from_key("rare"), "idf should favour the rare match");
+    }
+
+    #[test]
+    fn chinese_query_retrieves_chinese_doc() {
+        let idx = build(&[
+            ("cn", "北京大学是一所著名的大学"),
+            ("other", "the weather is nice today"),
+        ]);
+        let hits = idx.search("北京大学", 10);
+        assert_eq!(hits[0].id, ItemId::from_key("cn"));
+    }
+
+    #[test]
+    fn traditional_query_retrieves_simplified_doc() {
+        // G-4 end to end: query in traditional script, document in simplified.
+        let idx = build(&[("doc", "我在学习中文和数学")]);
+        let hits = idx.search("數學", 10);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, ItemId::from_key("doc"));
+    }
+
+    #[test]
+    fn oov_span_found_via_bigrams() {
+        let idx = build(&[("target", "购买闪迪存储卡"), ("noise", "今天天气很好")]);
+        let hits = idx.search("存储卡", 10);
+        assert!(!hits.is_empty());
+        assert_eq!(hits[0].id, ItemId::from_key("target"));
+    }
+
+    #[test]
+    fn empty_query_returns_nothing() {
+        let idx = build(&[("a", "hello world")]);
+        assert!(idx.search("", 10).is_empty());
+    }
+
+    #[test]
+    fn split_roundtrips_through_bytes() {
+        let idx = build(&[("a", "the quick brown fox"), ("b", "a lazy dog")]);
+        let split = idx.split_bytes().to_vec();
+
+        let reloaded = TantivyFts::from_split(&split, Tokenizer::default()).unwrap();
+        assert_eq!(reloaded.doc_count(), 2);
+        // Same query gives the same top hit after a store round-trip.
+        let before = idx.search("fox", 10);
+        let after = reloaded.search("fox", 10);
+        assert_eq!(before[0].id, after[0].id);
+    }
+
+    #[test]
+    fn retrieval_is_deterministic_across_rebuilds() {
+        // tantivy stamps each segment with a random UUID, so the split *bytes* are not
+        // byte-identical across builds — the strong form of G-6 does not hold for the FTS
+        // split (unlike the vector/pk/radj files, which do). What must hold, and does, is
+        // that retrieval *results* are identical: the same corpus answers the same query
+        // the same way regardless of the random segment ids.
+        let a = build(&[("x", "alpha beta gamma"), ("y", "beta gamma delta"), ("z", "gamma delta")]);
+        let b = build(&[("x", "alpha beta gamma"), ("y", "beta gamma delta"), ("z", "gamma delta")]);
+        let ra: Vec<_> = a.search("gamma delta", 10).into_iter().map(|h| h.id).collect();
+        let rb: Vec<_> = b.search("gamma delta", 10).into_iter().map(|h| h.id).collect();
+        assert_eq!(ra, rb, "retrieval order must be reproducible even if split bytes are not");
+    }
+}
