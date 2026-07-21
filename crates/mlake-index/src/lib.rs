@@ -10,6 +10,7 @@ pub mod generation;
 pub mod indexer;
 pub mod query_node;
 pub mod sstable;
+pub mod temporal;
 
 pub use engine::{Engine, QueryConfig};
 pub use fusion::{rrf, weighted_rrf, FusedHit, RankedArm, DEFAULT_RRF_K};

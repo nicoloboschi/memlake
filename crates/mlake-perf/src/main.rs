@@ -332,7 +332,7 @@ async fn run_workload(
             nprobe: config.nprobe,
         };
         let t = Instant::now();
-        node.query_raw_metered(memory_type, vector.as_deref(), text.as_deref(), &tags, depths, &qm)
+        node.query_raw_metered(memory_type, vector.as_deref(), text.as_deref(), &tags, depths, None, &qm)
             .await?;
         latencies.push(t.elapsed().as_secs_f64() * 1000.0);
         total_rt += qm.roundtrips();

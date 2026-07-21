@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use mlake_fts::Tokenizer;
-use mlake_index::{index, Consistency, IndexOptions, QueryNode};
+use mlake_index::{index, Consistency, IndexOptions, QueryNode, ScanCursor};
 use mlake_store::{QueryMetrics, Store};
 use mlake_wal::{Namespace, Writer};
 use tokio::sync::Mutex as AsyncMutex;
@@ -176,6 +176,11 @@ impl Memlake for MemlakeService {
         let consistency = convert::consistency(req.consistency);
         let depths = convert::arm_depths(req.vector_top_k, req.text_top_k, req.graph_top_k, req.nprobe);
         let text: Option<String> = if req.text.is_empty() { None } else { Some(req.text) };
+        // Temporal arm runs only when both window bounds are set.
+        let temporal_window = match (req.temporal_from, req.temporal_to) {
+            (Some(from), Some(to)) => Some((from, to)),
+            _ => None,
+        };
 
         let ns = self.namespace(&req.namespace);
         // Reuse the cached open snapshot when still current (see `snapshot`): a warm read is
@@ -205,7 +210,7 @@ impl Memlake for MemlakeService {
             let metrics = &metrics;
             let tags = &tags;
             async move {
-                node.query_raw_metered(mt, vref, tref, tags, depths, metrics)
+                node.query_raw_metered(mt, vref, tref, tags, depths, temporal_window, metrics)
                     .await
                     .map(|hits| (mt, hits))
             }
@@ -224,6 +229,197 @@ impl Memlake for MemlakeService {
             load_roundtrips: metrics.roundtrips() as u32,
         }))
     }
+
+    // ---- Admin / introspection ----
+
+    async fn list_namespaces(
+        &self,
+        _req: Request<pb::ListNamespacesRequest>,
+    ) -> Result<Response<pb::ListNamespacesResponse>, Status> {
+        let namespaces = discover_namespaces(&self.store).await.map_err(internal)?;
+        Ok(Response::new(pb::ListNamespacesResponse { namespaces }))
+    }
+
+    async fn stats(
+        &self,
+        req: Request<pb::StatsRequest>,
+    ) -> Result<Response<pb::StatsResponse>, Status> {
+        let req = req.into_inner();
+        if req.namespace.is_empty() {
+            return Err(Status::invalid_argument("namespace is required"));
+        }
+        let ns = self.namespace(&req.namespace);
+        let consistency = convert::consistency(req.consistency);
+
+        // The manifest gives the published index state; the snapshot gives the *live* doc
+        // counts, which differ from it by the un-indexed tail and any tombstones.
+        let (manifest, _etag) = ns.read_manifest().await.map_err(internal)?;
+        let snap = self.snapshot(&ns, consistency).await?;
+        let node = &snap.node;
+
+        let types: Vec<pb::TypeStats> = node
+            .memory_types()
+            .into_iter()
+            .map(|mt| pb::TypeStats {
+                memory_type: mt as u32,
+                doc_count: node.doc_count_of(mt) as u64,
+                cluster_count: node.cluster_count_of(mt) as u32,
+                train_count: manifest.index(mt).map(|i| i.train_count).unwrap_or(0),
+                has_index: manifest.index(mt).is_some(),
+            })
+            .collect();
+
+        Ok(Response::new(pb::StatsResponse {
+            namespace: req.namespace,
+            generation: manifest.generation,
+            prev_generation: manifest.prev_generation,
+            wal_head: manifest.wal_head,
+            wal_index_cursor: manifest.wal_index_cursor,
+            tokenizer_config_hash: manifest.tokenizer_config_hash,
+            format_version: manifest.format_version,
+            doc_count: node.doc_count() as u64,
+            types,
+            through_seq: snap.through_seq,
+            load_roundtrips: node.load_roundtrips as u32,
+        }))
+    }
+
+    async fn get(&self, req: Request<pb::GetRequest>) -> Result<Response<pb::GetResponse>, Status> {
+        let req = req.into_inner();
+        if req.namespace.is_empty() {
+            return Err(Status::invalid_argument("namespace is required"));
+        }
+        let ids = req
+            .ids
+            .iter()
+            .map(|b| convert::id_bytes(b))
+            .collect::<Result<Vec<_>, _>>()?;
+        if ids.is_empty() {
+            return Ok(Response::new(pb::GetResponse { memories: Vec::new() }));
+        }
+
+        let ns = self.namespace(&req.namespace);
+        let snap = self.snapshot(&ns, convert::consistency(req.consistency)).await?;
+        let found = snap.node.get_many(&ids).await.map_err(internal)?;
+        Ok(Response::new(pb::GetResponse {
+            memories: found
+                .into_iter()
+                .map(|m| convert::stored_record(m, req.include_vector))
+                .collect(),
+        }))
+    }
+
+    async fn scan(
+        &self,
+        req: Request<pb::ScanRequest>,
+    ) -> Result<Response<pb::ScanResponse>, Status> {
+        let req = req.into_inner();
+        if req.namespace.is_empty() {
+            return Err(Status::invalid_argument("namespace is required"));
+        }
+        let limit = match req.limit {
+            0 => DEFAULT_SCAN_LIMIT,
+            n => (n as usize).min(MAX_SCAN_LIMIT),
+        };
+        let tags = convert::tag_filter(req.tags);
+
+        let ns = self.namespace(&req.namespace);
+        let snap = self.snapshot(&ns, convert::consistency(req.consistency)).await?;
+        let node = &snap.node;
+
+        let mut types: Vec<u8> = if req.memory_types.is_empty() {
+            node.memory_types()
+        } else {
+            req.memory_types
+                .iter()
+                .map(|&t| convert::memory_type_u8(t))
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        types.sort_unstable();
+        types.dedup();
+
+        // Resume where the last page stopped. A cursor is only meaningful against the
+        // generation that issued it — cluster paths and ordering change when the indexer
+        // publishes — so a stale token restarts the scan rather than silently skipping or
+        // repeating memories.
+        let start = parse_page_token(&req.page_token, node.generation)?;
+        let mut pending: &[u8] = match &start {
+            Some((ty, _)) => match types.iter().position(|t| t == ty) {
+                Some(i) => &types[i..],
+                // The cursor's type is not in this request's set: nothing left to walk.
+                None => &[],
+            },
+            None => &types,
+        };
+        let mut cursor = start.map(|(_, c)| c).unwrap_or_default();
+
+        // Walk types in order, spilling into the next one whenever a page has room left, so
+        // a page is only short when the whole scan is exhausted.
+        let mut out = Vec::new();
+        let mut next_token = String::new();
+        while let Some((&ty, rest)) = pending.split_first() {
+            let (items, next) = node
+                .scan(ty, cursor, limit - out.len(), &tags)
+                .await
+                .map_err(internal)?;
+            out.extend(items.into_iter().map(|m| convert::stored_record(m, req.include_vector)));
+
+            match next {
+                // This type still has more and the page is full: stop here.
+                Some(c) if out.len() >= limit => {
+                    next_token = page_token(node.generation, ty, c);
+                    break;
+                }
+                // Page has room, so continue into this same type's next cluster.
+                Some(c) => cursor = c,
+                // Type exhausted: move to the next one.
+                None => {
+                    cursor = ScanCursor::default();
+                    if out.len() >= limit && !rest.is_empty() {
+                        next_token = page_token(node.generation, rest[0], cursor);
+                        break;
+                    }
+                    pending = rest;
+                }
+            }
+        }
+
+        Ok(Response::new(pb::ScanResponse { memories: out, next_page_token: next_token }))
+    }
+}
+
+/// Scan page sizes. The cap keeps one response bounded regardless of what a client asks
+/// for — a scan is the one read path whose cost grows with the corpus.
+const DEFAULT_SCAN_LIMIT: usize = 50;
+const MAX_SCAN_LIMIT: usize = 1000;
+
+/// Encode a scan cursor as an opaque token. The generation is embedded so a token issued
+/// against an older index is detected rather than silently misapplied.
+fn page_token(generation: u64, memory_type: u8, c: ScanCursor) -> String {
+    format!("{generation}:{memory_type}:{}:{}", c.cluster, c.offset)
+}
+
+/// Decode a page token, or `None` to start from the beginning. A token from a superseded
+/// generation restarts the scan — the alternative is skipping or repeating memories.
+fn parse_page_token(token: &str, generation: u64) -> Result<Option<(u8, ScanCursor)>, Status> {
+    if token.is_empty() {
+        return Ok(None);
+    }
+    let parts: Vec<&str> = token.split(':').collect();
+    let [gen, ty, cluster, offset] = parts[..] else {
+        return Err(Status::invalid_argument("malformed page_token"));
+    };
+    let bad = |_| Status::invalid_argument("malformed page_token");
+    if gen.parse::<u64>().map_err(bad)? != generation {
+        return Ok(None);
+    }
+    Ok(Some((
+        ty.parse::<u8>().map_err(bad)?,
+        ScanCursor {
+            cluster: cluster.parse::<usize>().map_err(bad)?,
+            offset: offset.parse::<usize>().map_err(bad)?,
+        },
+    )))
 }
 
 /// Run the indexer over the given namespaces (or all discovered ones) on a fixed interval.

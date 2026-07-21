@@ -45,13 +45,16 @@ pub struct RawHit {
     pub dense: Option<ArmScore>,
     pub text: Option<ArmScore>,
     pub graph: Option<ArmScore>,
+    /// The temporal arm: entry points in the query's time window + their one-hop spread,
+    /// scored by proximity to the window centre. `score` is the temporal score in [0, 1+].
+    pub temporal: Option<ArmScore>,
     /// The stored memory, materialized server-side (already fetched to score the candidate).
     pub memory: Option<StoredMemory>,
 }
 
 impl RawHit {
     fn new(id: MemoryId) -> Self {
-        Self { id, dense: None, text: None, graph: None, memory: None }
+        Self { id, dense: None, text: None, graph: None, temporal: None, memory: None }
     }
 }
 
@@ -385,11 +388,15 @@ impl QueryNode {
         // The virtual tail cluster sits just past the real ones, so one walk covers both the
         // indexed generation and the un-indexed overlay a query would also see.
         let tail_cluster = state.cluster_paths.len();
+        // An id can sit in both a cluster and the tail — a re-upsert of an already-indexed
+        // memory. The tail version is newer and wins, exactly as it does for a query, so the
+        // indexed copy is skipped and each memory is yielded once.
+        let superseded: HashSet<MemoryId> = state.tail_items.iter().map(|m| m.id).collect();
         let (mut cluster, mut offset) = (cursor.cluster, cursor.offset);
         let mut out = Vec::new();
 
         while out.len() < limit && cluster <= tail_cluster {
-            let items = if cluster == tail_cluster {
+            let items: Vec<StoredMemory> = if cluster == tail_cluster {
                 state
                     .tail_items
                     .iter()
@@ -398,6 +405,9 @@ impl QueryNode {
                     .collect()
             } else {
                 self.fetch_clusters(state, &[cluster], &metrics, 3).await?
+                    .into_iter()
+                    .filter(|m| !superseded.contains(&m.id))
+                    .collect()
             };
             // Filtering is deterministic for a fixed generation, so `offset` indexes the
             // filtered list stably across calls — the cursor stays valid between pages.
@@ -438,7 +448,7 @@ impl QueryNode {
             nprobe: config.nprobe,
         };
         let raw = self
-            .query_raw_metered(memory_type, vector, text, tags, depths, &metrics)
+            .query_raw_metered(memory_type, vector, text, tags, depths, None, &metrics)
             .await?;
         Ok(fuse_raw(&raw, top_k, config))
     }
@@ -447,6 +457,7 @@ impl QueryNode {
     /// scores** (dense cosine, BM25, graph activation) and per-arm ranks — no fusion. The
     /// client fuses (RRF or any weighting) with the raw signals. `*_top_k` bound each arm's
     /// candidate depth; a `*_top_k` of 0 skips that arm. Empty list if the type is unknown.
+    #[allow(clippy::too_many_arguments)]
     pub async fn query_raw_metered(
         &self,
         memory_type: u8,
@@ -454,6 +465,7 @@ impl QueryNode {
         text: Option<&str>,
         tags: &TagFilter,
         depths: ArmDepths,
+        temporal_window: Option<(i64, i64)>,
         metrics: &QueryMetrics,
     ) -> Result<Vec<RawHit>> {
         let Some(state) = self.per_type.get(&memory_type) else {
@@ -462,7 +474,21 @@ impl QueryNode {
         let (vector_scored, fts_scored, graph_scored, mut materialized) =
             self.run_arms(state, vector, text, tags, depths, metrics).await?;
 
-        // Merge the three arms' candidates by id, recording each arm's rank + raw score.
+        // The temporal arm: entry-point selection over the time window + one-hop spread. Needs
+        // the query vector (to rank entry points) and a window; scores by proximity, ranked
+        // desc so the client sees the strongest-in-window first.
+        let temporal_scored: Vec<(MemoryId, f32)> = match (vector, temporal_window) {
+            (Some(q), Some((from, to))) => {
+                let mut scored = self.temporal_arm(state, q, from, to, tags, &mut materialized, metrics).await?;
+                scored.sort_by(|a, b| {
+                    b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal).then(a.0.cmp(&b.0))
+                });
+                scored
+            }
+            _ => Vec::new(),
+        };
+
+        // Merge the arms' candidates by id, recording each arm's rank + raw score.
         let mut by_id: HashMap<MemoryId, RawHit> = HashMap::new();
         let mut fill = |scored: Vec<(MemoryId, f32)>, set: fn(&mut RawHit, ArmScore)| {
             for (rank, (id, score)) in scored.into_iter().enumerate() {
@@ -473,6 +499,7 @@ impl QueryNode {
         fill(vector_scored, |h, s| h.dense = Some(s));
         fill(fts_scored, |h, s| h.text = Some(s));
         fill(graph_scored, |h, s| h.graph = Some(s));
+        fill(temporal_scored, |h, s| h.temporal = Some(s));
 
         // Materialize any hit not already in hand — FTS-only hits that fell outside the
         // probed clusters. One coalesced pk lookup + cluster fetch covers them all; the
@@ -651,6 +678,152 @@ impl QueryNode {
         Ok(items)
     }
 
+    /// Materialize `ids` (those not already present) into `into`: one coalesced pk lookup +
+    /// cluster fetch. Tombstoned/absent ids resolve to nothing.
+    async fn materialize_into(
+        &self,
+        state: &FactTypeState,
+        ids: &[MemoryId],
+        into: &mut HashMap<MemoryId, StoredMemory>,
+        metrics: &QueryMetrics,
+    ) -> Result<()> {
+        let missing: Vec<MemoryId> = ids
+            .iter()
+            .filter(|id| !into.contains_key(id) && !self.tombstones.contains(id))
+            .copied()
+            .collect();
+        if missing.is_empty() {
+            return Ok(());
+        }
+        let clusters_map = state.pk.lookup_batch(&self.ns.store, &missing, Some((metrics, 4))).await?;
+        let clusters: HashSet<usize> = clusters_map.values().map(|c| *c as usize).collect();
+        if clusters.is_empty() {
+            return Ok(());
+        }
+        let want: HashSet<MemoryId> = missing.into_iter().collect();
+        let cids: Vec<usize> = clusters.into_iter().collect();
+        for item in self.fetch_clusters(state, &cids, metrics, 4).await? {
+            if want.contains(&item.id) {
+                into.entry(item.id).or_insert(item);
+            }
+        }
+        Ok(())
+    }
+
+    /// The temporal arm (SPEC-less; a 1:1 port of Hindsight's `retrieve_temporal_combined`
+    /// with the BFS bounded to one hop per INV-7). Select entry points in the query's time
+    /// window (one ranged scan of the time index), rank them by similarity, spread them across
+    /// the window with `select_with_temporal_coverage`, score by proximity to the window
+    /// centre, then spread one hop through links (semantic + causal). Returns `(id, score)`.
+    async fn temporal_arm(
+        &self,
+        state: &FactTypeState,
+        query: &[f32],
+        from: i64,
+        to: i64,
+        tags: &TagFilter,
+        materialized: &mut HashMap<MemoryId, StoredMemory>,
+        metrics: &QueryMetrics,
+    ) -> Result<Vec<(MemoryId, f32)>> {
+        use crate::temporal as tmp;
+        let eff = |m: &StoredMemory| {
+            m.timestamps.occurred_start.or(m.timestamps.mentioned_at).or(m.timestamps.occurred_end)
+        };
+        let prox = |m: &StoredMemory, default: f32| {
+            tmp::best_date(m.timestamps.occurred_start, m.timestamps.occurred_end, m.timestamps.mentioned_at)
+                .map(|d| tmp::temporal_proximity(d, from, to))
+                .unwrap_or(default)
+        };
+
+        // 1. Entry-point pool: ids whose effective_ts is in the window (one ranged scan) plus
+        //    in-window tail items.
+        let mut window_ids = if state.time.is_empty() {
+            Vec::new()
+        } else {
+            state.time.in_window(&self.ns.store, from, to, Some((metrics, 4))).await?
+        };
+        for m in &state.tail_items {
+            if eff(m).is_some_and(|ts| ts >= from && ts <= to) {
+                window_ids.push(m.id);
+            }
+        }
+        window_ids.retain(|id| !self.tombstones.contains(id));
+        if window_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.materialize_into(state, &window_ids, materialized, metrics).await?;
+
+        // 2. Similarity-ranked, tag-filtered pool -> coverage-spread entry points.
+        let mut pool: Vec<tmp::Candidate> = window_ids
+            .iter()
+            .filter_map(|id| materialized.get(id).map(|m| (id, m)))
+            .filter(|(_, m)| tags.matches(&m.tags))
+            .map(|(id, m)| tmp::Candidate {
+                id: *id,
+                similarity: mlake_core::cosine(query, &m.vector),
+                effective_ts: eff(m),
+            })
+            .collect();
+        pool.sort_by(|a, b| {
+            b.similarity.partial_cmp(&a.similarity).unwrap_or(std::cmp::Ordering::Equal).then(a.id.cmp(&b.id))
+        });
+        pool.truncate(tmp::TEMPORAL_POOL_SIZE);
+        let entry_points =
+            tmp::select_with_temporal_coverage(pool, from, to, tmp::TEMPORAL_ENTRY_POINTS, tmp::TEMPORAL_COVERAGE_BUCKETS);
+
+        // 3. Score entry points; they seed the spread with parent propagation score 1.0.
+        let mut scores: HashMap<MemoryId, f32> = HashMap::new();
+        let mut seeds: Vec<MemoryId> = Vec::new();
+        for ep in &entry_points {
+            if let Some(m) = materialized.get(&ep.id) {
+                scores.insert(ep.id, prox(m, tmp::NO_DATE_ENTRY));
+                seeds.push(ep.id);
+            }
+        }
+        if seeds.is_empty() {
+            return Ok(scores.into_iter().collect());
+        }
+
+        // 4. One hop through links: seeds' inline outgoing (semantic + causal) + radj incoming.
+        let incoming = state.radj.incoming_batch(&self.ns.store, &seeds, Some((metrics, 4))).await?;
+        // (neighbor, weight, boost)
+        let mut links: Vec<(MemoryId, f32, f32)> = Vec::new();
+        for seed in &seeds {
+            if let Some(m) = materialized.get(seed) {
+                for e in &m.semantic_out {
+                    links.push((e.target, e.weight.to_f32(), 1.0));
+                }
+                for e in &m.causal_out {
+                    links.push((e.target, e.weight.to_f32(), causal_boost_of(e.link_type)));
+                }
+            }
+            for e in incoming.get(seed).into_iter().flatten() {
+                let boost = match e.kind {
+                    mlake_graph::radj::EdgeKind::Semantic => 1.0,
+                    mlake_graph::radj::EdgeKind::Causal(t) => causal_boost_tag(t),
+                };
+                links.push((e.source, e.weight, boost));
+            }
+        }
+        let neighbor_ids: Vec<MemoryId> = links.iter().map(|(id, _, _)| *id).collect();
+        self.materialize_into(state, &neighbor_ids, materialized, metrics).await?;
+        for (nid, weight, boost) in links {
+            if scores.contains_key(&nid) || self.tombstones.contains(&nid) {
+                continue; // an entry point, or already scored via another seed's max below
+            }
+            let Some(m) = materialized.get(&nid) else { continue };
+            if !tags.matches(&m.tags) {
+                continue;
+            }
+            // Parent propagation score is 1.0 for entry-point seeds (one hop).
+            let combined = tmp::propagate(prox(m, tmp::NO_DATE_NEIGHBOR), 1.0, weight, boost);
+            let e = scores.entry(nid).or_insert(0.0);
+            *e = e.max(combined);
+        }
+
+        Ok(scores.into_iter().collect())
+    }
+
     /// The FTS arm's ranked hits with their raw BM25 scores.
     fn fts_arm(&self, state: &FactTypeState, text: &str, depth: usize, tags: &TagFilter) -> Vec<(MemoryId, f32)> {
         let mut hits = state.gen_fts.search_filtered(text, depth, tags);
@@ -771,6 +944,16 @@ impl QueryNode {
         metrics.record_phase(Phase::GraphExpand, te.elapsed());
         Ok(out)
     }
+}
+
+/// Spread multiplier for a causal edge's link type (temporal arm).
+fn causal_boost_of(lt: mlake_core::LinkType) -> f32 {
+    use mlake_core::LinkType::*;
+    crate::temporal::causal_boost(matches!(lt, Causes | CausedBy), matches!(lt, Enables | Prevents))
+}
+fn causal_boost_tag(t: mlake_graph::radj::LinkTypeTag) -> f32 {
+    use mlake_graph::radj::LinkTypeTag::*;
+    crate::temporal::causal_boost(matches!(t, Causes | CausedBy), matches!(t, Enables | Prevents))
 }
 
 /// Reconstruct each arm's ranking from the raw hits and combine with (weighted) RRF. This is

@@ -63,6 +63,7 @@ def _hits(pb_hits) -> list["Hit"]:
             dense=_arm(h.dense),
             text=_arm(h.text),
             graph=_arm(h.graph),
+            temporal=_arm(h.temporal),
             memory=_payload(h.memory) if h.HasField("memory") else None,
         )
         for h in pb_hits
@@ -80,11 +81,25 @@ def memory(
     proof_count: int = 0,
     entity_ids: Optional[Sequence[bytes]] = None,
     metadata: Optional[dict[str, str]] = None,
+    occurred_start: Optional[int] = None,
+    occurred_end: Optional[int] = None,
+    mentioned_at: Optional[int] = None,
+    event_date: Optional[int] = None,
 ) -> pb.Memory:
     """Build a Memory. Pass `key` (and leave `id` empty) to let the server derive a stable
     16-byte id from the key; or pass a 16-byte `id` directly. `entity_ids` are 16-byte ids
     (e.g. `uuid.UUID(...).bytes`). `metadata` is opaque str->str the server stores and returns
-    verbatim (never indexed) — e.g. context, document_id."""
+    verbatim (never indexed). The timestamp fields (epoch ints) drive the temporal arm; the
+    effective time is COALESCE(occurred_start, mentioned_at, occurred_end)."""
+    ts = pb.Timestamps()
+    if occurred_start is not None:
+        ts.occurred_start = occurred_start
+    if occurred_end is not None:
+        ts.occurred_end = occurred_end
+    if mentioned_at is not None:
+        ts.mentioned_at = mentioned_at
+    if event_date is not None:
+        ts.event_date = event_date
     return pb.Memory(
         id=id,
         key=key,
@@ -95,6 +110,7 @@ def memory(
         proof_count=proof_count,
         entity_ids=list(entity_ids or []),
         metadata=dict(metadata or {}),
+        timestamps=ts,
     )
 
 
@@ -125,9 +141,10 @@ class Hit:
     returned inline so recall needs no second round trip to hydrate."""
     id: bytes
     memory_type: int
-    dense: Arm   # vector / cosine
-    text: Arm    # BM25
-    graph: Arm   # graph activation
+    dense: Arm      # vector / cosine
+    text: Arm       # BM25
+    graph: Arm      # graph activation
+    temporal: Arm   # temporal (entry points + one-hop spread)
     memory: object = None   # Payload | None
 
     @property
@@ -199,16 +216,20 @@ class MemlakeClient:
         graph_top_k: int = 0,
         nprobe: int = 0,
         consistency: int = STRONG,
+        temporal_from: Optional[int] = None,
+        temporal_to: Optional[int] = None,
     ) -> list[Hit]:
-        """Run one query across `memory_types` (or all if None) with all three arms —
-        dense vector, BM25 full-text, and graph — in a single call. `vector` drives the
-        dense + graph arms; `text` drives full-text. `*_top_k` bound each arm's candidate
-        depth (0 = server default).
+        """Run one query across `memory_types` (or all if None) with the retrieval arms in a
+        single call. `vector` drives the dense + graph arms; `text` drives full-text. Passing
+        both `temporal_from` and `temporal_to` (epoch ints) additionally runs the temporal
+        arm: entry points whose effective time falls in the window, spread one hop and scored
+        by proximity to the window centre (requires `vector`). `*_top_k` bound each arm's
+        candidate depth (0 = server default).
 
         Returns a flat list of Hit, each carrying the RAW per-arm signals (`hit.dense`,
-        `hit.text`, `hit.graph`, each an `Arm(present, rank, score)`) plus `hit.memory_type`.
-        memlake does NOT fuse — group by `memory_type` and apply your own RRF / weighting.
-        The server-side roundtrips of the last call are available as `client.last_roundtrips`.
+        `hit.text`, `hit.graph`, `hit.temporal`, each an `Arm(present, rank, score)`) plus
+        `hit.memory_type`. memlake does NOT fuse — group by `memory_type` and apply your own
+        RRF / weighting. Last call's roundtrips are on `client.last_roundtrips`.
         """
         req = pb.QueryRequest(
             namespace=namespace,
@@ -223,6 +244,10 @@ class MemlakeClient:
         )
         if tags:
             req.tags.CopyFrom(pb.TagFilter(tags=list(tags), mode=tags_mode))
+        if temporal_from is not None:
+            req.temporal_from = temporal_from
+        if temporal_to is not None:
+            req.temporal_to = temporal_to
         resp = self._stub.Query(req)
         self.last_roundtrips = resp.load_roundtrips
         return _hits(resp.hits)

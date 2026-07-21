@@ -681,7 +681,7 @@ async fn query_fetches_only_probed_clusters_and_warms_the_cache() {
     // Cold query: fetches only the probed clusters (≤ nprobe requests), far fewer than the
     // total, and stays within the roundtrip budget.
     let cold = QueryMetrics::new();
-    let hits = node.query_raw_metered(1, Some(&q), None, &tf(), depths, &cold).await.unwrap();
+    let hits = node.query_raw_metered(1, Some(&q), None, &tf(), depths, None, &cold).await.unwrap();
     assert!(!hits.is_empty());
     assert!(
         cold.requests() <= nprobe,
@@ -694,7 +694,7 @@ async fn query_fetches_only_probed_clusters_and_warms_the_cache() {
 
     // Warm query: same probed clusters, now served from the NVMe cache.
     let warm = QueryMetrics::new();
-    node.query_raw_metered(1, Some(&q), None, &tf(), depths, &warm).await.unwrap();
+    node.query_raw_metered(1, Some(&q), None, &tf(), depths, None, &warm).await.unwrap();
     assert!(warm.cache_hits() > 0, "warm query should hit the cache");
     assert_eq!(warm.cache_misses(), 0, "warm query should not miss");
 }
@@ -1096,4 +1096,151 @@ async fn selective_tag_filter_prunes_to_admissible_clusters() {
         .filter(|i| ids.contains(&MemoryId::from_key(&format!("rare{i}"))))
         .count();
     assert!(rare_found >= 2, "pruning should surface rare memories from admissible clusters, found {rare_found}");
+}
+
+// ---- Admin reads: addressing memories without ranking them ------------------
+
+use mlake_index::ScanCursor;
+
+/// `get_many` addresses memories directly through the pk SSTable — no arms, no ranking —
+/// and answers from the WAL tail for writes the indexer has not folded in yet.
+#[tokio::test]
+async fn get_many_resolves_ids_from_the_generation_and_the_tail() {
+    let store = Store::in_memory();
+    let ns = namespace(store, "ns").await;
+    let mut writer = Writer::new(ns.clone());
+
+    writer
+        .commit(vec![
+            Op::Upsert(item("a", vec![1.0, 0.0], "alpha")),
+            Op::Upsert(item("b", vec![0.0, 1.0], "beta")),
+        ])
+        .await
+        .unwrap();
+    index(&ns, &Tokenizer::default(), IndexOptions::default()).await.unwrap();
+    // Lands in the tail, past the generation's cursor.
+    writer.commit(vec![Op::Upsert(item("c", vec![1.0, 1.0], "gamma"))]).await.unwrap();
+
+    let node = QueryNode::open(&ns, Tokenizer::default(), Consistency::Strong).await.unwrap();
+    let ids = [MemoryId::from_key("a"), MemoryId::from_key("c")];
+    let got = node.get_many(&ids).await.unwrap();
+
+    assert_eq!(got.len(), 2, "one id from the generation, one from the tail");
+    assert_eq!(got[0].id, ids[0], "results come back in the caller's order");
+    assert_eq!(got[0].text, "alpha");
+    assert_eq!(got[1].text, "gamma", "the un-indexed tail write must resolve");
+
+    // An unknown id is absent rather than an error — Get is a lookup, not an assertion.
+    let missing = node.get_many(&[MemoryId::from_key("nope")]).await.unwrap();
+    assert!(missing.is_empty());
+}
+
+/// A tombstoned id disappears from `get_many` even while the generation still physically
+/// contains it — the same overlay rule the query path follows.
+#[tokio::test]
+async fn get_many_hides_tombstoned_memories() {
+    let store = Store::in_memory();
+    let ns = namespace(store, "ns").await;
+    let mut writer = Writer::new(ns.clone());
+
+    writer.commit(vec![Op::Upsert(item("a", vec![1.0, 0.0], "alpha"))]).await.unwrap();
+    index(&ns, &Tokenizer::default(), IndexOptions::default()).await.unwrap();
+    writer.commit(vec![Op::Tombstone { id: MemoryId::from_key("a") }]).await.unwrap();
+
+    let node = QueryNode::open(&ns, Tokenizer::default(), Consistency::Strong).await.unwrap();
+    let got = node.get_many(&[MemoryId::from_key("a")]).await.unwrap();
+    assert!(got.is_empty(), "a deleted memory must not be addressable");
+}
+
+/// Paging through `scan` visits every live memory exactly once, across cluster boundaries
+/// and into the un-indexed tail, and terminates.
+#[tokio::test]
+async fn scan_pages_over_every_memory_exactly_once() {
+    let store = Store::in_memory();
+    let ns = namespace(store, "ns").await;
+    let mut writer = Writer::new(ns.clone());
+
+    // Enough memories to span several cluster files.
+    let ops: Vec<Op> = (0..120)
+        .map(|i| {
+            let a = i as f32 * 0.37;
+            Op::Upsert(item(&format!("m{i}"), vec![a.sin(), a.cos()], &format!("memory {i}")))
+        })
+        .collect();
+    writer.commit(ops).await.unwrap();
+    index(&ns, &Tokenizer::default(), IndexOptions::default()).await.unwrap();
+    // Two tail writes: one genuinely new, and one re-upsert of an already-indexed memory.
+    // The re-upsert exists in both a cluster file and the tail, so a scan that does not
+    // apply the overlay would return it twice.
+    writer
+        .commit(vec![
+            Op::Upsert(item("tail", vec![1.0, 0.0], "tail memory")),
+            Op::Upsert(item("m5", vec![0.5, 0.5], "memory 5 revised")),
+        ])
+        .await
+        .unwrap();
+
+    let node = QueryNode::open(&ns, Tokenizer::default(), Consistency::Strong).await.unwrap();
+
+    let mut seen = std::collections::HashSet::new();
+    let mut texts = std::collections::HashMap::new();
+    let mut cursor = Some(ScanCursor::default());
+    let mut pages = 0;
+    while let Some(c) = cursor {
+        let (items, next) = node.scan(1, c, 7, &tf()).await.unwrap();
+        for m in items {
+            assert!(seen.insert(m.id), "scan must not return a memory twice");
+            texts.insert(m.id, m.text);
+        }
+        cursor = next;
+        pages += 1;
+        assert!(pages < 100, "scan must terminate");
+    }
+
+    assert_eq!(seen.len(), 121, "every live memory, including the un-indexed tail one");
+    assert!(seen.contains(&MemoryId::from_key("tail")));
+    assert_eq!(seen.len(), node.doc_count(), "scan and doc_count must agree");
+    // The overlay wins: the re-upserted memory is seen once, in its newer form.
+    assert_eq!(
+        texts.get(&MemoryId::from_key("m5")).map(String::as_str),
+        Some("memory 5 revised"),
+        "a re-upserted memory must scan as its tail version, not the indexed one"
+    );
+}
+
+/// A tag filter narrows a scan the same way it narrows a query.
+#[tokio::test]
+async fn scan_respects_the_tag_filter() {
+    use mlake_core::TagsMatch;
+
+    let store = Store::in_memory();
+    let ns = namespace(store, "ns").await;
+    let mut writer = Writer::new(ns.clone());
+
+    let ops: Vec<Op> = (0..40)
+        .map(|i| {
+            let mut m = item(&format!("m{i}"), vec![i as f32, 1.0], "text");
+            if i % 5 == 0 {
+                m.tags = vec!["keep".into()];
+            }
+            Op::Upsert(m)
+        })
+        .collect();
+    writer.commit(ops).await.unwrap();
+    index(&ns, &Tokenizer::default(), IndexOptions::default()).await.unwrap();
+
+    let node = QueryNode::open(&ns, Tokenizer::default(), Consistency::Strong).await.unwrap();
+    let filter = mlake_core::TagFilter::new(vec!["keep".into()], TagsMatch::AnyStrict);
+
+    let mut seen = std::collections::HashSet::new();
+    let mut cursor = Some(ScanCursor::default());
+    while let Some(c) = cursor {
+        let (items, next) = node.scan(1, c, 3, &filter).await.unwrap();
+        for m in items {
+            assert!(m.tags.contains(&"keep".to_string()), "scan must honour the filter");
+            seen.insert(m.id);
+        }
+        cursor = next;
+    }
+    assert_eq!(seen.len(), 8, "the 8 tagged memories, paged across clusters");
 }

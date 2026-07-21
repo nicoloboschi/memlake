@@ -159,6 +159,13 @@ message QueryRequest {
   uint32 graph_top_k = 8;
   uint32 nprobe = 9;           // IVF clusters probed (0 = server default)
   Consistency consistency = 10;
+  // The temporal arm: when both are set, select entry points whose effective time
+  // (COALESCE(occurred_start, mentioned_at, occurred_end)) falls in [temporal_from,
+  // temporal_to], spread one hop through links, and score by proximity to the window centre.
+  // Epoch ints; the unit only needs to match what was written. Requires `vector` (entry
+  // points are similarity-ranked). Omit either to skip the arm.
+  optional int64 temporal_from = 11;
+  optional int64 temporal_to = 12;
 }
 
 // One arm's raw contribution to a hit. `present` says whether the arm surfaced this id;
@@ -193,6 +200,7 @@ message Hit {
   ArmScore dense = 3;          // vector / cosine arm
   ArmScore text = 4;           // BM25 arm
   ArmScore graph = 5;          // graph-expansion arm
+  ArmScore temporal = 7;       // temporal arm (entry points + one-hop spread)
   MemoryPayload memory = 6;    // the stored memory, returned inline (no extra roundtrip)
 }
 
@@ -210,3 +218,92 @@ message CreateNamespaceRequest {
 }
 
 message CreateNamespaceResponse {}
+
+// ---- Admin / introspection -------------------------------------------------
+
+message ListNamespacesRequest {}
+
+message ListNamespacesResponse {
+  repeated string namespaces = 1;   // sorted
+}
+
+message StatsRequest {
+  string namespace = 1;
+  Consistency consistency = 2;
+}
+
+// One memory_type's index state. Each type is an independent index, so every number here
+// is per-type; there is no meaningful corpus-wide equivalent except their sum.
+message TypeStats {
+  uint32 memory_type = 1;
+  // Live memories: the indexed generation's count, minus tombstones, plus un-indexed WAL
+  // tail entries. This is what a query can actually return.
+  uint64 doc_count = 2;
+  uint32 cluster_count = 3;
+  // Memory count when this type's IVF centroids were last trained. The gap between this
+  // and doc_count is what drives an assign-only retrain.
+  uint64 train_count = 4;
+  bool has_index = 5;   // false = present only in the WAL tail, never indexed yet
+}
+
+message StatsResponse {
+  string namespace = 1;
+  uint64 generation = 2;
+  optional uint64 prev_generation = 3;
+  uint64 wal_head = 4;
+  // Last WAL sequence folded into the generation. `wal_head - wal_index_cursor` is the
+  // un-indexed backlog a STRONG query pays to scan.
+  uint64 wal_index_cursor = 5;
+  string tokenizer_config_hash = 6;
+  uint32 format_version = 7;
+  uint64 doc_count = 8;              // sum over types
+  repeated TypeStats types = 9;
+  uint64 through_seq = 10;           // the WAL sequence this snapshot reflects
+  uint32 load_roundtrips = 11;
+}
+
+message GetRequest {
+  string namespace = 1;
+  repeated bytes ids = 2;            // 16-byte MemoryIds
+  // Include the embedding. Off by default: vectors dominate the response size and a
+  // caller browsing memories rarely wants them.
+  bool include_vector = 3;
+  Consistency consistency = 4;
+}
+
+message GetResponse {
+  // Only ids that resolved, in request order. A missing or tombstoned id is simply absent
+  // — Get is not an existence assertion.
+  repeated StoredMemoryRecord memories = 1;
+}
+
+// A memory returned by a non-query read. Unlike `Hit` there are no arm scores: nothing
+// ranked it, it was addressed directly.
+message StoredMemoryRecord {
+  bytes id = 1;
+  uint32 memory_type = 2;
+  MemoryPayload memory = 3;
+  Vector vector = 4;                 // present only if include_vector was set
+}
+
+message ScanRequest {
+  string namespace = 1;
+  // Types to walk, in ascending order. Empty means every type in the snapshot.
+  repeated uint32 memory_types = 2;
+  uint32 limit = 3;                  // 0 uses the server default
+  // Opaque cursor from the previous response. Empty starts at the beginning. A cursor is
+  // only valid against the generation that produced it; the server restarts the scan if
+  // the generation moved under it. It is a position, not a snapshot: writes landing
+  // mid-walk can shift later pages, so a scan is eventually-complete browsing, not a
+  // consistent iterator. Do not build anything that needs exactly-once over a live corpus
+  // on it.
+  string page_token = 4;
+  bool include_vector = 5;
+  TagFilter tags = 6;                // omit for no tag filter
+  Consistency consistency = 7;
+}
+
+message ScanResponse {
+  repeated StoredMemoryRecord memories = 1;
+  string next_page_token = 2;        // empty when the scan is exhausted
+}

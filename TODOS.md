@@ -5,12 +5,20 @@ Context: a first slice of the integration lives in the Hindsight worktree
 seam (`hindsight_api/engine/memories/`) with two implementations — `postgres`
 (the historical SQL path, unchanged and still the default) and `memlake`.
 
-The memlake provider currently plays a **narrow role**: it indexes facts and
-answers the dense + full-text arms, returning ranked ids that Hindsight hydrates
-from Postgres. Postgres stays the authoritative row store. Everything below is
-what stands between that and memlake actually owning the memories slice.
+**As of the inline-payload / entity-index work, memlake mode no longer writes
+anything memory-shaped to Postgres.** In that mode Hindsight skips the
+`memory_units` INSERT (ids are minted client-side), skips `unit_entities` (the
+unit→entity posting rides on the memory), skips all three `memory_links` writers
+— temporal has no counterpart, semantic is derived by the indexer, causal rides
+inline as `causal_out` — and skips the Phase-1/Phase-3 ANN passes. Recall reads
+the whole result row off the inline `MemoryPayload`, so there is no hydration
+query, and the graph arm comes from memlake's persisted entity index instead of
+`LinkExpansionRetriever`. Postgres keeps documents, chunks, banks, operations and
+the `entities` registry.
 
-Ordered by what blocks what.
+What is left is everything *other than* retain + recall: the non-search access
+paths, and the write paths (consolidation, curation, import) that still assume a
+SQL table. Ordered by what blocks what.
 
 ---
 
@@ -33,20 +41,28 @@ The `.proto` was rewritten (single `Query` RPC, `memory_types` repeated, per-arm
       consistency=…) -> list[Hit]`. The shared roundtrips are on
       `client.last_roundtrips`.
 
-**Hindsight follow-up:** the provider's stopgap in
-`engine/memories/memlake.py:initialize` (driving the generated stub directly) can
-be deleted and pointed back at the wrapper's `query()`.
+**Hindsight follow-up — done.** The stopgap that drove the generated stub
+directly is gone; the provider calls `client.query()` / `client.delete()`.
 
 Smaller client gaps (non-blocking, still open):
 
 - [ ] `memory()` accepts no `timestamps` and no `causal_out`, so callers mutate
-      the protobuf message after construction. Add both as kwargs.
+      the protobuf message after construction — which the provider does, in
+      `memlake.py:index_facts`. Add both as kwargs.
 - [ ] `proof_count` defaults to `0` in `memory()`; Hindsight's column defaults to
       `1`. Pick one, or make the parameter required, so the discrepancy is not
       silent.
 - [ ] No `grpc.aio` client. Hindsight is fully async and currently wraps every
       call in `asyncio.to_thread`, which costs a thread hop per retain batch and
       per recall.
+- [ ] **protobuf runtime conflict — blocks running the two together.** The
+      generated stubs call `ValidateProtobufRuntimeVersion(PUBLIC, 7, …)`, so they
+      require protobuf ≥ 7.x. Hindsight's lockfile pins protobuf 6.33.5 (via its
+      OTel deps), and importing `memlake_client` there dies with a
+      `VersionError`. Installing protobuf 7 into the Hindsight venv works and the
+      provider tests pass, but that is a manual override, not a resolution.
+      Either regenerate the stubs against a 6.x-compatible gencode, or agree on a
+      protobuf floor across both projects.
 
 ---
 
@@ -75,11 +91,16 @@ non-search access paths (scan, counts, delete-by-predicate, partial update).
 - [ ] **Counts / aggregates.** Bank stats (`GROUP BY fact_type`), consolidation
       backlog gauges, per-document unit counts, and the memories timeseries
       (`date_trunc` buckets) are all `COUNT(*)` queries today.
-- [ ] **Delete by predicate.** Only tombstone-by-id exists. Hindsight deletes
-      "all units for this document", "all units for this bank", "all observations
-      in this bank". The provider currently issues a `RETURNING id` on the
-      Postgres delete and mirrors the ids — correct, but it means the row store
-      must be consulted to delete from the index.
+- [ ] **Delete by predicate — now a correctness bug, not just a convenience.**
+      Only tombstone-by-id exists. Hindsight deletes "all units for this
+      document", "all units for this bank", "all observations in this bank". With
+      Postgres no longer holding the memories there is nothing left to enumerate
+      the victims: `document_id` lives in the un-queryable metadata bag, so
+      **re-ingesting a document adds its facts alongside the previous version's
+      instead of replacing them**, and duplicates accumulate. Hindsight logs a
+      warning at that site (`retain/fact_storage.py:handle_document_tracking`)
+      rather than pretending the delete happened. Needs either a
+      delete-by-metadata-predicate, an indexed `document_id`, or a scan.
 - [ ] **Partial update.** `Patch` carries only `proof_count_delta`. Hindsight
       mutates `text`, `embedding`, `tags`, `occurred_start/end`, `mentioned_at`,
       `consolidated_at`, `consolidation_failed_at`, `edited_at` — mostly from
@@ -102,7 +123,11 @@ of it participates in retrieval:
 - [ ] **`source_memory_ids`** — the observation → source-fact edge. Hindsight's
       `expand_observations` walks it in both directions (find the observations
       backed by these facts; find the facts behind these observations). No
-      analogue exists; `causal_out` is a different relation.
+      analogue exists; `causal_out` is a different relation. Beyond recall, this
+      also blocks *cleanup*: `delete_stale_observations_for_memories` exists to
+      drop observations whose sources are being replaced, and in memlake mode it
+      cannot run at all — Hindsight logs and skips it rather than querying the
+      empty table and reporting a clean sweep.
 - [x] **`context`, `metadata` (arbitrary JSON), `document_id` / `chunk_id`,
       `observation_scopes`, `access_count`, `created_at` / `updated_at`** — all of
       these can now ride in the opaque **`metadata`** (str→str) bag: memlake stores
@@ -209,23 +234,48 @@ of it participates in retrieval:
 
 ---
 
-## 5. Hindsight-side follow-ups (not memlake's job, but blocking parity)
+## 5. Hindsight-side status
 
-Write paths that still touch `memory_units` directly and are **not** mirrored to
-the provider. Each is a place where the index would go stale:
+**Routed to the provider (no Postgres memory/link writes):**
 
-- [ ] Consolidation — creates, updates, merges and deletes observations with raw
-      SQL (`engine/consolidation/consolidator.py`).
-- [ ] Curation — `update_memory_unit` edit / invalidate / revert
-      (`engine/memory_engine.py:6654`).
-- [ ] `delete_memory_unit`, `delete_bank`, `delete_document`,
-      `clear_observations`, `update_document` tag rewrites.
-- [ ] The document importer (`engine/transfer/importer.py`).
-- [ ] Graph and temporal retrieval still query Postgres regardless of provider —
-      only the dense + full-text arms are routed.
+- [x] Fact writes — `memory_units` INSERT skipped; ids minted by the provider
+      (`retain/fact_storage.py:insert_facts_batch`).
+- [x] `unit_entities` — the unit→entity posting travels on the memory as
+      `entity_ids`. The `entities` registry itself stays in Postgres: it is the
+      canonical name/alias store, and its UUIDs are what memlake records.
+- [x] `memory_links` — all three writers skipped. Causal edges ride inline;
+      semantic links are derived by the indexer; temporal links have no
+      counterpart (memlake carries the timestamps instead).
+- [x] Phase-1 and Phase-3 semantic ANN passes — skipped; they scanned
+      `memory_units` to build links the indexer now derives.
+- [x] Dense + full-text arms — served from the provider, results built from the
+      inline payload, no hydration query.
+- [x] Graph arm — `ProviderGraphRetriever` replaces `LinkExpansionRetriever` when
+      the provider owns the links.
+- [x] Consolidation — refuses to run and says so, rather than reading an empty
+      table and reporting a clean pass (see below).
 
-The broader shape of the problem: `DataAccessOps` covers only a fraction of
-`memory_units` access. Roughly 60 raw statements across `memory_engine.py`,
-`retrieval.py`, `link_expansion_retrieval.py`, `consolidator.py`,
-`fact_storage.py` and `export.py` hit the table directly. Full provider ownership
-means pushing those behind the interface first.
+**Still Postgres-only, so unsupported in memlake mode:**
+
+- [ ] **Consolidation** (`engine/consolidation/consolidator.py`) — selects
+      unconsolidated rows and writes observations back with raw INSERTs. Needs
+      scan + partial update + the observation↔fact relation before it can be
+      ported. Currently guarded off with a warning.
+- [ ] **Curation** — `update_memory_unit` edit / invalidate / revert. Needs
+      partial update and a non-tombstone archive state.
+- [ ] **`delete_memory_unit` / `delete_bank` / `delete_document` /
+      `clear_observations`** — need delete-by-predicate and `DeleteNamespace`.
+- [ ] **The document importer** (`engine/transfer/importer.py`) — writes facts
+      and then patches them with follow-up UPDATEs.
+- [ ] **Read-only surfaces that now return empty**: `list_memory_units` (the
+      curation UI), bank stats and the memories timeseries, `get_graph_data`,
+      document unit counts, and document/bank export. All are `SELECT`s against
+      `memory_units`; they need the scan and count RPCs in §1.
+- [ ] **Temporal arm** — `retrieve_temporal_combined` still queries Postgres and
+      therefore finds nothing. Blocked on a time-window query (§3).
+
+The broader shape of the remaining problem is unchanged: `DataAccessOps` covers
+only a fraction of `memory_units` access, and roughly 60 raw statements across
+`memory_engine.py`, `consolidator.py`, `importer.py` and `export.py` still hit the
+table directly. Retain and recall are now behind the provider interface; those
+paths are what is left.

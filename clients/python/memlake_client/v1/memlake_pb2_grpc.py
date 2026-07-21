@@ -49,6 +49,26 @@ class MemlakeStub:
                 request_serializer=memlake_dot_v1_dot_memlake__pb2.QueryRequest.SerializeToString,
                 response_deserializer=memlake_dot_v1_dot_memlake__pb2.QueryResponse.FromString,
                 _registered_method=True)
+        self.ListNamespaces = channel.unary_unary(
+                '/memlake.v1.Memlake/ListNamespaces',
+                request_serializer=memlake_dot_v1_dot_memlake__pb2.ListNamespacesRequest.SerializeToString,
+                response_deserializer=memlake_dot_v1_dot_memlake__pb2.ListNamespacesResponse.FromString,
+                _registered_method=True)
+        self.Stats = channel.unary_unary(
+                '/memlake.v1.Memlake/Stats',
+                request_serializer=memlake_dot_v1_dot_memlake__pb2.StatsRequest.SerializeToString,
+                response_deserializer=memlake_dot_v1_dot_memlake__pb2.StatsResponse.FromString,
+                _registered_method=True)
+        self.Get = channel.unary_unary(
+                '/memlake.v1.Memlake/Get',
+                request_serializer=memlake_dot_v1_dot_memlake__pb2.GetRequest.SerializeToString,
+                response_deserializer=memlake_dot_v1_dot_memlake__pb2.GetResponse.FromString,
+                _registered_method=True)
+        self.Scan = channel.unary_unary(
+                '/memlake.v1.Memlake/Scan',
+                request_serializer=memlake_dot_v1_dot_memlake__pb2.ScanRequest.SerializeToString,
+                response_deserializer=memlake_dot_v1_dot_memlake__pb2.ScanResponse.FromString,
+                _registered_method=True)
 
 
 class MemlakeServicer:
@@ -81,6 +101,47 @@ class MemlakeServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def ListNamespaces(self, request, context):
+        """---- Admin / introspection ----
+
+        These serve operators and the admin UI, not the hot path. They are answerable by any
+        replica for the same reason every other RPC is: the answer lives in object storage.
+        They are deliberately NOT part of the retrieval contract — a client doing recall
+        should never need them.
+
+        Every namespace in the bucket, by listing manifest objects. Cost is one LIST, so this
+        is an operator call, not something to poll per request.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def Stats(self, request, context):
+        """A namespace's index state: generation, WAL position, and per-memory_type doc and
+        cluster counts. Reads the manifest and each type's metadata — it does NOT fetch
+        cluster data, so its cost is independent of corpus size.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def Get(self, request, context):
+        """Fetch memories by id, without a query. Resolves each id through the primary-key
+        SSTable to its cluster, then range-reads only those clusters.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def Scan(self, request, context):
+        """Page through a memory_type's stored memories in cluster order. This is a full scan by
+        construction — the cost DOES grow with the corpus — so it exists for browsing and
+        debugging, never for retrieval. Use `Query` to find things.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_MemlakeServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -98,6 +159,26 @@ def add_MemlakeServicer_to_server(servicer, server):
                     servicer.Query,
                     request_deserializer=memlake_dot_v1_dot_memlake__pb2.QueryRequest.FromString,
                     response_serializer=memlake_dot_v1_dot_memlake__pb2.QueryResponse.SerializeToString,
+            ),
+            'ListNamespaces': grpc.unary_unary_rpc_method_handler(
+                    servicer.ListNamespaces,
+                    request_deserializer=memlake_dot_v1_dot_memlake__pb2.ListNamespacesRequest.FromString,
+                    response_serializer=memlake_dot_v1_dot_memlake__pb2.ListNamespacesResponse.SerializeToString,
+            ),
+            'Stats': grpc.unary_unary_rpc_method_handler(
+                    servicer.Stats,
+                    request_deserializer=memlake_dot_v1_dot_memlake__pb2.StatsRequest.FromString,
+                    response_serializer=memlake_dot_v1_dot_memlake__pb2.StatsResponse.SerializeToString,
+            ),
+            'Get': grpc.unary_unary_rpc_method_handler(
+                    servicer.Get,
+                    request_deserializer=memlake_dot_v1_dot_memlake__pb2.GetRequest.FromString,
+                    response_serializer=memlake_dot_v1_dot_memlake__pb2.GetResponse.SerializeToString,
+            ),
+            'Scan': grpc.unary_unary_rpc_method_handler(
+                    servicer.Scan,
+                    request_deserializer=memlake_dot_v1_dot_memlake__pb2.ScanRequest.FromString,
+                    response_serializer=memlake_dot_v1_dot_memlake__pb2.ScanResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -181,6 +262,114 @@ class Memlake:
             '/memlake.v1.Memlake/Query',
             memlake_dot_v1_dot_memlake__pb2.QueryRequest.SerializeToString,
             memlake_dot_v1_dot_memlake__pb2.QueryResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ListNamespaces(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/memlake.v1.Memlake/ListNamespaces',
+            memlake_dot_v1_dot_memlake__pb2.ListNamespacesRequest.SerializeToString,
+            memlake_dot_v1_dot_memlake__pb2.ListNamespacesResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def Stats(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/memlake.v1.Memlake/Stats',
+            memlake_dot_v1_dot_memlake__pb2.StatsRequest.SerializeToString,
+            memlake_dot_v1_dot_memlake__pb2.StatsResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def Get(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/memlake.v1.Memlake/Get',
+            memlake_dot_v1_dot_memlake__pb2.GetRequest.SerializeToString,
+            memlake_dot_v1_dot_memlake__pb2.GetResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def Scan(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/memlake.v1.Memlake/Scan',
+            memlake_dot_v1_dot_memlake__pb2.ScanRequest.SerializeToString,
+            memlake_dot_v1_dot_memlake__pb2.ScanResponse.FromString,
             options,
             channel_credentials,
             insecure,

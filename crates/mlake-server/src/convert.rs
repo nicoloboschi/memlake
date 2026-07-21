@@ -21,8 +21,7 @@ pub fn decode_vector(v: &pb::Vector) -> Result<Vec<f32>, Status> {
 }
 
 /// Encode a vector back to a raw little-endian f32 blob. Symmetric with `decode_vector`;
-/// kept for round-trip tests and any future response that echoes vectors.
-#[allow(dead_code)]
+/// used by the admin reads that echo a stored embedding back (`include_vector`).
 pub fn encode_vector(v: &[f32]) -> pb::Vector {
     let mut f32le = Vec::with_capacity(v.len() * 4);
     for x in v {
@@ -43,6 +42,12 @@ fn id_from(bytes: &[u8], key: &str) -> Result<MemoryId, Status> {
         .try_into()
         .map_err(|_| Status::invalid_argument("id must be exactly 16 bytes"))?;
     Ok(MemoryId::from_bytes(arr))
+}
+
+/// A bare 16-byte id, for callers that address a memory directly (tombstone and patch
+/// targets, and the admin `Get`) and so have no `key` fallback to derive one from.
+pub fn id_bytes(bytes: &[u8]) -> Result<MemoryId, Status> {
+    id_exact(bytes)
 }
 
 /// A bare 16-byte id (for tombstone / patch targets, which carry no key fallback).
@@ -157,6 +162,18 @@ fn payload(m: StoredMemory) -> pb::MemoryPayload {
     }
 }
 
+/// A directly-addressed memory (Get / Scan), which carries no arm scores because nothing
+/// ranked it. `include_vector` is opt-in: the embedding dominates the response size and a
+/// caller browsing memories rarely wants it.
+pub fn stored_record(m: StoredMemory, include_vector: bool) -> pb::StoredMemoryRecord {
+    pb::StoredMemoryRecord {
+        id: m.id.0.to_vec(),
+        memory_type: m.memory_type as u32,
+        vector: include_vector.then(|| encode_vector(&m.vector)),
+        memory: Some(payload(m)),
+    }
+}
+
 pub fn op(o: pb::Op) -> Result<Op, Status> {
     let kind = o.kind.ok_or_else(|| Status::invalid_argument("op has no kind set"))?;
     Ok(match kind {
@@ -222,6 +239,7 @@ pub fn raw_hit(memory_type: u8, h: RawHit) -> pb::Hit {
         dense: Some(arm_score(h.dense)),
         text: Some(arm_score(h.text)),
         graph: Some(arm_score(h.graph)),
+        temporal: Some(arm_score(h.temporal)),
         memory: h.memory.map(payload),
     }
 }
