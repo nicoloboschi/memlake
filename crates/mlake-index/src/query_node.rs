@@ -929,7 +929,10 @@ impl QueryNode {
         let mut window_ids = if state.time.is_empty() {
             Vec::new()
         } else {
-            state.time.in_window(&self.ns.store, from, to, Some((metrics, 4))).await?
+            state
+                .time
+                .in_window(&self.ns.store, from, to, tmp::TEMPORAL_WINDOW_CAP, Some((metrics, 4)))
+                .await?
         };
         for m in &state.tail_items {
             if eff(m).is_some_and(|ts| ts >= from && ts <= to) {

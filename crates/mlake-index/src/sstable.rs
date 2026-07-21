@@ -622,6 +622,7 @@ impl TimeTable {
         store: &Store,
         from: i64,
         to: i64,
+        cap: usize,
         ctx: Option<(&QueryMetrics, usize)>,
     ) -> Result<Vec<MemoryId>> {
         // The key for ts=`to` is `ts_key(to)` (…+zero padding); widen the high bound to that
@@ -632,6 +633,15 @@ impl TimeTable {
         let mut ids = Vec::new();
         for (_, value) in records {
             ids.extend(decode_ids(&value, usize::MAX));
+        }
+        // Bound the entry-point pool to a time-spread sample. The temporal arm materializes
+        // every id this returns (it needs their vectors to rank entry points by similarity),
+        // and window members scatter across clusters — so an unbounded window would read a
+        // large slice of the corpus. Records arrive in time order, so an even stride keeps the
+        // sample spread across the window (which is what the coverage step wants anyway).
+        if cap > 0 && ids.len() > cap {
+            let stride = ids.len() / cap;
+            ids = ids.into_iter().step_by(stride).take(cap).collect();
         }
         Ok(ids)
     }
@@ -715,7 +725,7 @@ mod tests {
         let tt = TimeTable::open(&idx, "t/time.data").unwrap();
 
         // Window [-10, 50] should return times -10, 0, 10, 20, 30, 40, 50 -> ids m-1..m5.
-        let got = tt.in_window(&store, -10, 50, None).await.unwrap();
+        let got = tt.in_window(&store, -10, 50, usize::MAX, None).await.unwrap();
         let mut got_keys: Vec<MemoryId> = got;
         got_keys.sort();
         let mut want: Vec<MemoryId> = (-1..=5).map(|i| MemoryId::from_key(&format!("m{i}"))).collect();
@@ -723,7 +733,7 @@ mod tests {
         assert_eq!(got_keys, want);
 
         // Empty window before everything.
-        assert!(tt.in_window(&store, i64::MIN, -1000, None).await.unwrap().is_empty());
+        assert!(tt.in_window(&store, i64::MIN, -1000, usize::MAX, None).await.unwrap().is_empty());
     }
 
     #[tokio::test]

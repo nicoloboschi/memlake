@@ -136,6 +136,11 @@ pub fn select_with_temporal_coverage(
 pub const TEMPORAL_POOL_SIZE: usize = 60;
 pub const TEMPORAL_ENTRY_POINTS: usize = 10;
 pub const TEMPORAL_COVERAGE_BUCKETS: usize = 8;
+/// Upper bound on window entry points materialized before similarity ranking + coverage. A
+/// ~4× oversample of the pool: enough headroom for the similarity/coverage selection to pick
+/// good entry points, while keeping the temporal arm's cluster reads bounded on a wide window
+/// (INV-7). Wider windows fall back to a time-spread sample of this many.
+pub const TEMPORAL_WINDOW_CAP: usize = 256;
 /// Default proximity when a unit has no date: 0.5 for entry points, 0.3 for spread neighbours.
 pub const NO_DATE_ENTRY: f32 = 0.5;
 pub const NO_DATE_NEIGHBOR: f32 = 0.3;
