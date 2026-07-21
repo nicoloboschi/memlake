@@ -400,6 +400,7 @@ async fn crash_before_manifest_swap_leaves_the_old_generation_serving() {
         empty_split.split_bytes(),
         mlake_index::RadjTable::build(vec![]).into(),
         mlake_index::PkTable::build(vec![]).into(),
+        mlake_index::EntityTable::build(vec![]).into(),
         &Vec::new(),
         0,
     )
@@ -563,6 +564,7 @@ async fn concurrent_generation_builds_write_disjoint_files() {
         empty_split.split_bytes(),
         mlake_index::RadjTable::build(vec![]).into(),
         mlake_index::PkTable::build(vec![(MemoryId::from_key("a"), 0)]).into(),
+        mlake_index::EntityTable::build(vec![]).into(),
         &Vec::new(),
         1,
     )
@@ -576,6 +578,7 @@ async fn concurrent_generation_builds_write_disjoint_files() {
         empty_split.split_bytes(),
         mlake_index::RadjTable::build(vec![]).into(),
         mlake_index::PkTable::build(vec![(MemoryId::from_key("b"), 0)]).into(),
+        mlake_index::EntityTable::build(vec![]).into(),
         &Vec::new(),
         1,
     )

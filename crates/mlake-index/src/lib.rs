@@ -17,7 +17,7 @@ pub use gc::{gc, gc_with_min_age, GcOutcome, DEFAULT_MIN_AGE};
 pub use generation::{read_fts_split, read_generation, write_generation, ClusterTagSummary, Generation, SsTablePair, TagSummary};
 pub use indexer::{index, IndexOptions, IndexOutcome};
 pub use query_node::{ArmDepths, ArmScore, Consistency, QueryNode, RawHit};
-pub use sstable::{PkTable, RadjTable, SsTableBuilder, SsTableIndex};
+pub use sstable::{EntityTable, PkTable, RadjTable, SsTableBuilder, SsTableIndex};
 
 pub type Result<T> = std::result::Result<T, Error>;
 

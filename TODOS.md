@@ -150,7 +150,7 @@ of it participates in retrieval:
         `EntityId` (mirrors `MemoryId`), killing the lossy UUID→u64 narrowing and
         its silent collisions. Touches core, graph, indexer, datagen. Format
         change (indexes rebuild). Mechanical, low-risk. *Do first.*
-  - **B. Persisted entity posting SSTable — the keystone.** At index time build
+  - **B. Persisted entity posting SSTable — DONE.** At index time we build
         `entity.idx` + `entity.data` mapping `EntityId → sorted [MemoryId]`, the
         same SSTable shape as radj/pk. The query node's `entity_candidates` reads
         it range-bounded with the per-entity cap (SPEC §7.2's bounded prefix).

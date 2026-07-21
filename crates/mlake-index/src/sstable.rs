@@ -13,7 +13,7 @@
 //! So a point lookup is "cached index binary-search + one ranged GET", independent of the
 //! table's size — the same discipline as the cluster files.
 
-use mlake_core::MemoryId;
+use mlake_core::{EntityId, MemoryId};
 use mlake_store::{QueryMetrics, Store};
 
 use crate::{Error, Result};
@@ -377,6 +377,79 @@ impl RadjTable {
             .map(|(id, bytes)| (id, decode_edges(&bytes)))
             .collect())
     }
+}
+
+/// The entity posting index: `EntityId -> sorted [MemoryId]`, the memories that carry each
+/// entity. Same SSTable discipline as `radj`/`pk` — one bounded ranged GET per entity, so the
+/// entity arm can find sharers anywhere in the corpus, not just in the probed clusters.
+///
+/// This is what makes the entity arm real graph expansion rather than a re-rank of the vector
+/// neighbourhood. Entities and memory ids are both 16-byte, so the value of each key is just
+/// the candidate `MemoryId`s concatenated.
+pub struct EntityTable {
+    index: SsTableIndex,
+    data_path: String,
+}
+
+impl EntityTable {
+    /// Build from `(entity, memory)` pairs (any order; grouped and sorted here).
+    pub fn build(mut pairs: Vec<(EntityId, MemoryId)>) -> (Vec<u8>, Vec<u8>) {
+        pairs.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+        let mut b = SsTableBuilder::new();
+        let mut i = 0;
+        while i < pairs.len() {
+            let entity = pairs[i].0;
+            let mut value = Vec::new();
+            while i < pairs.len() && pairs[i].0 == entity {
+                value.extend_from_slice(&pairs[i].1 .0);
+                i += 1;
+            }
+            b.add(entity.0, &value);
+        }
+        b.finish()
+    }
+
+    pub fn open(idx_bytes: &[u8], data_path: impl Into<String>) -> Result<Self> {
+        Ok(Self {
+            index: SsTableIndex::parse(idx_bytes)?,
+            data_path: data_path.into(),
+        })
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.index.is_empty()
+    }
+
+    /// The memories carrying each of `entities`, in one coalesced request, each list capped at
+    /// `cap` (the bounded posting-prefix read of SPEC §7.2 — a high-fan-out entity can't blow
+    /// the budget). Entities with no postings are absent from the map.
+    pub async fn candidates_batch(
+        &self,
+        store: &Store,
+        entities: &[EntityId],
+        cap: usize,
+        ctx: Option<(&QueryMetrics, usize)>,
+    ) -> Result<std::collections::HashMap<EntityId, Vec<MemoryId>>> {
+        // EntityId and MemoryId are both 16-byte, so reuse the MemoryId-keyed reader.
+        let keys: Vec<MemoryId> = entities.iter().map(|e| MemoryId(e.0)).collect();
+        let pairs = self.index.get_many(store, &self.data_path, &keys, ctx).await?;
+        Ok(pairs
+            .into_iter()
+            .map(|(k, bytes)| (EntityId(k.0), decode_ids(&bytes, cap)))
+            .collect())
+    }
+}
+
+fn decode_ids(bytes: &[u8], cap: usize) -> Vec<MemoryId> {
+    bytes
+        .chunks_exact(16)
+        .take(cap)
+        .map(|c| {
+            let mut a = [0u8; 16];
+            a.copy_from_slice(c);
+            MemoryId(a)
+        })
+        .collect()
 }
 
 /// Edge wire format: `[source:16][kind:1][linktype:1][weight:f32]` = 22 bytes.

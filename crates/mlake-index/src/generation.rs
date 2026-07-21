@@ -56,6 +56,12 @@ fn stats_key(prefix: &str) -> String {
 fn tag_summary_key(prefix: &str) -> String {
     format!("{prefix}/tags.json")
 }
+fn entity_idx_key(prefix: &str) -> String {
+    format!("{prefix}/entity.idx")
+}
+fn entity_data_key(prefix: &str) -> String {
+    format!("{prefix}/entity.data")
+}
 
 /// A unique per-attempt generation prefix. The nonce ensures two nodes building the same
 /// generation number never collide on object keys.
@@ -113,6 +119,7 @@ pub async fn write_generation(
     fts_split: &[u8],
     radj_tables: SsTablePair,
     pk_tables: SsTablePair,
+    entity_tables: SsTablePair,
     tag_summary: &TagSummary,
     doc_count: usize,
 ) -> Result<GenerationFiles> {
@@ -126,7 +133,7 @@ pub async fn write_generation(
     let centroids_bytes = centroids.to_bytes()?;
     let tag_bytes = serde_json::to_vec(tag_summary)?;
     let stats_bytes = serde_json::to_vec(&stats)?;
-    let (kc, kt, kf, kri, krc, kpi, kpd, ks) = (
+    let (kc, kt, kf, kri, krc, kpi, kpd, ks, kei, ked) = (
         centroids_key(prefix),
         tag_summary_key(prefix),
         fts_key(prefix),
@@ -135,6 +142,8 @@ pub async fn write_generation(
         pk_idx_key(prefix),
         pk_data_key(prefix),
         stats_key(prefix),
+        entity_idx_key(prefix),
+        entity_data_key(prefix),
     );
     // All metadata objects are independent, immutable, and unique to this prefix, so write
     // them concurrently rather than one sequential PUT at a time.
@@ -147,6 +156,8 @@ pub async fn write_generation(
         store.put(&kpi, pk_tables.idx),
         store.put(&kpd, pk_tables.data),
         store.put(&ks, stats_bytes),
+        store.put(&kei, entity_tables.idx),
+        store.put(&ked, entity_tables.data),
     )?;
 
     Ok(GenerationFiles {
@@ -159,6 +170,8 @@ pub async fn write_generation(
         fts_split: fts_key(prefix),
         stats: stats_key(prefix),
         tag_summary: tag_summary_key(prefix),
+        entity_idx: entity_idx_key(prefix),
+        entity_data: entity_data_key(prefix),
     })
 }
 

@@ -314,6 +314,16 @@ async fn build_memory_type_index(
     }
     let radj_tables = crate::sstable::RadjTable::build(radj_pairs);
 
+    // Entity postings: EntityId -> the memories that carry it. This is what lets the graph
+    // arm's entity expansion find sharers anywhere in the corpus (not just probed clusters).
+    let mut entity_pairs: Vec<(mlake_core::EntityId, MemoryId)> = Vec::new();
+    for item in &items {
+        for e in &item.entity_ids {
+            entity_pairs.push((*e, item.id));
+        }
+    }
+    let entity_tables = crate::sstable::EntityTable::build(entity_pairs);
+
     // Per-cluster tag summaries: the union of each cluster's tags + an untagged flag, so a
     // query can prune clusters that cannot contain a matching memory (SCALE.md Phase 4b).
     let tag_summary: crate::generation::TagSummary = clusters
@@ -344,6 +354,7 @@ async fn build_memory_type_index(
         &fts_split,
         radj_tables.into(),
         pk_tables.into(),
+        entity_tables.into(),
         &tag_summary,
         doc_count,
     )

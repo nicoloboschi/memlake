@@ -24,7 +24,7 @@ use mlake_wal::{Namespace, WalTail};
 
 use crate::fusion::{rrf, weighted_rrf, FusedHit, RankedArm};
 use crate::generation::{read_fts_split, TagSummary};
-use crate::sstable::{PkTable, RadjTable};
+use crate::sstable::{EntityTable, PkTable, RadjTable};
 use crate::{QueryConfig, Result};
 
 /// One arm's contribution to a hit: its 0-based rank within that arm and its raw score
@@ -83,6 +83,7 @@ struct FactTypeState {
     gen_fts: TantivyFts,
     radj: RadjTable,
     pk: PkTable,
+    entity: EntityTable,
     tail_items: Vec<StoredMemory>,
     tail_fts: TantivyFts,
     doc_count: usize,
@@ -174,9 +175,19 @@ impl QueryNode {
                             .await
                             .map_err(crate::Error::from)
                     };
+                    let entity_f = async {
+                        if files.entity_idx.is_empty() {
+                            Ok(bytes::Bytes::new())
+                        } else {
+                            ns.store
+                                .get_immutable(&files.entity_idx, Some((&metrics, 2)))
+                                .await
+                                .map_err(crate::Error::from)
+                        }
+                    };
                     let fts_f = read_fts_split(&ns.store, files, tokenizer.clone(), Some(&metrics));
-                    let (centroids_bytes, tag_bytes, radj_idx, pk_idx, gen_fts) =
-                        futures::try_join!(centroids_f, tag_f, radj_f, pk_f, fts_f)?;
+                    let (centroids_bytes, tag_bytes, radj_idx, pk_idx, entity_idx, gen_fts) =
+                        futures::try_join!(centroids_f, tag_f, radj_f, pk_f, entity_f, fts_f)?;
 
                     let tag_summary: TagSummary = if tag_bytes.is_empty() {
                         Vec::new()
@@ -184,6 +195,12 @@ impl QueryNode {
                         serde_json::from_slice(&tag_bytes).unwrap_or_default()
                     };
                     let pk = PkTable::open(&pk_idx, files.pk_data.clone())?;
+                    // Old generations have no entity index (back-compat): treat as empty.
+                    let entity = if entity_idx.is_empty() {
+                        EntityTable::open(&[0u8; 16], String::new())?
+                    } else {
+                        EntityTable::open(&entity_idx, files.entity_data.clone())?
+                    };
 
                     // Live doc count for this fact type: its pk record count minus tombstones
                     // that hit it, plus genuinely-new tail items.
@@ -206,6 +223,7 @@ impl QueryNode {
                         gen_fts,
                         radj: RadjTable::open(&radj_idx, files.radj_csr.clone())?,
                         pk,
+                        entity,
                         doc_count,
                         tail_items,
                         tail_fts,
@@ -224,6 +242,7 @@ impl QueryNode {
                         )?,
                         radj: RadjTable::open(&[0u8; 16], String::new())?,
                         pk: PkTable::open(&[0u8; 16], String::new())?,
+                        entity: EntityTable::open(&[0u8; 16], String::new())?,
                         doc_count,
                         tail_items,
                         tail_fts,
@@ -534,14 +553,22 @@ impl QueryNode {
             return Ok(Vec::new());
         }
 
-        // Seed incoming edges: one coalesced batch read over radj.csr for all seeds, rather
-        // than a ranged GET per seed.
+        // Two coalesced reads, issued together (same wave): the seeds' incoming edges over
+        // radj.csr, and the entity postings — the memories sharing each seed entity, from the
+        // persisted entity index. The postings are what make the entity arm real: it finds
+        // sharers anywhere in the corpus, not just in the clusters the vector arm probed.
         let tr = Instant::now();
         let seed_ids: Vec<MemoryId> = seeds.iter().map(|s| s.id).collect();
-        let incoming = state
-            .radj
-            .incoming_batch(&self.ns.store, &seed_ids, Some((metrics, 4)))
-            .await?;
+        let mut seed_entities: HashSet<EntityId> = HashSet::new();
+        for seed in &seeds {
+            seed_entities.extend(seed.entity_ids.iter().copied());
+        }
+        let seed_entities: Vec<EntityId> = seed_entities.into_iter().collect();
+        let per_entity_cap = GraphParams::default().per_entity_cap;
+        let (incoming, entity_candidates) = futures::try_join!(
+            state.radj.incoming_batch(&self.ns.store, &seed_ids, Some((metrics, 4))),
+            state.entity.candidates_batch(&self.ns.store, &seed_entities, per_entity_cap, Some((metrics, 4))),
+        )?;
         metrics.record_phase(Phase::GraphRadj, tr.elapsed());
 
         let mut wanted: HashSet<MemoryId> = HashSet::new();
@@ -555,6 +582,10 @@ impl QueryNode {
             for e in incoming.get(&seed.id).into_iter().flatten() {
                 wanted.insert(e.source);
             }
+        }
+        // Entity-arm candidates from the persisted postings also need materializing.
+        for ids in entity_candidates.values() {
+            wanted.extend(ids.iter().copied());
         }
         wanted.retain(|id| !by_id.contains_key(id) && !self.tombstones.contains(id));
 
@@ -577,16 +608,10 @@ impl QueryNode {
         }
 
         let te = Instant::now();
-        let mut entity_index: HashMap<EntityId, Vec<MemoryId>> = HashMap::new();
-        for item in by_id.values() {
-            for e in &item.entity_ids {
-                entity_index.entry(*e).or_default().push(item.id);
-            }
-        }
-
         let source = LazyGraphSource {
             by_id: &by_id,
-            entity_index: &entity_index,
+            // The persisted entity postings — sharers found across the whole corpus.
+            entity_index: &entity_candidates,
             incoming: &incoming,
             tombstones: &self.tombstones,
         };
