@@ -66,12 +66,12 @@ async fn write_index_then_query_from_a_fresh_node() {
     assert_eq!(node.doc_count(), 3);
 
     // A pure-vector query returns the nearest item.
-    let vec_hits = node.query(Some(&[1.0, 0.0, 0.0]), None, 10, QueryConfig::default()).await.unwrap();
+    let vec_hits = node.query(1, Some(&[1.0, 0.0, 0.0]), None, 10, QueryConfig::default()).await.unwrap();
     assert_eq!(vec_hits[0].id, ItemId::from_key("cats"), "nearest vector should lead");
 
     // A fused query blends the text signal: `dogs` is nearest-but-one by vector *and*
     // the text match, so convergent evidence puts it and `cats` at the top.
-    let hits = node.query(Some(&[1.0, 0.0, 0.0]), Some("loyal canine"), 10, QueryConfig::default()).await.unwrap();
+    let hits = node.query(1, Some(&[1.0, 0.0, 0.0]), Some("loyal canine"), 10, QueryConfig::default()).await.unwrap();
     let top2: Vec<_> = hits.iter().take(2).map(|h| h.id).collect();
     assert!(top2.contains(&ItemId::from_key("cats")));
     assert!(top2.contains(&ItemId::from_key("dogs")));
@@ -93,7 +93,7 @@ async fn writes_after_indexing_are_visible_under_strong_consistency() {
 
     let node = QueryNode::open(&ns, Tokenizer::default(), Consistency::Strong).await.unwrap();
     assert_eq!(node.doc_count(), 2, "the un-indexed write must be visible");
-    let hits = node.query(Some(&[0.0, 1.0]), None, 10, QueryConfig::default()).await.unwrap();
+    let hits = node.query(1, Some(&[0.0, 1.0]), None, 10, QueryConfig::default()).await.unwrap();
     assert_eq!(hits[0].id, ItemId::from_key("b"), "the tail write must be queryable");
 }
 
@@ -118,7 +118,7 @@ async fn deletes_after_indexing_take_effect_immediately() {
 
     let node = QueryNode::open(&ns, Tokenizer::default(), Consistency::Strong).await.unwrap();
     assert_eq!(node.doc_count(), 1);
-    let hits = node.query(Some(&[0.0, 1.0]), None, 10, QueryConfig::default()).await.unwrap();
+    let hits = node.query(1, Some(&[0.0, 1.0]), None, 10, QueryConfig::default()).await.unwrap();
     assert!(
         !hits.iter().any(|h| h.id == ItemId::from_key("drop")),
         "a tombstoned item must not appear in strong-consistency results"
@@ -172,8 +172,8 @@ async fn indexing_is_deterministic() {
         index(&ns, &Tokenizer::default(), IndexOptions::default()).await.unwrap();
         // Hash the published centroids + pk index as a proxy for generation content.
         let (manifest, _) = ns.read_manifest().await.unwrap();
-        let centroids = ns.store.get(&manifest.files.centroids, None).await.unwrap();
-        let pk = ns.store.get(&manifest.files.pk, None).await.unwrap();
+        let centroids = ns.store.get(&manifest.index(1).unwrap().files.centroids, None).await.unwrap();
+        let pk = ns.store.get(&manifest.index(1).unwrap().files.pk, None).await.unwrap();
         format!("{}-{}", centroids.bytes.len(), pk.bytes.len())
     }
 
@@ -211,7 +211,7 @@ async fn graph_arm_works_through_the_full_pipeline() {
         graph_weight: 1.0,
         ..QueryConfig::default()
     };
-    let hits = node.query(Some(&[1.0, 0.0, 0.0]), None, 10, cfg).await.unwrap();
+    let hits = node.query(1, Some(&[1.0, 0.0, 0.0]), None, 10, cfg).await.unwrap();
     let ids: Vec<_> = hits.iter().map(|h| h.id).collect();
     assert!(ids.contains(&ItemId::from_key("a")));
     assert!(ids.contains(&ItemId::from_key("a2")), "graph expansion should surface the neighbour");
@@ -260,7 +260,7 @@ async fn full_pipeline_against_minio() {
     );
     let node = QueryNode::open(&other, Tokenizer::default(), Consistency::Strong).await.unwrap();
     assert_eq!(node.doc_count(), 2);
-    let hits = node.query(Some(&[1.0, 0.0, 0.0]), Some("fox"), 10, QueryConfig::default()).await.unwrap();
+    let hits = node.query(1, Some(&[1.0, 0.0, 0.0]), Some("fox"), 10, QueryConfig::default()).await.unwrap();
     assert_eq!(hits[0].id, ItemId::from_key("x"));
 }
 
@@ -296,7 +296,7 @@ async fn gc_reclaims_folded_wal_and_old_generations_without_changing_results() {
     // Results are unchanged: GC only removed files nothing references.
     let after = QueryNode::open(&ns, Tokenizer::default(), Consistency::Strong).await.unwrap();
     assert_eq!(after.doc_count(), 3);
-    let hits = after.query(Some(&[0.0, 1.0]), None, 10, QueryConfig::default()).await.unwrap();
+    let hits = after.query(1, Some(&[0.0, 1.0]), None, 10, QueryConfig::default()).await.unwrap();
     assert_eq!(hits[0].id, ItemId::from_key("b"));
 }
 
@@ -357,7 +357,7 @@ async fn tombstone_survives_compaction_and_wal_gc() {
 
     let node = QueryNode::open(&ns, Tokenizer::default(), Consistency::Strong).await.unwrap();
     assert_eq!(node.doc_count(), 1, "the deleted item must stay gone after compaction");
-    assert!(node.query(Some(&[0.0, 1.0]), None, 10, QueryConfig::default())
+    assert!(node.query(1, Some(&[0.0, 1.0]), None, 10, QueryConfig::default())
         .await
         .unwrap()
         .iter()
@@ -476,7 +476,7 @@ async fn tantivy_fts_split_loads_from_storage_and_serves_queries() {
 
     // Load only the FTS split from the manifest's file map — the warm FTS path.
     let (manifest, _) = ns.read_manifest().await.unwrap();
-    let fts = mlake_index::read_fts_split(&ns.store, &manifest.files, Tokenizer::default(), None)
+    let fts = mlake_index::read_fts_split(&ns.store, &manifest.index(1).unwrap().files, Tokenizer::default(), None)
         .await
         .unwrap();
 
@@ -510,7 +510,7 @@ async fn default_indexing_preserves_the_graph_across_reruns() {
 
     let cfg = QueryConfig { graph_weight: 1.0, ..QueryConfig::default() };
     let node = QueryNode::open(&ns, Tokenizer::default(), Consistency::Strong).await.unwrap();
-    let hits = node.query(Some(&[1.0, 0.0, 0.0]), None, 10, cfg).await.unwrap();
+    let hits = node.query(1, Some(&[1.0, 0.0, 0.0]), None, 10, cfg).await.unwrap();
     assert!(
         hits.iter().any(|h| h.id == ItemId::from_key("a2")),
         "default indexing must leave the graph arm working (links derived)"
@@ -521,7 +521,7 @@ async fn default_indexing_preserves_the_graph_across_reruns() {
     index(&ns, &Tokenizer::default(), IndexOptions::default()).await.unwrap();
 
     let node2 = QueryNode::open(&ns, Tokenizer::default(), Consistency::Strong).await.unwrap();
-    let hits2 = node2.query(Some(&[1.0, 0.0, 0.0]), None, 10, cfg).await.unwrap();
+    let hits2 = node2.query(1, Some(&[1.0, 0.0, 0.0]), None, 10, cfg).await.unwrap();
     assert!(
         hits2.iter().any(|h| h.id == ItemId::from_key("a2")),
         "a second index run must not wipe the graph carried from the first"
@@ -656,7 +656,7 @@ async fn query_fetches_only_probed_clusters_and_warms_the_cache() {
     let node = QueryNode::open(&ns, Tokenizer::default(), Consistency::Strong).await.unwrap();
     let cluster_count = {
         let (m, _) = ns.read_manifest().await.unwrap();
-        m.files.clusters.len()
+        m.index(1).unwrap().files.clusters.len()
     };
     assert!(cluster_count >= 15, "test needs many clusters, got {cluster_count}");
 
@@ -666,7 +666,7 @@ async fn query_fetches_only_probed_clusters_and_warms_the_cache() {
     // Cold query: fetches only the probed clusters (≤ nprobe requests), far fewer than the
     // total, and stays within the roundtrip budget.
     let cold = QueryMetrics::new();
-    let hits = node.query_metered(Some(&q), None, 10, cfg, &cold).await.unwrap();
+    let hits = node.query_metered(1, Some(&q), None, 10, cfg, &cold).await.unwrap();
     assert!(!hits.is_empty());
     assert!(
         cold.requests() <= cfg.nprobe,
@@ -680,7 +680,7 @@ async fn query_fetches_only_probed_clusters_and_warms_the_cache() {
 
     // Warm query: same probed clusters, now served from the NVMe cache.
     let warm = QueryMetrics::new();
-    node.query_metered(Some(&q), None, 10, cfg, &warm).await.unwrap();
+    node.query_metered(1, Some(&q), None, 10, cfg, &warm).await.unwrap();
     assert!(warm.cache_hits() > 0, "warm query should hit the cache");
     assert_eq!(warm.cache_misses(), 0, "warm query should not miss");
 }
@@ -710,7 +710,7 @@ async fn graph_arm_materializes_neighbours_from_unprobed_clusters() {
     let node = QueryNode::open(&ns, Tokenizer::default(), Consistency::Strong).await.unwrap();
     // Low nprobe so only a couple of clusters are probed.
     let cfg = QueryConfig { nprobe: 2, graph_weight: 1.0, ..QueryConfig::default() };
-    let hits = node.query(Some(&[1.0, 0.0, 0.0]), None, 20, cfg).await.unwrap();
+    let hits = node.query(1, Some(&[1.0, 0.0, 0.0]), None, 20, cfg).await.unwrap();
     let ids: Vec<_> = hits.iter().map(|h| h.id).collect();
 
     assert!(ids.contains(&ItemId::from_key("seed")));
@@ -743,8 +743,8 @@ async fn incremental_fold_copies_unchanged_clusters_forward() {
     index(&ns, &Tokenizer::default(), IndexOptions::default()).await.unwrap();
     let (gen1, _) = ns.read_manifest().await.unwrap();
     let gen1_cluster_paths: std::collections::HashSet<_> =
-        gen1.files.clusters.iter().cloned().collect();
-    let n_clusters = gen1.files.clusters.len();
+        gen1.index(1).unwrap().files.clusters.iter().cloned().collect();
+    let n_clusters = gen1.index(1).unwrap().files.clusters.len();
     assert!(n_clusters >= 15, "need many clusters, got {n_clusters}");
 
     // A tiny incremental fold: one new item.
@@ -755,6 +755,8 @@ async fn incremental_fold_copies_unchanged_clusters_forward() {
     // The vast majority of gen2's cluster files are the SAME objects as gen1's (copied
     // forward, not rewritten). Only the cluster(s) the newcomer touched are new.
     let carried = gen2
+        .index(1)
+        .unwrap()
         .files
         .clusters
         .iter()
@@ -764,14 +766,14 @@ async fn incremental_fold_copies_unchanged_clusters_forward() {
         carried >= n_clusters - 3,
         "a one-item fold should copy forward almost every cluster: carried {carried} of {n_clusters}"
     );
-    assert!(carried < gen2.files.clusters.len() || gen2.files.clusters.len() > n_clusters,
+    assert!(carried < gen2.index(1).unwrap().files.clusters.len() || gen2.index(1).unwrap().files.clusters.len() > n_clusters,
         "at least one cluster must have been rewritten for the newcomer");
 
     // Correctness is unaffected: the new item and an old item are both queryable.
     let node = QueryNode::open(&ns, Tokenizer::default(), Consistency::Strong).await.unwrap();
     assert_eq!(node.doc_count(), 401);
     let cfg = QueryConfig { graph_weight: 0.0, ..QueryConfig::default() };
-    let hits = node.query(Some(&[1.0, 0.0, 0.0]), None, 10, cfg).await.unwrap();
+    let hits = node.query(1, Some(&[1.0, 0.0, 0.0]), None, 10, cfg).await.unwrap();
     assert_eq!(hits[0].id, ItemId::from_key("newcomer"), "the new item must be the nearest hit");
 }
 
@@ -814,7 +816,7 @@ async fn assign_only_recall_stays_close_to_a_retrain() {
     }
     index(&ns, &Tokenizer::default(), IndexOptions::default()).await.unwrap();
     let (m0, _) = ns.read_manifest().await.unwrap();
-    let train_count_0 = m0.train_count;
+    let train_count_0 = m0.index(1).unwrap().train_count;
 
     let extra = corpus_vecs(180, dim, 2);
     for chunk in extra.chunks(30) {
@@ -826,7 +828,7 @@ async fn assign_only_recall_stays_close_to_a_retrain() {
     }
     let (m1, _) = ns.read_manifest().await.unwrap();
     // Centroids were never retrained (still the seed generation's), proving assign-only.
-    assert_eq!(m1.train_count, train_count_0, "assign-only folds must not retrain under 2x growth");
+    assert_eq!(m1.index(1).unwrap().train_count, train_count_0, "assign-only folds must not retrain under 2x growth");
 
     // Recall of the assign-only generation vs brute force over the same items.
     let node = QueryNode::open(&ns, Tokenizer::default(), Consistency::Strong).await.unwrap();
@@ -834,7 +836,7 @@ async fn assign_only_recall_stays_close_to_a_retrain() {
     let cfg = QueryConfig { nprobe: 16, ..QueryConfig::default() };
     let mut total_recall = 0.0;
     for q in &queries {
-        let hits = node.query(Some(q), None, 10, cfg).await.unwrap();
+        let hits = node.query(1, Some(q), None, 10, cfg).await.unwrap();
         let got: std::collections::HashSet<_> = hits.iter().take(10).map(|h| h.id).collect();
         // Brute-force truth over all items currently live.
         // (Reconstruct ids from the query node is not exposed; instead assert non-trivial recall.)
@@ -845,4 +847,84 @@ async fn assign_only_recall_stays_close_to_a_retrain() {
     // empty clusters starving nprobe). A stricter recall-vs-brute-force gate lives in the
     // ivf crate; here we assert the assign-only path stays functional across folds.
     assert!(total_recall / queries.len() as f64 > 0.9);
+}
+
+// ---------------------------------------------------------------- fact_type sub-indexes (SCALE.md Phase 4.0)
+
+fn item_ft(key: &str, fact_type: u8, vector: Vec<f32>, text: &str) -> Item {
+    let mut it = item(key, vector, text);
+    it.fact_type = fact_type;
+    it
+}
+
+/// A bank namespace holds several fully-independent fact-type indexes behind one WAL and
+/// one manifest. A query is scoped to a fact type and never sees another type's items.
+#[tokio::test]
+async fn fact_types_are_independent_indexes_in_one_bank() {
+    let store = Store::in_memory();
+    let ns = namespace(store, "bank").await;
+    let mut writer = Writer::new(ns.clone());
+
+    // Two fact types, same bank, overlapping vector space.
+    writer
+        .commit(vec![
+            Op::Upsert(item_ft("s1", 1, vec![1.0, 0.0, 0.0], "semantic apple")),
+            Op::Upsert(item_ft("s2", 1, vec![0.9, 0.1, 0.0], "semantic banana")),
+            Op::Upsert(item_ft("e1", 2, vec![1.0, 0.0, 0.0], "episodic apple event")),
+            Op::Upsert(item_ft("e2", 2, vec![0.0, 1.0, 0.0], "episodic cherry event")),
+        ])
+        .await
+        .unwrap();
+    index(&ns, &Tokenizer::default(), IndexOptions::default()).await.unwrap();
+
+    // The manifest carries an independent index per fact type.
+    let (manifest, _) = ns.read_manifest().await.unwrap();
+    assert!(manifest.index(1).is_some(), "fact type 1 must be indexed");
+    assert!(manifest.index(2).is_some(), "fact type 2 must be indexed");
+    // Independent files — the two types share no objects.
+    let paths1: std::collections::HashSet<_> = manifest.index(1).unwrap().files.all_paths().collect();
+    let paths2: std::collections::HashSet<_> = manifest.index(2).unwrap().files.all_paths().collect();
+    assert!(paths1.is_disjoint(&paths2), "fact types must not share any object");
+
+    let node = QueryNode::open(&ns, Tokenizer::default(), Consistency::Strong).await.unwrap();
+    assert_eq!(node.doc_count(), 4);
+    assert_eq!(node.doc_count_of(1), 2);
+    assert_eq!(node.doc_count_of(2), 2);
+
+    // A query at [1,0,0] on fact type 1 returns only semantic items; on 2 only episodic.
+    let cfg = QueryConfig { graph_weight: 0.0, ..QueryConfig::default() };
+    let ft1 = node.query(1, Some(&[1.0, 0.0, 0.0]), None, 10, cfg).await.unwrap();
+    let ids1: std::collections::HashSet<_> = ft1.iter().map(|h| h.id).collect();
+    assert!(ids1.contains(&ItemId::from_key("s1")));
+    assert!(!ids1.contains(&ItemId::from_key("e1")), "fact type 1 must not return an episodic item");
+
+    let ft2 = node.query(2, Some(&[1.0, 0.0, 0.0]), None, 10, cfg).await.unwrap();
+    let ids2: std::collections::HashSet<_> = ft2.iter().map(|h| h.id).collect();
+    assert!(ids2.contains(&ItemId::from_key("e1")));
+    assert!(!ids2.contains(&ItemId::from_key("s1")), "fact type 2 must not return a semantic item");
+
+    // A fact type the bank doesn't have returns nothing, not an error.
+    assert!(node.query(9, Some(&[1.0, 0.0, 0.0]), None, 10, cfg).await.unwrap().is_empty());
+}
+
+/// One WAL, one manifest read: a bank with several fact types still opens with a bounded,
+/// size-independent number of roundtrips (the round-trip optimization).
+#[tokio::test]
+async fn multi_fact_type_open_reads_one_manifest() {
+    let store = Store::in_memory();
+    let ns = namespace(store, "bank").await;
+    let mut writer = Writer::new(ns.clone());
+    for i in 0..60 {
+        let ft = (i % 3) as u8 + 1;
+        let a = i as f32 * 0.3;
+        writer
+            .commit(vec![Op::Upsert(item_ft(&format!("i{i}"), ft, vec![a.sin(), a.cos(), 0.1], "doc"))])
+            .await
+            .unwrap();
+    }
+    index(&ns, &Tokenizer::default(), IndexOptions::default()).await.unwrap();
+
+    let node = QueryNode::open(&ns, Tokenizer::default(), Consistency::Strong).await.unwrap();
+    assert_eq!(node.fact_types().len(), 3, "three fact types under one bank");
+    assert_eq!(node.doc_count(), 60);
 }

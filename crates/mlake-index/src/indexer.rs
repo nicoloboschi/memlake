@@ -57,54 +57,49 @@ pub struct IndexOutcome {
 }
 
 /// Build the next generation for a namespace and publish it.
+/// Fold the bank's WAL into a new generation for each fact type and publish one manifest.
+///
+/// Fact types are fully independent indexes (no shared links/vectors/postings), so the fold
+/// partitions the live item set by `fact_type` and builds a separate generation per type,
+/// each with its own assign-only/copy-forward state (SCALE.md Phase 4). One WAL, one
+/// manifest — so a `bank + [fact_types]` query reads a single manifest and fans out.
 pub async fn index(ns: &Namespace, tokenizer: &Tokenizer, opts: IndexOptions) -> Result<IndexOutcome> {
     let (manifest, etag) = ns.read_manifest().await?;
-
-    // Incremental build: start from the previous generation's live items, then apply only
-    // the WAL slice `(cursor, head]`. This is what makes WAL GC safe — once an entry is
-    // folded into a generation, the generation carries it and the entry can be reclaimed
-    // (SPEC §5). The first run has no previous generation and folds from an empty base.
     let head = ns.wal_head().await?;
 
-    // Load the previous generation's centroids + cluster items — for the fold, and (in the
-    // assign-only path) for copy-forward. Empty on the first build.
-    let prev = if manifest.is_empty() {
-        None
-    } else {
-        Some(
-            crate::generation::read_generation(&ns.store, &manifest.files, manifest.generation, None)
-                .await?,
-        )
-    };
+    // Load each existing fact type's previous items (for the fold + copy-forward).
+    let mut prev_by_ft: std::collections::BTreeMap<u8, mlake_index_prev::Generation> =
+        std::collections::BTreeMap::new();
+    for ft in manifest.fact_types() {
+        let fti = manifest.index(ft).unwrap();
+        let gen =
+            crate::generation::read_generation(&ns.store, &fti.files, manifest.generation, None)
+                .await?;
+        prev_by_ft.insert(ft, gen);
+    }
 
+    // Fold the whole live item set (across all fact types), applying the tail.
     let mut by_id: std::collections::BTreeMap<[u8; 16], StoredItem> =
         std::collections::BTreeMap::new();
-    if let Some(p) = &prev {
-        for cluster in &p.clusters {
+    for gen in prev_by_ft.values() {
+        for cluster in &gen.clusters {
             for item in cluster {
                 by_id.insert(item.id.0, item.clone());
             }
         }
     }
 
-    // Apply the tail: upserts replace, tombstones remove, patches were folded by the scan.
     let scan = WalTail::new(ns)
         .scan(manifest.wal_index_cursor, Some(head))
         .await?;
     for id in &scan.tombstones {
         by_id.remove(&id.0);
     }
-    // Items introduced or replaced by this WAL slice are "new": their semantic links have
-    // not been derived yet. Carried-over items keep the links they were indexed with —
-    // derived data is expensive, so it is recomputed incrementally for new items, never
-    // wholesale-deleted (which would silently empty the graph on every plain index run).
     let mut new_ids: std::collections::HashSet<[u8; 16]> = std::collections::HashSet::new();
     for (id, item) in scan.upserts {
         new_ids.insert(id.0);
-        by_id.insert(id.0, item); // an upsert arrives with empty semantic_out
+        by_id.insert(id.0, item);
     }
-    // Patched carried items also change content, so they must be treated as dirty for the
-    // copy-forward decision.
     let mut touched: std::collections::HashSet<[u8; 16]> = new_ids.clone();
     for item in by_id.values_mut() {
         if let Some(deltas) = scan.pending_patches.get(&ItemId(item.id.0)) {
@@ -114,11 +109,7 @@ pub async fn index(ns: &Namespace, tokenizer: &Tokenizer, opts: IndexOptions) ->
         }
     }
 
-    // BTreeMap iteration is id-sorted, so the item order — and thus the build — is
-    // deterministic and replayable (G-6).
     let mut items: Vec<StoredItem> = by_id.into_values().collect();
-
-    // Drop carried links whose target was tombstoned in this slice.
     let live: std::collections::HashSet<[u8; 16]> = items.iter().map(|i| i.id.0).collect();
     for item in items.iter_mut() {
         item.semantic_out.retain(|e| live.contains(&e.target.0));
@@ -127,85 +118,138 @@ pub async fn index(ns: &Namespace, tokenizer: &Tokenizer, opts: IndexOptions) ->
     let generation = manifest.generation + 1;
     let doc_count = items.len();
 
-    // Assign-only vs full retrain. Retrain on the first build or once the corpus has grown
-    // 2× since the centroids were trained (SPEC §5.1) — a rare, amortized event. Otherwise
-    // reuse the published centroids, so a fold does not reshuffle the whole corpus.
+    // Partition the live items by fact type (BTreeMap keeps a deterministic type order).
+    let mut items_by_ft: std::collections::BTreeMap<u8, Vec<StoredItem>> =
+        std::collections::BTreeMap::new();
+    for item in items {
+        items_by_ft.entry(item.fact_type).or_default().push(item);
+    }
+
+    // Build an independent generation per fact type that still has items.
+    let nonce = mlake_core::ItemId::new_v4().as_uuid().simple().to_string();
+    let mut indexes: std::collections::BTreeMap<u8, mlake_core::manifest::FactTypeIndex> =
+        std::collections::BTreeMap::new();
+    for (ft, ft_items) in items_by_ft {
+        let fti = build_fact_type_index(
+            ns,
+            generation,
+            &nonce,
+            ft,
+            ft_items,
+            &new_ids,
+            &touched,
+            prev_by_ft.get(&ft),
+            manifest.index(ft),
+            opts,
+        )
+        .await?;
+        indexes.insert(ft, fti);
+    }
+
+    let mut next = manifest.clone();
+    next.generation = generation;
+    next.wal_index_cursor = head;
+    next.wal_head = head;
+    next.prev_wal_index_cursor = manifest.wal_index_cursor;
+    next.prev_generation = Some(manifest.generation);
+    next.tokenizer_config_hash = tokenizer.config_hash();
+    next.indexes = indexes;
+
+    let published = match etag {
+        Some(etag) => ns.swap_manifest(&etag, &next).await.map(|_| true).or_else(|e| {
+            if e.is_conflict() {
+                Ok(false)
+            } else {
+                Err(e)
+            }
+        })?,
+        None => false,
+    };
+
+    Ok(IndexOutcome {
+        generation,
+        doc_count,
+        published,
+    })
+}
+
+// Alias so the module can name Generation without importing it at the top (it is only used
+// in this function's type annotation).
+mod mlake_index_prev {
+    pub use crate::generation::Generation;
+}
+
+/// Build one fact type's independent generation (assign-only + copy-forward + local split +
+/// IVF link derivation) from its slice of the live items, and return its manifest entry.
+#[allow(clippy::too_many_arguments)]
+async fn build_fact_type_index(
+    ns: &Namespace,
+    generation: u64,
+    nonce: &str,
+    fact_type: u8,
+    mut items: Vec<StoredItem>,
+    new_ids: &std::collections::HashSet<[u8; 16]>,
+    touched: &std::collections::HashSet<[u8; 16]>,
+    prev_gen: Option<&crate::generation::Generation>,
+    prev_index: Option<&mlake_core::manifest::FactTypeIndex>,
+    opts: IndexOptions,
+) -> Result<mlake_core::manifest::FactTypeIndex> {
+    let doc_count = items.len();
+    let prev_train_count = prev_index.map(|p| p.train_count).unwrap_or(0);
+
+    // Assign-only vs retrain, scoped to this fact type.
     let retrain =
-        prev.is_none() || opts.force_retrain || doc_count as u64 > 2 * manifest.train_count.max(1);
+        prev_gen.is_none() || opts.force_retrain || doc_count as u64 > 2 * prev_train_count.max(1);
     let vectors: Vec<Vec<f32>> = items.iter().map(|i| i.vector.clone()).collect();
-    let (mut centroids, train_count) = match (&prev, retrain) {
-        (Some(p), false) => (p.centroids.clone(), manifest.train_count),
+    let (mut centroids, train_count) = match (prev_gen, retrain) {
+        (Some(p), false) => (p.centroids.clone(), prev_train_count),
         _ => (train_centroids(&vectors, opts.seed), doc_count as u64),
     };
 
-    // Assign every item to a centroid (assign-only reuses the existing geometry).
     let mut assignments: Vec<usize> = if centroids.is_empty() {
         vec![0; items.len()]
     } else {
         items.iter().map(|i| centroids.assign(&i.vector)).collect()
     };
 
-    // Local split: any cluster grown past 8× average is split in place, adding a centroid
-    // and reassigning only that cluster's members (SPFresh-lite, SCALE.md Phase 3).
     let split_clusters = local_split(&mut centroids, &items, &mut assignments, opts.seed);
 
-    // Incremental link derivation via the IVF, not O(N²): each new item probes centroids
-    // and scans only the probed clusters for its top-5 neighbours.
     if opts.derive_links && !centroids.is_empty() {
-        derive_links_ivf(&mut items, &new_ids, &centroids, &assignments);
+        derive_links_ivf(&mut items, new_ids, &centroids, &assignments);
     } else if opts.derive_links {
-        derive_semantic_links(&mut items, &new_ids);
+        derive_semantic_links(&mut items, new_ids);
     }
 
-    // Group items into clusters by assignment (id-sorted within a cluster, so an unchanged
-    // cluster is byte-identical to the previous generation's — the basis for copy-forward).
     let k = centroids.len().max(1);
     let mut clusters: Vec<Vec<StoredItem>> = vec![Vec::new(); k];
     for (item, &c) in items.iter().zip(assignments.iter()) {
         clusters[c].push(item.clone());
     }
 
-    let nonce = mlake_core::ItemId::new_v4().as_uuid().simple().to_string();
-    let prefix = crate::generation::attempt_prefix(&ns.name, generation, &nonce);
+    // Per-fact-type prefix so different types never collide on object keys.
+    let prefix = format!("{}/ft{fact_type}/gen-{generation}-{nonce}", ns.name);
 
-    // Copy-forward-by-reference: write only dirty clusters; reference unchanged ones by
-    // their previous path. At 10M this is the difference between rewriting ~17 GB of
-    // cluster files per fold and rewriting only the handful a small WAL slice touched
-    // (SCALE.md #2). A cluster is dirty if we retrained, it was split, its membership
-    // changed, or a member was touched by this slice.
-    let empty_clusters: Vec<Vec<StoredItem>> = Vec::new();
-    let old_clusters = prev.as_ref().map(|p| &p.clusters).unwrap_or(&empty_clusters);
-    let old_paths = &manifest.files.clusters;
+    // Copy-forward unchanged clusters (skip their PUT); rewrite only dirty ones.
+    let empty: Vec<Vec<StoredItem>> = Vec::new();
+    let old_clusters = prev_gen.map(|p| &p.clusters).unwrap_or(&empty);
+    let empty_paths: Vec<String> = Vec::new();
+    let old_paths = prev_index.map(|p| &p.files.clusters).unwrap_or(&empty_paths);
     let mut cluster_paths = Vec::with_capacity(k);
-    let mut clusters_written = 0usize;
     for i in 0..k {
         let can_copy_forward = !retrain
             && !split_clusters.contains(&i)
             && i < old_clusters.len()
             && i < old_paths.len()
-            && !cluster_changed(&clusters[i], &old_clusters[i], &touched);
+            && !cluster_changed(&clusters[i], &old_clusters[i], touched);
         if can_copy_forward {
             cluster_paths.push(old_paths[i].clone());
         } else {
-            let cf = ClusterFile {
-                centroid_id: i as u32,
-                items: clusters[i].clone(),
-            };
+            let cf = ClusterFile { centroid_id: i as u32, items: clusters[i].clone() };
             cluster_paths.push(crate::generation::write_cluster_file(&ns.store, &prefix, i, &cf).await?);
-            clusters_written += 1;
         }
     }
-    tracing::debug!(
-        namespace = %ns.name,
-        generation,
-        retrain,
-        clusters_written,
-        clusters_total = k,
-        "index fold: copy-forward kept {} of {k} cluster files",
-        k - clusters_written
-    );
 
-    // Build the pk index SSTable from the assignments (id → cluster).
+    // pk / radj / fts, scoped to this fact type.
     let mut pk_entries: Vec<(ItemId, u32)> = Vec::with_capacity(doc_count);
     for (ci, cluster) in clusters.iter().enumerate() {
         for item in cluster {
@@ -214,7 +258,6 @@ pub async fn index(ns: &Namespace, tokenizer: &Tokenizer, opts: IndexOptions) ->
     }
     let pk_tables = crate::sstable::PkTable::build(pk_entries);
 
-    // Build the tantivy FTS split (SPEC §5.3).
     let fts = mlake_fts::TantivyFts::build(
         items.iter().map(|i| (i.id, i.text.as_str())),
         mlake_fts::Tokenizer::new(mlake_fts::TokenizerConfig::default()),
@@ -222,7 +265,6 @@ pub async fn index(ns: &Namespace, tokenizer: &Tokenizer, opts: IndexOptions) ->
     .map_err(|e| crate::Error::Core(mlake_core::Error::Encode(e.to_string())))?;
     let fts_split = fts.split_bytes().to_vec();
 
-    // Build the radj SSTable from inline outgoing links.
     let mut radj_pairs: Vec<(ItemId, InEdge)> = Vec::new();
     for item in &items {
         for edge in &item.semantic_out {
@@ -256,40 +298,10 @@ pub async fn index(ns: &Namespace, tokenizer: &Tokenizer, opts: IndexOptions) ->
     )
     .await?;
 
-    let mut next = manifest.clone();
-    next.generation = generation;
-    next.wal_index_cursor = head;
-    next.wal_head = head;
-    next.train_count = train_count;
-    // Carry the outgoing generation's files and cursor forward as the GC grace window: a
-    // reader still holding this manifest keeps working until the next generation ages out.
-    next.prev_files = if manifest.is_empty() {
-        None
-    } else {
-        Some(manifest.files.clone())
-    };
-    next.prev_wal_index_cursor = manifest.wal_index_cursor;
-    next.files = files;
-    next.tokenizer_config_hash = tokenizer.config_hash();
-    next.prev_generation = Some(manifest.generation);
-
-    let published = match etag {
-        Some(etag) => ns.swap_manifest(&etag, &next).await.map(|_| true).or_else(|e| {
-            if e.is_conflict() {
-                // Another node published first. Its generation is equivalent; our files
-                // become unreferenced garbage for GC. Not an error (INV-6).
-                Ok(false)
-            } else {
-                Err(e)
-            }
-        })?,
-        None => false,
-    };
-
-    Ok(IndexOutcome {
-        generation,
-        doc_count,
-        published,
+    Ok(mlake_core::manifest::FactTypeIndex {
+        prev_files: prev_index.map(|p| p.files.clone()),
+        train_count,
+        files,
     })
 }
 

@@ -4,13 +4,15 @@
 //! then CAS-swapping this one object (INV-2). A reader that has read the manifest holds a
 //! consistent, complete view of a generation.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 pub const FORMAT_VERSION: u32 = 1;
 
 /// Paths to the files making up a generation. Stored as an explicit struct rather than a
 /// map so a missing file is a deserialization error rather than a runtime surprise.
-#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug, Default)]
 pub struct GenerationFiles {
     pub pk: String,
     pub centroids: String,
@@ -45,75 +47,91 @@ impl GenerationFiles {
     }
 }
 
+/// One fact_type's independent index within a bank. Fact types share nothing — no links,
+/// vectors, or postings — so each carries its own generation files and its own assign-only
+/// retrain state (SCALE.md Phase 4).
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug, Default)]
+pub struct FactTypeIndex {
+    pub files: GenerationFiles,
+    /// The previous generation's files for this fact type, retained as the GC grace window.
+    #[serde(default)]
+    pub prev_files: Option<GenerationFiles>,
+    /// Item count when this fact type's centroids were last trained (assign-only trigger).
+    #[serde(default)]
+    pub train_count: u64,
+}
+
+impl FactTypeIndex {
+    fn all_paths(&self) -> impl Iterator<Item = &str> {
+        self.files.all_paths().chain(
+            self.prev_files
+                .iter()
+                .flat_map(|f| f.all_paths())
+                .collect::<Vec<_>>(),
+        )
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 pub struct Manifest {
     pub format_version: u32,
     pub generation: u64,
-    /// Last WAL sequence folded into `generation`. Readers scan the WAL tail past this
-    /// point to satisfy strong consistency.
+    /// Last WAL sequence folded into the current generation. Readers scan the WAL tail past
+    /// this point to satisfy strong consistency.
     pub wal_index_cursor: u64,
     /// Last committed WAL sequence as of this manifest write.
     pub wal_head: u64,
-    pub files: GenerationFiles,
     /// Guards against querying a split built with a different tokenizer than the query
     /// parser uses — a silent, hard-to-debug recall failure otherwise.
     pub tokenizer_config_hash: String,
     /// Kept alive for the GC grace period so in-flight readers holding the previous
     /// manifest do not observe deleted files.
     pub prev_generation: Option<u64>,
-    /// The previous generation's file set, retained so GC can keep exactly those objects
-    /// alive as the grace window for a reader still holding the previous manifest —
-    /// without it, GC would have to guess the previous generation's (nonce-suffixed) paths.
-    #[serde(default)]
-    pub prev_files: Option<GenerationFiles>,
     /// The previous generation's WAL cursor. WAL entries at or below the *current* cursor
     /// are folded, but a strong reader that read the previous manifest is scanning
     /// `(prev_wal_index_cursor, head]`, so GC must keep entries above this watermark.
     #[serde(default)]
     pub prev_wal_index_cursor: u64,
-    /// Forward-compat sharding escape hatch (SCALE.md, Phase 0). `files` is the single
-    /// index (conceptually shard 0). A namespace that outgrows one index (~30M+) will
-    /// populate additional `shards`, each a self-contained `GenerationFiles` behind the
-    /// same WAL. Empty today — present so the schema never has to break to add it.
+    /// Per-fact-type independent indexes. A bank namespace holds one WAL and this map; each
+    /// entry is a fully separate generation. Empty until the first fold indexes something.
     #[serde(default)]
-    pub shards: Vec<GenerationFiles>,
-    /// Item count when the centroids were last trained. Assign-only folds reuse the
-    /// existing centroids; a full retrain is triggered only once the corpus has grown 2×
-    /// past this (SPEC §5.1, SCALE.md Phase 3), so retraining is a rare, amortized event.
-    #[serde(default)]
-    pub train_count: u64,
+    pub indexes: BTreeMap<u8, FactTypeIndex>,
 }
 
 impl Manifest {
-    /// The manifest for a namespace that has been created but never indexed.
+    /// The manifest for a bank namespace that has been created but never indexed.
     pub fn empty(tokenizer_config_hash: impl Into<String>) -> Self {
         Self {
             format_version: FORMAT_VERSION,
             generation: 0,
             wal_index_cursor: 0,
             wal_head: 0,
-            files: GenerationFiles {
-                pk: String::new(),
-                pk_data: String::new(),
-                centroids: String::new(),
-                clusters: Vec::new(),
-                radj_csr: String::new(),
-                radj_idx: String::new(),
-                fts_split: String::new(),
-                stats: String::new(),
-            },
             tokenizer_config_hash: tokenizer_config_hash.into(),
             prev_generation: None,
-            prev_files: None,
             prev_wal_index_cursor: 0,
-            shards: Vec::new(),
-            train_count: 0,
+            indexes: BTreeMap::new(),
         }
     }
 
-    /// True when no generation has been built yet, so all reads come from the WAL tail.
+    /// This fact type's index, or `None` if the bank has never indexed that type.
+    pub fn index(&self, fact_type: u8) -> Option<&FactTypeIndex> {
+        self.indexes.get(&fact_type)
+    }
+
+    /// The fact types this bank currently has an index for.
+    pub fn fact_types(&self) -> impl Iterator<Item = u8> + '_ {
+        self.indexes.keys().copied()
+    }
+
+    /// True when nothing has been indexed yet, so all reads come from the WAL tail.
     pub fn is_empty(&self) -> bool {
-        self.generation == 0 && self.files.pk.is_empty()
+        self.indexes.is_empty()
+    }
+
+    /// Every object path any fact type's current or previous generation references. GC
+    /// keeps exactly these and reclaims the rest.
+    pub fn all_referenced_paths(&self) -> impl Iterator<Item = &str> {
+        self.indexes.values().flat_map(|idx| idx.all_paths())
     }
 
     /// Number of WAL entries not yet folded into a generation.

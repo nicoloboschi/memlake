@@ -47,27 +47,22 @@ pub async fn gc_with_min_age(ns: &Namespace, min_age: Duration) -> Result<GcOutc
     let (manifest, _etag) = ns.read_manifest().await?;
     let mut outcome = GcOutcome::default();
 
-    // The live object set: everything the current and previous generations reference.
-    let mut referenced: HashSet<String> = HashSet::new();
-    for path in manifest.files.all_paths() {
-        referenced.insert(path.to_string());
-    }
-    if let Some(prev) = &manifest.prev_files {
-        for path in prev.all_paths() {
-            referenced.insert(path.to_string());
-        }
-    }
+    // The live object set: every path any fact type's current or previous generation
+    // references (the manifest aggregates them).
+    let referenced: HashSet<String> = manifest
+        .all_referenced_paths()
+        .map(|p| p.to_string())
+        .collect();
 
     let cutoff = chrono::Utc::now() - chrono::Duration::from_std(min_age).unwrap_or_default();
 
-    // Collect unreferenced generation objects that are old enough to be safe.
-    //
-    // Object-store `list` matches on path *segments*, so a prefix like `ns/gen-` would not
-    // match `ns/gen-1-{nonce}/…` (the segment is `gen-1-{nonce}`). List the namespace root
-    // and filter by string prefix instead.
-    let gen_string_prefix = format!("{}/gen-", ns.name);
+    // Collect unreferenced generation objects that are old enough to be safe. Generation
+    // files live at `{ns}/ft{ft}/gen-{G}-{nonce}/…`; the WAL is `{ns}/wal/…` and the
+    // manifest is `{ns}/manifest.json`, neither of which contains `/gen-`. So a generation
+    // object is any listed path under the namespace containing `/gen-`.
+    let ns_prefix = format!("{}/", ns.name);
     for (path, modified) in ns.store.list_with_age(&ns.name).await? {
-        if !path.starts_with(&gen_string_prefix) {
+        if !path.starts_with(&ns_prefix) || !path.contains("/gen-") {
             continue;
         }
         if referenced.contains(&path) {
