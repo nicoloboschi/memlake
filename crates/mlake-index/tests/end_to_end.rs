@@ -399,6 +399,7 @@ async fn crash_before_manifest_swap_leaves_the_old_generation_serving() {
         empty_split.split_bytes(),
         mlake_index::RadjTable::build(vec![]).into(),
         mlake_index::PkTable::build(vec![]).into(),
+        &Vec::new(),
         0,
     )
     .await
@@ -561,6 +562,7 @@ async fn concurrent_generation_builds_write_disjoint_files() {
         empty_split.split_bytes(),
         mlake_index::RadjTable::build(vec![]).into(),
         mlake_index::PkTable::build(vec![(MemoryId::from_key("a"), 0)]).into(),
+        &Vec::new(),
         1,
     )
     .await
@@ -573,6 +575,7 @@ async fn concurrent_generation_builds_write_disjoint_files() {
         empty_split.split_bytes(),
         mlake_index::RadjTable::build(vec![]).into(),
         mlake_index::PkTable::build(vec![(MemoryId::from_key("b"), 0)]).into(),
+        &Vec::new(),
         1,
     )
     .await
@@ -1042,4 +1045,48 @@ async fn tags_filter_the_fts_arm() {
     let ids: std::collections::HashSet<_> = r.iter().map(|h| h.id).collect();
     assert!(ids.contains(&MemoryId::from_key("x")));
     assert!(!ids.contains(&MemoryId::from_key("y")), "team-b filtered out of the FTS arm");
+}
+
+/// Phase 4b: with per-cluster tag summaries, a selective tag filter finds its matches even
+/// when they sit in clusters the plain nprobe-nearest probe would not fetch. The rare
+/// tagged memory is surrounded (in vector space) by many untagged ones, so at low nprobe
+/// the plain probe misses it — but tag-aware cluster selection prunes to the admissible
+/// clusters and finds it.
+#[tokio::test]
+async fn selective_tag_filter_prunes_to_admissible_clusters() {
+    let store = Store::in_memory();
+    let ns = namespace(store, "bank").await;
+    let mut writer = Writer::new(ns.clone());
+
+    // Many memories spread across vector space, all untagged except a handful with a rare
+    // tag scattered among them.
+    let mut ops = Vec::new();
+    for i in 0..600 {
+        let a = i as f32 * 0.21;
+        let v = vec![a.sin(), a.cos(), (a * 0.5).sin()];
+        if i % 200 == 7 {
+            ops.push(Op::Upsert(item_tags(&format!("rare{i}"), v, "special", &["rare"])));
+        } else {
+            ops.push(Op::Upsert(item_tags(&format!("u{i}"), v, "ordinary", &[])));
+        }
+    }
+    writer.commit(ops).await.unwrap();
+    index(&ns, &Tokenizer::default(), IndexOptions::default()).await.unwrap();
+    let node = QueryNode::open(&ns, Tokenizer::default(), Consistency::Strong).await.unwrap();
+
+    // Query near one rare memory, low nprobe, strict filter on the rare tag.
+    let a = 7.0f32 * 0.21;
+    let q = vec![a.sin(), a.cos(), (a * 0.5).sin()];
+    let f = mlake_core::TagFilter::new(vec!["rare".into()], TagsMatch::AnyStrict);
+    let cfg = QueryConfig { nprobe: 2, graph_weight: 0.0, ..QueryConfig::default() };
+
+    let hits = node.query(1, Some(&q), None, &f, 10, cfg).await.unwrap();
+    // Every returned memory carries the rare tag (correctness), and at least the three rare
+    // memories are found across the corpus despite nprobe=2 (pruning worked).
+    assert!(!hits.is_empty(), "tag-aware selection must find the rare tagged memories");
+    let ids: std::collections::HashSet<_> = hits.iter().map(|h| h.id).collect();
+    let rare_found = (0..600).filter(|i| i % 200 == 7)
+        .filter(|i| ids.contains(&MemoryId::from_key(&format!("rare{i}"))))
+        .count();
+    assert!(rare_found >= 2, "pruning should surface rare memories from admissible clusters, found {rare_found}");
 }

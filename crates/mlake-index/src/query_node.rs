@@ -22,7 +22,7 @@ use mlake_store::QueryMetrics;
 use mlake_wal::{Namespace, WalTail};
 
 use crate::fusion::{rrf, weighted_rrf, FusedHit, RankedArm};
-use crate::generation::read_fts_split;
+use crate::generation::{read_fts_split, TagSummary};
 use crate::sstable::{PkTable, RadjTable};
 use crate::{QueryConfig, Result};
 
@@ -40,6 +40,7 @@ pub enum Consistency {
 struct FactTypeState {
     centroids: Centroids,
     cluster_paths: Vec<String>,
+    tag_summary: TagSummary,
     gen_fts: TantivyFts,
     radj: RadjTable,
     pk: PkTable,
@@ -106,6 +107,15 @@ impl QueryNode {
                         .store
                         .get_immutable(&files.centroids, Some((&metrics, 2)))
                         .await?;
+                    let tag_summary: TagSummary = if files.tag_summary.is_empty() {
+                        Vec::new()
+                    } else {
+                        let b = ns
+                            .store
+                            .get_immutable(&files.tag_summary, Some((&metrics, 2)))
+                            .await?;
+                        serde_json::from_slice(&b).unwrap_or_default()
+                    };
                     let radj_idx = ns
                         .store
                         .get_immutable(&files.radj_idx, Some((&metrics, 2)))
@@ -132,6 +142,7 @@ impl QueryNode {
                     FactTypeState {
                         centroids: Centroids::from_bytes(&centroids_bytes)?,
                         cluster_paths: files.clusters.clone(),
+                        tag_summary,
                         gen_fts,
                         radj: RadjTable::open(&radj_idx, files.radj_csr.clone())?,
                         pk,
@@ -146,6 +157,7 @@ impl QueryNode {
                     FactTypeState {
                         centroids: Centroids::default(),
                         cluster_paths: Vec::new(),
+                        tag_summary: Vec::new(),
                         gen_fts: TantivyFts::build(
                             std::iter::empty::<(MemoryId, &str)>(),
                             tokenizer.clone(),
@@ -255,19 +267,54 @@ impl QueryNode {
 
     /// Choose which clusters to fetch for the vector arm.
     ///
-    /// Without a tag filter this is the plain `nprobe`-nearest probe. With a selective
-    /// filter, 4b will intersect the probe with a tag→cluster posting so the planner only
-    /// fetches clusters that can contain a matching memory and can scale nprobe cheaply.
-    /// For now (4a correctness) it is the plain probe; the tag filter is applied inline
-    /// after fetch.
+    /// Without a tag filter (or without per-cluster tag summaries) this is the plain
+    /// `nprobe`-nearest probe. With a filter, the per-cluster tag summaries prune clusters
+    /// that cannot contain a matching memory, and the query probes among the *admissible*
+    /// clusters — so a selective filter still finds its matches instead of them being
+    /// starved out of the nprobe-nearest set (SCALE.md Phase 4b). Because a selective filter
+    /// leaves few admissible clusters, fetching all of them (capped) stays within budget;
+    /// a broad filter admits ~everything, degrading to the plain probe.
     fn select_clusters(
         &self,
         state: &FactTypeState,
         query: &[f32],
         nprobe: usize,
-        _tags: &TagFilter,
+        tags: &TagFilter,
     ) -> Vec<usize> {
-        state.centroids.probe(query, nprobe)
+        if tags.is_noop() || state.tag_summary.is_empty() {
+            return state.centroids.probe(query, nprobe);
+        }
+
+        // Admissible clusters: those whose tag summary could contain a matching memory.
+        let admissible: Vec<usize> = (0..state.centroids.len())
+            .filter(|&c| {
+                state
+                    .tag_summary
+                    .get(c)
+                    .map(|s| tags.cluster_admits(&s.tags, s.has_untagged))
+                    .unwrap_or(true)
+            })
+            .collect();
+
+        // Rank the admissible clusters by centroid distance and take enough to cover the
+        // matches. Cap at a small multiple of nprobe so a broad filter can't blow the byte
+        // budget; a selective filter's admissible set is already small.
+        let cap = nprobe.saturating_mul(4).max(nprobe);
+        if admissible.len() <= cap {
+            return admissible;
+        }
+        let ranked = state.centroids.probe(query, state.centroids.len());
+        ranked
+            .into_iter()
+            .filter(|c| {
+                state
+                    .tag_summary
+                    .get(*c)
+                    .map(|s| tags.cluster_admits(&s.tags, s.has_untagged))
+                    .unwrap_or(true)
+            })
+            .take(cap)
+            .collect()
     }
 
     /// Fetch the items in the given clusters of a fact type — one coalesced roundtrip.

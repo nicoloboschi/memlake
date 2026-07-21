@@ -26,6 +26,9 @@ pub struct GenerationFiles {
     /// `pk.data`: the primary-key SSTable data blocks. `pk` above is its sparse index.
     #[serde(default)]
     pub pk_data: String,
+    /// Per-cluster tag summaries, for pruning clusters before fetch (SCALE.md Phase 4b).
+    #[serde(default)]
+    pub tag_summary: String,
 }
 
 impl GenerationFiles {
@@ -40,6 +43,7 @@ impl GenerationFiles {
             self.radj_idx.as_str(),
             self.fts_split.as_str(),
             self.stats.as_str(),
+            self.tag_summary.as_str(),
         ]
         .into_iter()
         .chain(self.clusters.iter().map(|s| s.as_str()))

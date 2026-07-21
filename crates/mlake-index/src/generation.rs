@@ -53,6 +53,9 @@ fn pk_data_key(prefix: &str) -> String {
 fn stats_key(prefix: &str) -> String {
     format!("{prefix}/stats.json")
 }
+fn tag_summary_key(prefix: &str) -> String {
+    format!("{prefix}/tags.json")
+}
 
 /// A unique per-attempt generation prefix. The nonce ensures two nodes building the same
 /// generation number never collide on object keys.
@@ -67,6 +70,18 @@ pub struct Stats {
     pub cluster_count: usize,
     pub edge_count: usize,
 }
+
+/// One cluster's tag summary, for pruning it before fetch (SCALE.md Phase 4b): the union of
+/// all its memories' tags, and whether any memory is untagged.
+#[derive(Serialize, Deserialize, Default, Clone)]
+pub struct ClusterTagSummary {
+    /// Distinct tags present across the cluster's memories, sorted.
+    pub tags: Vec<String>,
+    pub has_untagged: bool,
+}
+
+/// The per-cluster tag summaries for a generation, indexed by cluster id.
+pub type TagSummary = Vec<ClusterTagSummary>;
 
 /// Write a generation's files under a unique attempt `prefix` and return the manifest file
 /// map. Every file is genuinely write-once: because `prefix` is unique per attempt, no
@@ -98,10 +113,14 @@ pub async fn write_generation(
     fts_split: &[u8],
     radj_tables: SsTablePair,
     pk_tables: SsTablePair,
+    tag_summary: &TagSummary,
     doc_count: usize,
 ) -> Result<GenerationFiles> {
     store
         .put(&centroids_key(prefix), centroids.to_bytes()?)
+        .await?;
+    store
+        .put(&tag_summary_key(prefix), serde_json::to_vec(tag_summary)?)
         .await?;
 
     // The FTS file is the packed tantivy split — a self-contained index a query node
@@ -133,6 +152,7 @@ pub async fn write_generation(
         radj_idx: radj_idx_key(prefix),
         fts_split: fts_key(prefix),
         stats: stats_key(prefix),
+        tag_summary: tag_summary_key(prefix),
     })
 }
 

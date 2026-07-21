@@ -59,6 +59,32 @@ impl TagFilter {
         self.tags.is_empty() && self.mode != TagsMatch::Exact
     }
 
+    /// Whether a *cluster* could contain a memory that passes this filter, given the union
+    /// of all its memories' tags (`cluster_tags`) and whether any of its memories is
+    /// untagged (`has_untagged`). This is a conservative superset test used to prune
+    /// clusters before fetching them (SCALE.md Phase 4b): if it returns false, no memory in
+    /// the cluster can match, so the cluster is skipped; if true, the cluster is fetched and
+    /// the per-memory [`matches`] confirms. Necessary conditions:
+    /// * overlap modes need the cluster union to intersect the request;
+    /// * `all`/`all_strict`/`exact` need `request ⊆ cluster_union` (a memory carrying all
+    ///   request tags contributes them all to the union).
+    pub fn cluster_admits(&self, cluster_tags: &[String], has_untagged: bool) -> bool {
+        let req = &self.tags;
+        if req.is_empty() {
+            return match self.mode {
+                TagsMatch::Exact => has_untagged, // untagged scope
+                _ => true,                        // no filter
+            };
+        }
+        let untagged_ok = has_untagged;
+        match self.mode {
+            TagsMatch::Any => untagged_ok || overlaps(cluster_tags, req),
+            TagsMatch::All => untagged_ok || contains_all(cluster_tags, req),
+            TagsMatch::AnyStrict => overlaps(cluster_tags, req),
+            TagsMatch::AllStrict | TagsMatch::Exact => contains_all(cluster_tags, req),
+        }
+    }
+
     /// Whether a memory with `memory_tags` passes this filter.
     pub fn matches(&self, memory_tags: &[String]) -> bool {
         let req = &self.tags;

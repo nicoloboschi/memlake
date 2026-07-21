@@ -123,8 +123,22 @@ Sub-sequence:
   builds an independent generation per type under `{ns}/mt{n}/gen-{G}-{nonce}/`; the query
   node answers per memory_type (grouped). Tests: two types in one bank stay disjoint; a
   multi-type bank opens with one manifest read.
-- **4a** — tags correctness (5 modes, inline filter + tantivy field).
-- **4b** — selective pruning (per-cluster tag summaries + tag→cluster posting).
+- **4a — DONE** — tags correctness. `mlake-core::tags` has the `TagFilter` primitive with
+  faithful Hindsight semantics (all five modes + the untagged/exact nuances). One
+  correctness path for every arm via `TagFilter::matches`: the vector and graph arms filter
+  their materialized memories inline; the FTS arm stores tags in tantivy and post-filters
+  (over-fetching so a selective filter still yields k). `query`/`query_metered` take a
+  `&TagFilter`. Tests: all five modes over the vector arm, and a tag-filtered FTS query.
+- **4b — DONE** — selective pruning. The indexer writes per-cluster tag summaries (each
+  cluster's tag union + an untagged flag). `select_clusters` uses `TagFilter::cluster_admits`
+  to prune to admissible clusters and probes among them, so a selective filter finds its
+  matches instead of being starved out of the nprobe-nearest set; a broad filter degrades to
+  the plain probe. Test: at nprobe=2, a rare-tag filter still surfaces rare memories that the
+  plain probe would miss.
+  - **4b remaining (noted):** the tag summary is a whole-load JSON per generation and stores
+    full tag sets; at extreme cardinality it becomes a per-cluster tag *bloom* stored inside
+    `centroids.bin` (zero extra roundtrip) and/or a range-readable tag→cluster SSTable —
+    same discipline as pk/radj. The pruning interface (`select_clusters`) does not change.
 
 - **Phase 5** — cost metrics in the bench harness, gated.
 - **Phase 6** — scheduled compaction + purge SLA.

@@ -286,6 +286,27 @@ async fn build_memory_type_index(
     }
     let radj_tables = crate::sstable::RadjTable::build(radj_pairs);
 
+    // Per-cluster tag summaries: the union of each cluster's tags + an untagged flag, so a
+    // query can prune clusters that cannot contain a matching memory (SCALE.md Phase 4b).
+    let tag_summary: crate::generation::TagSummary = clusters
+        .iter()
+        .map(|cluster| {
+            let mut tags: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+            let mut has_untagged = false;
+            for m in cluster {
+                if m.tags.is_empty() {
+                    has_untagged = true;
+                } else {
+                    tags.extend(m.tags.iter().cloned());
+                }
+            }
+            crate::generation::ClusterTagSummary {
+                tags: tags.into_iter().collect(),
+                has_untagged,
+            }
+        })
+        .collect();
+
     let files = write_generation(
         &ns.store,
         &prefix,
@@ -294,6 +315,7 @@ async fn build_memory_type_index(
         &fts_split,
         radj_tables.into(),
         pk_tables.into(),
+        &tag_summary,
         doc_count,
     )
     .await?;
