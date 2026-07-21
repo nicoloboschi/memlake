@@ -1454,3 +1454,41 @@ async fn the_cluster_layout_is_visible_from_a_snapshot() {
     // Budget 0 reads nothing at all — the centroids-only path.
     assert!(node.sample_members(1, 0).await.unwrap().is_empty());
 }
+
+/// The un-indexed backlog is `wal_head - wal_index_cursor`, and it must be readable from
+/// the *log*, not the manifest: the indexer writes the manifest's head and cursor to the
+/// same value, so a view sourcing the head from there always reports a backlog of zero.
+#[tokio::test]
+async fn the_manifest_head_cannot_show_a_backlog_but_the_log_can() {
+    let store = Store::in_memory();
+    let ns = namespace(store, "ns").await;
+    let mut writer = Writer::new(ns.clone());
+
+    writer.commit(vec![Op::Upsert(item("a", vec![1.0, 0.0], "indexed"))]).await.unwrap();
+    index(&ns, &Tokenizer::default(), IndexOptions::default()).await.unwrap();
+
+    // Three writes the indexer has not folded: a genuine backlog of 3.
+    for k in ["b", "c", "d"] {
+        writer.commit(vec![Op::Upsert(item(k, vec![0.0, 1.0], "backlog"))]).await.unwrap();
+    }
+
+    let (manifest, _) = ns.read_manifest().await.unwrap();
+    assert_eq!(
+        manifest.wal_head, manifest.wal_index_cursor,
+        "the indexer writes both to the same value, so their difference is always 0"
+    );
+
+    let live_head = ns.wal_head().await.unwrap();
+    assert_eq!(live_head, 4, "four entries have been committed");
+    assert_eq!(
+        live_head - manifest.wal_index_cursor,
+        3,
+        "the live head is what makes the backlog visible"
+    );
+
+    // And the log view agrees about which entries are folded.
+    let (objects, _) = ns.list_wal(0, 100).await.unwrap();
+    let folded = objects.iter().filter(|o| o.seq <= manifest.wal_index_cursor).count();
+    let unfolded = objects.len() - folded;
+    assert_eq!((folded, unfolded), (1, 3));
+}

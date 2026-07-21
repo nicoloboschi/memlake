@@ -187,7 +187,19 @@ pub fn wal_entry(
 ) -> pb::WalEntryInfo {
     let mut counts = pb::WalOpCounts::default();
     let mut ops = Vec::new();
-    if let Some(entry) = decoded {
+    // Counts require decoding the entry, so when the caller did not ask for ops the field
+    // is left *absent* rather than zeroed. Zeros would read as "this entry has no ops",
+    // which is the opposite of the truth.
+    let Some(entry) = decoded else {
+        return pb::WalEntryInfo {
+            seq: o.seq,
+            size_bytes: o.size_bytes,
+            counts: None,
+            folded: o.seq <= wal_index_cursor,
+            ops,
+        };
+    };
+    {
         for op in &entry.ops {
             match op {
                 Op::Upsert(m) => {
@@ -204,14 +216,9 @@ pub fn wal_entry(
                     counts.tombstones += 1;
                     ops.push(wal_op(pb::wal_op_detail::Kind::Tombstone(id.0.to_vec())));
                 }
-                Op::Patch { id, .. } => {
+                Op::Patch { id, deltas } => {
                     counts.patches += 1;
-                    // The log view reports which memory a patch targets; the deltas
-                    // themselves are a write-path concern, not a log-reading one.
-                    ops.push(wal_op(pb::wal_op_detail::Kind::Patch(pb::Patch {
-                        id: id.0.to_vec(),
-                        ..Default::default()
-                    })));
+                    ops.push(wal_op(pb::wal_op_detail::Kind::Patch(patch_detail(id, deltas))));
                 }
                 Op::Guard { expect_seq_lt } => {
                     counts.guards += 1;
@@ -237,6 +244,27 @@ pub fn wal_entry(
 
 fn wal_op(kind: pb::wal_op_detail::Kind) -> pb::WalOpDetail {
     pb::WalOpDetail { kind: Some(kind) }
+}
+
+/// A patch op as the log view sees it: which memory it targets and which fields it sets.
+/// The deltas are the whole content of the op — reporting only the id would make every
+/// patch look like a no-op.
+fn patch_detail(id: &MemoryId, deltas: &[Delta]) -> pb::Patch {
+    let mut p = pb::Patch { id: id.0.to_vec(), ..Default::default() };
+    for d in deltas {
+        match d {
+            Delta::ProofCount(n) => p.proof_count_delta += n,
+            Delta::SetText(t) => p.text = Some(t.clone()),
+            Delta::SetVector(v) => p.vector = Some(encode_vector(v)),
+            Delta::SetTags(tags) => p.tags = Some(pb::TagList { tags: tags.clone() }),
+            Delta::SetTimestamps(ts) => p.timestamps = Some(timestamps_out(ts)),
+            Delta::MergeMetadata(kv) => p.metadata.extend(kv.iter().cloned()),
+            // Entity ids have no field on the wire `Patch` (clients cannot set them), so
+            // there is nothing to report beyond the op being a patch.
+            Delta::SetEntityIds(_) => {}
+        }
+    }
+    p
 }
 
 /// A predicate delete rendered for the log view. The entry records what the op asked to

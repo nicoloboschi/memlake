@@ -19,19 +19,21 @@
  * filter is the anti-pattern — it only rings, labels, and dims.
  */
 
-import { useId, useMemo, useRef, useState } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
 
 import { cmpU64, groupDigits, sharePct } from "@/lib/format";
 import { shortId } from "@/lib/ids";
 import { pca2, pcaStatusMessage, type PcaResult } from "@/lib/pca";
 import type { ClusterJson, ClusterMemberJson } from "@/lib/types";
 
-const W = 860;
-const H = 520;
+/**
+ * The SVG is drawn at the container's own pixel size (measured, not guessed) so
+ * one user unit is one CSS pixel: no viewBox letterboxing, no gutters, and — the
+ * part that matters — no implicit stretch of one axis relative to the other.
+ */
+const H = 420;
+const W_FALLBACK = 900;
 const PAD = { top: 16, right: 16, bottom: 46, left: 52 };
-
-const PLOT_W = W - PAD.left - PAD.right;
-const PLOT_H = H - PAD.top - PAD.bottom;
 
 /** Centroid radii. Area is proportional to size, so radius goes as sqrt. */
 const R_MIN = 5;
@@ -85,6 +87,20 @@ export function ClusterScatter({
   const gridId = useId();
   const [hover, setHover] = useState<Mark | null>(null);
   const svgRef = useRef<SVGSVGElement | null>(null);
+  const wrapRef = useRef<HTMLDivElement | null>(null);
+  const [width, setWidth] = useState(W_FALLBACK);
+
+  // Draw at the container's real width so the SVG never letterboxes.
+  useEffect(() => {
+    const el = wrapRef.current;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    const ro = new ResizeObserver(([entry]) => {
+      const w = Math.round(entry.contentRect.width);
+      if (w > 0) setWidth(w);
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
 
   // ---- which clusters get a hue (stable: by trained size, not by selection)
   const hueOf = useMemo(() => {
@@ -121,10 +137,13 @@ export function ClusterScatter({
   const marks = useMemo<Mark[]>(() => {
     if (pca.points.length === 0) return [];
 
-    const xs = pca.points.map((p) => p.x);
-    const ys = pca.points.map((p) => p.y);
-    const sx = makeScale(xs, PAD.left, PAD.left + PLOT_W);
-    const sy = makeScale(ys, PAD.top + PLOT_H, PAD.top); // y flipped
+    const plotW = width - PAD.left - PAD.right;
+    const plotH = H - PAD.top - PAD.bottom;
+    // EQUAL ASPECT: one unit of PC1 and one unit of PC2 get the same number of
+    // pixels. Stretching each axis to fill the box independently would make a
+    // near-1-D cloud look like a healthy 2-D spread, which is exactly the lie
+    // the variance-explained labels exist to prevent.
+    const { sx, sy } = equalAspectScales(pca.points, plotW, plotH);
 
     let maxSize = 1;
     for (const c of centroidRows) {
@@ -166,7 +185,7 @@ export function ClusterScatter({
       });
     });
     return out;
-  }, [pca, centroidRows, memberRows, hueOf]);
+  }, [pca, centroidRows, memberRows, hueOf, width]);
 
   const message = pcaStatusMessage(pca);
   const plottable = pca.status === "ok" || pca.status === "rank-one";
@@ -176,7 +195,7 @@ export function ClusterScatter({
     const svg = svgRef.current;
     if (!svg) return;
     const rect = svg.getBoundingClientRect();
-    const scale = W / rect.width;
+    const scale = width / rect.width;
     const px = (e.clientX - rect.left) * scale;
     const py = (e.clientY - rect.top) * scale;
 
@@ -198,14 +217,15 @@ export function ClusterScatter({
 
   return (
     <figure className="m-0">
-      <div className="relative">
+      <div className="relative" ref={wrapRef}>
         <svg
           ref={svgRef}
-          viewBox={`0 0 ${W} ${H}`}
+          viewBox={`0 0 ${width} ${H}`}
           width="100%"
+          height={H}
           role="img"
           aria-label={`PCA projection of ${centroidRows.length} IVF centroids and ${memberRows.length} sampled members`}
-          className="block min-h-[320px] select-none"
+          className="block select-none"
           onPointerMove={onPointerMove}
           onPointerLeave={() => setHover(null)}
           onClick={() => {
@@ -219,14 +239,14 @@ export function ClusterScatter({
           <defs>
             <pattern
               id={gridId}
-              width={PLOT_W / 6}
-              height={PLOT_H / 4}
+              width={(width - PAD.left - PAD.right) / 6}
+              height={(H - PAD.top - PAD.bottom) / 4}
               patternUnits="userSpaceOnUse"
               x={PAD.left}
               y={PAD.top}
             >
               <path
-                d={`M ${PLOT_W / 6} 0 L 0 0 0 ${PLOT_H / 4}`}
+                d={`M ${(width - PAD.left - PAD.right) / 6} 0 L 0 0 0 ${(H - PAD.top - PAD.bottom) / 4}`}
                 fill="none"
                 stroke="var(--color-viz-grid)"
                 strokeWidth="1"
@@ -238,8 +258,8 @@ export function ClusterScatter({
           <rect
             x={PAD.left}
             y={PAD.top}
-            width={PLOT_W}
-            height={PLOT_H}
+            width={width - PAD.left - PAD.right}
+            height={H - PAD.top - PAD.bottom}
             fill={`url(#${gridId})`}
             stroke="var(--color-viz-axis)"
             strokeWidth="1"
@@ -296,14 +316,12 @@ export function ClusterScatter({
                 );
               })}
 
-              {/* Selective direct labels: the three hued clusters and the
-                  current selection only — never a label on every mark. */}
+              {/* Direct-label the SELECTION only. Labelling the three hued
+                  clusters as well collides the moment centroids bunch up, and
+                  stacked labels detach from their marks — the legend already
+                  names those three, so the label here is pure supplement. */}
               {marks
-                .filter(
-                  (m) =>
-                    m.kind === "centroid" &&
-                    (topIds.includes(m.clusterId) || m.clusterId === selected),
-                )
+                .filter((m) => m.kind === "centroid" && m.clusterId === selected)
                 .map((m) => (
                   <text
                     key={`l-${m.clusterId}`}
@@ -351,7 +369,7 @@ export function ClusterScatter({
 
           {/* Axis labels carry the honesty of the chart. */}
           <text
-            x={PAD.left + PLOT_W / 2}
+            x={PAD.left + (width - PAD.left - PAD.right) / 2}
             y={H - 12}
             textAnchor="middle"
             className="fill-ink-dim"
@@ -362,7 +380,7 @@ export function ClusterScatter({
               : "PC1 · unavailable"}
           </text>
           <text
-            transform={`translate(16 ${PAD.top + PLOT_H / 2}) rotate(-90)`}
+            transform={`translate(16 ${PAD.top + (H - PAD.top - PAD.bottom) / 2}) rotate(-90)`}
             textAnchor="middle"
             className="fill-ink-dim"
             style={{ fontSize: 11, fontFamily: "var(--font-mono)" }}
@@ -374,7 +392,7 @@ export function ClusterScatter({
 
           {!plottable && (
             <text
-              x={W / 2}
+              x={width / 2}
               y={H / 2}
               textAnchor="middle"
               className="fill-ink-faint"
@@ -385,11 +403,19 @@ export function ClusterScatter({
           )}
         </svg>
 
-        {hover && plottable && <Tooltip mark={hover} totalSize={totalSize} />}
+        {hover && plottable && (
+          <Tooltip mark={hover} totalSize={totalSize} width={width} />
+        )}
       </div>
 
-      {/* Legend: identity is never colour-alone — every entry is named. */}
-      <div className="mt-2 flex items-center gap-x-4 gap-y-1 flex-wrap px-1">
+      {/* Legend: identity is never colour-alone — every entry is named. Hidden
+          when nothing is plotted, since it would describe marks that aren't
+          on screen. */}
+      <div
+        className={`mt-2 items-center gap-x-4 gap-y-1 flex-wrap px-1 ${
+          plottable ? "flex" : "hidden"
+        }`}
+      >
         {topIds.map((id, i) => (
           <LegendItem
             key={id}
@@ -452,9 +478,17 @@ function LegendItem({ color, label }: { color: string; label: string }) {
   );
 }
 
-function Tooltip({ mark, totalSize }: { mark: Mark; totalSize: string }) {
+function Tooltip({
+  mark,
+  totalSize,
+  width,
+}: {
+  mark: Mark;
+  totalSize: string;
+  width: number;
+}) {
   // Positioned in percentage of the SVG's own box so it tracks under scaling.
-  const left = `${(mark.x / W) * 100}%`;
+  const left = `${(mark.x / width) * 100}%`;
   const top = `${(mark.y / H) * 100}%`;
   return (
     <div
@@ -507,23 +541,44 @@ function Tooltip({ mark, totalSize }: { mark: Mark; totalSize: string }) {
 
 // ---- helpers ----------------------------------------------------------------
 
-function makeScale(values: number[], out0: number, out1: number) {
-  let lo = Infinity;
-  let hi = -Infinity;
-  for (const v of values) {
-    if (v < lo) lo = v;
-    if (v > hi) hi = v;
+/**
+ * Two scales sharing one units-per-pixel factor, each centered in its own axis.
+ * Returns identity-to-centre when the data has no extent at all.
+ */
+function equalAspectScales(
+  points: { x: number; y: number }[],
+  plotW: number,
+  plotH: number,
+) {
+  let xlo = Infinity, xhi = -Infinity, ylo = Infinity, yhi = -Infinity;
+  for (const p of points) {
+    if (p.x < xlo) xlo = p.x;
+    if (p.x > xhi) xhi = p.x;
+    if (p.y < ylo) ylo = p.y;
+    if (p.y > yhi) yhi = p.y;
   }
-  if (!Number.isFinite(lo) || !Number.isFinite(hi) || hi - lo < 1e-12) {
-    // A degenerate axis maps everything to the middle rather than dividing by 0.
-    const mid = (out0 + out1) / 2;
-    return () => mid;
+  const cx = (xlo + xhi) / 2;
+  const cy = (ylo + yhi) / 2;
+  const spanX = xhi - xlo;
+  const spanY = yhi - ylo;
+
+  const midX = PAD.left + plotW / 2;
+  const midY = PAD.top + plotH / 2;
+
+  if (!Number.isFinite(spanX) || (spanX < 1e-12 && spanY < 1e-12)) {
+    return { sx: () => midX, sy: () => midY };
   }
-  // 4% breathing room so marks never sit on the frame.
-  const pad = (hi - lo) * 0.04;
-  lo -= pad;
-  hi += pad;
-  return (v: number) => out0 + ((v - lo) / (hi - lo)) * (out1 - out0);
+
+  // 8% margin so the outermost marks never touch the frame.
+  const unitsPerPx = Math.max(
+    spanX / (plotW * 0.92),
+    spanY / (plotH * 0.92),
+    1e-12,
+  );
+  return {
+    sx: (v: number) => midX + (v - cx) / unitsPerPx,
+    sy: (v: number) => midY - (v - cy) / unitsPerPx, // y flipped
+  };
 }
 
 function pct(fraction: number): string {

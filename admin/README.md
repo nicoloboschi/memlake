@@ -94,6 +94,8 @@ All server-side only; none of it reaches the browser. See
 | `/ns/[ns]`              | `Stats`                       | Generation, WAL position, the **un-indexed backlog** (`wal_head − wal_index_cursor`), and a per-`memory_type` table. STRONG/EVENTUAL toggle. |
 | `/ns/[ns]/browse`       | `Scan`, `Get`                 | Cursor-paged walk of stored memories, with a detail panel. |
 | `/ns/[ns]/query`        | `Query`                       | The workbench: all arms, raw scores, client-side fusion. |
+| `/ns/[ns]/wal`          | `ListWal`                     | The write-ahead log, with the folded / un-folded boundary drawn as a region. |
+| `/ns/[ns]/clusters`     | `IndexLayout`                 | How k-means partitioned one memory_type: a browser-side PCA projection plus a sortable per-cluster table. |
 
 ### Things the UI is careful about
 
@@ -113,6 +115,14 @@ because there is no such thing.
 different from surfacing it with a score of 0. The results table renders those
 cells as `∅` on a tinted background, never as `0.0000`.
 
+**Folded is the whole point of the WAL page.** An entry is folded once the
+indexer has rolled it into a generation (`seq <= wal_index_cursor`). Everything
+past that line is what a STRONG query re-scans on *every* read, so the boundary
+is drawn as a labelled rule with the un-folded run tinted and accented — not a
+per-row badge you have to scan for. `start_seq` is a resume point, not a page
+number: the log is a window GC trims from the front, so the page keeps a token
+stack exactly like Scan.
+
 **The fusion is the client's.** memlake returns raw per-arm signal (dense cosine,
 BM25, graph activation, temporal proximity) and does no fusion at all. The
 default ordering is Reciprocal Rank Fusion computed **in your browser** —
@@ -122,6 +132,76 @@ single arm instead. The panel says so in its title; do not mistake that column
 for something the server computed.
 
 ---
+
+## The clusters page
+
+### PCA, in about forty lines
+
+`lib/pca.ts` computes the top two principal components in the browser — no
+dependency. The covariance matrix is never materialised (384x384 would be 147k
+floats); each power-iteration step applies `X^T X` implicitly in `O(n*d)`:
+
+    w = sum_i x_i (x_i . v)      // == X^T X v
+    v = w / |w|
+
+Deflating against `v1` and repeating gives `v2`, orthogonal by construction.
+Two properties the UI depends on: the starting vector is a **fixed** pseudo-random
+sequence (not `Math.random`) so the same data always projects to the same
+picture, and the sign is pinned by forcing the largest-magnitude loading
+positive, so the plot never mirrors itself between renders. Verified against a
+brute-force Jacobi eigendecomposition — explained-variance fractions agree to
+1e-6, and PC1 . PC2 correlation comes out at 1e-10.
+
+**Degenerate cases are named, never rendered as noise.** `pca2` returns a status
+and the page prints the reason instead of a plot:
+
+| status | when | what the page says |
+|---|---|---|
+| `no-dimensions` | `dim = 0` | this memory_type stores no embeddings; the dense arm does not run for it |
+| `too-few-rows` | fewer than 2 vectors (k=1 included) | a projection needs at least two points |
+| `no-variance` | every vector identical | PCA is undefined — there are no directions of variation |
+| `rank-one` | all points collinear | plotted, but PC2 carries no variance and the vertical axis is not meaningful |
+
+### Why the axes carry percentages
+
+Each axis is labelled `PC1 - N% of variance`. That number is the chart's
+honesty: if PC1+PC2 explain 16%, the picture is a hint of structure and nothing
+more, and the caption says so in those words when the total is low. The two axes
+share **one** units-per-pixel factor — stretching each to fill the box
+independently would make a nearly one-dimensional cloud look like a healthy
+spread, which is the exact lie the percentages exist to prevent.
+
+### Why only three clusters get a colour
+
+A scatter is an **all-pairs** chart: any two marks can end up adjacent, so the
+palette has to survive every pair, not just neighbours. On that test the
+documented categorical palette carries three slots. A k=26 index therefore
+cannot wear 26 hues — past three they stop being tellable apart, especially
+under CVD. The three largest clusters take slots 1-3 and the rest fold into a
+neutral "other".
+
+That is the useful three, not an arbitrary three: the biggest partitions are the
+ones that make probe cost uneven, which is what the picture is for. Every other
+cluster stays reachable — select it and it is ringed, labelled and isolated —
+and the table below is the chart's table-view twin, carrying every value the
+scatter encodes. Selection **never recolours**; it rings, labels and dims.
+
+The palette is validated, not eyeballed, against this app's own surface:
+
+```
+node scripts/validate_palette.js "#3987e5,#d95926,#199e70" \
+     --mode dark --surface "#0e1116" --pairs all
+```
+
+all six checks pass (worst all-pairs CVD ΔE 9.4 against a target of 8; worst
+normal-vision ΔE 20.9 against a floor of 15).
+
+### member_sample
+
+`0` returns centroids only, and that costs the server **no object-storage read at
+all** — centroids are already resident on every query node. Anything above 0
+reads cluster files, and the full member embeddings ship to the browser for the
+projection, so the route caps it at 1000.
 
 ## The embedding model
 
@@ -190,9 +270,11 @@ admin/
       embed/route.ts               GET status / POST warm up
       namespaces/route.ts          GET ListNamespaces / POST CreateNamespace
       namespaces/[namespace]/
-        stats/route.ts  scan/route.ts  get/route.ts  query/route.ts
+        stats/route.ts  scan/route.ts   get/route.ts
+        query/route.ts  wal/route.ts    layout/route.ts
   components/                      all "use client"
     NamespacesView  StatsView  BrowseView  QueryView
+    WalView  ClustersView  ClusterScatter
     MemoryDetail  NamespaceNav  filters  ui
   lib/
     memlake.ts   the gRPC client: proto load, memoized channel, one promisified
@@ -201,6 +283,7 @@ admin/
     embed.ts     bge-small-en-v1.5 via transformers.js
     types.ts     the JSON contract, shared by route handlers and components
     ids.ts       16 bytes <-> UUID           vector.ts  f32le <-> float32
+    pca.ts       browser-side 2-component PCA (power iteration + deflation)
     fusion.ts    client-side RRF             http.ts    route-handler plumbing
     client.ts    browser fetch helpers       format.ts  display formatting
 ```

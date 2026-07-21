@@ -18,9 +18,14 @@ the `entities` registry.
 
 With the temporal arm and the admin RPCs (`Get` / `Scan` / `Stats`), all four
 recall arms and the main read surfaces — the curation list, single-unit reads,
-bank fact counts — are served by the provider too. What is left is the
-**mutation** side: consolidation, curation, delete and import all still assume a
-SQL table. Ordered by what blocks what.
+bank fact counts — are served by the provider too. With `DeleteNamespace`,
+`DeleteByPredicate`, `Op.tombstone_where` and a full `Patch`, so are the deletes
+and the curation edit: a document re-ingest now *replaces* its facts instead of
+duplicating them.
+
+What is left is **consolidation** — the one subsystem still assuming a SQL table —
+plus the importer's follow-up UPDATEs and a handful of read surfaces. Ordered by
+what blocks what.
 
 ---
 
@@ -81,8 +86,8 @@ Smaller client gaps (non-blocking, still open):
 A `Hit` is now `{id, memory_type, dense, text, graph, temporal, memory}` — the
 **memory is returned inline** with every search hit — and the admin RPCs
 (`ListNamespaces`, `Stats`, `Get`, `Scan`) cover the non-search reads. What is
-left here is the *write* side: delete-by-predicate, partial update, and dropping
-a namespace.
+left here is mostly Scan's ergonomics — the write side (delete-by-predicate,
+partial update, `DeleteNamespace`) is now covered.
 
 - [x] **Return the memory inline on `Hit`.** Each hit now carries a
       `MemoryPayload` (`text, tags, proof_count, entity_ids, timestamps,
@@ -117,21 +122,34 @@ a namespace.
         and does not expose them as a countable relation.
   - [ ] The memories timeseries (`date_trunc` buckets over `created_at`) has no
         equivalent and still returns empty.
-- [ ] **Delete by predicate — now a correctness bug, not just a convenience.**
-      Only tombstone-by-id exists. Hindsight deletes "all units for this
-      document", "all units for this bank", "all observations in this bank". With
-      Postgres no longer holding the memories there is nothing left to enumerate
-      the victims: `document_id` lives in the un-queryable metadata bag, so
-      **re-ingesting a document adds its facts alongside the previous version's
-      instead of replacing them**, and duplicates accumulate. Hindsight logs a
-      warning at that site (`retain/fact_storage.py:handle_document_tracking`)
-      rather than pretending the delete happened. Needs either a
-      delete-by-metadata-predicate, an indexed `document_id`, or a scan.
-- [ ] **Partial update.** `Patch` carries only `proof_count_delta`. Hindsight
-      mutates `text`, `embedding`, `tags`, `occurred_start/end`, `mentioned_at`,
-      `consolidated_at`, `consolidation_failed_at`, `edited_at` — mostly from
-      consolidation and curation. Today each would need a full re-upsert.
-- [ ] **`DeleteNamespace`.** `delete_bank` has no way to drop a namespace.
+- [x] **Delete by predicate — DONE, and it fixed the re-ingest bug.**
+      `DeleteByPredicate` plus `Op.tombstone_where` land the whole problem. Hindsight
+      deletes a document's memories by `{document_id}` from the metadata bag
+      (`fact_storage.delete_document_from_provider`), used by both `delete_document`
+      and the re-ingest path in `handle_document_tracking`. The lazy (`eager=false`)
+      form is what makes it safe: the tombstone only removes writes older than its
+      own sequence, so replacement facts written moments later survive even though
+      the delete is issued first — no need to batch them into one entry.
+      Verified: importing the same 19 documents three times into a live bank leaves
+      exactly 239 memories each pass (it used to grow to 717).
+- [x] **Partial update — DONE.** `Patch` now carries text, vector, tags,
+      timestamps and a merging metadata map alongside `proof_count_delta`. Wired to
+      curation's edit path (`update_memory_unit`), which reads the pre-edit memory
+      through `Get` and applies the edit as one patch. Note Hindsight hands
+      embeddings around as the pgvector literal `'[0.1,...]'` in places, so the
+      provider parses either that or a float list.
+- [x] **`DeleteNamespace` — DONE.** Wired to `delete_bank`. One caveat found in
+      use: dropping a namespace that was never created returns `INTERNAL: no
+      manifest`, and callers delete defensively (`delete_bank` runs before ingest to
+      clear a prior run), so the provider swallows that specific error. A NOT_FOUND
+      status, or treating the drop as idempotent server-side, would be cleaner than
+      string-matching an INTERNAL message.
+  - [ ] Dropping a namespace while the indexer is folding it is not safe — the proto
+        says as much ("no snapshot atomicity across the deletes"). Observed once in a
+        loop of drop-then-reimport with the indexer running at a 3s interval: the
+        following `Stats` failed and that pass was lost. Either the drop should fence
+        the indexer, or the docs should state the operator is responsible for stopping
+        it first.
 
 ---
 
@@ -305,6 +323,11 @@ of it participates in retrieval:
       entity names resolved from the Postgres `entities` registry.
 - [x] `get_memory_unit` — served by `Get`.
 - [x] Bank fact counts (`_compute_bank_stats`) — served by `Stats`.
+- [x] Deletes — `delete_bank` drops the namespace, `delete_document` and the
+      retain re-ingest path predicate-delete by `document_id`, `clear_observations`
+      predicate-deletes the observation type.
+- [x] Curation edit — `update_memory_unit` reads the live memory through `Get` and
+      applies the edit as a `Patch`.
 - [x] Consolidation — refuses to run and says so, rather than reading an empty
       table and reporting a clean pass (see below).
 
@@ -316,12 +339,15 @@ of it participates in retrieval:
       `consolidated_at`) and the observation↔fact relation. Currently guarded off
       with a warning, so `consolidated_at` / `consolidation_failed_at` are always
       reported as null and every unit reads as pending.
-- [ ] **Curation** — `update_memory_unit` edit / invalidate / revert. Needs
-      partial update and a non-tombstone archive state. `list_memory_units`
-      therefore always reports `state: "valid"`, and the invalidated archive is
-      always empty.
-- [ ] **`delete_memory_unit` / `delete_bank` / `delete_document` /
-      `clear_observations`** — need delete-by-predicate and `DeleteNamespace`.
+- [ ] **Curation invalidate / revert.** The *edit* case is wired. Invalidate
+      moves a row to an archive table and revert moves it back; the provider has
+      only one-way tombstones, so both are still unsupported and
+      `list_memory_units` always reports `state: "valid"`.
+- [ ] **`delete_memory_unit` needs a bank_id.** The endpoint takes only a unit id
+      and resolves the bank from the `memory_units` row — with no row there is no
+      bank, and a provider delete needs a namespace. Hindsight now raises a clear
+      error instead of reporting "not found". Fix is an API change (thread the
+      bank through), not a memlake one.
 - [ ] **The document importer** (`engine/transfer/importer.py`) — writes facts
       and then patches them with follow-up UPDATEs.
 - [ ] **Still-empty read surfaces**: `get_graph_data` (needs the edges as a

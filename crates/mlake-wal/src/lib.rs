@@ -73,16 +73,33 @@ impl Namespace {
     }
 
     /// Delete every object under this namespace's prefix — manifest, WAL, all generations —
-    /// dropping the namespace entirely. Returns the number of objects removed. Irreversible
-    /// and not atomic: a concurrent write can recreate objects, so callers must not delete a
-    /// namespace that is being written.
+    /// dropping the namespace entirely. Returns the number of objects removed. Irreversible.
+    ///
+    /// The manifest is deleted *first*, and that is what fences a concurrent indexer. A fold
+    /// in flight read the manifest at some etag and publishes with a CAS swap conditional on
+    /// it (INV-2); once the manifest is gone, that swap fails its `If-Match` precondition and
+    /// the fold cannot publish. So after this returns the namespace is either absent (readers
+    /// get `NoManifest`) or freshly recreated with its own manifest — never a *surviving*
+    /// manifest that points at generation files this sweep has already deleted, which is the
+    /// dangling state that made a later `Stats`/query error.
+    ///
+    /// This does not make the drop transactional: a fold that lands generation files after
+    /// the sweep leaves them orphaned (unreferenced, GC-reclaimable), and a query that read
+    /// the manifest just before the delete may still fault on a since-deleted file. Dropping
+    /// a namespace under active writes is therefore still discouraged — the fence only
+    /// guarantees the drop cannot leave the namespace in a corrupt, dangling-manifest state.
     pub async fn delete_all(&self) -> Result<usize> {
         use futures::stream::{StreamExt, TryStreamExt};
+        // Fence the indexer before touching anything else (see the doc comment): with the
+        // manifest gone, no in-flight fold can CAS-publish a generation over what we sweep.
+        let manifest = manifest_path(&self.name);
+        self.store.delete(&manifest).await?;
+
         // The trailing slash keeps a sibling namespace whose name is a prefix (e.g. `foo` vs
-        // `foo-bar`) from being swept in.
+        // `foo-bar`) from being swept in. The manifest deleted above no longer appears here.
         let prefix = format!("{}/", self.name);
         let paths = self.store.list(&prefix).await?;
-        let count = paths.len();
+        let count = paths.len() + 1; // + the manifest deleted above
         let store = &self.store;
         futures::stream::iter(paths)
             .map(|p| async move { store.delete(&p).await })

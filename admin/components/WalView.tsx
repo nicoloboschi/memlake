@@ -115,6 +115,24 @@ export function WalView({ namespace }: { namespace: string }) {
   const unfoldedOnPage = entries.filter((e) => !e.folded).length;
   const headLags = data ? cmpU64(maxSeqSeen, data.walHead) > 0 : false;
 
+  /**
+   * The proto bills WalOpCounts as "cheap to compute and usually all an operator
+   * needs", i.e. available in the header view — but this server build only fills
+   * it in when include_ops was set. Four zero columns would read as "this entry
+   * has no ops", which is a different and wrong statement, so render them as
+   * not-measured instead.
+   */
+  const countsMissing =
+    !includeOps &&
+    entries.length > 0 &&
+    entries.every(
+      (e) =>
+        e.counts.upserts === 0 &&
+        e.counts.tombstones === 0 &&
+        e.counts.patches === 0 &&
+        e.counts.guards === 0,
+    );
+
   function toggleRow(seq: string) {
     if (!includeOps) return;
     setExpanded((prev) => {
@@ -219,6 +237,13 @@ export function WalView({ namespace }: { namespace: string }) {
                 Off by default: one entry is a whole group-commit batch and can
                 hold thousands of memories, so the listing stays a header view
                 unless asked. With it on, click a row to expand its ops.
+                {countsMissing && (
+                  <span className="text-warn">
+                    {" "}
+                    This build only fills in the op counts when include_ops is
+                    set, so those columns read “—” rather than a misleading 0.
+                  </span>
+                )}
               </span>
             </div>
           </>
@@ -312,6 +337,7 @@ export function WalView({ namespace }: { namespace: string }) {
                   showDivider={i === firstUnfolded && i > 0}
                   cursor={cursor}
                   includeOps={includeOps}
+                  countsMissing={countsMissing}
                   expanded={expanded.has(e.seq)}
                   onToggle={() => toggleRow(e.seq)}
                 />
@@ -361,6 +387,7 @@ function WalRow({
   showDivider,
   cursor,
   includeOps,
+  countsMissing,
   expanded,
   onToggle,
 }: {
@@ -368,6 +395,7 @@ function WalRow({
   showDivider: boolean;
   cursor: bigint;
   includeOps: boolean;
+  countsMissing: boolean;
   expanded: boolean;
   onToggle: () => void;
 }) {
@@ -407,10 +435,10 @@ function WalRow({
         <Td className="font-mono text-right tnum text-ink-dim">
           {fmtBytes(entry.sizeBytes)}
         </Td>
-        <OpCount n={entry.counts.upserts} />
-        <OpCount n={entry.counts.tombstones} />
-        <OpCount n={entry.counts.patches} />
-        <OpCount n={entry.counts.guards} />
+        <OpCount n={entry.counts.upserts} missing={countsMissing} />
+        <OpCount n={entry.counts.tombstones} missing={countsMissing} />
+        <OpCount n={entry.counts.patches} missing={countsMissing} />
+        <OpCount n={entry.counts.guards} missing={countsMissing} />
         <Td>
           {unfolded ? (
             <span className="font-mono text-[11px] text-warn">un-folded</span>
@@ -438,7 +466,17 @@ function WalRow({
   );
 }
 
-function OpCount({ n }: { n: number }) {
+function OpCount({ n, missing }: { n: number; missing: boolean }) {
+  if (missing) {
+    return (
+      <Td
+        className="font-mono text-right text-ink-faint/60"
+        title="this server build only fills in WalOpCounts when include_ops is set — this is 'not measured', not 'zero'"
+      >
+        —
+      </Td>
+    );
+  }
   return (
     <Td
       className={`font-mono text-right tnum ${n === 0 ? "text-ink-faint/50" : "text-ink"}`}
@@ -580,7 +618,14 @@ function WalOpDetail({ op }: { op: WalOpJson }) {
           </span>
         )}
         {sets.length === 0 && metaKeys.length === 0 && op.proofCountDelta === 0 && (
-          <span className="text-[11px] text-ink-faint">no-op patch</span>
+          // Either the patch really changed nothing, or the server returned the
+          // id without the field detail. Say what we know, not what we guess.
+          <span
+            className="text-[11px] text-ink-faint"
+            title="ListWal returned this patch's id with no populated fields — either a genuine no-op or the server did not decode them"
+          >
+            no field detail returned
+          </span>
         )}
       </div>
     );

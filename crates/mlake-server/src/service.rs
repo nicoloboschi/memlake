@@ -283,6 +283,7 @@ impl Memlake for MemlakeService {
         // The manifest gives the published index state; the snapshot gives the *live* doc
         // counts, which differ from it by the un-indexed tail and any tombstones.
         let (manifest, _etag) = ns.read_manifest().await.map_err(internal)?;
+        let wal_head = ns.wal_head().await.map_err(internal)?;
         let snap = self.snapshot(&ns, consistency).await?;
         let node = &snap.node;
 
@@ -302,7 +303,10 @@ impl Memlake for MemlakeService {
             namespace: req.namespace,
             generation: manifest.generation,
             prev_generation: manifest.prev_generation,
-            wal_head: manifest.wal_head,
+            // The *live* head, not `manifest.wal_head`: the indexer writes the manifest's
+            // head and cursor to the same value, so their difference is always zero. The
+            // backlog is the number this view exists to show, so it is worth one LIST.
+            wal_head,
             wal_index_cursor: manifest.wal_index_cursor,
             tokenizer_config_hash: manifest.tokenizer_config_hash,
             format_version: manifest.format_version,
@@ -492,8 +496,11 @@ impl Memlake for MemlakeService {
         let ns = self.namespace(&req.namespace);
 
         // The manifest gives the fold watermark, so each entry can say whether the indexer
-        // has already absorbed it — the distinction the whole view exists to show.
+        // has already absorbed it — the distinction the whole view exists to show. The head
+        // comes from the log itself: the manifest's copy is written equal to the cursor, so
+        // it can never show a backlog.
         let (manifest, _etag) = ns.read_manifest().await.map_err(internal)?;
+        let wal_head = ns.wal_head().await.map_err(internal)?;
         let (objects, next_seq) = ns.list_wal(req.start_seq, limit).await.map_err(internal)?;
 
         let mut entries = Vec::with_capacity(objects.len());
@@ -512,7 +519,7 @@ impl Memlake for MemlakeService {
 
         Ok(Response::new(pb::ListWalResponse {
             entries,
-            wal_head: manifest.wal_head.max(req.start_seq),
+            wal_head,
             wal_index_cursor: manifest.wal_index_cursor,
             next_seq: next_seq.unwrap_or(0),
         }))

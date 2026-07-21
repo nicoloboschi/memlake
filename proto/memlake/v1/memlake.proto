@@ -11,9 +11,11 @@ service Memlake {
   rpc CreateNamespace(CreateNamespaceRequest) returns (CreateNamespaceResponse);
 
   // Drop a whole namespace: delete every object under its prefix (manifest, WAL, all
-  // generations). Irreversible and unconditional — there is no snapshot atomicity across the
-  // deletes, so do not run it concurrently with writes to the same namespace. Returns the
-  // number of objects removed.
+  // generations). Irreversible. The manifest is deleted first, which fences a concurrent
+  // indexer — an in-flight fold loses its CAS publish and cannot leave a dangling manifest
+  // that points at swept files. The drop is still not transactional, though: a query racing
+  // the delete may fault on a since-deleted file, so dropping under active writes is
+  // discouraged. Returns the number of objects removed.
   rpc DeleteNamespace(DeleteNamespaceRequest) returns (DeleteNamespaceResponse);
 
   // Write a batch of ops as one atomic WAL entry. Returns once the entry is durably
@@ -405,8 +407,9 @@ message ListWalRequest {
   bool include_ops = 4;
 }
 
-// How many of each op kind an entry holds. Cheap to compute and usually all an operator
-// needs to see the shape of a batch.
+// How many of each op kind an entry holds. Counting requires decoding the entry, so this
+// is populated only when `include_ops` was set — and left ABSENT otherwise, because zeroed
+// counts would read as "this entry has no ops" rather than "nobody counted".
 message WalOpCounts {
   uint32 upserts = 1;
   uint32 tombstones = 2;
@@ -452,7 +455,10 @@ message WalEntryInfo {
 
 message ListWalResponse {
   repeated WalEntryInfo entries = 1;
-  uint64 wal_head = 2;                // last committed sequence
+  // Last committed sequence in the log, read from the log itself — not the manifest's copy,
+  // which the indexer writes equal to the cursor and so can never show a backlog. Global,
+  // never scoped to the requested page.
+  uint64 wal_head = 2;
   uint64 wal_index_cursor = 3;        // last sequence folded into the current generation
   uint64 next_seq = 4;                // resume point; 0 when the log is exhausted
 }
