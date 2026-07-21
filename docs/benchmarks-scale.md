@@ -64,6 +64,26 @@ Measured on the machine above, one scale at a time (namespace dropped between sc
 - **Build time grows ~N** (~7.5 min at 3M with `--no-links`), dominated by k-means assignment
   (now parallel) + cluster writes.
 
+## Cumulative per-arm wins @ 1M (warm p50)
+
+| Arm | Original | Now | Change |
+|-----|----------|-----|--------|
+| vector | 4.8ms | ~4.5ms | rerank query-norm hoisted |
+| fts | 43ms | ~7.6ms | payload store (~5.7×) |
+| hybrid | 45ms | ~8.3ms | payload store |
+| graph | **644ms** | **~8.7ms** | score-then-hydrate + payload (**~74×**) |
+| temporal | (unbounded/hung) | ~22ms, bounded | pool cap + payload |
+
+All landed as committed, tested changes: graph score-then-hydrate; parallelized fold
+O(N·√N) passes; payload store; temporal pool cap; rerank query-norm hoist; `get` via payload.
+
+Remaining perf items are deeper refactors best done with a validation checkpoint (not
+unsupervised): (a) **zero-copy cluster rerank** — `fetch_clusters` fully rkyv-deserializes each
+cluster to score it; scoring over the archived form and deserializing only the top-k would trim
+every cluster-fetching arm, but it's a hot-path API change with rkyv-lifetime ripple; (b) the
+**streaming/external-memory fold** — the O(N)-RAM first build caps this box at ~5–6M and is the
+true 100M blocker.
+
 ## Per-arm query profile @ 1M (warm, rt=0 → pure compute/cache)
 
 | Arm | p50 | Breakdown | Diagnosis |
