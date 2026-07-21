@@ -275,6 +275,7 @@ mod tests {
             entity_ids: vec![],
             semantic_out: vec![],
             causal_out: vec![],
+            metadata: vec![],
         }
     }
 

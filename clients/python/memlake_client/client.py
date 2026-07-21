@@ -44,6 +44,17 @@ def _arm(a) -> "Arm":
     return Arm(present=a.present, rank=a.rank, score=a.score)
 
 
+def _payload(p) -> "Payload":
+    return Payload(
+        text=p.text,
+        tags=list(p.tags),
+        proof_count=p.proof_count,
+        entity_ids=list(p.entity_ids),
+        metadata=dict(p.metadata),
+        timestamps=p.timestamps,
+    )
+
+
 def _hits(pb_hits) -> list["Hit"]:
     return [
         Hit(
@@ -52,6 +63,7 @@ def _hits(pb_hits) -> list["Hit"]:
             dense=_arm(h.dense),
             text=_arm(h.text),
             graph=_arm(h.graph),
+            memory=_payload(h.memory) if h.HasField("memory") else None,
         )
         for h in pb_hits
     ]
@@ -67,9 +79,11 @@ def memory(
     tags: Optional[Sequence[str]] = None,
     proof_count: int = 0,
     entity_ids: Optional[Sequence[int]] = None,
+    metadata: Optional[dict[str, str]] = None,
 ) -> pb.Memory:
     """Build a Memory. Pass `key` (and leave `id` empty) to let the server derive a stable
-    16-byte id from the key; or pass a 16-byte `id` directly."""
+    16-byte id from the key; or pass a 16-byte `id` directly. `metadata` is opaque str->str
+    the server stores and returns verbatim (never indexed) — e.g. context, document_id."""
     return pb.Memory(
         id=id,
         key=key,
@@ -79,6 +93,7 @@ def memory(
         tags=list(tags or []),
         proof_count=proof_count,
         entity_ids=list(entity_ids or []),
+        metadata=dict(metadata or {}),
     )
 
 
@@ -91,14 +106,28 @@ class Arm:
 
 
 @dataclass
+class Payload:
+    """The stored memory returned inline with a hit (embedding vector omitted). `metadata` is
+    the opaque str->str the caller wrote. `timestamps` is the raw protobuf Timestamps."""
+    text: str
+    tags: list
+    proof_count: int
+    entity_ids: list
+    metadata: dict
+    timestamps: object
+
+
+@dataclass
 class Hit:
-    """A retrieved candidate with the RAW per-arm signals. memlake does no fusion — combine
-    these however you like (RRF over ranks, weighted sum of scores, re-ranking...)."""
+    """A retrieved candidate: the RAW per-arm signals (memlake does no fusion — combine them
+    yourself: RRF over ranks, weighted scores, re-ranking...) plus the materialized `memory`,
+    returned inline so recall needs no second round trip to hydrate."""
     id: bytes
     memory_type: int
     dense: Arm   # vector / cosine
     text: Arm    # BM25
     graph: Arm   # graph activation
+    memory: object = None   # Payload | None
 
     @property
     def id_uuid(self) -> str:

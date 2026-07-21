@@ -112,6 +112,7 @@ fn main() -> Result<()> {
             entity_ids: vec![],
             semantic_out: vec![],
             causal_out: vec![],
+            metadata: vec![],
         });
     }
 

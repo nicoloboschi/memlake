@@ -3,7 +3,7 @@
 //! conversion returns `tonic::Status` so it maps straight onto a gRPC error.
 
 use mlake_core::memory::{CausalEdge, LinkType, Timestamps, Weight};
-use mlake_core::{Delta, Memory, MemoryId, Op, TagFilter, TagsMatch};
+use mlake_core::{Delta, Memory, MemoryId, Op, StoredMemory, TagFilter, TagsMatch};
 use mlake_index::{ArmDepths, ArmScore, Consistency, RawHit};
 use tonic::Status;
 
@@ -99,7 +99,46 @@ pub fn memory(m: pb::Memory) -> Result<Memory, Status> {
         proof_count: m.proof_count,
         entity_ids: m.entity_ids,
         causal_out,
+        metadata: m.metadata.into_iter().collect(),
     })
+}
+
+// ---- Read-side conversions (StoredMemory -> wire) ----
+
+fn timestamps_out(t: &Timestamps) -> pb::Timestamps {
+    pb::Timestamps {
+        event_date: t.event_date,
+        occurred_start: t.occurred_start,
+        occurred_end: t.occurred_end,
+        mentioned_at: t.mentioned_at,
+    }
+}
+
+fn causal_edge_out(e: &CausalEdge) -> pb::CausalEdge {
+    let link_type = match e.link_type {
+        LinkType::Causes => pb::LinkType::Causes,
+        LinkType::CausedBy => pb::LinkType::CausedBy,
+        LinkType::Enables => pb::LinkType::Enables,
+        LinkType::Prevents => pb::LinkType::Prevents,
+    };
+    pb::CausalEdge {
+        target: e.target.0.to_vec(),
+        link_type: link_type as i32,
+        weight: e.weight.to_f32(),
+    }
+}
+
+/// The stored memory as a wire payload (vector omitted — large, and the client has it).
+fn payload(m: StoredMemory) -> pb::MemoryPayload {
+    pb::MemoryPayload {
+        text: m.text,
+        tags: m.tags,
+        proof_count: m.proof_count,
+        entity_ids: m.entity_ids,
+        timestamps: Some(timestamps_out(&m.timestamps)),
+        causal_out: m.causal_out.iter().map(causal_edge_out).collect(),
+        metadata: m.metadata.into_iter().collect(),
+    }
 }
 
 pub fn op(o: pb::Op) -> Result<Op, Status> {
@@ -167,5 +206,6 @@ pub fn raw_hit(memory_type: u8, h: RawHit) -> pb::Hit {
         dense: Some(arm_score(h.dense)),
         text: Some(arm_score(h.text)),
         graph: Some(arm_score(h.graph)),
+        memory: h.memory.map(payload),
     }
 }

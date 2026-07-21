@@ -104,10 +104,12 @@ with MemlakeClient("memlake:50051") as c:
     c.create_namespace("my-bank")
 
     # Write a batch of memories. Returns once the batch is durable in object storage
-    # (a claimed WAL sequence) — not after indexing.
+    # (a claimed WAL sequence) — not after indexing. `metadata` is opaque str->str: memlake
+    # stores and returns it verbatim, never indexes it — stash context, document_id, etc.
     c.write("my-bank", [
         memory("s3-native retrieval engine", vector=embedding,
-               memory_type=1, tags=["prod"], key="doc-42"),
+               memory_type=1, tags=["prod"], key="doc-42",
+               metadata={"document_id": "d-42", "chunk_id": "0"}),
     ])
 
     # ONE query across memory_types (all, if omitted), always running the three arms —
@@ -119,12 +121,15 @@ with MemlakeClient("memlake:50051") as c:
 
     # memlake does NO fusion. Each hit carries the RAW per-arm signals — dense cosine, BM25,
     # graph activation, with each arm's rank — so the caller (e.g. Hindsight) runs its own
-    # RRF or weighting. memory_types are independent: group by memory_type first.
+    # RRF or weighting. The materialized memory (text, tags, timestamps, metadata) comes back
+    # INLINE, so recall needs no second round trip to hydrate. Types are independent: group
+    # by memory_type first.
     for h in hits:
         print(h.memory_type, h.id_uuid,
               h.dense.score, h.dense.rank,     # dense arm (present=False if it didn't retrieve h)
               h.text.score,  h.text.rank,      # BM25 arm
-              h.graph.score, h.graph.rank)     # graph arm
+              h.graph.score, h.graph.rank,     # graph arm
+              h.memory.text, h.memory.metadata)   # the memory, returned inline
 ```
 
 The contract is [`proto/memlake/v1/memlake.proto`](proto/memlake/v1/memlake.proto); generate a

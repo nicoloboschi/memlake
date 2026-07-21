@@ -35,20 +35,23 @@ pub struct ArmScore {
     pub score: f32,
 }
 
-/// A query candidate carrying the **raw** signal from each arm that surfaced it; an arm that
-/// did not is `None`. memlake does no fusion — the client combines these (RRF, weighting,
-/// re-ranking) however it likes.
+/// A query candidate carrying the **raw** signal from each arm that surfaced it (an arm that
+/// did not is `None`) plus the materialized `memory`. memlake does no fusion — the client
+/// combines the arm signals (RRF, weighting, re-ranking) however it likes, and gets the
+/// stored memory inline so recall needs no second round trip to hydrate.
 #[derive(Clone, Debug)]
 pub struct RawHit {
     pub id: MemoryId,
     pub dense: Option<ArmScore>,
     pub text: Option<ArmScore>,
     pub graph: Option<ArmScore>,
+    /// The stored memory, materialized server-side (already fetched to score the candidate).
+    pub memory: Option<StoredMemory>,
 }
 
 impl RawHit {
     fn new(id: MemoryId) -> Self {
-        Self { id, dense: None, text: None, graph: None }
+        Self { id, dense: None, text: None, graph: None, memory: None }
     }
 }
 
@@ -296,9 +299,8 @@ impl QueryNode {
         let Some(state) = self.per_type.get(&memory_type) else {
             return Ok(Vec::new());
         };
-        let (vector_scored, fts_scored, graph_scored) =
+        let (vector_scored, fts_scored, graph_scored, mut materialized) =
             self.run_arms(state, vector, text, tags, depths, metrics).await?;
-        metrics.check_budget(&self.ns.name, "query");
 
         // Merge the three arms' candidates by id, recording each arm's rank + raw score.
         let mut by_id: HashMap<MemoryId, RawHit> = HashMap::new();
@@ -311,11 +313,37 @@ impl QueryNode {
         fill(vector_scored, |h, s| h.dense = Some(s));
         fill(fts_scored, |h, s| h.text = Some(s));
         fill(graph_scored, |h, s| h.graph = Some(s));
+
+        // Materialize any hit not already in hand — FTS-only hits that fell outside the
+        // probed clusters. One coalesced pk lookup + cluster fetch covers them all; the
+        // graph arm's candidates are usually cache-warm from its own fetch.
+        let missing: Vec<MemoryId> =
+            by_id.keys().filter(|id| !materialized.contains_key(id)).copied().collect();
+        if !missing.is_empty() {
+            let clusters_map = state.pk.lookup_batch(&self.ns.store, &missing, Some((metrics, 3))).await?;
+            let clusters: std::collections::HashSet<usize> =
+                clusters_map.values().map(|c| *c as usize).collect();
+            if !clusters.is_empty() {
+                let cids: Vec<usize> = clusters.into_iter().collect();
+                for item in self.fetch_clusters(state, &cids, metrics, 3).await? {
+                    if by_id.contains_key(&item.id) {
+                        materialized.entry(item.id).or_insert(item);
+                    }
+                }
+            }
+        }
+        metrics.check_budget(&self.ns.name, "query");
+
+        // Attach the materialized memory to each hit (returned inline — no second round trip).
+        for (id, hit) in by_id.iter_mut() {
+            hit.memory = materialized.remove(id);
+        }
         Ok(by_id.into_values().collect())
     }
 
     /// Run the three arms for one memory_type, returning each arm's ranked candidates with
-    /// their raw scores: `(dense, fts, graph)`. Shared by every query path. The vector and
+    /// their raw scores `(dense, fts, graph)` plus the memories materialized while doing so
+    /// (the probed clusters + tail, keyed by id). Shared by every query path. The vector and
     /// graph arms share the probed clusters (one fetch); the graph arm seeds off the dense
     /// ranking. An arm with `top_k == 0`, or a missing input, yields an empty list.
     #[allow(clippy::type_complexity)]
@@ -327,7 +355,12 @@ impl QueryNode {
         tags: &TagFilter,
         depths: ArmDepths,
         metrics: &QueryMetrics,
-    ) -> Result<(Vec<(MemoryId, f32)>, Vec<(MemoryId, f32)>, Vec<(MemoryId, f32)>)> {
+    ) -> Result<(
+        Vec<(MemoryId, f32)>,
+        Vec<(MemoryId, f32)>,
+        Vec<(MemoryId, f32)>,
+        HashMap<MemoryId, StoredMemory>,
+    )> {
         // Vector arm: probe + fetch the candidate clusters once (RT3); the graph arm reuses
         // the materialized memories. Tags are applied inline (memories carry their tags).
         let (probed_items, vector_scored) = match vector {
@@ -372,7 +405,11 @@ impl QueryNode {
             Vec::new()
         };
 
-        Ok((vector_scored, fts_scored, graph_scored))
+        // The probed items (vector clusters + tail) are the base set of materialized memories
+        // the caller can return inline; anything else is fetched on demand by query_raw_metered.
+        let materialized: HashMap<MemoryId, StoredMemory> =
+            probed_items.into_iter().map(|m| (m.id, m)).collect();
+        Ok((vector_scored, fts_scored, graph_scored, materialized))
     }
 
     /// Choose which clusters to fetch for the vector arm.

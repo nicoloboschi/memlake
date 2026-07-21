@@ -101,6 +101,7 @@ mod tests {
             proof_count: 0,
             entity_ids: vec![1, 2],
             causal_out: vec![],
+            metadata: vec![],
         }
     }
 

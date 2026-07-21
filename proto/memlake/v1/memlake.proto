@@ -66,6 +66,10 @@ message Memory {
   repeated uint64 entity_ids = 8;
   Timestamps timestamps = 9;
   repeated CausalEdge causal_out = 10;
+  // Opaque client key→value metadata. memlake never indexes or interprets it — it is stored
+  // verbatim and returned on read (see `MemoryPayload.metadata`). Use it for fields memlake
+  // has no first-class model of: context, document_id, chunk_id, arbitrary JSON-as-string.
+  map<string, string> metadata = 11;
 }
 
 message Patch {
@@ -141,14 +145,30 @@ message ArmScore {
   float score = 3;
 }
 
-// A retrieved candidate with the raw signal from each arm. memlake does NO fusion: the
-// client combines these (RRF, weighting, re-ranking) itself.
+// The stored memory returned inline with a search hit. The server already has it
+// materialized to score the candidate, so returning it costs no extra object-storage read —
+// recall never needs a second round trip to hydrate. The embedding vector is omitted (large
+// and the client already has it); request it via Get if needed.
+message MemoryPayload {
+  string text = 1;
+  repeated string tags = 2;
+  uint32 proof_count = 3;
+  repeated uint64 entity_ids = 4;
+  Timestamps timestamps = 5;
+  repeated CausalEdge causal_out = 6;
+  map<string, string> metadata = 7;   // the opaque metadata, verbatim
+}
+
+// A retrieved candidate with the raw signal from each arm plus the materialized memory.
+// memlake does NO fusion: the client combines the raw arm scores (RRF, weighting,
+// re-ranking) itself.
 message Hit {
   bytes id = 1;                // 16-byte MemoryId
   uint32 memory_type = 2;
   ArmScore dense = 3;          // vector / cosine arm
   ArmScore text = 4;           // BM25 arm
   ArmScore graph = 5;          // graph-expansion arm
+  MemoryPayload memory = 6;    // the stored memory, returned inline (no extra roundtrip)
 }
 
 message QueryResponse {

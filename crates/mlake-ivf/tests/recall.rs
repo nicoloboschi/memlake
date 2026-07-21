@@ -41,6 +41,7 @@ fn corpus(n: usize, dim: usize, seed: u64) -> Vec<StoredMemory> {
                 entity_ids: vec![],
                 semantic_out: vec![],
                 causal_out: vec![],
+                metadata: vec![],
             }
         })
         .collect()

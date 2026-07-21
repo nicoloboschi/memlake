@@ -26,15 +26,19 @@ def main() -> int:
         seq = c.write(
             NS,
             [
-                memory("the cat sat on the mat", vec(0.1), memory_type=1, key="m1", tags=["animals"]),
-                memory("a dog barked loudly", vec(0.2), memory_type=1, key="m2", tags=["animals"]),
-                memory("stock prices rose today", vec(0.9), memory_type=1, key="m3", tags=["finance"]),
+                memory("the cat sat on the mat", vec(0.1), memory_type=1, key="m1",
+                       tags=["animals"], metadata={"document_id": "doc-1", "context": "pets"}),
+                memory("a dog barked loudly", vec(0.2), memory_type=1, key="m2",
+                       tags=["animals"], metadata={"document_id": "doc-1"}),
+                memory("stock prices rose today", vec(0.9), memory_type=1, key="m3",
+                       tags=["finance"], metadata={"document_id": "doc-2"}),
             ],
         )
         print(f"wrote batch, WAL seq={seq}")
 
         # STRONG consistency (default): visible immediately via the WAL tail, no indexing.
-        # ONE call, all memory_types, all three arms; each hit carries the raw per-arm signals.
+        # ONE call, all memory_types, all three arms; each hit carries the raw per-arm signals
+        # AND the materialized memory (text + metadata) inline — no second round trip.
         hits = c.query(NS, vector=vec(0.1), text="cat")
         print(f"query -> {len(hits)} hits (roundtrips={c.last_roundtrips})")
         for h in hits:
@@ -42,7 +46,8 @@ def main() -> int:
                 f"  mt={h.memory_type} {h.id_uuid[:8]}  "
                 f"dense={h.dense.score:.4f}@{h.dense.rank if h.dense.present else '-'}  "
                 f"text={h.text.score:.4f}@{h.text.rank if h.text.present else '-'}  "
-                f"graph={'y' if h.graph.present else '-'}"
+                f"graph={'y' if h.graph.present else '-'}  "
+                f"text={h.memory.text!r}  metadata={h.memory.metadata}"
             )
 
         # With a tag filter.

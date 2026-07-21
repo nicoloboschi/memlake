@@ -22,6 +22,7 @@ fn item(key: &str, proof: u32) -> Memory {
         proof_count: proof,
         entity_ids: vec![1, 2],
         causal_out: vec![],
+        metadata: vec![],
     }
 }
 

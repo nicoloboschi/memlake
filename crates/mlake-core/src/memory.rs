@@ -126,6 +126,12 @@ pub struct StoredMemory {
     pub entity_ids: Vec<u64>,
     pub semantic_out: Vec<SemanticEdge>,
     pub causal_out: Vec<CausalEdge>,
+    /// Opaque client key→value metadata. memlake never indexes or interprets it — it is
+    /// carried verbatim through storage and returned on read, so a client (e.g. Hindsight)
+    /// can stash `context` / `document_id` / `chunk_id` / arbitrary JSON-as-string and get it
+    /// back with a search hit, no second round trip. Sorted by key for deterministic
+    /// serialization (G-6).
+    pub metadata: Vec<(String, String)>,
 }
 
 impl StoredMemory {
@@ -167,6 +173,9 @@ pub struct Memory {
     /// Causal edges are intrinsic and travel in the WAL. Semantic edges are absent here
     /// by construction: they are derived by the indexer (SPEC §3.2).
     pub causal_out: Vec<CausalEdge>,
+    /// Opaque key→value metadata, stored and returned verbatim, never indexed. See
+    /// [`StoredMemory::metadata`].
+    pub metadata: Vec<(String, String)>,
 }
 
 impl Memory {
@@ -175,6 +184,8 @@ impl Memory {
     pub fn into_stored(mut self) -> StoredMemory {
         self.entity_ids.sort_unstable();
         self.entity_ids.dedup();
+        // Deterministic metadata order for byte-identical output (G-6).
+        self.metadata.sort_by(|a, b| a.0.cmp(&b.0));
         StoredMemory {
             id: self.id,
             vector: self.vector,
@@ -186,6 +197,7 @@ impl Memory {
             entity_ids: self.entity_ids,
             semantic_out: Vec::new(),
             causal_out: self.causal_out,
+            metadata: self.metadata,
         }
     }
 }
@@ -207,6 +219,7 @@ mod tests {
             entity_ids: vec![1, 3, 5, 7],
             semantic_out: vec![],
             causal_out: vec![],
+            metadata: vec![],
         };
         assert_eq!(item.shared_entity_count(&[3, 5, 9]), 2);
         assert_eq!(item.shared_entity_count(&[2, 4]), 0);
@@ -225,6 +238,7 @@ mod tests {
             proof_count: 0,
             entity_ids: vec![5, 1, 5, 3],
             causal_out: vec![],
+            metadata: vec![],
         };
         let stored = item.into_stored();
         assert_eq!(stored.entity_ids, vec![1, 3, 5]);

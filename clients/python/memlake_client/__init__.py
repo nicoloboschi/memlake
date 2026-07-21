@@ -22,6 +22,7 @@ from .client import (
     Arm,
     Hit,
     MemlakeClient,
+    Payload,
     memory,
 )
 
@@ -30,6 +31,7 @@ __all__ = [
     "memory",
     "Hit",
     "Arm",
+    "Payload",
     "ANY",
     "ALL",
     "ANY_STRICT",

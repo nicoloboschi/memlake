@@ -183,6 +183,7 @@ mod tests {
             proof_count: proof,
             entity_ids: vec![],
             causal_out: vec![],
+            metadata: vec![],
         }
     }
 

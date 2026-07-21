@@ -21,7 +21,7 @@ use anyhow::{Context, Result};
 use datagen::{GenConfig, Generator};
 use mlake_core::{Op, TagFilter, TagsMatch};
 use mlake_fts::Tokenizer;
-use mlake_index::{index, Consistency, IndexOptions, QueryConfig, QueryNode};
+use mlake_index::{index, ArmDepths, Consistency, IndexOptions, QueryConfig, QueryNode};
 use mlake_store::{DiskCache, QueryMetrics, Store, StoreMetrics};
 use mlake_wal::{Namespace, Writer};
 
@@ -325,17 +325,15 @@ async fn run_workload(
     for q in qs {
         let (vector, text, tags, config) = build(q);
         let qm = QueryMetrics::new();
+        let depths = ArmDepths {
+            vector: config.arm_depth,
+            text: config.arm_depth,
+            graph: if config.graph_weight > 0.0 { config.arm_depth } else { 0 },
+            nprobe: config.nprobe,
+        };
         let t = Instant::now();
-        node.query_metered(
-            memory_type,
-            vector.as_deref(),
-            text.as_deref(),
-            &tags,
-            10,
-            config,
-            &qm,
-        )
-        .await?;
+        node.query_raw_metered(memory_type, vector.as_deref(), text.as_deref(), &tags, depths, &qm)
+            .await?;
         latencies.push(t.elapsed().as_secs_f64() * 1000.0);
         total_rt += qm.roundtrips();
         for (name, us) in qm.phase_breakdown() {

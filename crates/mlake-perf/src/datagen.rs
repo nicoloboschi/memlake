@@ -140,6 +140,11 @@ impl Generator {
                 proof_count: 0,
                 entity_ids,
                 causal_out,
+                // A little opaque metadata, so the read path exercises returning it.
+                metadata: vec![
+                    ("doc".to_string(), format!("d{}", i % 1000)),
+                    ("src".to_string(), "perf".to_string()),
+                ],
             });
         }
         out
