@@ -185,8 +185,12 @@ impl Store {
         Ok(bytes)
     }
 
-    /// Read several ranges of one object. The store coalesces adjacent ranges, so this
-    /// stays a single roundtrip even when the ranges are not contiguous.
+    /// Read several ranges of one *immutable* object, through the NVMe cache when attached.
+    ///
+    /// Each `(path, range)` names immutable bytes (SSTable blocks under a nonce prefix), so
+    /// the cache is keyed by path+range. Ranges already resident are served locally; only
+    /// the misses go to S3, coalesced into a single request. This is what warms the graph
+    /// arm's `radj`/`pk` block reads.
     pub async fn get_ranges(
         &self,
         path: &str,
@@ -196,23 +200,58 @@ impl Store {
         if ranges.is_empty() {
             return Ok(Vec::new());
         }
-        let start = Instant::now();
-        let parts = self
-            .inner
-            .get_ranges(&Path::from(path), ranges)
-            .await
-            .map_err(|e| match e {
-                object_store::Error::NotFound { .. } => Error::NotFound(path.to_string()),
-                other => other.into(),
-            })?;
-        let total: u64 = parts.iter().map(|b| b.len() as u64).sum();
-        if let Some((metrics, rt)) = ctx {
-            metrics.record_request(rt, total, start.elapsed());
+
+        let range_key = |r: &std::ops::Range<usize>| format!("{path}#{}-{}", r.start, r.end);
+
+        // Cache lookup per range; collect the misses to fetch.
+        let mut out: Vec<Option<Bytes>> = vec![None; ranges.len()];
+        let mut miss_idx: Vec<usize> = Vec::new();
+        if let Some(cache) = &self.cache {
+            for (i, r) in ranges.iter().enumerate() {
+                let key = crate::cache::CacheKey::new("", &range_key(r), "immutable");
+                if let Some(b) = cache.get(&key) {
+                    out[i] = Some(b);
+                    if let Some((metrics, _)) = ctx {
+                        metrics.record_cache_hit();
+                    }
+                } else {
+                    miss_idx.push(i);
+                }
+            }
+        } else {
+            miss_idx = (0..ranges.len()).collect();
         }
-        if let Some(m) = &self.store_metrics {
-            m.record_get(total);
+
+        if !miss_idx.is_empty() {
+            let miss_ranges: Vec<std::ops::Range<usize>> =
+                miss_idx.iter().map(|&i| ranges[i].clone()).collect();
+            let start = Instant::now();
+            let fetched = self
+                .inner
+                .get_ranges(&Path::from(path), &miss_ranges)
+                .await
+                .map_err(|e| match e {
+                    object_store::Error::NotFound { .. } => Error::NotFound(path.to_string()),
+                    other => other.into(),
+                })?;
+            let total: u64 = fetched.iter().map(|b| b.len() as u64).sum();
+            if let Some((metrics, rt)) = ctx {
+                metrics.record_request(rt, total, start.elapsed());
+                metrics.record_cache_miss();
+            }
+            if let Some(m) = &self.store_metrics {
+                m.record_get(total);
+            }
+            for (&i, bytes) in miss_idx.iter().zip(fetched.into_iter()) {
+                if let Some(cache) = &self.cache {
+                    let key = crate::cache::CacheKey::new("", &range_key(&ranges[i]), "immutable");
+                    cache.put(key, bytes.clone());
+                }
+                out[i] = Some(bytes);
+            }
         }
-        Ok(parts)
+
+        Ok(out.into_iter().map(|b| b.unwrap_or_default()).collect())
     }
 
     /// Unconditional write. Only legal for immutable objects, whose paths are unique by

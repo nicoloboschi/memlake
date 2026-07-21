@@ -12,8 +12,52 @@ use std::time::Duration;
 /// The hard cold-path roundtrip budget from SPEC §6.1.
 pub const COLD_ROUNDTRIP_BUDGET: usize = 4;
 
-/// Counters for one query's object-storage usage.
-#[derive(Debug, Default)]
+/// A timed phase of a query, for the diagnostics breakdown.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Phase {
+    Probe,
+    FetchClusters,
+    Rerank,
+    Fts,
+    GraphRadj,
+    GraphPk,
+    GraphFetch,
+    GraphExpand,
+    Fuse,
+}
+
+impl Phase {
+    pub const ALL: [Phase; 9] = [
+        Phase::Probe,
+        Phase::FetchClusters,
+        Phase::Rerank,
+        Phase::Fts,
+        Phase::GraphRadj,
+        Phase::GraphPk,
+        Phase::GraphFetch,
+        Phase::GraphExpand,
+        Phase::Fuse,
+    ];
+    pub fn name(self) -> &'static str {
+        match self {
+            Phase::Probe => "probe",
+            Phase::FetchClusters => "fetch_clusters",
+            Phase::Rerank => "rerank",
+            Phase::Fts => "fts",
+            Phase::GraphRadj => "graph_radj",
+            Phase::GraphPk => "graph_pk",
+            Phase::GraphFetch => "graph_fetch",
+            Phase::GraphExpand => "graph_expand",
+            Phase::Fuse => "fuse",
+        }
+    }
+    fn idx(self) -> usize {
+        self as usize
+    }
+}
+
+/// Counters for one query's object-storage usage and phase timing.
+#[derive(Debug)]
 pub struct QueryMetrics {
     /// Highest roundtrip number reached. Requests issued in parallel share a number, so
     /// this counts *round trips*, not requests.
@@ -23,11 +67,46 @@ pub struct QueryMetrics {
     latency_micros: AtomicU64,
     cache_hits: AtomicUsize,
     cache_misses: AtomicUsize,
+    /// Accumulated wall-clock micros per phase — the diagnostics breakdown.
+    phase_micros: [AtomicU64; 9],
+}
+
+impl Default for QueryMetrics {
+    fn default() -> Self {
+        Self {
+            max_roundtrip: AtomicUsize::new(0),
+            requests: AtomicUsize::new(0),
+            bytes: AtomicU64::new(0),
+            latency_micros: AtomicU64::new(0),
+            cache_hits: AtomicUsize::new(0),
+            cache_misses: AtomicUsize::new(0),
+            phase_micros: std::array::from_fn(|_| AtomicU64::new(0)),
+        }
+    }
 }
 
 impl QueryMetrics {
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
+    }
+
+    /// Record `duration` against a phase. Use [`QueryMetrics::time`] for the common
+    /// "time this block" pattern.
+    pub fn record_phase(&self, phase: Phase, duration: Duration) {
+        self.phase_micros[phase.idx()].fetch_add(duration.as_micros() as u64, Ordering::Relaxed);
+    }
+
+    /// Micros accumulated for a phase.
+    pub fn phase_micros(&self, phase: Phase) -> u64 {
+        self.phase_micros[phase.idx()].load(Ordering::Relaxed)
+    }
+
+    /// The full phase breakdown, `(name, micros)`, in a stable order.
+    pub fn phase_breakdown(&self) -> Vec<(&'static str, u64)> {
+        Phase::ALL
+            .iter()
+            .map(|p| (p.name(), self.phase_micros(*p)))
+            .collect()
     }
 
     pub fn record_request(&self, roundtrip_no: usize, bytes: u64, latency: Duration) {

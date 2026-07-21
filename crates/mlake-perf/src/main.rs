@@ -184,6 +184,8 @@ struct WorkloadResult {
     p99_ms: f64,
     roundtrips: f64,
     cost: cost::ReadCost,
+    /// Per-phase micros per query (name, us/query), non-zero phases only.
+    phases: Vec<(String, f64)>,
 }
 
 struct ReadReport {
@@ -209,9 +211,19 @@ impl ReadReport {
 }
 
 fn fmt_workload(w: &WorkloadResult) -> String {
+    let breakdown = if w.phases.is_empty() {
+        String::new()
+    } else {
+        let parts: Vec<String> = w
+            .phases
+            .iter()
+            .map(|(n, us)| format!("{n} {:.0}us", us))
+            .collect();
+        format!("\n                   [{}]", parts.join("  "))
+    };
     format!(
         "    {name:14} p50 {p50:>6.1}ms  p90 {p90:>6.1}ms  p99 {p99:>6.1}ms  \
-         rt {rt:>3.1}  {gpq:>4.1} GET/q  ${cost:.4}/1k\n",
+         rt {rt:>3.1}  {gpq:>4.1} GET/q  ${cost:.4}/1k{breakdown}\n",
         name = w.name,
         p50 = w.p50_ms,
         p90 = w.p90_ms,
@@ -278,6 +290,7 @@ async fn run_workload(
     let base = store_metrics.snapshot();
     let mut latencies = Vec::with_capacity(qs.len());
     let mut total_rt = 0usize;
+    let mut phase_us: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
     for q in qs {
         let (vector, text, tags, config) = build(q);
         let qm = QueryMetrics::new();
@@ -294,7 +307,16 @@ async fn run_workload(
         .await?;
         latencies.push(t.elapsed().as_secs_f64() * 1000.0);
         total_rt += qm.roundtrips();
+        for (name, us) in qm.phase_breakdown() {
+            *phase_us.entry(name.to_string()).or_default() += us;
+        }
     }
+    let n = qs.len().max(1) as f64;
+    let phases: Vec<(String, f64)> = phase_us
+        .into_iter()
+        .filter(|(_, us)| *us > 0)
+        .map(|(name, us)| (name, us as f64 / n))
+        .collect();
     let phase = store_metrics.since(&base);
     latencies.sort_by(|a, b| a.partial_cmp(b).unwrap());
     Ok(WorkloadResult {
@@ -304,6 +326,7 @@ async fn run_workload(
         p99_ms: pct(&latencies, 99.0),
         roundtrips: total_rt as f64 / qs.len().max(1) as f64,
         cost: cost::read_cost(&cost::Pricing::default(), &phase, qs.len()),
+        phases,
     })
 }
 

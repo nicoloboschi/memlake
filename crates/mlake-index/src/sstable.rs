@@ -182,6 +182,47 @@ impl SsTableIndex {
         let bytes = store.get_range(data_path, start..end, ctx).await?;
         Ok(scan_block(&bytes, &key.0))
     }
+
+    /// Look up many keys in **one coalesced request**: the distinct blocks the keys fall
+    /// into are read together via `get_ranges` (the store coalesces adjacent ranges), then
+    /// scanned in memory. This turns "N point lookups = N ranged GETs" into a single
+    /// roundtrip — the fix for the graph arm's per-seed `radj`/`pk` reads.
+    pub async fn get_many(
+        &self,
+        store: &Store,
+        data_path: &str,
+        keys: &[MemoryId],
+        ctx: Option<(&QueryMetrics, usize)>,
+    ) -> Result<Vec<(MemoryId, Vec<u8>)>> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Distinct blocks needed, and which keys land in each.
+        let mut block_keys: std::collections::BTreeMap<(usize, usize), Vec<MemoryId>> =
+            std::collections::BTreeMap::new();
+        for k in keys {
+            if let Some(b) = self.block_for(&k.0) {
+                let range = (b.offset as usize, b.offset as usize + b.len as usize);
+                block_keys.entry(range).or_default().push(*k);
+            }
+        }
+        if block_keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ranges: Vec<std::ops::Range<usize>> =
+            block_keys.keys().map(|(s, e)| *s..*e).collect();
+        let blocks = store.get_ranges(data_path, &ranges, ctx).await?;
+
+        let mut out = Vec::new();
+        for (block_bytes, ks) in blocks.iter().zip(block_keys.values()) {
+            for k in ks {
+                if let Some(v) = scan_block(block_bytes, &k.0) {
+                    out.push((*k, v));
+                }
+            }
+        }
+        Ok(out)
+    }
 }
 
 /// Linear scan of a block for `key`. Records are sorted, so the scan stops once it passes
@@ -252,6 +293,20 @@ impl PkTable {
             .await?
             .map(|v| u32::from_le_bytes([v[0], v[1], v[2], v[3]])))
     }
+
+    /// Resolve many ids to their clusters in one coalesced request.
+    pub async fn lookup_batch(
+        &self,
+        store: &Store,
+        ids: &[MemoryId],
+        ctx: Option<(&QueryMetrics, usize)>,
+    ) -> Result<std::collections::HashMap<MemoryId, u32>> {
+        let pairs = self.index.get_many(store, &self.data_path, ids, ctx).await?;
+        Ok(pairs
+            .into_iter()
+            .map(|(id, v)| (id, u32::from_le_bytes([v[0], v[1], v[2], v[3]])))
+            .collect())
+    }
 }
 
 /// The reverse-adjacency index as an SSTable: target id → its incoming edges. `incoming`
@@ -303,6 +358,24 @@ impl RadjTable {
             Some(bytes) => Ok(decode_edges(&bytes)),
             None => Ok(Vec::new()),
         }
+    }
+
+    /// Incoming edges for many targets in one coalesced request — the graph arm's seed
+    /// expansion, turned from N ranged GETs into a single roundtrip.
+    pub async fn incoming_batch(
+        &self,
+        store: &Store,
+        targets: &[MemoryId],
+        ctx: Option<(&QueryMetrics, usize)>,
+    ) -> Result<std::collections::HashMap<MemoryId, Vec<InEdge>>> {
+        let pairs = self
+            .index
+            .get_many(store, &self.data_path, targets, ctx)
+            .await?;
+        Ok(pairs
+            .into_iter()
+            .map(|(id, bytes)| (id, decode_edges(&bytes)))
+            .collect())
     }
 }
 

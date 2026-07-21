@@ -16,7 +16,7 @@ pub mod metrics;
 pub mod store;
 
 pub use cache::{CacheKey, DiskCache};
-pub use metrics::{QueryMetrics, StoreMetrics, StoreSnapshot, COLD_ROUNDTRIP_BUDGET};
+pub use metrics::{Phase, QueryMetrics, StoreMetrics, StoreSnapshot, COLD_ROUNDTRIP_BUDGET};
 pub use store::{Etag, Store, Versioned};
 
 pub type Result<T> = std::result::Result<T, Error>;

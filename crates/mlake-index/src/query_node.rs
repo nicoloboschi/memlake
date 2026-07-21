@@ -12,13 +12,14 @@
 //! write visible immediately (INV-5).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::time::Instant;
 
 use mlake_core::{MemoryId, StoredMemory, TagFilter};
 use mlake_fts::{TantivyFts, Tokenizer};
 use mlake_graph::radj::InEdge;
 use mlake_graph::{GraphParams, GraphSource};
 use mlake_ivf::{exact_search, Centroids};
-use mlake_store::QueryMetrics;
+use mlake_store::{Phase, QueryMetrics};
 use mlake_wal::{Namespace, WalTail};
 
 use crate::fusion::{rrf, weighted_rrf, FusedHit, RankedArm};
@@ -232,14 +233,20 @@ impl QueryNode {
         // tags, so filtering is free once fetched (the shared TagFilter primitive).
         let (probed_items, vector_ranking) = match vector {
             Some(q) if !state.centroids.is_empty() => {
+                let t = Instant::now();
                 let probed = self.select_clusters(state, q, config.nprobe, tags);
+                metrics.record_phase(Phase::Probe, t.elapsed());
+                let t = Instant::now();
                 let mut items = self.fetch_clusters(state, &probed, metrics, 3).await?;
+                metrics.record_phase(Phase::FetchClusters, t.elapsed());
                 items.extend(state.tail_items.iter().cloned());
                 items.retain(|m| tags.matches(&m.tags));
+                let t = Instant::now();
                 let ranking: Vec<MemoryId> = exact_search(&items, q, config.arm_depth)
                     .into_iter()
                     .map(|h| h.id)
                     .collect();
+                metrics.record_phase(Phase::Rerank, t.elapsed());
                 (items, ranking)
             }
             _ => {
@@ -249,10 +256,12 @@ impl QueryNode {
             }
         };
 
+        let tf = Instant::now();
         let fts_ranking = text
             .filter(|t| !t.is_empty())
             .map(|t| self.fts_arm(state, t, config.arm_depth, tags))
             .unwrap_or_default();
+        metrics.record_phase(Phase::Fts, tf.elapsed());
 
         // The graph arm is skipped when weighted to zero — it does ranged pk/radj reads, so
         // running an arm that contributes nothing to fusion would be pure waste.
@@ -264,7 +273,10 @@ impl QueryNode {
         };
 
         metrics.check_budget(&self.ns.name, "query");
-        Ok(fuse(&vector_ranking, &fts_ranking, &graph_ranking, top_k, config))
+        let tfz = Instant::now();
+        let fused = fuse(&vector_ranking, &fts_ranking, &graph_ranking, top_k, config);
+        metrics.record_phase(Phase::Fuse, tfz.elapsed());
+        Ok(fused)
     }
 
     /// Choose which clusters to fetch for the vector arm.
@@ -388,11 +400,15 @@ impl QueryNode {
             return Ok(Vec::new());
         }
 
-        let mut incoming: HashMap<MemoryId, Vec<InEdge>> = HashMap::new();
-        for seed in &seeds {
-            let edges = state.radj.incoming(&self.ns.store, &seed.id, Some((metrics, 4))).await?;
-            incoming.insert(seed.id, edges);
-        }
+        // Seed incoming edges: one coalesced batch read over radj.csr for all seeds, rather
+        // than a ranged GET per seed.
+        let tr = Instant::now();
+        let seed_ids: Vec<MemoryId> = seeds.iter().map(|s| s.id).collect();
+        let incoming = state
+            .radj
+            .incoming_batch(&self.ns.store, &seed_ids, Some((metrics, 4)))
+            .await?;
+        metrics.record_phase(Phase::GraphRadj, tr.elapsed());
 
         let mut wanted: HashSet<MemoryId> = HashSet::new();
         for seed in &seeds {
@@ -402,25 +418,31 @@ impl QueryNode {
             for e in &seed.causal_out {
                 wanted.insert(e.target);
             }
-            for e in &incoming[&seed.id] {
+            for e in incoming.get(&seed.id).into_iter().flatten() {
                 wanted.insert(e.source);
             }
         }
         wanted.retain(|id| !by_id.contains_key(id) && !self.tombstones.contains(id));
 
-        let mut clusters_needed: HashSet<usize> = HashSet::new();
-        for id in &wanted {
-            if let Some(c) = state.pk.lookup(&self.ns.store, id, Some((metrics, 4))).await? {
-                clusters_needed.insert(c as usize);
-            }
-        }
+        // Resolve all candidates' clusters in one coalesced batch read over pk.data.
+        let tp = Instant::now();
+        let wanted_vec: Vec<MemoryId> = wanted.into_iter().collect();
+        let clusters_map = state
+            .pk
+            .lookup_batch(&self.ns.store, &wanted_vec, Some((metrics, 4)))
+            .await?;
+        metrics.record_phase(Phase::GraphPk, tp.elapsed());
+        let clusters_needed: HashSet<usize> = clusters_map.values().map(|c| *c as usize).collect();
         if !clusters_needed.is_empty() {
+            let tf = Instant::now();
             let ids: Vec<usize> = clusters_needed.into_iter().collect();
             for item in self.fetch_clusters(state, &ids, metrics, 4).await? {
                 by_id.entry(item.id).or_insert(item);
             }
+            metrics.record_phase(Phase::GraphFetch, tf.elapsed());
         }
 
+        let te = Instant::now();
         let mut entity_index: HashMap<u64, Vec<MemoryId>> = HashMap::new();
         for item in by_id.values() {
             for e in &item.entity_ids {
@@ -440,11 +462,13 @@ impl QueryNode {
             GraphParams { budget: depth, ..GraphParams::default() },
         );
         // Filter graph candidates by the tag filter using their materialized tags.
-        Ok(ranked
+        let out = ranked
             .into_iter()
             .filter(|r| by_id.get(&r.id).map(|m| tags.matches(&m.tags)).unwrap_or(false))
             .map(|r| r.id)
-            .collect())
+            .collect();
+        metrics.record_phase(Phase::GraphExpand, te.elapsed());
+        Ok(out)
     }
 }
 
