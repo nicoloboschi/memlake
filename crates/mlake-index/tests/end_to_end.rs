@@ -1126,7 +1126,7 @@ async fn get_many_resolves_ids_from_the_generation_and_the_tail() {
 
     let node = QueryNode::open(&ns, Tokenizer::default()).await.unwrap();
     let ids = [MemoryId::from_key("a"), MemoryId::from_key("c")];
-    let got = node.get_many(&ids).await.unwrap();
+    let got = node.get_many(&ids, true).await.unwrap();
 
     assert_eq!(got.len(), 2, "one id from the generation, one from the tail");
     assert_eq!(got[0].id, ids[0], "results come back in the caller's order");
@@ -1134,7 +1134,7 @@ async fn get_many_resolves_ids_from_the_generation_and_the_tail() {
     assert_eq!(got[1].text, "gamma", "the un-indexed tail write must resolve");
 
     // An unknown id is absent rather than an error — Get is a lookup, not an assertion.
-    let missing = node.get_many(&[MemoryId::from_key("nope")]).await.unwrap();
+    let missing = node.get_many(&[MemoryId::from_key("nope")], true).await.unwrap();
     assert!(missing.is_empty());
 }
 
@@ -1151,7 +1151,7 @@ async fn get_many_hides_tombstoned_memories() {
     writer.commit(vec![Op::Tombstone { id: MemoryId::from_key("a") }]).await.unwrap();
 
     let node = QueryNode::open(&ns, Tokenizer::default()).await.unwrap();
-    let got = node.get_many(&[MemoryId::from_key("a")]).await.unwrap();
+    let got = node.get_many(&[MemoryId::from_key("a")], false).await.unwrap();
     assert!(got.is_empty(), "a deleted memory must not be addressable");
 }
 
@@ -1281,7 +1281,7 @@ async fn get_and_scan_hide_predicate_deleted_memories() {
 
     let node = QueryNode::open(&ns, Tokenizer::default()).await.unwrap();
     // get_many must not resolve the predicate-deleted id...
-    let got = node.get_many(&[MemoryId::from_key("d1c0"), MemoryId::from_key("d2c0")]).await.unwrap();
+    let got = node.get_many(&[MemoryId::from_key("d1c0"), MemoryId::from_key("d2c0")], false).await.unwrap();
     let got_ids: std::collections::HashSet<_> = got.iter().map(|m| m.id).collect();
     assert!(!got_ids.contains(&MemoryId::from_key("d1c0")), "get must hide a predicate-deleted memory");
     assert!(got_ids.contains(&MemoryId::from_key("d2c0")), "a non-matching memory stays addressable");

@@ -354,7 +354,7 @@ impl Memlake for MemlakeService {
 
         let ns = self.namespace(&req.namespace);
         let snap = self.snapshot(&ns).await?;
-        let found = snap.node.get_many(&ids).await.map_err(internal)?;
+        let found = snap.node.get_many(&ids, req.include_vector).await.map_err(internal)?;
         Ok(Response::new(pb::GetResponse {
             memories: found
                 .into_iter()

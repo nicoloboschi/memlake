@@ -429,7 +429,7 @@ impl QueryNode {
     /// The tail overlay is consulted first and wins: it is strictly newer than the indexed
     /// generation. Tombstoned and unknown ids are simply absent from the result — this is a
     /// lookup, not an existence assertion.
-    pub async fn get_many(&self, ids: &[MemoryId]) -> Result<Vec<StoredMemory>> {
+    pub async fn get_many(&self, ids: &[MemoryId], include_vector: bool) -> Result<Vec<StoredMemory>> {
         let metrics = QueryMetrics::new();
         let wanted: HashSet<MemoryId> =
             ids.iter().copied().filter(|id| !self.tombstones.contains(id)).collect();
@@ -447,12 +447,25 @@ impl QueryNode {
         }
 
         // Anything the tail did not answer must come from an indexed generation. Each fact
-        // type is a separate index, so an id is resolved against every type's pk table.
+        // type is a separate index, so an id is resolved against every type's index.
         for state in self.per_type.values() {
             let missing: Vec<MemoryId> =
                 wanted.iter().copied().filter(|id| !found.contains_key(id)).collect();
             if missing.is_empty() {
                 break;
+            }
+            if !include_vector {
+                // Fast path: the caller does not want the embedding, so read each memory's row
+                // from the payload store (one coalesced ranged GET) instead of deserializing
+                // its whole cluster file. Returned memories carry an empty `vector`.
+                for (id, item) in
+                    state.payload.lookup_batch(&self.ns.store, &missing, Some((&metrics, 1))).await?
+                {
+                    if wanted.contains(&id) {
+                        found.entry(id).or_insert(item);
+                    }
+                }
+                continue;
             }
             let by_cluster = state.pk.lookup_batch(&self.ns.store, &missing, Some((&metrics, 1))).await?;
             if by_cluster.is_empty() {
