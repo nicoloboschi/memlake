@@ -1,0 +1,274 @@
+/**
+ * The JSON contract between the Next.js route handlers (`app/api/**`) and the
+ * client components. This module is deliberately dependency-free and pure so it
+ * can be imported from both sides of the boundary.
+ *
+ * Wire notes that shape these types:
+ *  - protobuf 64-bit ints arrive from proto-loader as decimal *strings* (the
+ *    loader is configured with `longs: String`). They stay strings here so no
+ *    precision is lost in JSON; use BigInt for arithmetic.
+ *  - protobuf `bytes` arrive as Node Buffers. Ids are 16 raw bytes and are
+ *    always converted to canonical UUID strings before crossing this boundary.
+ *  - a `Vector` is raw little-endian f32; it is never shipped whole to the
+ *    browser, only summarised (see `VectorSummary`).
+ */
+
+// ---- enums (mirrors of the proto enums, as string names) --------------------
+
+export const CONSISTENCIES = ["STRONG", "EVENTUAL"] as const;
+export type Consistency = (typeof CONSISTENCIES)[number];
+
+export const TAGS_MATCHES = [
+  "ANY",
+  "ALL",
+  "ANY_STRICT",
+  "ALL_STRICT",
+  "EXACT",
+] as const;
+export type TagsMatch = (typeof TAGS_MATCHES)[number];
+
+export const TAGS_MATCH_HELP: Record<TagsMatch, string> = {
+  ANY: "at least one of the tags (untagged memories allowed)",
+  ALL: "all of the tags (untagged memories allowed)",
+  ANY_STRICT: "ANY, but untagged memories are excluded",
+  ALL_STRICT: "ALL, but untagged memories are excluded",
+  EXACT: "the memory's tag set equals the filter exactly",
+};
+
+export const LINK_TYPES = ["CAUSES", "CAUSED_BY", "ENABLES", "PREVENTS"] as const;
+export type LinkType = (typeof LINK_TYPES)[number];
+
+export const ARMS = ["dense", "text", "graph"] as const;
+export type Arm = (typeof ARMS)[number];
+
+export const ARM_LABEL: Record<Arm, string> = {
+  dense: "dense",
+  text: "text",
+  graph: "graph",
+};
+
+export const ARM_SCORE_KIND: Record<Arm, string> = {
+  dense: "cosine similarity",
+  text: "BM25",
+  graph: "activation",
+};
+
+// ---- value objects ----------------------------------------------------------
+
+export interface TimestampsJson {
+  /** int64 as a decimal string, or null when the field was not set. */
+  eventDate: string | null;
+  occurredStart: string | null;
+  occurredEnd: string | null;
+  mentionedAt: string | null;
+}
+
+export interface CausalEdgeJson {
+  /** 16-byte MemoryId, rendered as a UUID. */
+  target: string;
+  linkType: LinkType;
+  weight: number;
+}
+
+export interface MemoryPayloadJson {
+  text: string;
+  tags: string[];
+  proofCount: number;
+  /** 16-byte EntityIds, rendered as UUIDs. */
+  entityIds: string[];
+  timestamps: TimestampsJson | null;
+  causalOut: CausalEdgeJson[];
+  /** Opaque client metadata, returned verbatim by the server. */
+  metadata: Record<string, string>;
+}
+
+/**
+ * A compact stand-in for a full embedding. 384 raw floats per row would swamp
+ * both the JSON payload and the table, so the handler sends the shape plus a
+ * short prefix.
+ */
+export interface VectorSummary {
+  dim: number;
+  /** The first `head.length` components, in order. */
+  head: number[];
+  /** L2 norm of the full vector (≈1 for a bge embedding). */
+  norm: number;
+  /** Total byte length of the `f32le` payload. */
+  bytes: number;
+}
+
+export interface StoredMemoryJson {
+  /** 16-byte MemoryId, rendered as a UUID. */
+  id: string;
+  memoryType: number;
+  memory: MemoryPayloadJson | null;
+  vector: VectorSummary | null;
+}
+
+export interface ArmScoreJson {
+  /**
+   * Whether this arm surfaced the hit at all. `false` is NOT the same as
+   * `score === 0` — the arm simply never saw this id.
+   */
+  present: boolean;
+  /** 0-based position within this arm. Meaningless when `present` is false. */
+  rank: number;
+  /** The arm's native score. Meaningless when `present` is false. */
+  score: number;
+}
+
+export interface HitJson {
+  id: string;
+  memoryType: number;
+  dense: ArmScoreJson;
+  text: ArmScoreJson;
+  graph: ArmScoreJson;
+  /** The stored memory, returned inline by the server (no hydrate roundtrip). */
+  memory: MemoryPayloadJson | null;
+}
+
+// ---- API responses ----------------------------------------------------------
+
+export interface ApiErrorBody {
+  error: {
+    /** Numeric gRPC status code, or -1 for a local (non-RPC) failure. */
+    code: number;
+    /** e.g. "UNIMPLEMENTED", "UNAVAILABLE", "LOCAL". */
+    codeName: string;
+    message: string;
+    /** Operator-facing suggestion, when we can offer one. */
+    hint?: string;
+  };
+}
+
+export interface ListNamespacesJson {
+  namespaces: string[];
+  /** Server wall-clock for the RPC, in ms. */
+  elapsedMs: number;
+}
+
+export interface CreateNamespaceJson {
+  namespace: string;
+  elapsedMs: number;
+}
+
+export interface TypeStatsJson {
+  memoryType: number;
+  /** uint64 as a decimal string. */
+  docCount: string;
+  clusterCount: number;
+  trainCount: string;
+  hasIndex: boolean;
+}
+
+export interface StatsJson {
+  namespace: string;
+  generation: string;
+  prevGeneration: string | null;
+  walHead: string;
+  walIndexCursor: string;
+  /** `wal_head - wal_index_cursor`, computed with BigInt. */
+  backlog: string;
+  tokenizerConfigHash: string;
+  formatVersion: number;
+  docCount: string;
+  throughSeq: string;
+  loadRoundtrips: number;
+  types: TypeStatsJson[];
+  elapsedMs: number;
+}
+
+export interface ScanJson {
+  memories: StoredMemoryJson[];
+  /** Opaque cursor; empty string means the scan is exhausted. */
+  nextPageToken: string;
+  elapsedMs: number;
+}
+
+export interface GetJson {
+  memories: StoredMemoryJson[];
+  elapsedMs: number;
+}
+
+export type QueryVectorSource = "embedded" | "raw" | "none";
+
+export interface QueryJson {
+  hits: HitJson[];
+  loadRoundtrips: number;
+  /** Wall-clock of the Query RPC alone, measured server-side. */
+  rpcMs: number;
+  /** Wall-clock of embedding the query text, when we embedded it. */
+  embedMs: number | null;
+  vectorSource: QueryVectorSource;
+  vectorDim: number | null;
+  /** Model id used for `vectorSource === "embedded"`. */
+  embeddingModel: string | null;
+  /** The exact prefix prepended to the query text before embedding. */
+  queryPrefix: string | null;
+}
+
+export type EmbedState = "disabled" | "idle" | "loading" | "ready" | "error";
+
+export interface EmbedStatusJson {
+  enabled: boolean;
+  model: string;
+  dim: number;
+  /** "cls" — matches the benchmark harness; see lib/embed.ts. */
+  pooling: string;
+  queryPrefix: string;
+  state: EmbedState;
+  error: string | null;
+}
+
+// ---- request bodies ---------------------------------------------------------
+
+export interface TagFilterInput {
+  tags: string[];
+  mode: TagsMatch;
+}
+
+export interface ScanRequestBody {
+  memoryTypes: number[];
+  limit: number;
+  pageToken: string;
+  includeVector: boolean;
+  tags: TagFilterInput | null;
+  consistency: Consistency;
+}
+
+export interface GetRequestBody {
+  ids: string[];
+  includeVector: boolean;
+  consistency: Consistency;
+}
+
+export interface QueryRequestBody {
+  /** Free text: drives the BM25 arm, and (unless `vector` is given) the embedding. */
+  text: string;
+  memoryTypes: number[];
+  tags: TagFilterInput | null;
+  vectorTopK: number;
+  textTopK: number;
+  graphTopK: number;
+  nprobe: number;
+  consistency: Consistency;
+  /**
+   * "embed"  – embed `text` server-side (default)
+   * "raw"    – use `vector` verbatim
+   * "none"   – skip the dense + graph arms entirely
+   */
+  vectorMode: "embed" | "raw" | "none";
+  /** Only read when `vectorMode === "raw"`. */
+  vector: number[] | null;
+}
+
+// ---- helpers ----------------------------------------------------------------
+
+export function isApiError(body: unknown): body is ApiErrorBody {
+  return (
+    typeof body === "object" &&
+    body !== null &&
+    "error" in body &&
+    typeof (body as ApiErrorBody).error === "object"
+  );
+}

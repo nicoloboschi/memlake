@@ -8,7 +8,8 @@ and rebuilt from S3.
 
 Built as a prototype from [`docs/SPEC.md`](docs/SPEC.md). Each arm's write and read path is
 documented in detail: [`docs/arms/vector.md`](docs/arms/vector.md),
-[`docs/arms/text.md`](docs/arms/text.md), [`docs/arms/graph.md`](docs/arms/graph.md).
+[`docs/arms/text.md`](docs/arms/text.md), [`docs/arms/graph.md`](docs/arms/graph.md),
+[`docs/arms/temporal.md`](docs/arms/temporal.md).
 
 ## Model & naming
 
