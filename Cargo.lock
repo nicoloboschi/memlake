@@ -1421,6 +1421,7 @@ dependencies = [
  "object_store",
  "rand 0.8.7",
  "rand_chacha",
+ "rayon",
  "serde",
  "serde_json",
  "tantivy",

@@ -201,10 +201,12 @@ async fn build_memory_type_index(
     let retrain =
         prev_gen.is_none() || opts.force_retrain || doc_count as u64 > 2 * prev_train_count.max(1);
     let vectors: Vec<Vec<f32>> = items.iter().map(|i| i.vector.clone()).collect();
+    let tt = std::time::Instant::now();
     let (mut centroids, train_count) = match (prev_gen, retrain) {
         (Some(p), false) => (p.centroids.clone(), prev_train_count),
         _ => (train_centroids(&vectors, opts.seed), doc_count as u64),
     };
+    phase_log("train", tt);
 
     let mut assignments: Vec<usize> = if centroids.is_empty() {
         vec![0; items.len()]
@@ -214,11 +216,13 @@ async fn build_memory_type_index(
 
     let split_clusters = local_split(&mut centroids, &items, &mut assignments, opts.seed);
 
+    let td = std::time::Instant::now();
     if opts.derive_links && !centroids.is_empty() {
         derive_links_ivf(&mut items, new_ids, &centroids, &assignments);
     } else if opts.derive_links {
         derive_semantic_links(&mut items, new_ids);
     }
+    phase_log("derive_links", td);
 
     let k = centroids.len().max(1);
     let mut clusters: Vec<Vec<StoredMemory>> = vec![Vec::new(); k];
@@ -234,7 +238,9 @@ async fn build_memory_type_index(
     let old_clusters = prev_gen.map(|p| &p.clusters).unwrap_or(&empty);
     let empty_paths: Vec<String> = Vec::new();
     let old_paths = prev_index.map(|p| &p.files.clusters).unwrap_or(&empty_paths);
-    let mut cluster_paths = Vec::with_capacity(k);
+    let tw = std::time::Instant::now();
+    let mut cluster_paths: Vec<Option<String>> = vec![None; k];
+    let mut dirty_writes = Vec::new();
     for i in 0..k {
         let can_copy_forward = !retrain
             && !split_clusters.contains(&i)
@@ -242,12 +248,32 @@ async fn build_memory_type_index(
             && i < old_paths.len()
             && !cluster_changed(&clusters[i], &old_clusters[i], touched);
         if can_copy_forward {
-            cluster_paths.push(old_paths[i].clone());
+            cluster_paths[i] = Some(old_paths[i].clone());
         } else {
             let cf = ClusterFile { centroid_id: i as u32, items: clusters[i].clone() };
-            cluster_paths.push(crate::generation::write_cluster_file(&ns.store, &prefix, i, &cf).await?);
+            let store = ns.store.clone();
+            let prefix = prefix.clone();
+            dirty_writes.push(async move {
+                crate::generation::write_cluster_file(&store, &prefix, i, &cf)
+                    .await
+                    .map(|path| (i, path))
+            });
         }
     }
+    // Write the dirty clusters with bounded concurrency instead of one sequential PUT at a
+    // time — the dominant cost of a full build over S3 (SCALE.md Phase 3 perf).
+    {
+        use futures::stream::{StreamExt, TryStreamExt};
+        let written: Vec<(usize, String)> = futures::stream::iter(dirty_writes)
+            .buffer_unordered(32)
+            .try_collect()
+            .await?;
+        for (i, path) in written {
+            cluster_paths[i] = Some(path);
+        }
+    }
+    let cluster_paths: Vec<String> = cluster_paths.into_iter().map(|p| p.unwrap_or_default()).collect();
+    phase_log("cluster_write", tw);
 
     // pk / radj / fts, scoped to this fact type.
     let mut pk_entries: Vec<(MemoryId, u32)> = Vec::with_capacity(doc_count);
@@ -258,12 +284,14 @@ async fn build_memory_type_index(
     }
     let pk_tables = crate::sstable::PkTable::build(pk_entries);
 
+    let tfts = std::time::Instant::now();
     let fts = mlake_fts::TantivyFts::build_with_tags(
         items.iter().map(|i| (i.id, i.text.as_str(), i.tags.as_slice())),
         mlake_fts::Tokenizer::new(mlake_fts::TokenizerConfig::default()),
     )
     .map_err(|e| crate::Error::Core(mlake_core::Error::Encode(e.to_string())))?;
     let fts_split = fts.split_bytes().to_vec();
+    phase_log("fts_build", tfts);
 
     let mut radj_pairs: Vec<(MemoryId, InEdge)> = Vec::new();
     for item in &items {
@@ -307,6 +335,7 @@ async fn build_memory_type_index(
         })
         .collect();
 
+    let twg = std::time::Instant::now();
     let files = write_generation(
         &ns.store,
         &prefix,
@@ -319,12 +348,21 @@ async fn build_memory_type_index(
         doc_count,
     )
     .await?;
+    phase_log("write_meta", twg);
 
     Ok(mlake_core::manifest::FactTypeIndex {
         prev_files: prev_index.map(|p| p.files.clone()),
         train_count,
         files,
     })
+}
+
+/// Log an index phase's duration to stderr when `MEMLAKE_TIMING` is set. Cheap enough to
+/// leave in — a couple of `Instant`s per fold.
+fn phase_log(phase: &str, start: std::time::Instant) {
+    if std::env::var("MEMLAKE_TIMING").is_ok() {
+        eprintln!("[index] {phase}: {:.2}s", start.elapsed().as_secs_f64());
+    }
 }
 
 /// True if a cluster's membership or content changed versus the previous generation. Both
@@ -413,32 +451,42 @@ fn derive_links_ivf(
     let vectors: Vec<Vec<f32>> = items.iter().map(|i| i.vector.clone()).collect();
     let ids: Vec<MemoryId> = items.iter().map(|i| i.id).collect();
 
-    for j in 0..items.len() {
-        if !new_ids.contains(&items[j].id.0) {
-            continue;
-        }
-        let probed = centroids.probe(&vectors[j], DERIVE_NPROBE);
-        let mut scored: BTreeMap<[u8; 16], f32> = BTreeMap::new();
-        for c in probed {
-            for &m in &members[c] {
-                if m == j {
-                    continue;
-                }
-                let sim = mlake_core::cosine(&vectors[j], &vectors[m]);
-                if sim >= SEMANTIC_LINK_THRESHOLD {
-                    scored.insert(ids[m].0, sim);
+    // Each new item's neighbour derivation is independent (reads the shared vectors/ids
+    // snapshots, writes only its own semantic_out), so derive them across all cores. This
+    // is the dominant cost of a first-time index build (16 probes × cluster members ×
+    // cosine, per new item), so parallelizing it is what keeps large ingests tractable.
+    use rayon::prelude::*;
+    let derived: Vec<(usize, Vec<SemanticEdge>)> = (0..items.len())
+        .into_par_iter()
+        .filter(|&j| new_ids.contains(&items[j].id.0))
+        .map(|j| {
+            let probed = centroids.probe(&vectors[j], DERIVE_NPROBE);
+            let mut scored: BTreeMap<[u8; 16], f32> = BTreeMap::new();
+            for c in probed {
+                for &m in &members[c] {
+                    if m == j {
+                        continue;
+                    }
+                    let sim = mlake_core::cosine(&vectors[j], &vectors[m]);
+                    if sim >= SEMANTIC_LINK_THRESHOLD {
+                        scored.insert(ids[m].0, sim);
+                    }
                 }
             }
-        }
-        let mut neighbours: Vec<([u8; 16], f32)> = scored.into_iter().collect();
-        neighbours.sort_by(|a, b| {
-            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal).then(a.0.cmp(&b.0))
-        });
-        neighbours.truncate(MAX_SEMANTIC_OUT);
-        items[j].semantic_out = neighbours
-            .into_iter()
-            .map(|(id, sim)| SemanticEdge { target: MemoryId(id), weight: Weight::from_f32(sim) })
-            .collect();
+            let mut neighbours: Vec<([u8; 16], f32)> = scored.into_iter().collect();
+            neighbours.sort_by(|a, b| {
+                b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal).then(a.0.cmp(&b.0))
+            });
+            neighbours.truncate(MAX_SEMANTIC_OUT);
+            let edges = neighbours
+                .into_iter()
+                .map(|(id, sim)| SemanticEdge { target: MemoryId(id), weight: Weight::from_f32(sim) })
+                .collect();
+            (j, edges)
+        })
+        .collect();
+    for (j, edges) in derived {
+        items[j].semantic_out = edges;
     }
 }
 
@@ -453,33 +501,39 @@ fn derive_semantic_links(items: &mut [StoredMemory], new_ids: &std::collections:
     let vectors: Vec<Vec<f32>> = items.iter().map(|i| i.vector.clone()).collect();
     let ids: Vec<MemoryId> = items.iter().map(|i| i.id).collect();
 
-    for (i, item) in items.iter_mut().enumerate() {
-        if !new_ids.contains(&item.id.0) {
-            continue; // carried item: its links are already derived and preserved
-        }
-        let mut scored: BTreeMap<[u8; 16], f32> = BTreeMap::new();
-        for (j, v) in vectors.iter().enumerate() {
-            if i == j {
-                continue;
+    use rayon::prelude::*;
+    let derived: Vec<(usize, Vec<SemanticEdge>)> = (0..items.len())
+        .into_par_iter()
+        .filter(|&i| new_ids.contains(&items[i].id.0))
+        .map(|i| {
+            let mut scored: BTreeMap<[u8; 16], f32> = BTreeMap::new();
+            for (j, v) in vectors.iter().enumerate() {
+                if i == j {
+                    continue;
+                }
+                let sim = mlake_core::cosine(&vectors[i], v);
+                if sim >= SEMANTIC_LINK_THRESHOLD {
+                    scored.insert(ids[j].0, sim);
+                }
             }
-            let sim = mlake_core::cosine(&vectors[i], v);
-            if sim >= SEMANTIC_LINK_THRESHOLD {
-                scored.insert(ids[j].0, sim);
-            }
-        }
-        let mut neighbours: Vec<([u8; 16], f32)> = scored.into_iter().collect();
-        neighbours.sort_by(|a, b| {
-            b.1.partial_cmp(&a.1)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then(a.0.cmp(&b.0))
-        });
-        neighbours.truncate(MAX_SEMANTIC_OUT);
-        item.semantic_out = neighbours
-            .into_iter()
-            .map(|(id, sim)| SemanticEdge {
-                target: MemoryId(id),
-                weight: Weight::from_f32(sim),
-            })
-            .collect();
+            let mut neighbours: Vec<([u8; 16], f32)> = scored.into_iter().collect();
+            neighbours.sort_by(|a, b| {
+                b.1.partial_cmp(&a.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then(a.0.cmp(&b.0))
+            });
+            neighbours.truncate(MAX_SEMANTIC_OUT);
+            let edges = neighbours
+                .into_iter()
+                .map(|(id, sim)| SemanticEdge {
+                    target: MemoryId(id),
+                    weight: Weight::from_f32(sim),
+                })
+                .collect();
+            (i, edges)
+        })
+        .collect();
+    for (i, edges) in derived {
+        items[i].semantic_out = edges;
     }
 }

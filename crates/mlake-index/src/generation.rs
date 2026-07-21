@@ -116,32 +116,38 @@ pub async fn write_generation(
     tag_summary: &TagSummary,
     doc_count: usize,
 ) -> Result<GenerationFiles> {
-    store
-        .put(&centroids_key(prefix), centroids.to_bytes()?)
-        .await?;
-    store
-        .put(&tag_summary_key(prefix), serde_json::to_vec(tag_summary)?)
-        .await?;
-
-    // The FTS file is the packed tantivy split — a self-contained index a query node
-    // materializes into its NVMe/mmap tier (SPEC §6.1).
-    store.put(&fts_key(prefix), fts_split.to_vec()).await?;
-
-    // pk and radj are SSTables: a small `.idx` (loaded whole) and a large `.data`/`.csr`
-    // (range-read per lookup), so neither is ever whole-fetched at 10M scale (SCALE.md #3).
-    store.put(&radj_idx_key(prefix), radj_tables.idx).await?;
-    store.put(&radj_csr_key(prefix), radj_tables.data).await?;
-    store.put(&pk_idx_key(prefix), pk_tables.idx).await?;
-    store.put(&pk_data_key(prefix), pk_tables.data).await?;
-
+    // All metadata objects are independent, immutable, and unique to this prefix, so write
+    // them concurrently rather than one sequential PUT at a time.
     let stats = Stats {
         doc_count,
         cluster_count: cluster_paths.len(),
         edge_count: 0,
     };
-    store
-        .put(&stats_key(prefix), serde_json::to_vec(&stats)?)
-        .await?;
+    let centroids_bytes = centroids.to_bytes()?;
+    let tag_bytes = serde_json::to_vec(tag_summary)?;
+    let stats_bytes = serde_json::to_vec(&stats)?;
+    let (kc, kt, kf, kri, krc, kpi, kpd, ks) = (
+        centroids_key(prefix),
+        tag_summary_key(prefix),
+        fts_key(prefix),
+        radj_idx_key(prefix),
+        radj_csr_key(prefix),
+        pk_idx_key(prefix),
+        pk_data_key(prefix),
+        stats_key(prefix),
+    );
+    // All metadata objects are independent, immutable, and unique to this prefix, so write
+    // them concurrently rather than one sequential PUT at a time.
+    futures::try_join!(
+        store.put(&kc, centroids_bytes),
+        store.put(&kt, tag_bytes),
+        store.put(&kf, fts_split.to_vec()),
+        store.put(&kri, radj_tables.idx),
+        store.put(&krc, radj_tables.data),
+        store.put(&kpi, pk_tables.idx),
+        store.put(&kpd, pk_tables.data),
+        store.put(&ks, stats_bytes),
+    )?;
 
     Ok(GenerationFiles {
         pk: pk_idx_key(prefix),
@@ -177,15 +183,20 @@ pub async fn read_generation(
     generation: u64,
     metrics: Option<&QueryMetrics>,
 ) -> Result<Generation> {
+    use futures::stream::{StreamExt, TryStreamExt};
+    const FETCH_CONCURRENCY: usize = 16;
+
     let centroids_bytes = store.get(&files.centroids, metrics.map(|m| (m, 2))).await?;
     let centroids = Centroids::from_bytes(&centroids_bytes.bytes)?;
 
-    // Cluster files fetched concurrently — one roundtrip regardless of count.
-    let cluster_futures = files
-        .clusters
-        .iter()
-        .map(|path| store.get(path, metrics.map(|m| (m, 3))));
-    let cluster_objects = futures::future::try_join_all(cluster_futures).await?;
+    // Cluster files fetched with bounded concurrency: at 1M there are ~1000 multi-MB
+    // clusters, and firing them all at once would push GBs of streamed bodies through the
+    // HTTP client simultaneously (enough to truncate responses under load).
+    let cluster_objects: Vec<_> = futures::stream::iter(files.clusters.iter())
+        .map(|path| store.get(path, metrics.map(|m| (m, 3))))
+        .buffered(FETCH_CONCURRENCY)
+        .try_collect()
+        .await?;
     let mut clusters = Vec::with_capacity(cluster_objects.len());
     for obj in &cluster_objects {
         clusters.push(ClusterFile::from_bytes(&obj.bytes)?.items);

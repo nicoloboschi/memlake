@@ -19,6 +19,7 @@ tokio.workspace = true
 tracing.workspace = true
 chrono = "0.4"
 tantivy = "0.22"
+rayon.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

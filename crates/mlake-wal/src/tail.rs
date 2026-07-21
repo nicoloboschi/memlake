@@ -11,7 +11,6 @@
 
 use std::collections::HashMap;
 
-use futures::future::try_join_all;
 use mlake_core::wal::fold_proof_count;
 use mlake_core::{Delta, MemoryId, Op, StoredMemory, WalEntry};
 
@@ -63,9 +62,15 @@ impl<'a> WalTail<'a> {
 
     /// Fetch and fold every entry in `(after_seq, through_seq]`.
     ///
-    /// Entries are fetched concurrently — they are independent objects, so the whole tail
-    /// is one roundtrip's worth of latency rather than one per entry.
+    /// Entries are fetched concurrently but with **bounded** concurrency: WAL entries can be
+    /// several MB each (a group-committed batch), so fetching hundreds at once would push
+    /// hundreds of MB of streamed bodies through the HTTP client simultaneously — enough to
+    /// truncate responses under load. A fixed window keeps the tail scan fast without that.
     pub async fn scan(&self, after_seq: u64, through_seq: Option<u64>) -> Result<TailScan> {
+        use futures::stream::{StreamExt, TryStreamExt};
+
+        const FETCH_CONCURRENCY: usize = 16;
+
         let prefix = format!("{}/wal/", self.namespace.name);
         let mut paths: Vec<(u64, String)> = self
             .namespace
@@ -81,10 +86,12 @@ impl<'a> WalTail<'a> {
         // earlier upsert of the same id.
         paths.sort_by_key(|(seq, _)| *seq);
 
-        let fetches = paths
-            .iter()
-            .map(|(_, path)| self.namespace.store.get(path, None));
-        let objects = try_join_all(fetches).await?;
+        // Fetch with bounded concurrency, preserving sequence order in the output.
+        let objects: Vec<_> = futures::stream::iter(paths.iter())
+            .map(|(_, path)| self.namespace.store.get(path, None))
+            .buffered(FETCH_CONCURRENCY)
+            .try_collect()
+            .await?;
 
         let mut entries = Vec::with_capacity(objects.len());
         for obj in &objects {
