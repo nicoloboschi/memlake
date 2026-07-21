@@ -116,11 +116,10 @@ of it participates in retrieval:
       live rows in `memory_units`, invalidated ones moved to
       `invalidated_memory_units` (a `LIKE memory_units` clone) and revertible.
       memlake has tombstones, which are one-way.
-- [ ] **`entity_ids` width.** Hindsight entity ids are UUIDs; memlake wants `u64`.
-      The provider narrows to the top 8 bytes
-      (`memlake.py:_entity_id_to_u64`) — lossy, and a collision silently merges
-      two entities in the graph arm. → Widen to a 16-byte `EntityId`
-      (§3 Plan **A**), the clean fix.
+- [x] **`entity_ids` width — DONE (§3 Plan A).** Widened to a 16-byte `EntityId`
+      (mirrors `MemoryId`, on the wire as `bytes`). The lossy UUID→u64 narrowing and
+      its silent collisions are gone; drop `memlake.py:_entity_id_to_u64` and pass
+      `uuid.bytes`.
 - [ ] **`memory_type` is a `u8`**; Hindsight's `fact_type` is a string enum
       (`world` / `experience` / `observation`). The mapping lives in
       `engine/memories/base.py:FACT_TYPE_TO_MEMORY_TYPE`. Fine for now, but it
@@ -146,7 +145,7 @@ of it participates in retrieval:
 
   ### Plan: make the graph arm real (entities + observation edges)
 
-  - **A. Widen entity ids to 16 bytes.** `entity_ids: Vec<u64>` → a 16-byte
+  - **A. Widen entity ids to 16 bytes — DONE.** `entity_ids: Vec<u64>` → a 16-byte
         `EntityId` (mirrors `MemoryId`), killing the lossy UUID→u64 narrowing and
         its silent collisions. Touches core, graph, indexer, datagen. Format
         change (indexes rebuild). Mechanical, low-risk. *Do first.*

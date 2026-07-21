@@ -2,10 +2,13 @@
 
 An S3-native retrieval engine for small memory records. One storage layer serves three
 retrieval arms — **IVF vector search**, **BM25 full-text** (Chinese-capable), and **bounded
-graph link-expansion** — fused into a single ranking. Object storage is the sole source of
-truth; query nodes are stateless caches that can be thrown away and rebuilt from S3.
+graph link-expansion**. Each hit carries the raw per-arm scores; the client fuses. Object
+storage is the sole source of truth; query nodes are stateless caches that can be thrown away
+and rebuilt from S3.
 
-Built as a prototype from [`docs/SPEC.md`](docs/SPEC.md).
+Built as a prototype from [`docs/SPEC.md`](docs/SPEC.md). Each arm's write and read path is
+documented in detail: [`docs/arms/vector.md`](docs/arms/vector.md),
+[`docs/arms/text.md`](docs/arms/text.md), [`docs/arms/graph.md`](docs/arms/graph.md).
 
 ## Model & naming
 
@@ -54,9 +57,10 @@ The three paths are fully decoupled and each runs on any stateless node:
   publishes it by `If-Match`-swapping the manifest. Two nodes indexing the same generation
   write to disjoint prefixes and one CAS wins — no locks.
 * **Query** — `QueryNode::open` loads the manifest and each type's metadata; `query` probes
-  IVF centroids, range-reads only the candidate clusters, runs BM25 over the FTS split,
-  expands graph links, and fuses the arms with weighted RRF. The un-indexed WAL tail is
-  scanned and overlaid so **acked writes are visible immediately** (INV-5).
+  IVF centroids, range-reads only the candidate clusters, runs BM25 over the FTS split, and
+  expands graph links, returning each candidate with its **raw per-arm scores** (the client
+  fuses — memlake does not). The un-indexed WAL tail is scanned and overlaid so **acked
+  writes are visible immediately** (INV-5).
 
 Invariants that hold the design together:
 
