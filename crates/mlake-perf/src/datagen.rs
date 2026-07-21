@@ -52,6 +52,10 @@ impl Default for GenConfig {
     }
 }
 
+/// Epoch (arbitrary, ~2023) the synthetic effective-time series starts at. Memory `i` occurs
+/// ~`i` seconds after this, so the corpus spans `scale` seconds of history.
+pub const TIME_EPOCH: i64 = 1_700_000_000;
+
 const WORDS: &[&str] = &[
     "memory", "recall", "vector", "graph", "lake", "index", "cluster", "query", "tag",
     "entity", "semantic", "episodic", "signal", "search", "bank", "fold", "shard", "probe",
@@ -137,13 +141,18 @@ impl Generator {
                 Vec::new()
             };
 
+            // Effective time spread across the corpus: memory `i` occurs `i` seconds after a
+            // fixed epoch (plus a little jitter), so a window query [from, to] selects a
+            // contiguous slice and the temporal arm has real entry points to rank and spread.
+            let occurred_start = TIME_EPOCH + i as i64 + rng.gen_range(0..2);
+
             out.push(Memory {
                 id: MemoryId::from_key(&Self::key(i)),
                 vector,
                 text,
                 memory_type: (i % self.cfg.memory_types.max(1) as usize) as u8 + 1,
                 tags,
-                timestamps: Timestamps::default(),
+                timestamps: Timestamps { occurred_start: Some(occurred_start), ..Timestamps::default() },
                 proof_count: 0,
                 entity_ids,
                 causal_out,
@@ -164,6 +173,13 @@ impl Generator {
         let mut v: Vec<f32> = center.iter().map(|x| x + rng.gen_range(-0.2..0.2)).collect();
         mlake_core::normalize(&mut v);
         v
+    }
+
+    /// A time window `[from, to]` centered on memory `i`'s time, `span` seconds wide — so the
+    /// temporal arm's entry-point scan returns roughly `span` in-window memories.
+    pub fn time_window(&self, i: usize, span: i64) -> (i64, i64) {
+        let center = TIME_EPOCH + (i % self.cfg.scale.max(1)) as i64;
+        (center - span / 2, center + span / 2)
     }
 
     pub fn center_count(&self) -> usize {

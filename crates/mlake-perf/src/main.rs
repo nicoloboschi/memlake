@@ -46,7 +46,7 @@ async fn main() -> Result<()> {
             let queries = flag_usize(&args, "--queries", 200);
             let (mem_b, disk_b) = budgets(&args);
             let store = new_store(store_metrics())?;
-            let r = read_bench(&store, &bank_name(cfg.scale), cfg, queries, mem_b, disk_b).await?;
+            let r = read_bench(&store, &bank_name(cfg.scale), cfg, queries, mem_b, disk_b, flag_usize(&args, "--concurrency", 1)).await?;
             println!("\n{}", r.render());
         }
         "suite" => {
@@ -60,7 +60,7 @@ async fn main() -> Result<()> {
                 eprintln!("=== scale {scale}: read ===");
                 let (mem_b, disk_b) = budgets(&args);
                 let store = new_store(store_metrics())?;
-                let rd = read_bench(&store, &bank_name(scale), cfg, 200, mem_b, disk_b).await?;
+                let rd = read_bench(&store, &bank_name(scale), cfg, 200, mem_b, disk_b, flag_usize(&args, "--concurrency", 1)).await?;
                 reports.push((w, rd));
             }
             println!("\n{}", render_suite(&reports));
@@ -262,6 +262,7 @@ fn fmt_workload(w: &WorkloadResult) -> String {
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn read_bench(
     store: &Store,
     bank: &str,
@@ -269,6 +270,7 @@ async fn read_bench(
     queries: usize,
     mem_budget: u64,
     disk_budget: u64,
+    concurrency: usize,
 ) -> Result<ReadReport> {
     // A cache-backed store so the warm pass is served locally, with independent, bounded
     // memory and disk budgets (predictable resource usage). Wiped up front so the cold pass
@@ -287,29 +289,39 @@ async fn read_bench(
     let memory_types = node.memory_types();
     let mt = *memory_types.first().unwrap_or(&1);
 
-    // Build the query set (vectors near random centers) and the workloads.
+    // Build the query set (vectors near random centers) and, for the temporal arm, one time
+    // window per query spread across the corpus's history.
     let qs: Vec<Vec<f32>> = (0..queries)
         .map(|i| gen.query_vector(i % gen.center_count(), 7 + i as u64))
+        .collect();
+    let span = (cfg.scale as i64 / 50).clamp(500, 50_000); // ~2% of history per window
+    let windows: Vec<(i64, i64)> = (0..queries)
+        .map(|i| gen.time_window(i * cfg.scale / queries.max(1), span))
         .collect();
 
     let novec = QueryConfig { graph_weight: 0.0, ..QueryConfig::default() };
     let withgraph = QueryConfig::default();
-    type WB = Box<dyn Fn(&[f32]) -> (Option<Vec<f32>>, Option<String>, TagFilter, QueryConfig)>;
+    type WB = Box<
+        dyn Fn(usize, &[f32]) -> (Option<Vec<f32>>, Option<String>, TagFilter, QueryConfig, Option<(i64, i64)>)
+            + Sync,
+    >;
+    let windows_t = windows.clone();
     let workloads: Vec<(&str, WB)> = vec![
-        ("vector", Box::new(move |q: &[f32]| (Some(q.to_vec()), None, TagFilter::none(), novec))),
-        ("fts", Box::new(move |_q: &[f32]| (None, Some("memory vector search".into()), TagFilter::none(), novec))),
-        ("hybrid", Box::new(move |q: &[f32]| (Some(q.to_vec()), Some("memory vector".into()), TagFilter::none(), novec))),
-        ("graph", Box::new(move |q: &[f32]| (Some(q.to_vec()), None, TagFilter::none(), withgraph))),
-        ("tags-any", Box::new(move |q: &[f32]| (Some(q.to_vec()), None, TagFilter::new(vec!["tag-1".into(), "tag-2".into()], TagsMatch::Any), novec))),
-        ("tags-strict", Box::new(move |q: &[f32]| (Some(q.to_vec()), None, TagFilter::new(vec!["tag-1".into()], TagsMatch::AnyStrict), novec))),
+        ("vector", Box::new(move |_i, q: &[f32]| (Some(q.to_vec()), None, TagFilter::none(), novec, None))),
+        ("fts", Box::new(move |_i, _q: &[f32]| (None, Some("memory vector search".into()), TagFilter::none(), novec, None))),
+        ("hybrid", Box::new(move |_i, q: &[f32]| (Some(q.to_vec()), Some("memory vector".into()), TagFilter::none(), novec, None))),
+        ("graph", Box::new(move |_i, q: &[f32]| (Some(q.to_vec()), None, TagFilter::none(), withgraph, None))),
+        ("temporal", Box::new(move |i: usize, q: &[f32]| (Some(q.to_vec()), None, TagFilter::none(), novec, Some(windows_t[i])))),
+        ("tags-any", Box::new(move |_i, q: &[f32]| (Some(q.to_vec()), None, TagFilter::new(vec!["tag-1".into(), "tag-2".into()], TagsMatch::Any), novec, None))),
+        ("tags-strict", Box::new(move |_i, q: &[f32]| (Some(q.to_vec()), None, TagFilter::new(vec!["tag-1".into()], TagsMatch::AnyStrict), novec, None))),
     ];
 
     // Cold pass: fresh cache-miss metrics per query. Warm pass: repeat (served from cache).
     let mut cold = Vec::new();
     let mut warm = Vec::new();
     for (name, build) in &workloads {
-        cold.push(run_workload(&node, mt, &qs, build, store.store_metrics().unwrap(), name).await?);
-        warm.push(run_workload(&node, mt, &qs, build, store.store_metrics().unwrap(), name).await?);
+        cold.push(run_workload(&node, mt, &qs, build, store.store_metrics().unwrap(), name, concurrency).await?);
+        warm.push(run_workload(&node, mt, &qs, build, store.store_metrics().unwrap(), name, concurrency).await?);
     }
 
     Ok(ReadReport {
@@ -329,30 +341,47 @@ async fn run_workload(
     node: &QueryNode,
     memory_type: u8,
     qs: &[Vec<f32>],
-    build: &dyn Fn(&[f32]) -> (Option<Vec<f32>>, Option<String>, TagFilter, QueryConfig),
+    build: &(dyn Fn(usize, &[f32]) -> (Option<Vec<f32>>, Option<String>, TagFilter, QueryConfig, Option<(i64, i64)>) + Sync),
     store_metrics: &Arc<StoreMetrics>,
     name: &str,
+    concurrency: usize,
 ) -> Result<WorkloadResult> {
+    use futures::stream::{StreamExt, TryStreamExt};
     let base = store_metrics.snapshot();
-    let mut latencies = Vec::with_capacity(qs.len());
+
+    // Each query is one future; `buffer_unordered(concurrency)` keeps up to `concurrency` in
+    // flight at once, so percentiles reflect latency under parallel load (concurrency=1 is the
+    // sequential baseline). The node is shared read-only across the concurrent queries.
+    let per_query: Vec<(f64, usize, Vec<(String, u64)>)> = futures::stream::iter(qs.iter().enumerate())
+        .map(|(i, q)| async move {
+            let (vector, text, tags, config, tw) = build(i, q);
+            let qm = QueryMetrics::new();
+            let depths = ArmDepths {
+                vector: config.arm_depth,
+                text: config.arm_depth,
+                graph: if config.graph_weight > 0.0 { config.arm_depth } else { 0 },
+                nprobe: config.nprobe,
+            };
+            let t = Instant::now();
+            node.query_raw_metered(memory_type, vector.as_deref(), text.as_deref(), &tags, depths, tw, &qm)
+                .await?;
+            let lat = t.elapsed().as_secs_f64() * 1000.0;
+            let phases: Vec<(String, u64)> =
+                qm.phase_breakdown().into_iter().map(|(n, us)| (n.to_string(), us)).collect();
+            Ok::<_, anyhow::Error>((lat, qm.roundtrips(), phases))
+        })
+        .buffer_unordered(concurrency.max(1))
+        .try_collect()
+        .await?;
+
+    let mut latencies: Vec<f64> = Vec::with_capacity(per_query.len());
     let mut total_rt = 0usize;
     let mut phase_us: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
-    for q in qs {
-        let (vector, text, tags, config) = build(q);
-        let qm = QueryMetrics::new();
-        let depths = ArmDepths {
-            vector: config.arm_depth,
-            text: config.arm_depth,
-            graph: if config.graph_weight > 0.0 { config.arm_depth } else { 0 },
-            nprobe: config.nprobe,
-        };
-        let t = Instant::now();
-        node.query_raw_metered(memory_type, vector.as_deref(), text.as_deref(), &tags, depths, None, &qm)
-            .await?;
-        latencies.push(t.elapsed().as_secs_f64() * 1000.0);
-        total_rt += qm.roundtrips();
-        for (name, us) in qm.phase_breakdown() {
-            *phase_us.entry(name.to_string()).or_default() += us;
+    for (lat, rt, phases) in per_query {
+        latencies.push(lat);
+        total_rt += rt;
+        for (pn, us) in phases {
+            *phase_us.entry(pn).or_default() += us;
         }
     }
     let n = qs.len().max(1) as f64;
