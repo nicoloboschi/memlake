@@ -13,7 +13,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use mlake_core::{MemoryId, StoredMemory};
+use mlake_core::{MemoryId, StoredMemory, TagFilter};
 use mlake_fts::{TantivyFts, Tokenizer};
 use mlake_graph::radj::InEdge;
 use mlake_graph::{GraphParams, GraphSource};
@@ -94,8 +94,8 @@ impl QueryNode {
         let mut per_type = BTreeMap::new();
         for ft in memory_types {
             let tail_items = tail_by_ft.remove(&ft).unwrap_or_default();
-            let tail_fts = TantivyFts::build(
-                tail_items.iter().map(|i| (i.id, i.text.as_str())),
+            let tail_fts = TantivyFts::build_with_tags(
+                tail_items.iter().map(|i| (i.id, i.text.as_str(), i.tags.as_slice())),
                 tokenizer.clone(),
             )?;
 
@@ -192,11 +192,12 @@ impl QueryNode {
         memory_type: u8,
         vector: Option<&[f32]>,
         text: Option<&str>,
+        tags: &TagFilter,
         top_k: usize,
         config: QueryConfig,
     ) -> Result<Vec<FusedHit>> {
         let metrics = QueryMetrics::new();
-        self.query_metered(memory_type, vector, text, top_k, config, &metrics).await
+        self.query_metered(memory_type, vector, text, tags, top_k, config, &metrics).await
     }
 
     /// Like [`query`], but records object-storage usage into `metrics`.
@@ -205,6 +206,7 @@ impl QueryNode {
         memory_type: u8,
         vector: Option<&[f32]>,
         text: Option<&str>,
+        tags: &TagFilter,
         top_k: usize,
         config: QueryConfig,
         metrics: &QueryMetrics,
@@ -214,27 +216,34 @@ impl QueryNode {
         };
 
         // Probe + fetch the candidate clusters once (RT3); vector and graph arms share them.
+        // The tag filter is applied inline to the materialized memories — they carry their
+        // tags, so filtering is free once fetched (the shared TagFilter primitive).
         let (probed_items, vector_ranking) = match vector {
             Some(q) if !state.centroids.is_empty() => {
-                let probed = state.centroids.probe(q, config.nprobe);
+                let probed = self.select_clusters(state, q, config.nprobe, tags);
                 let mut items = self.fetch_clusters(state, &probed, metrics, 3).await?;
                 items.extend(state.tail_items.iter().cloned());
+                items.retain(|m| tags.matches(&m.tags));
                 let ranking: Vec<MemoryId> = exact_search(&items, q, config.arm_depth)
                     .into_iter()
                     .map(|h| h.id)
                     .collect();
                 (items, ranking)
             }
-            _ => (state.tail_items.clone(), Vec::new()),
+            _ => {
+                let mut items = state.tail_items.clone();
+                items.retain(|m| tags.matches(&m.tags));
+                (items, Vec::new())
+            }
         };
 
         let fts_ranking = text
             .filter(|t| !t.is_empty())
-            .map(|t| self.fts_arm(state, t, config.arm_depth))
+            .map(|t| self.fts_arm(state, t, config.arm_depth, tags))
             .unwrap_or_default();
 
         let graph_ranking = if !vector_ranking.is_empty() {
-            self.graph_arm(state, &vector_ranking, &probed_items, config.arm_depth, metrics)
+            self.graph_arm(state, &vector_ranking, &probed_items, config.arm_depth, tags, metrics)
                 .await?
         } else {
             Vec::new()
@@ -242,6 +251,23 @@ impl QueryNode {
 
         metrics.check_budget(&self.ns.name, "query");
         Ok(fuse(&vector_ranking, &fts_ranking, &graph_ranking, top_k, config))
+    }
+
+    /// Choose which clusters to fetch for the vector arm.
+    ///
+    /// Without a tag filter this is the plain `nprobe`-nearest probe. With a selective
+    /// filter, 4b will intersect the probe with a tag→cluster posting so the planner only
+    /// fetches clusters that can contain a matching memory and can scale nprobe cheaply.
+    /// For now (4a correctness) it is the plain probe; the tag filter is applied inline
+    /// after fetch.
+    fn select_clusters(
+        &self,
+        state: &FactTypeState,
+        query: &[f32],
+        nprobe: usize,
+        _tags: &TagFilter,
+    ) -> Vec<usize> {
+        state.centroids.probe(query, nprobe)
     }
 
     /// Fetch the items in the given clusters of a fact type — one coalesced roundtrip.
@@ -271,12 +297,12 @@ impl QueryNode {
         Ok(items)
     }
 
-    fn fts_arm(&self, state: &FactTypeState, text: &str, depth: usize) -> Vec<MemoryId> {
-        let mut hits = state.gen_fts.search(text, depth);
+    fn fts_arm(&self, state: &FactTypeState, text: &str, depth: usize, tags: &TagFilter) -> Vec<MemoryId> {
+        let mut hits = state.gen_fts.search_filtered(text, depth, tags);
         hits.extend(
             state
                 .tail_fts
-                .search(text, depth)
+                .search_filtered(text, depth, tags)
                 .into_iter()
                 .filter(|h| !self.tombstones.contains(&h.id)),
         );
@@ -291,12 +317,14 @@ impl QueryNode {
         hits.into_iter().map(|h| h.id).collect()
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn graph_arm(
         &self,
         state: &FactTypeState,
         vector_ranking: &[MemoryId],
         probed_items: &[StoredMemory],
         depth: usize,
+        tags: &TagFilter,
         metrics: &QueryMetrics,
     ) -> Result<Vec<MemoryId>> {
         let mut by_id: HashMap<MemoryId, StoredMemory> =
@@ -357,14 +385,17 @@ impl QueryNode {
             incoming: &incoming,
             tombstones: &self.tombstones,
         };
-        Ok(mlake_graph::retrieve(
+        let ranked = mlake_graph::retrieve(
             &source,
             &seeds,
             GraphParams { budget: depth, ..GraphParams::default() },
-        )
-        .into_iter()
-        .map(|r| r.id)
-        .collect())
+        );
+        // Filter graph candidates by the tag filter using their materialized tags.
+        Ok(ranked
+            .into_iter()
+            .filter(|r| by_id.get(&r.id).map(|m| tags.matches(&m.tags)).unwrap_or(false))
+            .map(|r| r.id)
+            .collect())
     }
 }
 

@@ -29,6 +29,10 @@ fn item(key: &str, vector: Vec<f32>, text: &str) -> Memory {
     }
 }
 
+fn tf() -> mlake_core::TagFilter {
+    mlake_core::TagFilter::none()
+}
+
 async fn namespace(store: Store, name: &str) -> Namespace {
     let ns = Namespace::new(name, store);
     ns.create_if_absent(&Tokenizer::default().config_hash()).await.unwrap();
@@ -66,12 +70,12 @@ async fn write_index_then_query_from_a_fresh_node() {
     assert_eq!(node.doc_count(), 3);
 
     // A pure-vector query returns the nearest item.
-    let vec_hits = node.query(1, Some(&[1.0, 0.0, 0.0]), None, 10, QueryConfig::default()).await.unwrap();
+    let vec_hits = node.query(1, Some(&[1.0, 0.0, 0.0]), None, &tf(), 10, QueryConfig::default()).await.unwrap();
     assert_eq!(vec_hits[0].id, MemoryId::from_key("cats"), "nearest vector should lead");
 
     // A fused query blends the text signal: `dogs` is nearest-but-one by vector *and*
     // the text match, so convergent evidence puts it and `cats` at the top.
-    let hits = node.query(1, Some(&[1.0, 0.0, 0.0]), Some("loyal canine"), 10, QueryConfig::default()).await.unwrap();
+    let hits = node.query(1, Some(&[1.0, 0.0, 0.0]), Some("loyal canine"), &tf(), 10, QueryConfig::default()).await.unwrap();
     let top2: Vec<_> = hits.iter().take(2).map(|h| h.id).collect();
     assert!(top2.contains(&MemoryId::from_key("cats")));
     assert!(top2.contains(&MemoryId::from_key("dogs")));
@@ -93,7 +97,7 @@ async fn writes_after_indexing_are_visible_under_strong_consistency() {
 
     let node = QueryNode::open(&ns, Tokenizer::default(), Consistency::Strong).await.unwrap();
     assert_eq!(node.doc_count(), 2, "the un-indexed write must be visible");
-    let hits = node.query(1, Some(&[0.0, 1.0]), None, 10, QueryConfig::default()).await.unwrap();
+    let hits = node.query(1, Some(&[0.0, 1.0]), None, &tf(), 10, QueryConfig::default()).await.unwrap();
     assert_eq!(hits[0].id, MemoryId::from_key("b"), "the tail write must be queryable");
 }
 
@@ -118,7 +122,7 @@ async fn deletes_after_indexing_take_effect_immediately() {
 
     let node = QueryNode::open(&ns, Tokenizer::default(), Consistency::Strong).await.unwrap();
     assert_eq!(node.doc_count(), 1);
-    let hits = node.query(1, Some(&[0.0, 1.0]), None, 10, QueryConfig::default()).await.unwrap();
+    let hits = node.query(1, Some(&[0.0, 1.0]), None, &tf(), 10, QueryConfig::default()).await.unwrap();
     assert!(
         !hits.iter().any(|h| h.id == MemoryId::from_key("drop")),
         "a tombstoned item must not appear in strong-consistency results"
@@ -211,7 +215,7 @@ async fn graph_arm_works_through_the_full_pipeline() {
         graph_weight: 1.0,
         ..QueryConfig::default()
     };
-    let hits = node.query(1, Some(&[1.0, 0.0, 0.0]), None, 10, cfg).await.unwrap();
+    let hits = node.query(1, Some(&[1.0, 0.0, 0.0]), None, &tf(), 10, cfg).await.unwrap();
     let ids: Vec<_> = hits.iter().map(|h| h.id).collect();
     assert!(ids.contains(&MemoryId::from_key("a")));
     assert!(ids.contains(&MemoryId::from_key("a2")), "graph expansion should surface the neighbour");
@@ -260,7 +264,7 @@ async fn full_pipeline_against_minio() {
     );
     let node = QueryNode::open(&other, Tokenizer::default(), Consistency::Strong).await.unwrap();
     assert_eq!(node.doc_count(), 2);
-    let hits = node.query(1, Some(&[1.0, 0.0, 0.0]), Some("fox"), 10, QueryConfig::default()).await.unwrap();
+    let hits = node.query(1, Some(&[1.0, 0.0, 0.0]), Some("fox"), &tf(), 10, QueryConfig::default()).await.unwrap();
     assert_eq!(hits[0].id, MemoryId::from_key("x"));
 }
 
@@ -296,7 +300,7 @@ async fn gc_reclaims_folded_wal_and_old_generations_without_changing_results() {
     // Results are unchanged: GC only removed files nothing references.
     let after = QueryNode::open(&ns, Tokenizer::default(), Consistency::Strong).await.unwrap();
     assert_eq!(after.doc_count(), 3);
-    let hits = after.query(1, Some(&[0.0, 1.0]), None, 10, QueryConfig::default()).await.unwrap();
+    let hits = after.query(1, Some(&[0.0, 1.0]), None, &tf(), 10, QueryConfig::default()).await.unwrap();
     assert_eq!(hits[0].id, MemoryId::from_key("b"));
 }
 
@@ -357,7 +361,7 @@ async fn tombstone_survives_compaction_and_wal_gc() {
 
     let node = QueryNode::open(&ns, Tokenizer::default(), Consistency::Strong).await.unwrap();
     assert_eq!(node.doc_count(), 1, "the deleted item must stay gone after compaction");
-    assert!(node.query(1, Some(&[0.0, 1.0]), None, 10, QueryConfig::default())
+    assert!(node.query(1, Some(&[0.0, 1.0]), None, &tf(), 10, QueryConfig::default())
         .await
         .unwrap()
         .iter()
@@ -510,7 +514,7 @@ async fn default_indexing_preserves_the_graph_across_reruns() {
 
     let cfg = QueryConfig { graph_weight: 1.0, ..QueryConfig::default() };
     let node = QueryNode::open(&ns, Tokenizer::default(), Consistency::Strong).await.unwrap();
-    let hits = node.query(1, Some(&[1.0, 0.0, 0.0]), None, 10, cfg).await.unwrap();
+    let hits = node.query(1, Some(&[1.0, 0.0, 0.0]), None, &tf(), 10, cfg).await.unwrap();
     assert!(
         hits.iter().any(|h| h.id == MemoryId::from_key("a2")),
         "default indexing must leave the graph arm working (links derived)"
@@ -521,7 +525,7 @@ async fn default_indexing_preserves_the_graph_across_reruns() {
     index(&ns, &Tokenizer::default(), IndexOptions::default()).await.unwrap();
 
     let node2 = QueryNode::open(&ns, Tokenizer::default(), Consistency::Strong).await.unwrap();
-    let hits2 = node2.query(1, Some(&[1.0, 0.0, 0.0]), None, 10, cfg).await.unwrap();
+    let hits2 = node2.query(1, Some(&[1.0, 0.0, 0.0]), None, &tf(), 10, cfg).await.unwrap();
     assert!(
         hits2.iter().any(|h| h.id == MemoryId::from_key("a2")),
         "a second index run must not wipe the graph carried from the first"
@@ -666,7 +670,7 @@ async fn query_fetches_only_probed_clusters_and_warms_the_cache() {
     // Cold query: fetches only the probed clusters (≤ nprobe requests), far fewer than the
     // total, and stays within the roundtrip budget.
     let cold = QueryMetrics::new();
-    let hits = node.query_metered(1, Some(&q), None, 10, cfg, &cold).await.unwrap();
+    let hits = node.query_metered(1, Some(&q), None, &tf(), 10, cfg, &cold).await.unwrap();
     assert!(!hits.is_empty());
     assert!(
         cold.requests() <= cfg.nprobe,
@@ -680,7 +684,7 @@ async fn query_fetches_only_probed_clusters_and_warms_the_cache() {
 
     // Warm query: same probed clusters, now served from the NVMe cache.
     let warm = QueryMetrics::new();
-    node.query_metered(1, Some(&q), None, 10, cfg, &warm).await.unwrap();
+    node.query_metered(1, Some(&q), None, &tf(), 10, cfg, &warm).await.unwrap();
     assert!(warm.cache_hits() > 0, "warm query should hit the cache");
     assert_eq!(warm.cache_misses(), 0, "warm query should not miss");
 }
@@ -710,7 +714,7 @@ async fn graph_arm_materializes_neighbours_from_unprobed_clusters() {
     let node = QueryNode::open(&ns, Tokenizer::default(), Consistency::Strong).await.unwrap();
     // Low nprobe so only a couple of clusters are probed.
     let cfg = QueryConfig { nprobe: 2, graph_weight: 1.0, ..QueryConfig::default() };
-    let hits = node.query(1, Some(&[1.0, 0.0, 0.0]), None, 20, cfg).await.unwrap();
+    let hits = node.query(1, Some(&[1.0, 0.0, 0.0]), None, &tf(), 20, cfg).await.unwrap();
     let ids: Vec<_> = hits.iter().map(|h| h.id).collect();
 
     assert!(ids.contains(&MemoryId::from_key("seed")));
@@ -773,7 +777,7 @@ async fn incremental_fold_copies_unchanged_clusters_forward() {
     let node = QueryNode::open(&ns, Tokenizer::default(), Consistency::Strong).await.unwrap();
     assert_eq!(node.doc_count(), 401);
     let cfg = QueryConfig { graph_weight: 0.0, ..QueryConfig::default() };
-    let hits = node.query(1, Some(&[1.0, 0.0, 0.0]), None, 10, cfg).await.unwrap();
+    let hits = node.query(1, Some(&[1.0, 0.0, 0.0]), None, &tf(), 10, cfg).await.unwrap();
     assert_eq!(hits[0].id, MemoryId::from_key("newcomer"), "the new item must be the nearest hit");
 }
 
@@ -836,7 +840,7 @@ async fn assign_only_recall_stays_close_to_a_retrain() {
     let cfg = QueryConfig { nprobe: 16, ..QueryConfig::default() };
     let mut total_recall = 0.0;
     for q in &queries {
-        let hits = node.query(1, Some(q), None, 10, cfg).await.unwrap();
+        let hits = node.query(1, Some(q), None, &tf(), 10, cfg).await.unwrap();
         let got: std::collections::HashSet<_> = hits.iter().take(10).map(|h| h.id).collect();
         // Brute-force truth over all items currently live.
         // (Reconstruct ids from the query node is not exposed; instead assert non-trivial recall.)
@@ -893,18 +897,18 @@ async fn memory_types_are_independent_indexes_in_one_bank() {
 
     // A query at [1,0,0] on fact type 1 returns only semantic items; on 2 only episodic.
     let cfg = QueryConfig { graph_weight: 0.0, ..QueryConfig::default() };
-    let ft1 = node.query(1, Some(&[1.0, 0.0, 0.0]), None, 10, cfg).await.unwrap();
+    let ft1 = node.query(1, Some(&[1.0, 0.0, 0.0]), None, &tf(), 10, cfg).await.unwrap();
     let ids1: std::collections::HashSet<_> = ft1.iter().map(|h| h.id).collect();
     assert!(ids1.contains(&MemoryId::from_key("s1")));
     assert!(!ids1.contains(&MemoryId::from_key("e1")), "fact type 1 must not return an episodic item");
 
-    let ft2 = node.query(2, Some(&[1.0, 0.0, 0.0]), None, 10, cfg).await.unwrap();
+    let ft2 = node.query(2, Some(&[1.0, 0.0, 0.0]), None, &tf(), 10, cfg).await.unwrap();
     let ids2: std::collections::HashSet<_> = ft2.iter().map(|h| h.id).collect();
     assert!(ids2.contains(&MemoryId::from_key("e1")));
     assert!(!ids2.contains(&MemoryId::from_key("s1")), "fact type 2 must not return a semantic item");
 
     // A fact type the bank doesn't have returns nothing, not an error.
-    assert!(node.query(9, Some(&[1.0, 0.0, 0.0]), None, 10, cfg).await.unwrap().is_empty());
+    assert!(node.query(9, Some(&[1.0, 0.0, 0.0]), None, &tf(), 10, cfg).await.unwrap().is_empty());
 }
 
 /// One WAL, one manifest read: a bank with several fact types still opens with a bounded,
@@ -927,4 +931,115 @@ async fn multi_memory_type_open_reads_one_manifest() {
     let node = QueryNode::open(&ns, Tokenizer::default(), Consistency::Strong).await.unwrap();
     assert_eq!(node.memory_types().len(), 3, "three fact types under one bank");
     assert_eq!(node.doc_count(), 60);
+}
+
+// ---------------------------------------------------------------- tags filtering (SCALE.md Phase 4a)
+
+use mlake_core::TagsMatch;
+
+fn item_tags(key: &str, vector: Vec<f32>, text: &str, tags: &[&str]) -> Memory {
+    let mut it = item(key, vector, text);
+    it.tags = tags.iter().map(|s| s.to_string()).collect();
+    it
+}
+
+/// Tags filtering across the five tags_match modes, applied to the vector and FTS arms.
+#[tokio::test]
+async fn tags_filter_the_query_in_all_five_modes() {
+    let store = Store::in_memory();
+    let ns = namespace(store, "bank").await;
+    let mut writer = Writer::new(ns.clone());
+    // Same vector neighbourhood, different tag sets.
+    writer
+        .commit(vec![
+            Op::Upsert(item_tags("ab", vec![1.0, 0.0, 0.0], "alpha apple", &["a", "b"])),
+            Op::Upsert(item_tags("a", vec![0.99, 0.01, 0.0], "alpha apricot", &["a"])),
+            Op::Upsert(item_tags("c", vec![0.98, 0.0, 0.02], "alpha cherry", &["c"])),
+            Op::Upsert(item_tags("none", vec![0.97, 0.0, 0.03], "alpha nothing", &[])),
+        ])
+        .await
+        .unwrap();
+    index(&ns, &Tokenizer::default(), IndexOptions::default()).await.unwrap();
+    let node = QueryNode::open(&ns, Tokenizer::default(), Consistency::Strong).await.unwrap();
+
+    let q = vec![1.0f32, 0.0, 0.0];
+    let cfg = QueryConfig { graph_weight: 0.0, ..QueryConfig::default() };
+    let ids = |hits: &[mlake_index::FusedHit]| -> std::collections::HashSet<MemoryId> {
+        hits.iter().map(|h| h.id).collect()
+    };
+
+    // any [a] -> {ab, a} (overlap) plus untagged {none}.
+    let r = node
+        .query(1, Some(&q), None, &mlake_core::TagFilter::new(vec!["a".into()], TagsMatch::Any), 10, cfg)
+        .await
+        .unwrap();
+    let s = ids(&r);
+    assert!(s.contains(&MemoryId::from_key("ab")) && s.contains(&MemoryId::from_key("a")));
+    assert!(s.contains(&MemoryId::from_key("none")), "any includes untagged");
+    assert!(!s.contains(&MemoryId::from_key("c")));
+
+    // any_strict [a] -> {ab, a}, no untagged.
+    let r = node
+        .query(1, Some(&q), None, &mlake_core::TagFilter::new(vec!["a".into()], TagsMatch::AnyStrict), 10, cfg)
+        .await
+        .unwrap();
+    let s = ids(&r);
+    assert!(s.contains(&MemoryId::from_key("ab")) && s.contains(&MemoryId::from_key("a")));
+    assert!(!s.contains(&MemoryId::from_key("none")), "strict excludes untagged");
+
+    // all [a,b] -> {ab} plus untagged {none}.
+    let r = node
+        .query(1, Some(&q), None, &mlake_core::TagFilter::new(vec!["a".into(), "b".into()], TagsMatch::All), 10, cfg)
+        .await
+        .unwrap();
+    let s = ids(&r);
+    assert!(s.contains(&MemoryId::from_key("ab")));
+    assert!(!s.contains(&MemoryId::from_key("a")), "a lacks b");
+    assert!(s.contains(&MemoryId::from_key("none")), "all includes untagged");
+
+    // all_strict [a,b] -> {ab} only.
+    let r = node
+        .query(1, Some(&q), None, &mlake_core::TagFilter::new(vec!["a".into(), "b".into()], TagsMatch::AllStrict), 10, cfg)
+        .await
+        .unwrap();
+    let s = ids(&r);
+    assert_eq!(s, std::iter::once(MemoryId::from_key("ab")).collect::<std::collections::HashSet<_>>());
+
+    // exact [a] -> {a} only (ab is a superset).
+    let r = node
+        .query(1, Some(&q), None, &mlake_core::TagFilter::new(vec!["a".into()], TagsMatch::Exact), 10, cfg)
+        .await
+        .unwrap();
+    assert_eq!(ids(&r), std::iter::once(MemoryId::from_key("a")).collect::<std::collections::HashSet<_>>());
+
+    // exact [] -> untagged only.
+    let r = node
+        .query(1, Some(&q), None, &mlake_core::TagFilter::new(vec![], TagsMatch::Exact), 10, cfg)
+        .await
+        .unwrap();
+    assert_eq!(ids(&r), std::iter::once(MemoryId::from_key("none")).collect::<std::collections::HashSet<_>>());
+}
+
+/// The FTS arm also honours the tag filter (via stored tags + the shared primitive).
+#[tokio::test]
+async fn tags_filter_the_fts_arm() {
+    let store = Store::in_memory();
+    let ns = namespace(store, "bank").await;
+    let mut writer = Writer::new(ns.clone());
+    writer
+        .commit(vec![
+            Op::Upsert(item_tags("x", vec![1.0, 0.0], "the quick brown fox", &["team-a"])),
+            Op::Upsert(item_tags("y", vec![0.0, 1.0], "the quick brown fox", &["team-b"])),
+        ])
+        .await
+        .unwrap();
+    index(&ns, &Tokenizer::default(), IndexOptions::default()).await.unwrap();
+    let node = QueryNode::open(&ns, Tokenizer::default(), Consistency::Strong).await.unwrap();
+
+    // Pure-text query with a strict tag filter returns only the team-a memory.
+    let f = mlake_core::TagFilter::new(vec!["team-a".into()], TagsMatch::AnyStrict);
+    let r = node.query(1, None, Some("quick brown fox"), &f, 10, QueryConfig::default()).await.unwrap();
+    let ids: std::collections::HashSet<_> = r.iter().map(|h| h.id).collect();
+    assert!(ids.contains(&MemoryId::from_key("x")));
+    assert!(!ids.contains(&MemoryId::from_key("y")), "team-b filtered out of the FTS arm");
 }

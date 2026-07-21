@@ -6,6 +6,7 @@
 
 pub mod id;
 pub mod memory;
+pub mod tags;
 pub mod manifest;
 pub mod wal;
 
@@ -14,6 +15,7 @@ pub use memory::{
     CausalEdge, MemoryType, Memory, LinkType, SemanticEdge, StoredMemory, Timestamps,
     MAX_SEMANTIC_OUT, SEMANTIC_LINK_THRESHOLD,
 };
+pub use tags::{TagFilter, TagsMatch};
 pub use manifest::{GenerationFiles, Manifest};
 pub use wal::{Delta, Op, WalEntry};
 

@@ -258,8 +258,8 @@ async fn build_memory_type_index(
     }
     let pk_tables = crate::sstable::PkTable::build(pk_entries);
 
-    let fts = mlake_fts::TantivyFts::build(
-        items.iter().map(|i| (i.id, i.text.as_str())),
+    let fts = mlake_fts::TantivyFts::build_with_tags(
+        items.iter().map(|i| (i.id, i.text.as_str(), i.tags.as_slice())),
         mlake_fts::Tokenizer::new(mlake_fts::TokenizerConfig::default()),
     )
     .map_err(|e| crate::Error::Core(mlake_core::Error::Encode(e.to_string())))?;

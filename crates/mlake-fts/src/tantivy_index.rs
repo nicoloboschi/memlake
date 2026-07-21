@@ -12,7 +12,7 @@
 
 use std::path::Path;
 
-use mlake_core::MemoryId;
+use mlake_core::{MemoryId, TagFilter};
 use tantivy::collector::TopDocs;
 use tantivy::query::{BooleanQuery, Occur, Query, TermQuery};
 use tantivy::schema::{
@@ -39,6 +39,7 @@ struct Fields {
     words: tantivy::schema::Field,
     bigrams: tantivy::schema::Field,
     id: tantivy::schema::Field,
+    tags: tantivy::schema::Field,
 }
 
 fn build_schema() -> (Schema, Fields) {
@@ -52,8 +53,11 @@ fn build_schema() -> (Schema, Fields) {
     let bigrams = sb.add_text_field("bigrams", opts);
     // The item id, stored so a hit can be mapped back. Hyphenated UUID round-trips cleanly.
     let id = sb.add_text_field("id", STORED);
+    // Tags, stored as a JSON array so a hit is filtered with the shared `TagFilter.matches`
+    // primitive — one correctness path for every arm, rather than five tantivy queries.
+    let tags = sb.add_text_field("tags", STORED);
     let schema = sb.build();
-    (schema, Fields { words, bigrams, id })
+    (schema, Fields { words, bigrams, id, tags })
 }
 
 /// Turn a list of token texts into a tantivy pre-tokenized value. Offsets are synthetic
@@ -95,9 +99,19 @@ pub struct TantivyFts {
 }
 
 impl TantivyFts {
-    /// Build an index over `(id, text)` documents, tokenizing each with the shared chain.
+    /// Build an index over `(id, text)` documents with no tags. Convenience for callers
+    /// (like the benchmark) whose corpus is untagged.
     pub fn build<'a>(
         docs: impl IntoIterator<Item = (MemoryId, &'a str)>,
+        tokenizer: Tokenizer,
+    ) -> tantivy::Result<Self> {
+        Self::build_with_tags(docs.into_iter().map(|(id, text)| (id, text, &[] as &[String])), tokenizer)
+    }
+
+    /// Build an index over `(id, text, tags)` documents, tokenizing each with the shared
+    /// chain and storing tags for filtering.
+    pub fn build_with_tags<'a>(
+        docs: impl IntoIterator<Item = (MemoryId, &'a str, &'a [String])>,
         tokenizer: Tokenizer,
     ) -> tantivy::Result<Self> {
         let (schema, fields) = build_schema();
@@ -107,7 +121,7 @@ impl TantivyFts {
         let mut doc_count = 0;
         {
             let mut writer: tantivy::IndexWriter = index.writer(50_000_000)?;
-            for (id, text) in docs {
+            for (id, text, tags) in docs {
                 let tokens = tokenizer.tokenize(text);
                 let mut words = Vec::new();
                 let mut bigrams = Vec::new();
@@ -117,10 +131,12 @@ impl TantivyFts {
                         Field::Bigrams => bigrams.push(t.text),
                     }
                 }
+                let tags_json = serde_json::to_string(tags).unwrap_or_else(|_| "[]".into());
                 writer.add_document(doc!(
                     fields.words => pretokenized(&words),
                     fields.bigrams => pretokenized(&bigrams),
                     fields.id => id.as_uuid().to_string(),
+                    fields.tags => tags_json,
                 ))?;
                 doc_count += 1;
             }
@@ -153,6 +169,7 @@ impl TantivyFts {
             words: schema.get_field("words").unwrap(),
             bigrams: schema.get_field("bigrams").unwrap(),
             id: schema.get_field("id").unwrap(),
+            tags: schema.get_field("tags").unwrap(),
         };
         let reader = index
             .reader_builder()
@@ -182,11 +199,18 @@ impl TantivyFts {
         self.doc_count == 0
     }
 
-    /// BM25 search. The query is tokenized with the same chain the documents were, and each
-    /// query term becomes a `Should` clause on its field, so a term in the words field and
-    /// the same term in the bigrams field both contribute — the dual-emission scoring of
-    /// SPEC §8 step 4, now over tantivy's BM25.
+    /// Unfiltered BM25 search (no tag filter).
     pub fn search(&self, query: &str, k: usize) -> Vec<FtsHit> {
+        self.search_filtered(query, k, &TagFilter::none())
+    }
+
+    /// BM25 search with a tag filter. The query is tokenized with the same chain the
+    /// documents were, each term a `Should` clause across both fields (dual-emission
+    /// scoring, SPEC §8 step 4). A tag filter is applied by retrieving each hit's stored
+    /// tags and running the shared [`TagFilter::matches`] — the same primitive every arm
+    /// uses. To keep a selective filter from starving `k`, the search over-fetches before
+    /// filtering.
+    pub fn search_filtered(&self, query: &str, k: usize, filter: &TagFilter) -> Vec<FtsHit> {
         let terms = self.tokenizer.query_terms(query);
         if terms.is_empty() {
             return Vec::new();
@@ -207,22 +231,40 @@ impl TantivyFts {
             .collect();
         let query = BooleanQuery::new(clauses);
 
+        // With a filter, over-fetch so post-filtering still yields ~k. Capped so a huge
+        // corpus doesn't pull an unbounded result set.
+        let limit = if filter.is_noop() {
+            k
+        } else {
+            (k.saturating_mul(50)).clamp(k, 10_000)
+        };
+
         let searcher = self.reader.searcher();
-        let Ok(top) = searcher.search(&query, &TopDocs::with_limit(k)) else {
+        let Ok(top) = searcher.search(&query, &TopDocs::with_limit(limit)) else {
             return Vec::new();
         };
 
-        let mut hits = Vec::with_capacity(top.len());
+        let mut hits = Vec::with_capacity(k);
         for (score, addr) in top {
             let Ok(doc) = searcher.doc::<TantivyDocument>(addr) else {
                 continue;
             };
+            if !filter.is_noop() {
+                let tags = doc
+                    .get_first(self.schema_fields.tags)
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok())
+                    .unwrap_or_default();
+                if !filter.matches(&tags) {
+                    continue;
+                }
+            }
             if let Some(id_str) = doc.get_first(self.schema_fields.id).and_then(|v| v.as_str()) {
                 if let Ok(uuid) = Uuid::parse_str(id_str) {
-                    hits.push(FtsHit {
-                        id: MemoryId::from(uuid),
-                        score,
-                    });
+                    hits.push(FtsHit { id: MemoryId::from(uuid), score });
+                    if hits.len() >= k {
+                        break;
+                    }
                 }
             }
         }
