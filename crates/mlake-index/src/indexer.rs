@@ -103,8 +103,7 @@ pub async fn index(ns: &Namespace, tokenizer: &Tokenizer, opts: IndexOptions) ->
     let mut touched: std::collections::HashSet<[u8; 16]> = new_ids.clone();
     for item in by_id.values_mut() {
         if let Some(deltas) = scan.pending_patches.get(&MemoryId(item.id.0)) {
-            item.proof_count =
-                mlake_core::wal::fold_proof_count(item.proof_count, deltas.iter().copied());
+            mlake_core::wal::apply_deltas(item, deltas);
             touched.insert(item.id.0);
         }
     }

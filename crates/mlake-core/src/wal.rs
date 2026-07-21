@@ -6,20 +6,63 @@
 
 use rkyv::{Archive, Deserialize, Serialize};
 
-use crate::id::MemoryId;
-use crate::memory::Memory;
+use crate::id::{EntityId, MemoryId};
+use crate::memory::{Memory, StoredMemory, Timestamps};
 
 /// Alignment rkyv requires to read an archived `WalEntry` in place.
 const ARCHIVE_ALIGNMENT: usize = 8;
 
-/// A commutative delta. Read-modify-write is forbidden on the write path (SPEC §4), so
-/// mutations that would otherwise need a read are expressed as deltas that fold to the
-/// same result regardless of the order they are applied in.
-#[derive(Archive, Deserialize, Serialize, Clone, Copy, PartialEq, Debug)]
+/// A partial update to a memory. `ProofCount` is a commutative *relative* delta (read-
+/// modify-write is forbidden on the write path, SPEC §4); the `Set*` variants are *absolute*
+/// field replacements, applied last-write-wins in op order. Together they express a partial
+/// update without re-sending the whole memory — text/embedding/tags/timestamps from
+/// consolidation and curation, plus arbitrary metadata (merged, not replaced).
+#[derive(Archive, Deserialize, Serialize, Clone, PartialEq, Debug)]
 #[archive(check_bytes)]
 pub enum Delta {
     /// Increment (or decrement, if negative) the proof count.
     ProofCount(i32),
+    SetText(String),
+    SetVector(Vec<f32>),
+    SetTags(Vec<String>),
+    SetEntityIds(Vec<EntityId>),
+    SetTimestamps(Timestamps),
+    /// Upsert these metadata keys (merge — other keys are untouched).
+    MergeMetadata(Vec<(String, String)>),
+}
+
+/// Apply one delta to a stored memory in place.
+pub fn apply_delta(item: &mut StoredMemory, delta: &Delta) {
+    match delta {
+        Delta::ProofCount(n) => {
+            item.proof_count = (item.proof_count as i64 + *n as i64).clamp(0, u32::MAX as i64) as u32;
+        }
+        Delta::SetText(t) => item.text = t.clone(),
+        Delta::SetVector(v) => item.vector = v.clone(),
+        Delta::SetTags(t) => item.tags = t.clone(),
+        Delta::SetEntityIds(e) => {
+            item.entity_ids = e.clone();
+            item.entity_ids.sort_unstable();
+            item.entity_ids.dedup();
+        }
+        Delta::SetTimestamps(ts) => item.timestamps = *ts,
+        Delta::MergeMetadata(pairs) => {
+            for (k, v) in pairs {
+                match item.metadata.iter_mut().find(|(ek, _)| ek == k) {
+                    Some(existing) => existing.1 = v.clone(),
+                    None => item.metadata.push((k.clone(), v.clone())),
+                }
+            }
+            item.metadata.sort_by(|a, b| a.0.cmp(&b.0));
+        }
+    }
+}
+
+/// Apply a sequence of deltas in order.
+pub fn apply_deltas(item: &mut StoredMemory, deltas: &[Delta]) {
+    for d in deltas {
+        apply_delta(item, d);
+    }
 }
 
 #[derive(Archive, Deserialize, Serialize, Clone, PartialEq, Debug)]
@@ -74,12 +117,13 @@ impl WalEntry {
     }
 }
 
-/// Folds a stream of deltas into a starting value.
-pub fn fold_proof_count(start: u32, deltas: impl Iterator<Item = Delta>) -> u32 {
+/// Folds the proof-count deltas in a stream into a starting value (other delta kinds are
+/// ignored — they are absolute field sets, not counters).
+pub fn fold_proof_count<'a>(start: u32, deltas: impl Iterator<Item = &'a Delta>) -> u32 {
     let mut acc = start as i64;
     for d in deltas {
-        match d {
-            Delta::ProofCount(n) => acc += n as i64,
+        if let Delta::ProofCount(n) = d {
+            acc += *n as i64;
         }
     }
     acc.clamp(0, u32::MAX as i64) as u32
@@ -154,14 +198,14 @@ mod tests {
 
     #[test]
     fn proof_count_deltas_are_order_independent() {
-        let a = fold_proof_count(5, [Delta::ProofCount(3), Delta::ProofCount(-2)].into_iter());
-        let b = fold_proof_count(5, [Delta::ProofCount(-2), Delta::ProofCount(3)].into_iter());
+        let a = fold_proof_count(5, [Delta::ProofCount(3), Delta::ProofCount(-2)].iter());
+        let b = fold_proof_count(5, [Delta::ProofCount(-2), Delta::ProofCount(3)].iter());
         assert_eq!(a, b);
         assert_eq!(a, 6);
     }
 
     #[test]
     fn proof_count_saturates_at_zero() {
-        assert_eq!(fold_proof_count(1, [Delta::ProofCount(-5)].into_iter()), 0);
+        assert_eq!(fold_proof_count(1, [Delta::ProofCount(-5)].iter()), 0);
     }
 }

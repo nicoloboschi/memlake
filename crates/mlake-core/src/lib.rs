@@ -17,7 +17,7 @@ pub use memory::{
 };
 pub use tags::{TagFilter, TagsMatch};
 pub use manifest::{GenerationFiles, Manifest};
-pub use wal::{Delta, Op, WalEntry};
+pub use wal::{apply_delta, apply_deltas, Delta, Op, WalEntry};
 
 #[derive(thiserror::Error, Debug)]
 pub enum Error {

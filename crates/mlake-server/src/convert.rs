@@ -179,10 +179,29 @@ pub fn op(o: pb::Op) -> Result<Op, Status> {
     Ok(match kind {
         pb::op::Kind::Upsert(m) => Op::Upsert(memory(m)?),
         pb::op::Kind::Tombstone(id) => Op::Tombstone { id: id_exact(&id)? },
-        pb::op::Kind::Patch(p) => Op::Patch {
-            id: id_exact(&p.id)?,
-            deltas: vec![Delta::ProofCount(p.proof_count_delta)],
-        },
+        pb::op::Kind::Patch(p) => {
+            let id = id_exact(&p.id)?;
+            let mut deltas = Vec::new();
+            if p.proof_count_delta != 0 {
+                deltas.push(Delta::ProofCount(p.proof_count_delta));
+            }
+            if let Some(t) = p.text {
+                deltas.push(Delta::SetText(t));
+            }
+            if let Some(v) = &p.vector {
+                deltas.push(Delta::SetVector(decode_vector(v)?));
+            }
+            if let Some(tl) = p.tags {
+                deltas.push(Delta::SetTags(tl.tags));
+            }
+            if let Some(ts) = p.timestamps {
+                deltas.push(Delta::SetTimestamps(timestamps(Some(ts))));
+            }
+            if !p.metadata.is_empty() {
+                deltas.push(Delta::MergeMetadata(p.metadata.into_iter().collect()));
+            }
+            Op::Patch { id, deltas }
+        }
         pb::op::Kind::GuardExpectSeqLt(seq) => Op::Guard { expect_seq_lt: seq },
     })
 }

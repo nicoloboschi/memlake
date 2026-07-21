@@ -11,7 +11,7 @@
 
 use std::collections::HashMap;
 
-use mlake_core::wal::fold_proof_count;
+use mlake_core::wal::apply_deltas;
 use mlake_core::{Delta, MemoryId, Op, StoredMemory, WalEntry};
 
 use crate::{parse_wal_seq, Namespace, Result};
@@ -41,7 +41,7 @@ impl TailScan {
     /// Apply any tail patches to an item materialized from the generation.
     pub fn apply_patches(&self, item: &mut StoredMemory) {
         if let Some(deltas) = self.pending_patches.get(&item.id) {
-            item.proof_count = fold_proof_count(item.proof_count, deltas.iter().copied());
+            apply_deltas(item, deltas);
         }
     }
 
@@ -148,15 +148,14 @@ pub fn fold_entries(entries: &[WalEntry]) -> TailScan {
                         continue;
                     }
                     if let Some(item) = scan.upserts.get_mut(id) {
-                        // The item is in the tail: fold immediately.
-                        item.proof_count =
-                            fold_proof_count(item.proof_count, deltas.iter().copied());
+                        // The item is in the tail: apply immediately.
+                        apply_deltas(item, deltas);
                     } else {
                         // The item lives in the generation: defer until it is materialized.
                         scan.pending_patches
                             .entry(*id)
                             .or_default()
-                            .extend(deltas.iter().copied());
+                            .extend(deltas.iter().cloned());
                     }
                 }
                 Op::Guard { .. } => {}

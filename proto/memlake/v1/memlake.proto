@@ -102,9 +102,23 @@ message Memory {
   map<string, string> metadata = 11;
 }
 
+// A tag list wrapper — message presence distinguishes "replace tags with this (maybe empty)
+// list" from "leave tags untouched", which a bare `repeated` cannot.
+message TagList {
+  repeated string tags = 1;
+}
+
+// A partial update to one memory: set only the fields present, leave the rest. Avoids
+// re-sending the whole memory for consolidation/curation edits. `proof_count_delta` is
+// relative; the rest are absolute sets (metadata merges its keys, it does not replace).
 message Patch {
-  bytes id = 1;               // 16-byte MemoryId
-  int32 proof_count_delta = 2;
+  bytes id = 1;                       // 16-byte MemoryId
+  int32 proof_count_delta = 2;        // relative; 0 = no change
+  optional string text = 3;           // set text
+  Vector vector = 4;                  // set the embedding (present => set)
+  TagList tags = 5;                   // replace tags (present => set, empty list clears)
+  Timestamps timestamps = 6;          // set timestamps (present => set)
+  map<string, string> metadata = 7;   // upsert these metadata keys (merge, not replace)
 }
 
 message Op {

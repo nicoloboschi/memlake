@@ -221,8 +221,53 @@ class MemlakeClient:
     def tombstone(self, id16: bytes) -> pb.Op:
         return pb.Op(tombstone=id16)
 
-    def patch(self, id16: bytes, proof_count_delta: int) -> pb.Op:
-        return pb.Op(patch=pb.Patch(id=id16, proof_count_delta=proof_count_delta))
+    def patch(
+        self,
+        id16: bytes,
+        *,
+        proof_count_delta: int = 0,
+        text: Optional[str] = None,
+        vector: Optional[Sequence[float]] = None,
+        tags: Optional[Sequence[str]] = None,
+        occurred_start: Optional[int] = None,
+        occurred_end: Optional[int] = None,
+        mentioned_at: Optional[int] = None,
+        event_date: Optional[int] = None,
+        metadata: Optional[dict[str, str]] = None,
+    ) -> pb.Op:
+        """Build a partial-update op: set only the fields you pass, leave the rest.
+        `proof_count_delta` is relative; the rest are absolute sets; `metadata` merges (upserts
+        its keys). Passing any timestamp replaces the whole Timestamps. Pair with `update()`
+        or include in a `write_ops` batch."""
+        p = pb.Patch(id=id16, proof_count_delta=proof_count_delta)
+        if text is not None:
+            p.text = text
+        if vector is not None:
+            p.vector.CopyFrom(pb.Vector(f32le=struct.pack(f"<{len(vector)}f", *vector)))
+        if tags is not None:
+            p.tags.CopyFrom(pb.TagList(tags=list(tags)))
+        if any(t is not None for t in (occurred_start, occurred_end, mentioned_at, event_date)):
+            ts = pb.Timestamps()
+            if occurred_start is not None:
+                ts.occurred_start = occurred_start
+            if occurred_end is not None:
+                ts.occurred_end = occurred_end
+            if mentioned_at is not None:
+                ts.mentioned_at = mentioned_at
+            if event_date is not None:
+                ts.event_date = event_date
+            p.timestamps.CopyFrom(ts)
+        if metadata:
+            p.metadata.update(metadata)
+        return pb.Op(patch=p)
+
+    def update(self, namespace: str, id16: bytes, **fields) -> int:
+        """Partial update of one memory (see `patch` for the fields). Returns the WAL sequence.
+        Visible immediately for a still-un-indexed memory (tail); for an already-indexed one it
+        takes retrieval effect at the next indexer run (the embedding/text are re-indexed then)."""
+        return self._stub.Write(
+            pb.WriteRequest(namespace=namespace, ops=[self.patch(id16, **fields)])
+        ).seq
 
     # -- query ---------------------------------------------------------------
 
