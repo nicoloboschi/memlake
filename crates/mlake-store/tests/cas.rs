@@ -1,9 +1,10 @@
 //! Conditional-write semantics (INV-3).
 //!
-//! These run against every backend the system can be deployed on, because the whole
-//! design rests on `If-None-Match` and `If-Match` behaving identically everywhere. Any
-//! backend that silently degrades a conditional write into an unconditional one would
-//! lose committed data without erroring, so the assertions here are deliberately blunt.
+//! The whole design rests on `If-None-Match` and `If-Match` behaving correctly, so these
+//! run against both the deployment target (S3, via MinIO) and the in-memory stand-in that
+//! implements the same conditional-put contract. Any backend that silently degraded a
+//! conditional write into an unconditional one would lose committed data without erroring,
+//! so the assertions here are deliberately blunt.
 //!
 //! The MinIO cases are skipped unless a MinIO endpoint is reachable, so `cargo test` works
 //! on a machine with no Docker; CI and the nightly runs start it via docker-compose.
@@ -15,40 +16,19 @@ use mlake_store::{Error, Store};
 struct Backend {
     name: &'static str,
     store: Store,
-    /// Whether this backend implements `If-Match` (conditional *update*).
-    ///
-    /// `LocalFileSystem` implements `If-None-Match` but returns "not yet implemented" for
-    /// `PutMode::Update`, so it cannot host a manifest swap. That is a real deployment
-    /// constraint, not a test artifact: local-disk mode is usable for single-writer
-    /// development only, and any multi-writer deployment needs S3 or MinIO. Recorded here
-    /// so the limitation is visible rather than discovered in production.
-    supports_cas_swap: bool,
-    _guard: Option<tempfile::TempDir>,
 }
 
 async fn backends() -> Vec<Backend> {
+    // Only backends that faithfully implement the S3 conditional-put contract. The local
+    // filesystem is deliberately absent: it cannot do `If-Match` at all, so it can never
+    // host a manifest swap and is not a supported storage target.
     let mut out = vec![Backend {
         name: "memory",
         store: Store::in_memory(),
-        supports_cas_swap: true,
-        _guard: None,
     }];
 
-    let dir = tempfile::tempdir().unwrap();
-    out.push(Backend {
-        name: "local",
-        store: Store::local(dir.path()).unwrap(),
-        supports_cas_swap: false,
-        _guard: Some(dir),
-    });
-
     if let Some(store) = minio().await {
-        out.push(Backend {
-            name: "minio",
-            store,
-            supports_cas_swap: true,
-            _guard: None,
-        });
+        out.push(Backend { name: "minio", store });
     } else {
         eprintln!("note: MinIO unreachable, skipping the S3-compatible CAS cases");
     }
@@ -81,7 +61,7 @@ fn key(test: &str) -> String {
 
 #[tokio::test]
 async fn put_if_absent_creates_then_rejects() {
-    for Backend { name, store, .. } in backends().await {
+    for Backend { name, store } in backends().await {
         let path = key("create");
         store
             .put_if_absent(&path, b"first".to_vec())
@@ -102,10 +82,7 @@ async fn put_if_absent_creates_then_rejects() {
 
 #[tokio::test]
 async fn cas_swap_succeeds_on_matching_etag_and_fails_on_stale() {
-    for Backend { name, store, supports_cas_swap, .. } in backends().await {
-        if !supports_cas_swap {
-            continue;
-        }
+    for Backend { name, store } in backends().await {
         let path = key("swap");
         store.put_if_absent(&path, b"v1".to_vec()).await.unwrap();
 
@@ -132,7 +109,7 @@ async fn cas_swap_succeeds_on_matching_etag_and_fails_on_stale() {
 /// The WAL commit protocol: N writers race for one sequence number, exactly one wins.
 #[tokio::test]
 async fn concurrent_creates_produce_exactly_one_winner() {
-    for Backend { name, store, .. } in backends().await {
+    for Backend { name, store } in backends().await {
         let path = Arc::new(key("race"));
         let store = Arc::new(store);
 
@@ -163,16 +140,13 @@ async fn concurrent_creates_produce_exactly_one_winner() {
 /// published a generation.
 #[tokio::test]
 async fn concurrent_swaps_produce_exactly_one_winner() {
-    for Backend { name, store, supports_cas_swap, .. } in backends().await {
-        if !supports_cas_swap {
-            continue;
-        }
+    for Backend { name, store } in backends().await {
         let path = Arc::new(key("swap-race"));
         let store = Arc::new(store);
         // The base content must differ from every writer's payload. An etag is derived
         // from content, so a writer that rewrites the existing bytes leaves the version
         // unchanged and a second writer's If-Match would still legitimately match — see
-        // `identical_content_does_not_advance_the_version` below.
+        // `rewriting_identical_content_has_backend_specific_etag_semantics` below.
         store.put_if_absent(&path, b"base".to_vec()).await.unwrap();
         let etag = Arc::new(store.get(&path, None).await.unwrap().etag.unwrap());
 
@@ -203,7 +177,7 @@ async fn concurrent_swaps_produce_exactly_one_winner() {
 
 #[tokio::test]
 async fn missing_objects_report_not_found() {
-    for Backend { name, store, .. } in backends().await {
+    for Backend { name, store } in backends().await {
         let missing = store.get(&key("absent"), None).await;
         assert!(
             matches!(missing, Err(Error::NotFound(_))),
@@ -216,7 +190,7 @@ async fn missing_objects_report_not_found() {
 async fn delete_is_idempotent() {
     // GC runs on any node and may race another node doing the same work, so deleting an
     // already-deleted file must not be an error.
-    for Backend { name, store, .. } in backends().await {
+    for Backend { name, store } in backends().await {
         let path = key("delete");
         store.put_if_absent(&path, b"x".to_vec()).await.unwrap();
         store.delete(&path).await.unwrap();
@@ -228,29 +202,6 @@ async fn delete_is_idempotent() {
     }
 }
 
-/// Pins the LocalFileSystem limitation so it is a known, asserted property rather than a
-/// surprise. If a future object_store release implements `If-Match` for local files, this
-/// test fails and `supports_cas_swap` should be flipped to true.
-#[tokio::test]
-async fn local_filesystem_still_lacks_conditional_update() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = Store::local(dir.path()).unwrap();
-    let path = "obj";
-    store.put_if_absent(path, b"v1".to_vec()).await.unwrap();
-    let etag = store.get(path, None).await.unwrap().etag;
-
-    match etag {
-        Some(etag) => {
-            let result = store.cas_swap(path, &etag, b"v2".to_vec()).await;
-            assert!(
-                result.is_err(),
-                "LocalFileSystem gained If-Match support: enable supports_cas_swap for it"
-            );
-        }
-        // No etag at all is an even stronger form of the same limitation.
-        None => {}
-    }
-}
 
 /// Etag semantics differ across backends, and memlake must not depend on either flavour.
 ///
@@ -267,10 +218,7 @@ async fn local_filesystem_still_lacks_conditional_update() {
 /// This test documents the divergence so a future backend swap surfaces it loudly.
 #[tokio::test]
 async fn rewriting_identical_content_has_backend_specific_etag_semantics() {
-    for Backend { name, store, supports_cas_swap, .. } in backends().await {
-        if !supports_cas_swap {
-            continue;
-        }
+    for Backend { name, store } in backends().await {
         let path = key("same-content");
         store.put_if_absent(&path, b"same".to_vec()).await.unwrap();
         let before = store.get(&path, None).await.unwrap().etag.unwrap();

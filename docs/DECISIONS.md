@@ -17,10 +17,21 @@ micro-benchmarks stay in Rust in `crates/mlake-bench`.
 
 ## Storage backend
 
-MinIO via `docker-compose.yml` from day one, so `If-None-Match` / `If-Match` conditional
-writes (INV-3) are validated against a real implementation rather than a stand-in. Unit
-tests additionally run against `object_store::LocalFileSystem` with a latency-injecting
-wrapper, per SPEC §10.4.
+**S3 only.** The object-store backend is S3 (MinIO in dev via `docker-compose.yml`), so
+`If-None-Match` / `If-Match` conditional writes (INV-3) are validated against a real
+implementation. The design is optimized for the S3 interface — coalesced ranged GETs, a
+bounded roundtrip budget, larger immutable objects — not for a local disk.
+
+`object_store::LocalFileSystem` is **deliberately not supported**: it implements
+`If-None-Match` but returns "not yet implemented" for `If-Match`, so it cannot host a
+manifest swap. Rather than carry a backend that silently can't do the thing the whole
+coordination model depends on, it is removed. Fast unit tests use `object_store::InMemory`
+instead — unlike the local filesystem, it implements the full conditional-put contract, so
+it is a faithful stand-in for the S3 *interface* without a network. (This supersedes SPEC
+§10.4's suggestion of a LocalFileSystem test rig.)
+
+Local disk still appears in one place, correctly: the NVMe read cache (`DiskCache`), which
+per INV-4 is only ever a cache — deleting it changes latency, never results.
 
 ## Accuracy benchmark
 

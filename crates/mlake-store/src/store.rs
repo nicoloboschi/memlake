@@ -40,13 +40,10 @@ impl Store {
         Self { inner }
     }
 
-    /// A store backed by the local filesystem. Used by unit tests and by the latency-shim
-    /// rig; `LocalFileSystem` implements the same conditional-write semantics MinIO does.
-    pub fn local(root: impl AsRef<std::path::Path>) -> Result<Self> {
-        let fs = object_store::local::LocalFileSystem::new_with_prefix(root)?;
-        Ok(Self::new(Arc::new(fs)))
-    }
-
+    /// An in-memory store, for fast unit tests. `object_store`'s `InMemory` implements the
+    /// same conditional-put semantics (`If-None-Match` / `If-Match`) as S3, so it is a
+    /// faithful stand-in for the S3 *interface* without a network — unlike a local
+    /// filesystem, which cannot do conditional updates at all. It backs no deployment.
     pub fn in_memory() -> Self {
         Self::new(Arc::new(object_store::memory::InMemory::new()))
     }
