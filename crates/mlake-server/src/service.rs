@@ -408,31 +408,44 @@ impl Memlake for MemlakeService {
         if req.namespace.is_empty() {
             return Err(Status::invalid_argument("namespace is required"));
         }
-        let metadata_equals: Vec<(String, String)> = req.metadata_equals.into_iter().collect();
-        let tags = convert::tag_filter(req.tags);
+        // Build the predicate once — shared by both the lazy WAL op and the eager scan.
+        let pred = convert::predicate(pb::Predicate {
+            memory_types: req.memory_types.clone(),
+            metadata_equals: req.metadata_equals.clone(),
+            tags: req.tags.clone(),
+        })?;
         // Safety: refuse an empty predicate unless the caller explicitly asked to delete all.
-        if metadata_equals.is_empty() && tags.is_noop() && !req.delete_all {
+        if pred.is_empty() && !req.delete_all {
             return Err(Status::invalid_argument(
                 "empty predicate: set metadata_equals/tags, or delete_all to remove every memory",
             ));
         }
 
-        let ns = self.namespace(&req.namespace);
-        // STRONG snapshot: match against the latest state (incl. un-indexed writes) so a
-        // re-ingest that just wrote the old facts still sees them.
-        let snap = self.snapshot(&ns, Consistency::Strong).await?;
-        let types: Vec<u8> = req
-            .memory_types
-            .iter()
-            .map(|&t| convert::memory_type_u8(t))
-            .collect::<Result<Vec<_>, _>>()?;
+        // Default (lazy): one atomic, race-closed TombstoneWhere WAL op. Nothing is scanned —
+        // the delete is materialized at the next fold, where the indexer reads every cluster
+        // anyway. This is the path re-ingest should use (ideally batched with the new upserts).
+        if !req.eager {
+            let writer = self.writer_for(&req.namespace);
+            let seq = {
+                let mut w = writer.lock().await;
+                w.commit(vec![mlake_core::Op::TombstoneWhere { predicate: pred }])
+                    .await
+                    .map_err(internal)?
+                    .seq
+            };
+            self.invalidate(&req.namespace);
+            return Ok(Response::new(pb::DeleteByPredicateResponse { deleted: 0, seq }));
+        }
 
-        let ids = snap.node.ids_matching(&types, &metadata_equals, &tags).await.map_err(internal)?;
+        // Eager: scan now, tombstone matches by id (O(corpus)), return the exact count.
+        let ns = self.namespace(&req.namespace);
+        let snap = self.snapshot(&ns, Consistency::Strong).await?;
+        let metadata_equals: Vec<(String, String)> = req.metadata_equals.into_iter().collect();
+        let tags = convert::tag_filter(req.tags);
+        let ids = snap.node.ids_matching(&pred.memory_types, &metadata_equals, &tags).await.map_err(internal)?;
         if ids.is_empty() {
             return Ok(Response::new(pb::DeleteByPredicateResponse { deleted: 0, seq: 0 }));
         }
-
-        // Tombstone the matches, chunked so one WAL entry never gets pathologically large.
         const TOMBSTONE_BATCH: usize = 10_000;
         let deleted = ids.len() as u64;
         let writer = self.writer_for(&req.namespace);
@@ -447,7 +460,94 @@ impl Memlake for MemlakeService {
         self.invalidate(&req.namespace);
         Ok(Response::new(pb::DeleteByPredicateResponse { deleted, seq: last_seq }))
     }
+
+    async fn list_wal(
+        &self,
+        req: Request<pb::ListWalRequest>,
+    ) -> Result<Response<pb::ListWalResponse>, Status> {
+        let req = req.into_inner();
+        if req.namespace.is_empty() {
+            return Err(Status::invalid_argument("namespace is required"));
+        }
+        let limit = match req.limit {
+            0 => DEFAULT_WAL_LIMIT,
+            n => (n as usize).min(MAX_WAL_LIMIT),
+        };
+        let ns = self.namespace(&req.namespace);
+
+        // The manifest gives the fold watermark, so each entry can say whether the indexer
+        // has already absorbed it — the distinction the whole view exists to show.
+        let (manifest, _etag) = ns.read_manifest().await.map_err(internal)?;
+        let (objects, next_seq) = ns.list_wal(req.start_seq, limit).await.map_err(internal)?;
+
+        let mut entries = Vec::with_capacity(objects.len());
+        for o in objects {
+            // Decoding is per-entry and opt-in: one entry is a whole group-commit batch.
+            // A racing GC can reclaim an entry between the LIST and this read, which is
+            // normal for a folded entry — report it with counts unset rather than failing
+            // the whole page.
+            let decoded = if req.include_ops {
+                ns.read_wal_entry(o.seq).await.ok()
+            } else {
+                None
+            };
+            entries.push(convert::wal_entry(&o, manifest.wal_index_cursor, decoded.as_ref()));
+        }
+
+        Ok(Response::new(pb::ListWalResponse {
+            entries,
+            wal_head: manifest.wal_head.max(req.start_seq),
+            wal_index_cursor: manifest.wal_index_cursor,
+            next_seq: next_seq.unwrap_or(0),
+        }))
+    }
+
+    async fn index_layout(
+        &self,
+        req: Request<pb::IndexLayoutRequest>,
+    ) -> Result<Response<pb::IndexLayoutResponse>, Status> {
+        let req = req.into_inner();
+        if req.namespace.is_empty() {
+            return Err(Status::invalid_argument("namespace is required"));
+        }
+        let memory_type = convert::memory_type_u8(req.memory_type)?;
+        let sample = (req.member_sample as usize).min(MAX_MEMBER_SAMPLE);
+
+        let ns = self.namespace(&req.namespace);
+        let snap = self.snapshot(&ns, convert::consistency(req.consistency)).await?;
+        let node = &snap.node;
+
+        // Centroids are already resident from opening the snapshot, so this branch costs
+        // zero object-storage reads; only member sampling touches cluster files.
+        let (dim, clusters) = match node.cluster_layout(memory_type) {
+            Some(layout) => (layout.dim as u32, convert::cluster_infos(&layout)),
+            None => (0, Vec::new()),
+        };
+
+        let members = node
+            .sample_members(memory_type, sample)
+            .await
+            .map_err(internal)?
+            .into_iter()
+            .map(|(cluster_id, m)| convert::cluster_member(cluster_id, m))
+            .collect();
+
+        Ok(Response::new(pb::IndexLayoutResponse {
+            namespace: req.namespace,
+            memory_type: req.memory_type,
+            generation: node.generation,
+            dim,
+            clusters,
+            members,
+        }))
+    }
 }
+
+/// WAL page sizes, and the ceiling on a member sample. All three bound one response: the
+/// log can be long, and a sample is a picture of the layout, not a bulk export.
+const DEFAULT_WAL_LIMIT: usize = 50;
+const MAX_WAL_LIMIT: usize = 500;
+const MAX_MEMBER_SAMPLE: usize = 5000;
 
 /// Scan page sizes. The cap keeps one response bounded regardless of what a client asks
 /// for — a scan is the one read path whose cost grows with the corpus.

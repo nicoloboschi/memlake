@@ -371,6 +371,25 @@ impl Store {
         Ok(paths)
     }
 
+    /// List object paths under a prefix together with each object's size, sorted ascending.
+    ///
+    /// The size comes from the listing itself, so surfacing it costs the same one LIST as
+    /// [`Store::list`] — the alternative, a HEAD per object, would turn a log view into N
+    /// roundtrips.
+    pub async fn list_with_size(&self, prefix: &str) -> Result<Vec<(String, u64)>> {
+        if let Some(m) = &self.store_metrics {
+            m.record_list();
+        }
+        let mut out: Vec<(String, u64)> = self
+            .inner
+            .list(Some(&Path::from(prefix)))
+            .map_ok(|meta| (meta.location.to_string(), meta.size as u64))
+            .try_collect()
+            .await?;
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(out)
+    }
+
     /// List object paths under a prefix together with each object's last-modified time, so
     /// GC can apply an age-based grace window before deleting.
     pub async fn list_with_age(

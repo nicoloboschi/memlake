@@ -1352,3 +1352,105 @@ async fn text_only_memories_do_not_trip_the_dimension_check() {
         .unwrap();
     assert!(!hits.is_empty(), "a text-only memory must still be retrievable");
 }
+
+// ---- Operator views: the WAL window and the IVF layout ----------------------
+
+/// The WAL is listable as a window: sequences, sizes, and where the indexer's fold
+/// watermark sits. Entries stay readable and decodable after being folded, until GC.
+#[tokio::test]
+async fn the_wal_is_listable_and_decodable() {
+    let store = Store::in_memory();
+    let ns = namespace(store, "ns").await;
+    let mut writer = Writer::new(ns.clone());
+
+    writer.commit(vec![Op::Upsert(item("a", vec![1.0, 0.0], "first"))]).await.unwrap();
+    writer
+        .commit(vec![
+            Op::Upsert(item("b", vec![0.0, 1.0], "second")),
+            Op::Tombstone { id: MemoryId::from_key("a") },
+        ])
+        .await
+        .unwrap();
+
+    let (objects, next) = ns.list_wal(0, 10).await.unwrap();
+    assert_eq!(objects.len(), 2, "both committed entries are retained");
+    assert_eq!(objects[0].seq, 1);
+    assert_eq!(objects[1].seq, 2);
+    assert!(objects.iter().all(|o| o.size_bytes > 0), "sizes come from the listing");
+    assert!(next.is_none(), "the log is exhausted");
+
+    // The second entry is one atomic batch holding both ops.
+    let entry = ns.read_wal_entry(2).await.unwrap();
+    assert_eq!(entry.seq, 2);
+    assert_eq!(entry.ops.len(), 2, "a group commit is one entry with many ops");
+    assert!(entry.ops.iter().any(|o| matches!(o, Op::Tombstone { .. })));
+}
+
+/// Paging the WAL walks every entry once and terminates.
+#[tokio::test]
+async fn the_wal_pages_from_a_start_sequence() {
+    let store = Store::in_memory();
+    let ns = namespace(store, "ns").await;
+    let mut writer = Writer::new(ns.clone());
+    for i in 0..7 {
+        writer
+            .commit(vec![Op::Upsert(item(&format!("m{i}"), vec![i as f32, 1.0], "x"))])
+            .await
+            .unwrap();
+    }
+
+    let mut seen = Vec::new();
+    let mut start = 0u64;
+    loop {
+        let (objects, next) = ns.list_wal(start, 3).await.unwrap();
+        seen.extend(objects.iter().map(|o| o.seq));
+        match next {
+            Some(n) => start = n,
+            None => break,
+        }
+        assert!(seen.len() <= 7, "paging must not revisit entries");
+    }
+    assert_eq!(seen, (1..=7).collect::<Vec<u64>>());
+}
+
+/// The IVF layout is readable straight off an open snapshot: centroids, their trained
+/// sizes, and a bounded member sample carrying each memory's cluster.
+#[tokio::test]
+async fn the_cluster_layout_is_visible_from_a_snapshot() {
+    let store = Store::in_memory();
+    let ns = namespace(store, "ns").await;
+    let mut writer = Writer::new(ns.clone());
+
+    let ops: Vec<Op> = (0..200)
+        .map(|i| {
+            let a = i as f32 * 0.31;
+            Op::Upsert(item(&format!("m{i}"), vec![a.sin(), a.cos(), (a * 0.5).sin()], "text"))
+        })
+        .collect();
+    writer.commit(ops).await.unwrap();
+    index(&ns, &Tokenizer::default(), IndexOptions::default()).await.unwrap();
+
+    let node = QueryNode::open(&ns, Tokenizer::default(), Consistency::Strong).await.unwrap();
+    let layout = node.cluster_layout(1).expect("type 1 is in the snapshot");
+
+    assert_eq!(layout.dim, 3);
+    assert!(!layout.centroids.is_empty(), "k-means produced centroids");
+    assert_eq!(layout.centroids.len(), layout.sizes.len(), "sizes parallel the centroids");
+    assert!(layout.centroids.iter().all(|c| c.len() == layout.dim));
+    assert_eq!(
+        layout.sizes.iter().sum::<usize>(),
+        200,
+        "every indexed memory is assigned to exactly one cluster"
+    );
+
+    // A sample spans clusters and stays within its budget.
+    let members = node.sample_members(1, 40).await.unwrap();
+    assert!(!members.is_empty(), "sampling must return members");
+    assert!(members.len() <= 40 + node.cluster_count_of(1), "the budget bounds the sample");
+    assert!(members.iter().all(|(c, _)| (*c as usize) < layout.centroids.len()));
+    let distinct: std::collections::HashSet<u32> = members.iter().map(|(c, _)| *c).collect();
+    assert!(distinct.len() > 1, "the sample must span clusters, not clump in one");
+
+    // Budget 0 reads nothing at all — the centroids-only path.
+    assert!(node.sample_members(1, 0).await.unwrap().is_empty());
+}

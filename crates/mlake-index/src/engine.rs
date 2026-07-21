@@ -276,6 +276,7 @@ mod tests {
             semantic_out: vec![],
             causal_out: vec![],
             metadata: vec![],
+            write_seq: 0,
         }
     }
 

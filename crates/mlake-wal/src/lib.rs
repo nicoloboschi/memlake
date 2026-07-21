@@ -16,7 +16,7 @@ pub use commit::{CommitResult, Writer};
 pub use tail::{TailScan, WalTail};
 
 use mlake_core::manifest::{manifest_path, wal_path};
-use mlake_core::Manifest;
+use mlake_core::{Manifest, WalEntry};
 use mlake_store::{Error as StoreError, Etag, Store};
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -103,6 +103,48 @@ impl Namespace {
         let paths = self.store.list(&prefix).await?;
         Ok(paths.last().and_then(|p| parse_wal_seq(p)).unwrap_or(0))
     }
+
+    /// The WAL objects currently retained, ascending by sequence, starting at `start_seq`.
+    /// Returns the page and the sequence to resume from, or `None` when exhausted.
+    ///
+    /// This is a *window*, not a history: once the indexer folds an entry, GC is free to
+    /// reclaim it, so the oldest sequence here is generally well above 0. One LIST answers
+    /// it, sizes included — nothing is decoded.
+    pub async fn list_wal(
+        &self,
+        start_seq: u64,
+        limit: usize,
+    ) -> Result<(Vec<WalObject>, Option<u64>)> {
+        let prefix = format!("{}/wal/", self.name);
+        let mut objects: Vec<WalObject> = self
+            .store
+            .list_with_size(&prefix)
+            .await?
+            .into_iter()
+            .filter_map(|(path, size_bytes)| {
+                parse_wal_seq(&path).map(|seq| WalObject { seq, size_bytes })
+            })
+            .filter(|o| o.seq >= start_seq)
+            .collect();
+        objects.sort_by_key(|o| o.seq);
+
+        let next = objects.get(limit).map(|o| o.seq);
+        objects.truncate(limit);
+        Ok((objects, next))
+    }
+
+    /// Read and decode one WAL entry. `Err(NotFound)` if GC has already reclaimed it.
+    pub async fn read_wal_entry(&self, seq: u64) -> Result<WalEntry> {
+        let bytes = self.store.get(&seq_path(&self.name, seq), None).await?;
+        Ok(WalEntry::from_bytes(&bytes.bytes)?)
+    }
+}
+
+/// A WAL object as the log view sees it: its sequence and stored size, undecoded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WalObject {
+    pub seq: u64,
+    pub size_bytes: u64,
 }
 
 /// Extract the sequence number from a WAL object key.

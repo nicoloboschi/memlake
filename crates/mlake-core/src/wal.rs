@@ -71,6 +71,13 @@ pub enum Op {
     Upsert(Memory),
     Tombstone { id: MemoryId },
     Patch { id: MemoryId, deltas: Vec<Delta> },
+    /// Delete every memory matching `predicate` whose last write is *older* than this entry's
+    /// sequence. Atomic (one entry), race-closed (a concurrent or same-entry upsert with an
+    /// equal/higher seq survives), and lazy: evaluated at read against the active predicates
+    /// and materialized at the next fold. Put it in the same entry as the re-ingest's upserts
+    /// to replace a document's facts atomically — the new upserts share this seq, so they are
+    /// not deleted.
+    TombstoneWhere { predicate: crate::predicate::Predicate },
     /// Optimistic precondition: the entry is only valid if the WAL head was below this
     /// sequence when it was written. Lets a client express compare-and-set without a lock.
     Guard { expect_seq_lt: u64 },

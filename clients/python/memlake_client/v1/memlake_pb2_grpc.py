@@ -74,6 +74,16 @@ class MemlakeStub:
                 request_serializer=memlake_dot_v1_dot_memlake__pb2.DeleteByPredicateRequest.SerializeToString,
                 response_deserializer=memlake_dot_v1_dot_memlake__pb2.DeleteByPredicateResponse.FromString,
                 _registered_method=True)
+        self.ListWal = channel.unary_unary(
+                '/memlake.v1.Memlake/ListWal',
+                request_serializer=memlake_dot_v1_dot_memlake__pb2.ListWalRequest.SerializeToString,
+                response_deserializer=memlake_dot_v1_dot_memlake__pb2.ListWalResponse.FromString,
+                _registered_method=True)
+        self.IndexLayout = channel.unary_unary(
+                '/memlake.v1.Memlake/IndexLayout',
+                request_serializer=memlake_dot_v1_dot_memlake__pb2.IndexLayoutRequest.SerializeToString,
+                response_deserializer=memlake_dot_v1_dot_memlake__pb2.IndexLayoutResponse.FromString,
+                _registered_method=True)
 
 
 class MemlakeServicer:
@@ -156,6 +166,26 @@ class MemlakeServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def ListWal(self, request, context):
+        """The write-ahead log as an operator view: which sequences are committed, and which the
+        indexer has not folded yet. Entries at or below the manifest's `wal_index_cursor` are
+        folded and may already have been reclaimed by GC, so this is a window on the live log,
+        not a history of every write ever made.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def IndexLayout(self, request, context):
+        """How k-means partitioned one memory_type: its trained centroids, per-cluster sizes and
+        tag summaries, and optionally a sample of member memories. Centroids are already
+        resident on every query node, so returning them alone costs no object-storage read;
+        sampling members does read cluster files, and is bounded by `member_sample`.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_MemlakeServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -198,6 +228,16 @@ def add_MemlakeServicer_to_server(servicer, server):
                     servicer.DeleteByPredicate,
                     request_deserializer=memlake_dot_v1_dot_memlake__pb2.DeleteByPredicateRequest.FromString,
                     response_serializer=memlake_dot_v1_dot_memlake__pb2.DeleteByPredicateResponse.SerializeToString,
+            ),
+            'ListWal': grpc.unary_unary_rpc_method_handler(
+                    servicer.ListWal,
+                    request_deserializer=memlake_dot_v1_dot_memlake__pb2.ListWalRequest.FromString,
+                    response_serializer=memlake_dot_v1_dot_memlake__pb2.ListWalResponse.SerializeToString,
+            ),
+            'IndexLayout': grpc.unary_unary_rpc_method_handler(
+                    servicer.IndexLayout,
+                    request_deserializer=memlake_dot_v1_dot_memlake__pb2.IndexLayoutRequest.FromString,
+                    response_serializer=memlake_dot_v1_dot_memlake__pb2.IndexLayoutResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -416,6 +456,60 @@ class Memlake:
             '/memlake.v1.Memlake/DeleteByPredicate',
             memlake_dot_v1_dot_memlake__pb2.DeleteByPredicateRequest.SerializeToString,
             memlake_dot_v1_dot_memlake__pb2.DeleteByPredicateResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ListWal(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/memlake.v1.Memlake/ListWal',
+            memlake_dot_v1_dot_memlake__pb2.ListWalRequest.SerializeToString,
+            memlake_dot_v1_dot_memlake__pb2.ListWalResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def IndexLayout(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/memlake.v1.Memlake/IndexLayout',
+            memlake_dot_v1_dot_memlake__pb2.IndexLayoutRequest.SerializeToString,
+            memlake_dot_v1_dot_memlake__pb2.IndexLayoutResponse.FromString,
             options,
             channel_credentials,
             insecure,

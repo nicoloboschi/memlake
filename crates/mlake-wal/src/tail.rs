@@ -12,7 +12,7 @@
 use std::collections::HashMap;
 
 use mlake_core::wal::apply_deltas;
-use mlake_core::{Delta, MemoryId, Op, StoredMemory, WalEntry};
+use mlake_core::{Delta, MemoryId, Op, Predicate, StoredMemory, WalEntry};
 
 use crate::{parse_wal_seq, Namespace, Result};
 
@@ -27,6 +27,9 @@ pub struct TailScan {
     /// Patches for items that live in the generation rather than the tail. The query
     /// layer applies these after materializing the indexed item.
     pub pending_patches: HashMap<MemoryId, Vec<Delta>>,
+    /// Predicate deletes in the tail: `(sequence, predicate)`. A generation memory is hidden
+    /// if it matches any predicate whose sequence exceeds the memory's `write_seq`.
+    pub predicate_tombstones: Vec<(u64, Predicate)>,
     /// Highest sequence included in this scan — the consistency point of the read.
     pub through_seq: u64,
     pub entries_scanned: usize,
@@ -38,6 +41,17 @@ impl TailScan {
         self.tombstones.contains(id)
     }
 
+    /// Whether a memory is deleted — by id (tombstone) or by a predicate tombstone that
+    /// post-dates its last write. Predicate deletes are evaluated on the full record, so this
+    /// takes the memory, not just the id.
+    pub fn is_hidden(&self, item: &StoredMemory) -> bool {
+        self.tombstones.contains(&item.id)
+            || self
+                .predicate_tombstones
+                .iter()
+                .any(|(seq, p)| item.write_seq < *seq && p.matches(item))
+    }
+
     /// Apply any tail patches to an item materialized from the generation.
     pub fn apply_patches(&self, item: &mut StoredMemory) {
         if let Some(deltas) = self.pending_patches.get(&item.id) {
@@ -46,7 +60,10 @@ impl TailScan {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.upserts.is_empty() && self.tombstones.is_empty() && self.pending_patches.is_empty()
+        self.upserts.is_empty()
+            && self.tombstones.is_empty()
+            && self.pending_patches.is_empty()
+            && self.predicate_tombstones.is_empty()
     }
 }
 
@@ -133,6 +150,10 @@ pub fn fold_entries(entries: &[WalEntry]) -> TailScan {
                     // write wins" means for a full-item replace.
                     scan.pending_patches.remove(&id);
                     stored.proof_count = item.proof_count;
+                    // The write's sequence: a predicate tombstone at S deletes only writes
+                    // *before* S, so this upsert (write_seq == its entry's seq) survives a
+                    // same-entry predicate delete — atomic re-ingest.
+                    stored.write_seq = entry.seq;
                     scan.upserts.insert(id, stored);
                 }
                 Op::Tombstone { id } => {
@@ -157,6 +178,13 @@ pub fn fold_entries(entries: &[WalEntry]) -> TailScan {
                             .or_default()
                             .extend(deltas.iter().cloned());
                     }
+                }
+                Op::TombstoneWhere { predicate } => {
+                    // Drop tail upserts written before this op that match (a same-entry upsert
+                    // has write_seq == entry.seq, so `< entry.seq` spares it — re-ingest).
+                    scan.upserts
+                        .retain(|_, m| !(m.write_seq < entry.seq && predicate.matches(m)));
+                    scan.predicate_tombstones.push((entry.seq, predicate.clone()));
                 }
                 Op::Guard { .. } => {}
             }

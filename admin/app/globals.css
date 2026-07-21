@@ -23,6 +23,36 @@
   --color-arm-graph: #9d86f0;
   --color-arm-temporal: #4fc4a8;
 
+  /*
+   * Chart palette. These are the documented dark categorical slots 1-3, not
+   * eyeballed values, and they are validated as a set against THIS surface
+   * (--color-panel #0e1116) with the all-pairs rule that scatter charts require
+   * — any two marks can end up side by side, so adjacent-only checking would
+   * hide a collapse:
+   *
+   *   node scripts/validate_palette.js "#3987e5,#d95926,#199e70" \
+   *        --mode dark --surface "#0e1116" --pairs all
+   *   → lightness band PASS · chroma floor PASS
+   *   → CVD separation PASS (worst all-pairs deutan ΔE 9.4, target ≥ 8)
+   *   → normal-vision floor PASS (worst ΔE 20.9, floor ≥ 15)
+   *   → contrast vs surface PASS (all ≥ 3:1)
+   *
+   * Three is the cap, not a shortage of ideas: with all pairs in play the
+   * documented eight cannot clear the floors, so a fourth hue would be a
+   * palette that fails its own check. Everything past the top three folds into
+   * `viz-other` — see ClusterScatter.
+   */
+  --color-viz-1: #3987e5;
+  --color-viz-2: #d95926;
+  --color-viz-3: #199e70;
+  /* "Other" is deliberately gray: it carries no identity, only presence.
+     Contrast vs #0e1116 — members 3.99:1, centroids 6.16:1. */
+  --color-viz-other: #6b7480;
+  --color-viz-other-strong: #8a94a3;
+  /* Recessive chrome: solid hairlines one step off the surface, never dashed. */
+  --color-viz-grid: #1c222c;
+  --color-viz-axis: #2a3341;
+
   --font-mono: ui-monospace, "SFMono-Regular", "SF Mono", "Menlo", "Consolas",
     "Liberation Mono", monospace;
   --font-sans: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", "Roboto",

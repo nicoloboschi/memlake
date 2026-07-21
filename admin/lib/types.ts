@@ -213,6 +213,129 @@ export interface QueryJson {
   temporalWindow: { from: string; to: string } | null;
 }
 
+// ---- WAL --------------------------------------------------------------------
+
+export interface WalOpCountsJson {
+  upserts: number;
+  tombstones: number;
+  patches: number;
+  guards: number;
+}
+
+export interface WalUpsertJson {
+  kind: "upsert";
+  id: string;
+  memoryType: number;
+  text: string;
+  tags: string[];
+  /** 0 means the memory carries NO embedding — render that, not "0". */
+  vectorDim: number;
+}
+
+export interface WalTombstoneJson {
+  kind: "tombstone";
+  id: string;
+}
+
+export interface WalPatchJson {
+  kind: "patch";
+  id: string;
+  proofCountDelta: number;
+  /** Which optional fields the patch actually sets (present => set). */
+  setsText: boolean;
+  text: string | null;
+  setsVector: boolean;
+  vectorDim: number;
+  setsTags: boolean;
+  tags: string[];
+  setsTimestamps: boolean;
+  timestamps: TimestampsJson | null;
+  /** Merged, not replaced. */
+  metadata: Record<string, string>;
+}
+
+export interface WalGuardJson {
+  kind: "guard";
+  /** The optimistic precondition: the write applies only if head < this seq. */
+  expectSeqLt: string;
+}
+
+export type WalOpJson =
+  | WalUpsertJson
+  | WalTombstoneJson
+  | WalPatchJson
+  | WalGuardJson
+  | { kind: "unknown" };
+
+export interface WalEntryJson {
+  seq: string;
+  sizeBytes: string;
+  counts: WalOpCountsJson;
+  /**
+   * True once the indexer has folded this entry into a generation
+   * (seq <= wal_index_cursor). Un-folded entries are exactly what a STRONG
+   * query pays to scan on every read.
+   */
+  folded: boolean;
+  /** Only populated when include_ops was requested. */
+  ops: WalOpJson[];
+}
+
+export interface ListWalJson {
+  entries: WalEntryJson[];
+  walHead: string;
+  walIndexCursor: string;
+  /** Resume point; "0" when the log is exhausted. */
+  nextSeq: string;
+  /** wal_head - wal_index_cursor, computed with BigInt. */
+  backlog: string;
+  elapsedMs: number;
+}
+
+export interface ListWalRequestBody {
+  startSeq: string;
+  limit: number;
+  includeOps: boolean;
+}
+
+// ---- IVF layout -------------------------------------------------------------
+
+export interface ClusterJson {
+  clusterId: number;
+  /** Full centroid, as float32 values — the browser needs them to run PCA. */
+  centroid: number[];
+  /** Trained size: excludes un-indexed WAL-tail writes. */
+  size: string;
+  tags: string[];
+  hasUntagged: boolean;
+}
+
+export interface ClusterMemberJson {
+  id: string;
+  clusterId: number;
+  vector: number[];
+  text: string;
+}
+
+export interface IndexLayoutJson {
+  namespace: string;
+  memoryType: number;
+  generation: string;
+  /** 0 when this memory_type has no embeddings at all. */
+  dim: number;
+  clusters: ClusterJson[];
+  members: ClusterMemberJson[];
+  /** Sum of the trained cluster sizes — the denominator for "% of corpus". */
+  totalSize: string;
+  elapsedMs: number;
+}
+
+export interface IndexLayoutRequestBody {
+  memoryType: number;
+  memberSample: number;
+  consistency: Consistency;
+}
+
 export type EmbedState = "disabled" | "idle" | "loading" | "ready" | "error";
 
 export interface EmbedStatusJson {

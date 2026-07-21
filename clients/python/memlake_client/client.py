@@ -194,6 +194,15 @@ class MemlakeClient:
         ops = [pb.Op(tombstone=i) for i in ids]
         return self._stub.Write(pb.WriteRequest(namespace=namespace, ops=ops)).seq
 
+    def _predicate(self, metadata_equals, tags, tags_mode, memory_types) -> pb.Predicate:
+        p = pb.Predicate(
+            memory_types=list(memory_types or []),
+            metadata_equals=dict(metadata_equals or {}),
+        )
+        if tags:
+            p.tags.CopyFrom(pb.TagFilter(tags=list(tags), mode=tags_mode))
+        return p
+
     def delete_by_predicate(
         self,
         namespace: str,
@@ -203,20 +212,45 @@ class MemlakeClient:
         tags_mode: int = ANY,
         memory_types: Optional[Sequence[int]] = None,
         delete_all: bool = False,
+        eager: bool = False,
     ) -> int:
-        """Tombstone every memory matching the predicate and return how many were deleted.
-        `metadata_equals` is AND-matched — e.g. `{"document_id": "d-42", "chunk_id": "3"}` to
-        replace a document's facts on re-ingest. A full scan (metadata is not indexed), so this
-        is a maintenance op, not a query. An empty predicate is rejected unless `delete_all`."""
+        """Delete every memory matching the predicate (metadata AND tags — e.g.
+        `{"document_id": "d-42", "chunk_id": "3"}`). An empty predicate is rejected unless
+        `delete_all`.
+
+        By default this writes one atomic, race-closed TombstoneWhere WAL op, materialized at
+        the next fold — the right path for document re-ingest; it returns 0 (nothing scanned).
+        Pass `eager=True` for an immediate O(corpus) scan that returns the exact count. To
+        replace a document's facts atomically, prefer `write_ops([tombstone_where(...), *upserts])`
+        so the delete and the new facts share one sequence."""
         req = pb.DeleteByPredicateRequest(
             namespace=namespace,
             memory_types=list(memory_types or []),
             metadata_equals=dict(metadata_equals or {}),
             delete_all=delete_all,
+            eager=eager,
         )
         if tags:
             req.tags.CopyFrom(pb.TagFilter(tags=list(tags), mode=tags_mode))
         return self._stub.DeleteByPredicate(req).deleted
+
+    def tombstone_where(
+        self,
+        *,
+        metadata_equals: Optional[dict[str, str]] = None,
+        tags: Optional[Sequence[str]] = None,
+        tags_mode: int = ANY,
+        memory_types: Optional[Sequence[int]] = None,
+    ) -> pb.Op:
+        """A predicate-delete op for a `write_ops` batch. Put it in the SAME batch as the new
+        upserts to replace a document's facts atomically — the new upserts share the entry's
+        sequence, so the delete (which only removes older writes) spares them."""
+        return pb.Op(tombstone_where=self._predicate(metadata_equals, tags, tags_mode, memory_types))
+
+    def upsert(self, m: pb.Memory) -> pb.Op:
+        """Wrap a `memory(...)` as an op, for mixing with tombstone_where/patch in a
+        `write_ops` batch (e.g. atomic document re-ingest)."""
+        return pb.Op(upsert=m)
 
     def tombstone(self, id16: bytes) -> pb.Op:
         return pb.Op(tombstone=id16)

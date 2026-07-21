@@ -98,6 +98,10 @@ pub struct QueryNode {
     ns: Namespace,
     per_type: BTreeMap<u8, FactTypeState>,
     tombstones: HashSet<MemoryId>,
+    /// Active predicate deletes from the tail: `(sequence, predicate)`. A generation memory
+    /// is hidden if it matches one whose sequence exceeds the memory's `write_seq`. Evaluated
+    /// lazily at read; materialized at the next fold.
+    predicate_tombstones: Vec<(u64, mlake_core::Predicate)>,
     /// The WAL sequence this snapshot reflects.
     pub through_seq: u64,
     /// The generation this snapshot's indexed files belong to. Part of the snapshot's
@@ -106,6 +110,18 @@ pub struct QueryNode {
     pub generation: u64,
     /// Roundtrips consumed opening this snapshot (loading the metadata), for the budget.
     pub load_roundtrips: usize,
+}
+
+/// One fact type's IVF layout, borrowed from the open snapshot: the trained centroids and
+/// what k-means put in each. Everything here was already in memory.
+pub struct ClusterLayout<'a> {
+    pub dim: usize,
+    pub centroids: &'a [Vec<f32>],
+    /// Members assigned per centroid at train time, parallel to `centroids`.
+    pub sizes: &'a [usize],
+    /// Per-cluster tag summaries, parallel to `centroids` when present. May be shorter (or
+    /// empty) for a generation built before tag summaries existed.
+    pub tag_summary: &'a TagSummary,
 }
 
 /// A position in a [`QueryNode::scan`]: which cluster of a fact type, and how far into it.
@@ -140,6 +156,7 @@ impl QueryNode {
             .scan(manifest.wal_index_cursor, Some(head))
             .await?;
         let tombstones: HashSet<MemoryId> = scan.tombstones.iter().copied().collect();
+        let predicate_tombstones = scan.predicate_tombstones.clone();
         let mut tail_by_ft: BTreeMap<u8, Vec<StoredMemory>> = BTreeMap::new();
         for item in scan.upserts.into_values() {
             tail_by_ft.entry(item.memory_type).or_default().push(item);
@@ -290,6 +307,7 @@ impl QueryNode {
             ns: ns.clone(),
             per_type,
             tombstones,
+            predicate_tombstones,
             through_seq: head,
             generation: manifest.generation,
             load_roundtrips: metrics.roundtrips(),
@@ -315,6 +333,74 @@ impl QueryNode {
     /// exists only in the un-indexed tail.
     pub fn cluster_count_of(&self, memory_type: u8) -> usize {
         self.per_type.get(&memory_type).map(|s| s.cluster_paths.len()).unwrap_or(0)
+    }
+
+    /// How k-means partitioned one fact type: each cluster's centroid, trained size, and
+    /// tag summary. `None` for a type this snapshot does not hold.
+    ///
+    /// This costs no object-storage read at all — the centroids and tag summaries are
+    /// already resident, loaded once when the snapshot opened, because every query probes
+    /// against them.
+    ///
+    /// The sizes are the *trained* sizes: they count what the generation was built from and
+    /// so exclude un-indexed WAL-tail writes, which is why they can disagree with
+    /// [`QueryNode::doc_count_of`].
+    pub fn cluster_layout(&self, memory_type: u8) -> Option<ClusterLayout<'_>> {
+        let state = self.per_type.get(&memory_type)?;
+        Some(ClusterLayout {
+            dim: state.centroids.dim,
+            centroids: &state.centroids.vectors,
+            sizes: &state.centroids.sizes,
+            tag_summary: &state.tag_summary,
+        })
+    }
+
+    /// A bounded sample of member memories with the cluster each belongs to, for plotting
+    /// the layout rather than reading it exhaustively.
+    ///
+    /// Clusters are sampled at an even stride across the whole layout, and the number of
+    /// cluster files read is capped, so the cost stays bounded no matter how large the
+    /// corpus or how big a `budget` the caller asks for.
+    pub async fn sample_members(
+        &self,
+        memory_type: u8,
+        budget: usize,
+    ) -> Result<Vec<(u32, StoredMemory)>> {
+        let Some(state) = self.per_type.get(&memory_type) else {
+            return Ok(Vec::new());
+        };
+        let total = state.cluster_paths.len();
+        if budget == 0 || total == 0 {
+            return Ok(Vec::new());
+        }
+
+        /// Cap on cluster files read for one sample — this is a visualization, and the
+        /// point is to show the shape of the layout, not to pay for the whole corpus.
+        const MAX_CLUSTER_READS: usize = 64;
+        let reads = total.min(MAX_CLUSTER_READS).min(budget);
+        // Even stride so the sample spans the layout instead of clumping at cluster 0.
+        let picks: Vec<usize> = (0..reads).map(|i| i * total / reads).collect();
+        let per_cluster = (budget / reads).max(1);
+
+        let metrics = QueryMetrics::new();
+        let fetched = futures::future::try_join_all(picks.into_iter().map(|c| {
+            let metrics = &metrics;
+            async move {
+                let blob = self.ns.store.get_immutable(&state.cluster_paths[c], Some((metrics, 3))).await?;
+                Ok::<_, crate::Error>((c, mlake_ivf::ClusterFile::from_bytes(&blob)?))
+            }
+        }))
+        .await?;
+
+        let mut out = Vec::new();
+        for (c, cf) in fetched {
+            for item in cf.items.into_iter().take(per_cluster) {
+                if !self.tombstones.contains(&item.id) {
+                    out.push((c as u32, item));
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// The embedding dimension a fact type's index was built with, if it has one.
@@ -599,6 +685,10 @@ impl QueryNode {
         for (id, hit) in by_id.iter_mut() {
             hit.memory = materialized.remove(id);
         }
+        // A hit with no materialized memory is one the FTS split still indexes but that is now
+        // tombstoned or predicate-deleted (the split predates the delete); `fetch_clusters`
+        // filtered it out, so drop it — a deleted memory must never surface via any arm.
+        by_id.retain(|_, hit| hit.memory.is_some());
         Ok(by_id.into_values().collect())
     }
 
@@ -725,6 +815,16 @@ impl QueryNode {
             .collect()
     }
 
+    /// Whether a memory is deleted — by id (tombstone) or by a tail predicate delete that
+    /// post-dates its last write. Evaluated on the full record (predicates read metadata).
+    fn hidden(&self, m: &StoredMemory) -> bool {
+        self.tombstones.contains(&m.id)
+            || self
+                .predicate_tombstones
+                .iter()
+                .any(|(seq, p)| m.write_seq < *seq && p.matches(m))
+    }
+
     /// Fetch the items in the given clusters of a fact type — one coalesced roundtrip.
     async fn fetch_clusters(
         &self,
@@ -744,7 +844,8 @@ impl QueryNode {
         for blob in &blobs {
             let cf = mlake_ivf::ClusterFile::from_bytes(blob)?;
             for item in cf.items {
-                if !self.tombstones.contains(&item.id) {
+                // Drop tombstoned + predicate-deleted memories so no arm can surface them.
+                if !self.hidden(&item) {
                     items.push(item);
                 }
             }

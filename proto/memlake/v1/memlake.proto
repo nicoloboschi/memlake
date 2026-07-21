@@ -51,6 +51,18 @@ service Memlake {
   // must hold), e.g. `{document_id, chunk_id}` to replace a document's facts on re-ingest.
   // A full scan by construction (metadata is not indexed) — a maintenance op, not a query.
   rpc DeleteByPredicate(DeleteByPredicateRequest) returns (DeleteByPredicateResponse);
+
+  // The write-ahead log as an operator view: which sequences are committed, and which the
+  // indexer has not folded yet. Entries at or below the manifest's `wal_index_cursor` are
+  // folded and may already have been reclaimed by GC, so this is a window on the live log,
+  // not a history of every write ever made.
+  rpc ListWal(ListWalRequest) returns (ListWalResponse);
+
+  // How k-means partitioned one memory_type: its trained centroids, per-cluster sizes and
+  // tag summaries, and optionally a sample of member memories. Centroids are already
+  // resident on every query node, so returning them alone costs no object-storage read;
+  // sampling members does read cluster files, and is bounded by `member_sample`.
+  rpc IndexLayout(IndexLayoutRequest) returns (IndexLayoutResponse);
 }
 
 // ---- Value types -----------------------------------------------------------
@@ -121,12 +133,24 @@ message Patch {
   map<string, string> metadata = 7;   // upsert these metadata keys (merge, not replace)
 }
 
+// A conjunction (AND) over a memory's type, metadata, and tags. An empty predicate matches
+// every memory (used for "delete everything"). Reused by TombstoneWhere and DeleteByPredicate.
+message Predicate {
+  repeated uint32 memory_types = 1;      // restrict to these types; empty = any
+  map<string, string> metadata_equals = 2;  // all these key=value pairs must be present
+  TagFilter tags = 3;                    // optional tag condition
+}
+
 message Op {
   oneof kind {
     Memory upsert = 1;
     bytes tombstone = 2;          // 16-byte MemoryId to delete
     Patch patch = 3;
     uint64 guard_expect_seq_lt = 4;   // optimistic precondition (compare-and-set)
+    // Delete every memory matching the predicate whose last write is older than this entry's
+    // sequence. Put it in the SAME entry as a re-ingest's upserts to atomically replace a
+    // document's facts: the new upserts share this seq, so the delete spares them.
+    Predicate tombstone_where = 5;
   }
 }
 
@@ -251,6 +275,14 @@ message DeleteByPredicateRequest {
   // Safety: an empty predicate (no metadata, no tags) is rejected unless delete_all is set,
   // so a stray empty request cannot wipe the namespace by accident.
   bool delete_all = 5;
+  // How the delete is executed:
+  //   false (default) — write one TombstoneWhere WAL op: atomic, race-closed, and lazy
+  //     (materialized at the next fold). `deleted` is 0 (nothing is scanned). This is the
+  //     right path for document re-ingest. To replace atomically, prefer a single Write with
+  //     [Op.tombstone_where, Op.upsert...] so the delete and the new facts share one seq.
+  //   true — scan now and tombstone matches by id: O(corpus), returns the exact `deleted`
+  //     count, and materializes immediately. An admin verb, not the ingest path.
+  bool eager = 6;
 }
 
 message DeleteByPredicateResponse {
@@ -345,4 +377,107 @@ message ScanRequest {
 message ScanResponse {
   repeated StoredMemoryRecord memories = 1;
   string next_page_token = 2;        // empty when the scan is exhausted
+}
+
+// ---- WAL introspection -----------------------------------------------------
+
+message ListWalRequest {
+  string namespace = 1;
+  // Start at this sequence. 0 begins at the oldest entry still retained.
+  uint64 start_seq = 2;
+  uint32 limit = 3;          // 0 uses the server default
+  // Decode each entry's ops. Off by default: one entry is a whole group-commit batch and
+  // can hold thousands of memories, so the listing stays a header view unless asked.
+  bool include_ops = 4;
+}
+
+// How many of each op kind an entry holds. Cheap to compute and usually all an operator
+// needs to see the shape of a batch.
+message WalOpCounts {
+  uint32 upserts = 1;
+  uint32 tombstones = 2;
+  uint32 patches = 3;
+  uint32 guards = 4;
+  // Predicate deletes (`DeleteByPredicate`). Counted apart from `tombstones` because one
+  // op can remove any number of memories, so the two are not comparable quantities.
+  uint32 predicate_tombstones = 5;
+}
+
+// One op inside an entry. An upsert reports its memory's identity and shape rather than
+// the whole record — this is a log view, not a way to read memories back (use Get).
+message WalOpDetail {
+  oneof kind {
+    WalUpsert upsert = 1;
+    bytes tombstone = 2;              // 16-byte MemoryId
+    Patch patch = 3;
+    uint64 guard_expect_seq_lt = 4;
+    // A predicate delete, rendered as a human-readable summary of what it matched
+    // (e.g. `type=1 meta[document_id=d-42] tags:ANY[prod]`). The log view shows what the
+    // op asked for; which memories it actually hit is not recorded in the entry.
+    string tombstone_where = 5;
+  }
+}
+
+message WalUpsert {
+  bytes id = 1;                       // 16-byte MemoryId
+  uint32 memory_type = 2;
+  string text = 3;
+  repeated string tags = 4;
+  uint32 vector_dim = 5;              // 0 = the memory carries no embedding
+}
+
+message WalEntryInfo {
+  uint64 seq = 1;                     // the entry's order point
+  uint64 size_bytes = 2;              // the WAL object's size
+  WalOpCounts counts = 3;
+  // True once the indexer has folded this entry into a generation (seq <= wal_index_cursor).
+  // Un-folded entries are exactly what a STRONG query pays to scan on every read.
+  bool folded = 4;
+  repeated WalOpDetail ops = 5;       // only when include_ops was set
+}
+
+message ListWalResponse {
+  repeated WalEntryInfo entries = 1;
+  uint64 wal_head = 2;                // last committed sequence
+  uint64 wal_index_cursor = 3;        // last sequence folded into the current generation
+  uint64 next_seq = 4;                // resume point; 0 when the log is exhausted
+}
+
+// ---- IVF layout ------------------------------------------------------------
+
+message IndexLayoutRequest {
+  string namespace = 1;
+  uint32 memory_type = 2;
+  // Sample up to this many member memories, spread across clusters, and return their
+  // vectors. 0 returns centroids only — which needs no object-storage read at all, since
+  // the centroids are already resident. Sampling reads cluster files, so it is bounded.
+  uint32 member_sample = 3;
+  Consistency consistency = 4;
+}
+
+message ClusterInfo {
+  uint32 cluster_id = 1;
+  Vector centroid = 2;                // raw little-endian f32, length = dim * 4
+  // Members assigned to this centroid when the generation was built. Note this is the
+  // trained size: it does not include un-indexed WAL-tail writes.
+  uint64 size = 3;
+  repeated string tags = 4;           // the cluster's tag summary (union over members)
+  bool has_untagged = 5;
+}
+
+// A member memory returned for plotting, with just enough to label a point.
+message ClusterMember {
+  bytes id = 1;                       // 16-byte MemoryId
+  uint32 cluster_id = 2;
+  Vector vector = 3;
+  string text = 4;
+}
+
+message IndexLayoutResponse {
+  string namespace = 1;
+  uint32 memory_type = 2;
+  uint64 generation = 3;
+  uint32 dim = 4;                     // 0 when the type has no embeddings
+  repeated ClusterInfo clusters = 5;
+  repeated ClusterMember members = 6; // empty unless member_sample was set
 }

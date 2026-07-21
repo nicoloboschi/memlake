@@ -132,6 +132,11 @@ pub struct StoredMemory {
     /// back with a search hit, no second round trip. Sorted by key for deterministic
     /// serialization (G-6).
     pub metadata: Vec<(String, String)>,
+    /// The WAL sequence of this memory's last upsert. Set during the fold, carried through
+    /// generations. A predicate tombstone at sequence `S` hides only memories with
+    /// `write_seq < S`, so a re-upsert (higher seq) survives the delete — this is what makes
+    /// predicate delete race-closed and re-ingest-safe.
+    pub write_seq: u64,
 }
 
 impl StoredMemory {
@@ -198,6 +203,7 @@ impl Memory {
             semantic_out: Vec::new(),
             causal_out: self.causal_out,
             metadata: self.metadata,
+            write_seq: 0, // set by the WAL fold from the entry's sequence.
         }
     }
 }
@@ -226,6 +232,7 @@ mod tests {
             semantic_out: vec![],
             causal_out: vec![],
             metadata: vec![],
+            write_seq: 0,
         };
         assert_eq!(item.shared_entity_count(&[3, 5, 9].map(eid)), 2);
         assert_eq!(item.shared_entity_count(&[2, 4].map(eid)), 0);

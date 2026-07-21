@@ -175,6 +175,98 @@ export interface QueryResponse {
   loadRoundtrips: number;
 }
 
+// ---- WAL introspection ------------------------------------------------------
+
+export interface WireWalOpCounts {
+  upserts: number;
+  tombstones: number;
+  patches: number;
+  guards: number;
+}
+
+export interface WireWalUpsert {
+  id: Buffer | null;
+  memoryType: number;
+  text: string;
+  tags: string[];
+  vectorDim: number;
+}
+
+export interface WirePatch {
+  id: Buffer | null;
+  proofCountDelta: number;
+  text?: string | null;
+  _text?: string;
+  vector: WireVector | null;
+  tags: { tags: string[] } | null;
+  timestamps: WireTimestamps | null;
+  metadata: Record<string, string>;
+}
+
+export interface WireWalOpDetail {
+  // With `oneofs: true` the loader sets this to the name of the member present.
+  kind?: "upsert" | "tombstone" | "patch" | "guardExpectSeqLt";
+  upsert?: WireWalUpsert | null;
+  tombstone?: Buffer | null;
+  patch?: WirePatch | null;
+  guardExpectSeqLt?: string;
+}
+
+export interface WireWalEntryInfo {
+  seq: string;
+  sizeBytes: string;
+  counts: WireWalOpCounts | null;
+  folded: boolean;
+  ops: WireWalOpDetail[];
+}
+
+export interface ListWalRequest {
+  namespace: string;
+  startSeq: string;
+  limit: number;
+  includeOps: boolean;
+}
+
+export interface ListWalResponse {
+  entries: WireWalEntryInfo[];
+  walHead: string;
+  walIndexCursor: string;
+  nextSeq: string;
+}
+
+// ---- IVF layout -------------------------------------------------------------
+
+export interface WireClusterInfo {
+  clusterId: number;
+  centroid: WireVector | null;
+  size: string;
+  tags: string[];
+  hasUntagged: boolean;
+}
+
+export interface WireClusterMember {
+  id: Buffer | null;
+  clusterId: number;
+  vector: WireVector | null;
+  text: string;
+}
+
+export interface IndexLayoutRequest {
+  namespace: string;
+  memoryType: number;
+  memberSample: number;
+  consistency: Consistency;
+}
+
+export interface IndexLayoutResponse {
+  namespace: string;
+  memoryType: number;
+  generation: string;
+  dim: number;
+  clusters: WireClusterInfo[];
+  members: WireClusterMember[];
+}
+
 // ---- errors -----------------------------------------------------------------
 
 /** A failure worth showing to an operator verbatim, RPC or otherwise. */
@@ -269,6 +361,8 @@ type MemlakeStub = grpc.Client & {
   Get: UnaryCall<GetRequest, GetResponse>;
   Scan: UnaryCall<ScanRequest, ScanResponse>;
   Query: UnaryCall<QueryRequest, QueryResponse>;
+  ListWal: UnaryCall<ListWalRequest, ListWalResponse>;
+  IndexLayout: UnaryCall<IndexLayoutRequest, IndexLayoutResponse>;
 };
 
 interface MemlakeGlobal {
@@ -410,6 +504,16 @@ export const memlake = {
   },
   query(req: QueryRequest, deadlineMs?: number) {
     return unary<QueryRequest, QueryResponse>("Query", req, deadlineMs);
+  },
+  listWal(req: ListWalRequest, deadlineMs?: number) {
+    return unary<ListWalRequest, ListWalResponse>("ListWal", req, deadlineMs);
+  },
+  indexLayout(req: IndexLayoutRequest, deadlineMs?: number) {
+    return unary<IndexLayoutRequest, IndexLayoutResponse>(
+      "IndexLayout",
+      req,
+      deadlineMs,
+    );
   },
 };
 

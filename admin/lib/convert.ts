@@ -9,29 +9,41 @@
  */
 
 import { bytesToUuid } from "./ids";
-import { summarizeF32le } from "./vector";
+import { f32leToFloats, summarizeF32le } from "./vector";
 import type {
   ArmScoreJson,
   CausalEdgeJson,
+  ClusterJson,
+  ClusterMemberJson,
   HitJson,
+  IndexLayoutJson,
   LinkType,
+  ListWalJson,
   MemoryPayloadJson,
   StatsJson,
   StoredMemoryJson,
   TimestampsJson,
   TypeStatsJson,
   VectorSummary,
+  WalEntryJson,
+  WalOpJson,
 } from "./types";
 import { LINK_TYPES } from "./types";
 import type {
+  IndexLayoutResponse,
+  ListWalResponse,
   StatsResponse,
   WireArmScore,
   WireCausalEdge,
+  WireClusterInfo,
+  WireClusterMember,
   WireHit,
   WireMemoryPayload,
   WireStoredMemoryRecord,
   WireTimestamps,
   WireVector,
+  WireWalEntryInfo,
+  WireWalOpDetail,
 } from "./memlake";
 
 /** Buffers are Uint8Arrays, but be defensive: proto-loader can hand back either. */
@@ -44,6 +56,16 @@ function asBytes(b: Buffer | Uint8Array | null | undefined): Uint8Array {
 function u64(v: string | number | null | undefined): string {
   if (v === null || v === undefined) return "0";
   return typeof v === "string" ? v : String(v);
+}
+
+/** `a - b` on u64 decimal strings, clamped at 0. A WAL seq exceeds Number range. */
+function diffU64(a: string, b: string): string {
+  try {
+    const d = BigInt(a) - BigInt(b);
+    return (d > 0n ? d : 0n).toString();
+  } catch {
+    return "0";
+  }
 }
 
 function linkType(v: string | number | null | undefined): LinkType {
@@ -169,17 +191,144 @@ export function typeStatsToJson(t: {
   };
 }
 
+// ---- WAL --------------------------------------------------------------------
+
+export function walOpToJson(op: WireWalOpDetail): WalOpJson {
+  // With `oneofs: true` the loader names the member that is actually set, which
+  // is the only reliable discriminator: `defaults: true` would otherwise leave
+  // zero-valued siblings looking present.
+  switch (op.kind) {
+    case "upsert": {
+      const u = op.upsert;
+      return {
+        kind: "upsert",
+        id: bytesToUuid(asBytes(u?.id)),
+        memoryType: u?.memoryType ?? 0,
+        text: u?.text ?? "",
+        tags: u?.tags ?? [],
+        vectorDim: u?.vectorDim ?? 0,
+      };
+    }
+    case "tombstone":
+      return { kind: "tombstone", id: bytesToUuid(asBytes(op.tombstone)) };
+    case "patch": {
+      const p = op.patch;
+      const vectorBytes = asBytes(p?.vector?.f32le);
+      return {
+        kind: "patch",
+        id: bytesToUuid(asBytes(p?.id)),
+        proofCountDelta: p?.proofCountDelta ?? 0,
+        // proto3 `optional string`: the synthetic-oneof marker distinguishes
+        // "set to empty" from "not set".
+        setsText: p?._text !== undefined,
+        text: p?._text !== undefined ? (p?.text ?? "") : null,
+        // Message-typed fields: present => set.
+        setsVector: vectorBytes.length > 0,
+        vectorDim: Math.floor(vectorBytes.length / 4),
+        setsTags: p?.tags != null,
+        tags: p?.tags?.tags ?? [],
+        setsTimestamps: p?.timestamps != null,
+        timestamps: timestampsToJson(p?.timestamps),
+        metadata: p?.metadata ?? {},
+      };
+    }
+    case "guardExpectSeqLt":
+      return { kind: "guard", expectSeqLt: u64(op.guardExpectSeqLt) };
+    default:
+      return { kind: "unknown" };
+  }
+}
+
+export function walEntryToJson(e: WireWalEntryInfo): WalEntryJson {
+  return {
+    seq: u64(e.seq),
+    sizeBytes: u64(e.sizeBytes),
+    counts: {
+      upserts: e.counts?.upserts ?? 0,
+      tombstones: e.counts?.tombstones ?? 0,
+      patches: e.counts?.patches ?? 0,
+      guards: e.counts?.guards ?? 0,
+    },
+    folded: Boolean(e.folded),
+    ops: (e.ops ?? []).map(walOpToJson),
+  };
+}
+
+export function listWalToJson(
+  r: ListWalResponse,
+  elapsedMs: number,
+): ListWalJson {
+  const walHead = u64(r.walHead);
+  const walIndexCursor = u64(r.walIndexCursor);
+  return {
+    entries: (r.entries ?? []).map(walEntryToJson),
+    walHead,
+    walIndexCursor,
+    nextSeq: u64(r.nextSeq),
+    backlog: diffU64(walHead, walIndexCursor),
+    elapsedMs,
+  };
+}
+
+// ---- IVF layout -------------------------------------------------------------
+
+/**
+ * Unlike Scan/Get, the layout page ships the FULL centroid and member vectors:
+ * the PCA projection runs in the browser, so it needs every component. The
+ * member count is bounded by `member_sample` for exactly this reason.
+ */
+export function clusterToJson(c: WireClusterInfo): ClusterJson {
+  const bytes = asBytes(c.centroid?.f32le);
+  return {
+    clusterId: c.clusterId ?? 0,
+    centroid: bytes.length ? f32leToFloats(bytes) : [],
+    size: u64(c.size),
+    tags: c.tags ?? [],
+    hasUntagged: Boolean(c.hasUntagged),
+  };
+}
+
+export function clusterMemberToJson(m: WireClusterMember): ClusterMemberJson {
+  const bytes = asBytes(m.vector?.f32le);
+  return {
+    id: bytesToUuid(asBytes(m.id)),
+    clusterId: m.clusterId ?? 0,
+    vector: bytes.length ? f32leToFloats(bytes) : [],
+    text: m.text ?? "",
+  };
+}
+
+export function indexLayoutToJson(
+  r: IndexLayoutResponse,
+  elapsedMs: number,
+): IndexLayoutJson {
+  const clusters = (r.clusters ?? [])
+    .map(clusterToJson)
+    .sort((a, b) => a.clusterId - b.clusterId);
+  let total = 0n;
+  for (const c of clusters) {
+    try {
+      total += BigInt(c.size);
+    } catch {
+      /* keep going: a malformed size should not blank the page */
+    }
+  }
+  return {
+    namespace: r.namespace ?? "",
+    memoryType: r.memoryType ?? 0,
+    generation: u64(r.generation),
+    dim: r.dim ?? 0,
+    clusters,
+    members: (r.members ?? []).map(clusterMemberToJson),
+    totalSize: total.toString(),
+    elapsedMs,
+  };
+}
+
 export function statsToJson(s: StatsResponse, elapsedMs: number): StatsJson {
   const walHead = u64(s.walHead);
   const walIndexCursor = u64(s.walIndexCursor);
-  // u64 subtraction: a WAL sequence can exceed Number.MAX_SAFE_INTEGER.
-  let backlog = "0";
-  try {
-    const d = BigInt(walHead) - BigInt(walIndexCursor);
-    backlog = (d > 0n ? d : 0n).toString();
-  } catch {
-    backlog = "0";
-  }
+  const backlog = diffU64(walHead, walIndexCursor);
   return {
     namespace: s.namespace ?? "",
     generation: u64(s.generation),

@@ -3,7 +3,8 @@
 //! conversion returns `tonic::Status` so it maps straight onto a gRPC error.
 
 use mlake_core::memory::{CausalEdge, LinkType, Timestamps, Weight};
-use mlake_core::{Delta, EntityId, Memory, MemoryId, Op, StoredMemory, TagFilter, TagsMatch};
+use mlake_core::predicate::tags_mode_to_u8;
+use mlake_core::{Delta, EntityId, Memory, MemoryId, Op, Predicate, StoredMemory, TagFilter, TagsMatch};
 use mlake_index::{ArmDepths, ArmScore, Consistency, RawHit};
 use tonic::Status;
 
@@ -174,6 +175,126 @@ pub fn stored_record(m: StoredMemory, include_vector: bool) -> pb::StoredMemoryR
     }
 }
 
+// ---- Admin views (WAL log, IVF layout) ----
+
+/// One WAL object as a log row. `folded` is the whole point of the view: an entry at or
+/// below the manifest's cursor is already in a generation, everything above it is backlog
+/// that each STRONG query re-scans.
+pub fn wal_entry(
+    o: &mlake_wal::WalObject,
+    wal_index_cursor: u64,
+    decoded: Option<&mlake_core::WalEntry>,
+) -> pb::WalEntryInfo {
+    let mut counts = pb::WalOpCounts::default();
+    let mut ops = Vec::new();
+    if let Some(entry) = decoded {
+        for op in &entry.ops {
+            match op {
+                Op::Upsert(m) => {
+                    counts.upserts += 1;
+                    ops.push(wal_op(pb::wal_op_detail::Kind::Upsert(pb::WalUpsert {
+                        id: m.id.0.to_vec(),
+                        memory_type: m.memory_type as u32,
+                        text: m.text.clone(),
+                        tags: m.tags.clone(),
+                        vector_dim: m.vector.len() as u32,
+                    })));
+                }
+                Op::Tombstone { id } => {
+                    counts.tombstones += 1;
+                    ops.push(wal_op(pb::wal_op_detail::Kind::Tombstone(id.0.to_vec())));
+                }
+                Op::Patch { id, .. } => {
+                    counts.patches += 1;
+                    // The log view reports which memory a patch targets; the deltas
+                    // themselves are a write-path concern, not a log-reading one.
+                    ops.push(wal_op(pb::wal_op_detail::Kind::Patch(pb::Patch {
+                        id: id.0.to_vec(),
+                        ..Default::default()
+                    })));
+                }
+                Op::Guard { expect_seq_lt } => {
+                    counts.guards += 1;
+                    ops.push(wal_op(pb::wal_op_detail::Kind::GuardExpectSeqLt(*expect_seq_lt)));
+                }
+                Op::TombstoneWhere { predicate } => {
+                    counts.predicate_tombstones += 1;
+                    ops.push(wal_op(pb::wal_op_detail::Kind::TombstoneWhere(
+                        predicate_summary(predicate),
+                    )));
+                }
+            }
+        }
+    }
+    pb::WalEntryInfo {
+        seq: o.seq,
+        size_bytes: o.size_bytes,
+        counts: Some(counts),
+        folded: o.seq <= wal_index_cursor,
+        ops,
+    }
+}
+
+fn wal_op(kind: pb::wal_op_detail::Kind) -> pb::WalOpDetail {
+    pb::WalOpDetail { kind: Some(kind) }
+}
+
+/// A predicate delete rendered for the log view. The entry records what the op asked to
+/// match, never which memories it hit — that is decided when the fold applies it.
+fn predicate_summary(p: &mlake_core::predicate::Predicate) -> String {
+    if p.is_empty() {
+        return "everything (unconstrained predicate)".into();
+    }
+    let mut parts = Vec::new();
+    if !p.memory_types.is_empty() {
+        let types: Vec<String> = p.memory_types.iter().map(|t| t.to_string()).collect();
+        parts.push(format!("type={}", types.join(",")));
+    }
+    for (k, v) in &p.metadata_equals {
+        parts.push(format!("meta[{k}={v}]"));
+    }
+    if !p.tags.is_empty() {
+        let mode = match p.tags_mode {
+            1 => "ALL",
+            2 => "ANY_STRICT",
+            3 => "ALL_STRICT",
+            4 => "EXACT",
+            _ => "ANY",
+        };
+        parts.push(format!("tags:{mode}[{}]", p.tags.join(",")));
+    }
+    parts.join(" ")
+}
+
+/// The IVF layout as wire clusters. Tag summaries are parallel to the centroids but may be
+/// absent on a generation built before they existed, so they are looked up defensively.
+pub fn cluster_infos(layout: &mlake_index::ClusterLayout<'_>) -> Vec<pb::ClusterInfo> {
+    layout
+        .centroids
+        .iter()
+        .enumerate()
+        .map(|(i, centroid)| {
+            let summary = layout.tag_summary.get(i);
+            pb::ClusterInfo {
+                cluster_id: i as u32,
+                centroid: Some(encode_vector(centroid)),
+                size: layout.sizes.get(i).copied().unwrap_or(0) as u64,
+                tags: summary.map(|s| s.tags.clone()).unwrap_or_default(),
+                has_untagged: summary.map(|s| s.has_untagged).unwrap_or(false),
+            }
+        })
+        .collect()
+}
+
+pub fn cluster_member(cluster_id: u32, m: StoredMemory) -> pb::ClusterMember {
+    pb::ClusterMember {
+        id: m.id.0.to_vec(),
+        cluster_id,
+        vector: Some(encode_vector(&m.vector)),
+        text: m.text,
+    }
+}
+
 pub fn op(o: pb::Op) -> Result<Op, Status> {
     let kind = o.kind.ok_or_else(|| Status::invalid_argument("op has no kind set"))?;
     Ok(match kind {
@@ -202,7 +323,36 @@ pub fn op(o: pb::Op) -> Result<Op, Status> {
             }
             Op::Patch { id, deltas }
         }
+        pb::op::Kind::TombstoneWhere(p) => Op::TombstoneWhere { predicate: predicate(p)? },
         pb::op::Kind::GuardExpectSeqLt(seq) => Op::Guard { expect_seq_lt: seq },
+    })
+}
+
+/// A wire predicate -> the core `Predicate` (tags-mode carried as a `u8` discriminant).
+pub fn predicate(p: pb::Predicate) -> Result<Predicate, Status> {
+    let memory_types = p
+        .memory_types
+        .iter()
+        .map(|&t| memory_type_u8(t))
+        .collect::<Result<Vec<_>, _>>()?;
+    let (tags, tags_mode) = match p.tags {
+        Some(tf) if !tf.tags.is_empty() => {
+            let mode = match pb::TagsMatch::try_from(tf.mode).unwrap_or(pb::TagsMatch::Any) {
+                pb::TagsMatch::Any => TagsMatch::Any,
+                pb::TagsMatch::All => TagsMatch::All,
+                pb::TagsMatch::AnyStrict => TagsMatch::AnyStrict,
+                pb::TagsMatch::AllStrict => TagsMatch::AllStrict,
+                pb::TagsMatch::Exact => TagsMatch::Exact,
+            };
+            (tf.tags, tags_mode_to_u8(mode))
+        }
+        _ => (Vec::new(), 0),
+    };
+    Ok(Predicate {
+        memory_types,
+        metadata_equals: p.metadata_equals.into_iter().collect(),
+        tags,
+        tags_mode,
     })
 }
 

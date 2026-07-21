@@ -100,6 +100,18 @@ pub async fn index(ns: &Namespace, tokenizer: &Tokenizer, opts: IndexOptions) ->
         new_ids.insert(id.0);
         by_id.insert(id.0, item);
     }
+    // Materialize predicate deletes: drop every memory a tail predicate tombstone matches
+    // whose last write predates it (a same-entry re-ingest upsert has write_seq == the
+    // predicate's seq, so it survives). This is where the eager scan becomes free — the fold
+    // is already reading every cluster.
+    if !scan.predicate_tombstones.is_empty() {
+        by_id.retain(|_, m| {
+            !scan
+                .predicate_tombstones
+                .iter()
+                .any(|(seq, p)| m.write_seq < *seq && p.matches(m))
+        });
+    }
     let mut touched: std::collections::HashSet<[u8; 16]> = new_ids.clone();
     for item in by_id.values_mut() {
         if let Some(deltas) = scan.pending_patches.get(&MemoryId(item.id.0)) {
