@@ -121,4 +121,58 @@ fix is a **row-addressable payload** so a point read fetches one memory, not its
   from the split — no cluster read. Smaller blast radius, doesn't help graph/get.
 
 Recommended: Option A, since it also removes the residual ~40ms from the graph arm and speeds
-`get`. Not yet implemented — this is the next drastic-perf item after the graph arm.
+`get`.
+
+### Payload store — DONE (Option A)
+
+Added `PayloadTable`: `id -> memory rkyv bytes with the embedding stripped`, an SSTable
+range-read per id (like pk/radj/entity). The fold builds it; the final query materialization
+pass and the graph tag-filter branch hydrate misses via one coalesced payload lookup instead of
+pk + whole-cluster fetch. The vector is omitted because query hits return `MemoryPayload` (no
+vector); the vector arm's rerank and the temporal arm's entry-point ranking still read clusters
+(they need vectors), as does `get --include_vector`. `FORMAT_VERSION -> 3`. Storage grows ~17%
+(1.95 → 2.28 GB at 1M) for the vector-stripped rows.
+
+**Measured @ 1M (warm p50):** fts **44 → 7.7ms** (~5.7×), hybrid 45 → 8.3ms, graph **44.5 → 8.9ms**.
+Combined with the earlier score-then-hydrate change, the graph arm went **644ms → 8.9ms (~72×)**.
+Every arm is now single-digit ms warm (vector 4.7, fts 7.6, hybrid 8.3, graph 8.7), except tags
+(~17-21ms, which fetch probed clusters + rerank) and temporal (see below).
+
+## Temporal arm — enabled, and a scaling finding
+
+The datagen now stamps `occurred_start` (memory `i` at `epoch + i`s), and `read_bench` has a
+`temporal` workload (vector + time window). Enabling it surfaced a real issue: the temporal arm
+**materializes the entire time window before truncating to its 60-entry pool**, and it needs the
+candidates' *vectors* (it ranks entry points by similarity to the query), so it reads whole
+cluster files. Because time and vector-cluster are uncorrelated, a window of W memories touches
+~min(W, √N) clusters — a wide window (e.g. 2% of history ≈ 20k memories at 1M) reads most of the
+corpus and the query never returns in reasonable time. Bounded to ~120-memory windows it is fine.
+
+This is the same *materialize-before-truncate* shape the graph fix removed, but harder: the
+truncation key (similarity) needs vectors, which the payload store omits. Fix options:
+1. **Bound `in_window`** to a capped, time-spread sample of entry points (materialize ≤ pool×k,
+   not the whole window) — smallest change, slight recall trade.
+2. **Store vectors in the payload store** too — makes temporal (and every point read) fast, at
+   the cost of duplicating the embedding (storage ~doubles).
+
+## Concurrent-request percentiles
+
+`read_bench --concurrency C` runs queries through `buffer_unordered(C)` so percentiles reflect
+latency under parallel load (C=1 is the sequential baseline).
+
+**Measured @ 1M, warm, C=32 (32 queries in flight):** latency barely moves vs sequential — the
+read path is CPU + local cache with no cross-query contention (a stateless node scales with
+cores):
+
+| Arm | warm p50 | warm p90 | warm p99 |
+|-----|----------|----------|----------|
+| vector | 4.7ms | 5.5ms | 10.2ms |
+| fts | 7.6ms | 8.1ms | 16.2ms |
+| hybrid | 8.3ms | 9.3ms | 23.8ms |
+| graph | 8.7ms | 11.4ms | 63.1ms |
+| temporal | 22.6ms | 35.2ms | 163.7ms |
+
+**Cold, C=32** spikes (p90/p99 in the 100s of ms): 32 concurrent cold queries all miss the cache
+and hammer the *single local MinIO* at once, saturating it (e.g. vector cold fetch_clusters
+146ms). That is a one-box test artifact, not a design limit — in production each stateless node
+has its own warm cache and S3 fans out across many backends. Warm is the served-state metric.

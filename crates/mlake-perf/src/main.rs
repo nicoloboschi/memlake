@@ -294,7 +294,11 @@ async fn read_bench(
     let qs: Vec<Vec<f32>> = (0..queries)
         .map(|i| gen.query_vector(i % gen.center_count(), 7 + i as u64))
         .collect();
-    let span = (cfg.scale as i64 / 50).clamp(500, 50_000); // ~2% of history per window
+    // A realistic bounded window (~120 in-window memories). The temporal arm materializes the
+    // whole window before truncating to its pool, and window members scatter across clusters
+    // (time and vector-cluster are uncorrelated), so a wide window makes it read a large slice
+    // of the corpus — see docs/benchmarks-scale.md.
+    let span: i64 = 120;
     let windows: Vec<(i64, i64)> = (0..queries)
         .map(|i| gen.time_window(i * cfg.scale / queries.max(1), span))
         .collect();
