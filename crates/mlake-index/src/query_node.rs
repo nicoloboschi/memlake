@@ -1057,46 +1057,15 @@ impl QueryNode {
         )?;
         metrics.record_phase(Phase::GraphRadj, tr.elapsed());
 
-        let mut wanted: HashSet<MemoryId> = HashSet::new();
-        for seed in &seeds {
-            for e in &seed.semantic_out {
-                wanted.insert(e.target);
-            }
-            for e in &seed.causal_out {
-                wanted.insert(e.target);
-            }
-            for e in incoming.get(&seed.id).into_iter().flatten() {
-                wanted.insert(e.source);
-            }
-        }
-        // Entity-arm candidates from the persisted postings also need materializing.
-        for ids in entity_candidates.values() {
-            wanted.extend(ids.iter().copied());
-        }
-        wanted.retain(|id| !by_id.contains_key(id) && !self.tombstones.contains(id));
-
-        // Resolve all candidates' clusters in one coalesced batch read over pk.data.
-        let tp = Instant::now();
-        let wanted_vec: Vec<MemoryId> = wanted.into_iter().collect();
-        let clusters_map = state
-            .pk
-            .lookup_batch(&self.ns.store, &wanted_vec, Some((metrics, 4)))
-            .await?;
-        metrics.record_phase(Phase::GraphPk, tp.elapsed());
-        let clusters_needed: HashSet<usize> = clusters_map.values().map(|c| *c as usize).collect();
-        if !clusters_needed.is_empty() {
-            let tf = Instant::now();
-            let ids: Vec<usize> = clusters_needed.into_iter().collect();
-            for item in self.fetch_clusters(state, &ids, metrics, 4).await? {
-                by_id.entry(item.id).or_insert(item);
-            }
-            metrics.record_phase(Phase::GraphFetch, tf.elapsed());
-        }
-
+        // Score structurally — NO candidate hydration. Activation comes entirely from the
+        // graph structure already in hand: seed edges, incoming edges (radj), and how many
+        // seed-entity postings each candidate appears in (its shared-entity count). Existence
+        // is just "not tombstoned": semantic/causal targets were liveness-filtered at fold
+        // time, so an edge only dangles if its target was deleted since. This is the change
+        // that removed the whole-corpus hydration: previously every candidate (thousands, via
+        // `per_entity_cap`) was read from its cluster just to be scored and then truncated.
         let te = Instant::now();
         let source = LazyGraphSource {
-            by_id: &by_id,
-            // The persisted entity postings — sharers found across the whole corpus.
             entity_index: &entity_candidates,
             incoming: &incoming,
             tombstones: &self.tombstones,
@@ -1106,14 +1075,33 @@ impl QueryNode {
             &seeds,
             GraphParams { budget: depth, ..GraphParams::default() },
         );
-        // Filter graph candidates by the tag filter using their materialized tags. Keep the
-        // raw activation score so the client can fuse it however it likes.
+        metrics.record_phase(Phase::GraphExpand, te.elapsed());
+
+        // Only the ranked results (≤ budget) are hydrated, and only when a tag filter needs
+        // their tags. Without a filter, nothing is fetched here — the final materialization
+        // pass hydrates the surviving hits once, shared across all arms.
+        if tags.is_noop() {
+            return Ok(ranked.into_iter().map(|r| (r.id, r.activation)).collect());
+        }
+        let tf = Instant::now();
+        let ranked_ids: Vec<MemoryId> = ranked.iter().map(|r| r.id).collect();
+        let clusters_map = state
+            .pk
+            .lookup_batch(&self.ns.store, &ranked_ids, Some((metrics, 4)))
+            .await?;
+        let clusters: HashSet<usize> = clusters_map.values().map(|c| *c as usize).collect();
+        if !clusters.is_empty() {
+            let cids: Vec<usize> = clusters.into_iter().collect();
+            for item in self.fetch_clusters(state, &cids, metrics, 4).await? {
+                by_id.entry(item.id).or_insert(item);
+            }
+        }
+        metrics.record_phase(Phase::GraphFetch, tf.elapsed());
         let out = ranked
             .into_iter()
             .filter(|r| by_id.get(&r.id).map(|m| tags.matches(&m.tags)).unwrap_or(false))
             .map(|r| (r.id, r.activation))
             .collect();
-        metrics.record_phase(Phase::GraphExpand, te.elapsed());
         Ok(out)
     }
 }
@@ -1165,34 +1153,30 @@ fn fuse_raw(raw: &[RawHit], top_k: usize, config: QueryConfig) -> Vec<FusedHit> 
     weighted_rrf(&arms, config.rrf_k, top_k)
 }
 
+/// The graph source for structural scoring — no item hydration. The entity postings are
+/// already scoped to one memory_type (the fold builds a separate entity index per type), so
+/// candidates need no per-item memory_type check, and liveness is a tombstone test.
 struct LazyGraphSource<'a> {
-    by_id: &'a HashMap<MemoryId, StoredMemory>,
     entity_index: &'a HashMap<EntityId, Vec<MemoryId>>,
     incoming: &'a HashMap<MemoryId, Vec<InEdge>>,
     tombstones: &'a HashSet<MemoryId>,
 }
 
 impl GraphSource for LazyGraphSource<'_> {
-    fn entity_candidates(&self, entity_id: EntityId, memory_type: Option<u8>, cap: usize) -> Vec<MemoryId> {
+    fn entity_candidates(&self, entity_id: EntityId, _memory_type: Option<u8>, cap: usize) -> Vec<MemoryId> {
+        // The posting is already this memory_type's index, so no per-item type check is needed.
         self.entity_index
             .get(&entity_id)
             .into_iter()
             .flatten()
             .filter(|id| !self.tombstones.contains(id))
-            .filter(|id| match (memory_type, self.by_id.get(id)) {
-                (Some(ft), Some(item)) => item.memory_type == ft,
-                _ => true,
-            })
             .take(cap)
             .copied()
             .collect()
     }
 
-    fn item(&self, id: &MemoryId) -> Option<StoredMemory> {
-        if self.tombstones.contains(id) {
-            return None;
-        }
-        self.by_id.get(id).cloned()
+    fn exists(&self, id: &MemoryId) -> bool {
+        !self.tombstones.contains(id)
     }
 
     fn incoming(&self, target: &MemoryId) -> Vec<InEdge> {

@@ -249,8 +249,8 @@ impl GraphSource for Engine {
             .collect()
     }
 
-    fn item(&self, id: &MemoryId) -> Option<StoredMemory> {
-        self.items.get(id).cloned()
+    fn exists(&self, id: &MemoryId) -> bool {
+        self.items.contains_key(id)
     }
 
     fn incoming(&self, target: &MemoryId) -> Vec<InEdge> {

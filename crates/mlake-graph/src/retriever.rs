@@ -13,7 +13,7 @@
 //! on candidates per entity, and a timeout fallback that drops the entity arm — never a
 //! recursive walk whose cost depends on graph shape (SPEC §7, "Forbidden").
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
 use mlake_core::{EntityId, MemoryId, StoredMemory};
 
@@ -29,9 +29,12 @@ pub trait GraphSource {
     /// stops a high-fan-out entity from blowing the budget.
     fn entity_candidates(&self, entity_id: EntityId, memory_type: Option<u8>, cap: usize) -> Vec<MemoryId>;
 
-    /// Materialize an item by id, or `None` if it is tombstoned or absent. This is where
-    /// dangling edges become invisible without any cleanup (SPEC §7.7).
-    fn item(&self, id: &MemoryId) -> Option<StoredMemory>;
+    /// True if `id` is a live memory — it exists and is not tombstoned. Scoring is purely
+    /// structural (edge weights + shared-entity counts), so a candidate never needs to be
+    /// hydrated to be scored; this liveness check is all that is needed to drop dangling or
+    /// deleted edges (SPEC §7.7). The full memories of only the *ranked* results are fetched,
+    /// by the caller, after truncation to `budget`.
+    fn exists(&self, id: &MemoryId) -> bool;
 
     /// Incoming edges for a target, from reverse adjacency.
     fn incoming(&self, target: &MemoryId) -> Vec<crate::radj::InEdge>;
@@ -113,26 +116,22 @@ fn expand_entities(
     let seed_entities: Vec<EntityId> = seed_entities.into_iter().collect();
     let seed_set: BTreeSet<MemoryId> = seeds.iter().map(|s| s.id).collect();
 
-    // Gather candidate ids across every seed entity, deduplicated. The per-entity cap is
-    // applied to each posting read, not to the union, matching the reference's LATERAL cap.
-    let mut candidates: BTreeSet<MemoryId> = BTreeSet::new();
+    // A candidate's shared-entity count *is* the number of distinct seed-entity postings it
+    // appears in: the posting for entity `e` is exactly the memories that carry `e`, so a
+    // candidate seen in the postings of `e1` and `e3` shares both. Tallying appearances gives
+    // the score directly — no candidate is hydrated to recompute `shared_entity_count`, which
+    // is what made this arm read a large fraction of the corpus. The per-entity cap is applied
+    // to each posting read, matching the reference's LATERAL cap.
+    let mut shared: HashMap<MemoryId, u32> = HashMap::new();
     for entity in &seed_entities {
         for id in source.entity_candidates(*entity, memory_type, cap) {
             if !seed_set.contains(&id) {
-                candidates.insert(id);
+                *shared.entry(id).or_insert(0) += 1;
             }
         }
     }
-
-    for cand_id in candidates {
-        let Some(cand) = source.item(&cand_id) else {
-            // Tombstoned or dangling: skip, no cleanup needed.
-            continue;
-        };
-        let shared = cand.shared_entity_count(&seed_entities) as u32;
-        if shared > 0 {
-            acc.add_entity(cand_id, shared);
-        }
+    for (cand_id, count) in shared {
+        acc.add_entity(cand_id, count);
     }
 }
 
@@ -142,13 +141,13 @@ fn expand_semantic(source: &dyn GraphSource, seeds: &[StoredMemory], acc: &mut S
     for seed in seeds {
         // Outgoing: free, already inline in the seed record.
         for edge in &seed.semantic_out {
-            if source.item(&edge.target).is_some() {
+            if source.exists(&edge.target) {
                 acc.add_semantic(edge.target, edge.weight.to_f32());
             }
         }
         // Incoming: from reverse adjacency.
         for in_edge in source.incoming(&seed.id) {
-            if in_edge.kind == EdgeKind::Semantic && source.item(&in_edge.source).is_some() {
+            if in_edge.kind == EdgeKind::Semantic && source.exists(&in_edge.source) {
                 acc.add_semantic(in_edge.source, in_edge.weight);
             }
         }
@@ -159,13 +158,12 @@ fn expand_semantic(source: &dyn GraphSource, seeds: &[StoredMemory], acc: &mut S
 fn expand_causal(source: &dyn GraphSource, seeds: &[StoredMemory], acc: &mut ScoreAccumulator) {
     for seed in seeds {
         for edge in &seed.causal_out {
-            if source.item(&edge.target).is_some() {
+            if source.exists(&edge.target) {
                 acc.add_causal(edge.target, edge.weight.to_f32());
             }
         }
         for in_edge in source.incoming(&seed.id) {
-            if matches!(in_edge.kind, EdgeKind::Causal(_)) && source.item(&in_edge.source).is_some()
-            {
+            if matches!(in_edge.kind, EdgeKind::Causal(_)) && source.exists(&in_edge.source) {
                 acc.add_causal(in_edge.source, in_edge.weight);
             }
         }
@@ -233,11 +231,8 @@ mod tests {
                 .collect()
         }
 
-        fn item(&self, id: &MemoryId) -> Option<StoredMemory> {
-            if self.tombstoned.contains(id) {
-                return None;
-            }
-            self.items.get(id).cloned()
+        fn exists(&self, id: &MemoryId) -> bool {
+            !self.tombstoned.contains(id) && self.items.contains_key(id)
         }
 
         fn incoming(&self, target: &MemoryId) -> Vec<InEdge> {
