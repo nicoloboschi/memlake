@@ -169,9 +169,12 @@ pub async fn index(ns: &Namespace, tokenizer: &Tokenizer, opts: IndexOptions) ->
     }
     let radj = ReverseAdjacency::build(radj_pairs);
 
-    // Write the generation files, then publish by CAS-swapping the manifest.
+    // Write the generation files under a prefix unique to this attempt, so concurrent
+    // builders of the same generation number never overwrite each other's files (INV-2).
+    let nonce = mlake_core::ItemId::new_v4().as_uuid().simple().to_string();
+    let prefix = crate::generation::attempt_prefix(&ns.name, generation, &nonce);
     let files = write_generation(
-        &ns.store, &ns.name, generation, &centroids, &clusters, &fts_split, &radj, &pk,
+        &ns.store, &prefix, &centroids, &clusters, &fts_split, &radj, &pk,
     )
     .await?;
 
@@ -179,6 +182,14 @@ pub async fn index(ns: &Namespace, tokenizer: &Tokenizer, opts: IndexOptions) ->
     next.generation = generation;
     next.wal_index_cursor = head;
     next.wal_head = head;
+    // Carry the outgoing generation's files and cursor forward as the GC grace window: a
+    // reader still holding this manifest keeps working until the next generation ages out.
+    next.prev_files = if manifest.is_empty() {
+        None
+    } else {
+        Some(manifest.files.clone())
+    };
+    next.prev_wal_index_cursor = manifest.wal_index_cursor;
     next.files = files;
     next.tokenizer_config_hash = tokenizer.config_hash();
     next.prev_generation = Some(manifest.generation);

@@ -48,24 +48,33 @@ pub struct Generation {
     pub pk: PkIndex,
 }
 
-/// File names within a generation prefix.
-fn centroids_key(ns: &str, g: u64) -> String {
-    format!("{}/centroids.json", generation_prefix(ns, g))
+/// File names within a generation *attempt* prefix. The prefix is unique per index
+/// attempt (`{ns}/gen-{G}-{nonce}`), so two nodes racing to build generation G write to
+/// disjoint keys and can never overwrite each other's files — the winner's manifest points
+/// at its own prefix, the loser's files are orphaned for GC (INV-2).
+fn centroids_key(prefix: &str) -> String {
+    format!("{prefix}/centroids.json")
 }
-fn cluster_key(ns: &str, g: u64, i: usize) -> String {
-    format!("{}/cluster-{i}.bin", generation_prefix(ns, g))
+fn cluster_key(prefix: &str, i: usize) -> String {
+    format!("{prefix}/cluster-{i}.bin")
 }
-fn fts_key(ns: &str, g: u64) -> String {
-    format!("{}/fts/split.bin", generation_prefix(ns, g))
+fn fts_key(prefix: &str) -> String {
+    format!("{prefix}/fts/split.bin")
 }
-fn radj_key(ns: &str, g: u64) -> String {
-    format!("{}/radj.json", generation_prefix(ns, g))
+fn radj_key(prefix: &str) -> String {
+    format!("{prefix}/radj.json")
 }
-fn pk_key(ns: &str, g: u64) -> String {
-    format!("{}/pk.idx", generation_prefix(ns, g))
+fn pk_key(prefix: &str) -> String {
+    format!("{prefix}/pk.idx")
 }
-fn stats_key(ns: &str, g: u64) -> String {
-    format!("{}/stats.json", generation_prefix(ns, g))
+fn stats_key(prefix: &str) -> String {
+    format!("{prefix}/stats.json")
+}
+
+/// A unique per-attempt generation prefix. The nonce ensures two nodes building the same
+/// generation number never collide on object keys.
+pub fn attempt_prefix(namespace: &str, generation: u64, nonce: &str) -> String {
+    format!("{}-{nonce}", generation_prefix(namespace, generation))
 }
 
 /// Generation-level statistics, for observability and compaction decisions.
@@ -76,12 +85,13 @@ pub struct Stats {
     pub edge_count: usize,
 }
 
-/// Write a generation's files to the store and return the manifest file map. Every file is
-/// written unconditionally because its path is unique to this generation (INV-2).
+/// Write a generation's files under a unique attempt `prefix` and return the manifest file
+/// map. Every file is genuinely write-once: because `prefix` is unique per attempt, no
+/// other index run ever writes these keys, so the immutability invariant holds even when
+/// two nodes build the same generation number concurrently (INV-2).
 pub async fn write_generation(
     store: &Store,
-    namespace: &str,
-    generation: u64,
+    prefix: &str,
     centroids: &Centroids,
     clusters: &[ClusterFile],
     fts_split: &[u8],
@@ -89,27 +99,21 @@ pub async fn write_generation(
     pk: &PkIndex,
 ) -> Result<GenerationFiles> {
     store
-        .put(&centroids_key(namespace, generation), centroids.to_bytes()?)
+        .put(&centroids_key(prefix), centroids.to_bytes()?)
         .await?;
 
     let mut cluster_paths = Vec::with_capacity(clusters.len());
     for (i, cluster) in clusters.iter().enumerate() {
-        let key = cluster_key(namespace, generation, i);
+        let key = cluster_key(prefix, i);
         store.put(&key, cluster.to_bytes()?).await?;
         cluster_paths.push(key);
     }
 
     // The FTS file is the packed tantivy split — a self-contained index a query node
     // materializes into its NVMe/mmap tier (SPEC §6.1).
-    store
-        .put(&fts_key(namespace, generation), fts_split.to_vec())
-        .await?;
-    store
-        .put(&radj_key(namespace, generation), radj.to_bytes()?)
-        .await?;
-    store
-        .put(&pk_key(namespace, generation), serde_json::to_vec(pk)?)
-        .await?;
+    store.put(&fts_key(prefix), fts_split.to_vec()).await?;
+    store.put(&radj_key(prefix), radj.to_bytes()?).await?;
+    store.put(&pk_key(prefix), serde_json::to_vec(pk)?).await?;
 
     let stats = Stats {
         doc_count: pk.entries.len(),
@@ -117,17 +121,17 @@ pub async fn write_generation(
         edge_count: radj.edge_count(),
     };
     store
-        .put(&stats_key(namespace, generation), serde_json::to_vec(&stats)?)
+        .put(&stats_key(prefix), serde_json::to_vec(&stats)?)
         .await?;
 
     Ok(GenerationFiles {
-        pk: pk_key(namespace, generation),
-        centroids: centroids_key(namespace, generation),
+        pk: pk_key(prefix),
+        centroids: centroids_key(prefix),
         clusters: cluster_paths,
-        radj_csr: radj_key(namespace, generation),
-        radj_idx: radj_key(namespace, generation),
-        fts_split: fts_key(namespace, generation),
-        stats: stats_key(namespace, generation),
+        radj_csr: radj_key(prefix),
+        radj_idx: radj_key(prefix),
+        fts_split: fts_key(prefix),
+        stats: stats_key(prefix),
     })
 }
 

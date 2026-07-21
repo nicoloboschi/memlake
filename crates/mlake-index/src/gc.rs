@@ -1,18 +1,33 @@
 //! Garbage collection (SPEC §5.4).
 //!
-//! Two kinds of file become reclaimable over time: generation files no longer referenced
-//! by the manifest (an old generation superseded by a newer one), and WAL entries already
-//! folded into a generation. Both are safe to delete only after they can no longer be
-//! read by an in-flight query — which for generations means keeping `prev_generation` as a
-//! grace window, and for the WAL means keeping everything past the manifest cursor.
+//! GC is **reference-based**: it keeps exactly the objects the current manifest points at,
+//! plus the previous generation's objects (retained in the manifest as the grace window),
+//! and reclaims everything else — orphaned files from index attempts that lost the manifest
+//! swap, and superseded generations. Because generation files live under a per-attempt
+//! nonce prefix, "delete by generation number" is not enough; only the manifest knows which
+//! objects are live.
 //!
-//! GC is idempotent and runs on any node: deleting an already-deleted file is a no-op, so
-//! two nodes collecting concurrently do not conflict (INV-6).
+//! Two grace windows protect in-flight readers:
+//! * **generations** — the current and previous generation's files are always kept, so a
+//!   reader still holding the previous manifest sees a complete tree;
+//! * **the WAL** — entries are kept back to the *previous* generation's cursor, since a
+//!   strong reader on the previous manifest is scanning `(prev_cursor, head]`.
+//!
+//! An additional age floor (`min_age`) keeps very recently written objects regardless, so
+//! an index run that is mid-flight on another node is never collected out from under it.
+//! GC is idempotent and safe to run on any node (INV-6): a delete of an already-deleted or
+//! still-referenced-elsewhere object is a no-op.
 
-use mlake_core::manifest::generation_prefix;
+use std::collections::HashSet;
+use std::time::Duration;
+
 use mlake_wal::{parse_wal_seq, Namespace};
 
 use crate::Result;
+
+/// Default age floor: objects younger than this are never collected, covering an index
+/// run in progress on another node. Matches the spec's 15-minute file grace.
+pub const DEFAULT_MIN_AGE: Duration = Duration::from_secs(15 * 60);
 
 /// What a GC pass reclaimed.
 #[derive(Default, Debug, PartialEq, Eq)]
@@ -21,41 +36,66 @@ pub struct GcOutcome {
     pub wal_entries_deleted: usize,
 }
 
-/// Reclaim unreferenced files for a namespace.
-///
-/// Deletes:
-/// * generation files under `gen-{G}/` for any `G` older than `prev_generation` — the
-///   current and previous generations are both retained so a reader mid-flight on the
-///   previous manifest still sees a complete tree;
-/// * WAL entries at or below `wal_index_cursor`, which are durably folded into the
-///   current generation and can no longer be needed by any consistent read.
+/// Reclaim unreferenced objects, keeping anything younger than [`DEFAULT_MIN_AGE`].
 pub async fn gc(ns: &Namespace) -> Result<GcOutcome> {
+    gc_with_min_age(ns, DEFAULT_MIN_AGE).await
+}
+
+/// Reclaim unreferenced objects, keeping anything younger than `min_age`. Tests pass
+/// `Duration::ZERO` to exercise deletion deterministically without waiting.
+pub async fn gc_with_min_age(ns: &Namespace, min_age: Duration) -> Result<GcOutcome> {
     let (manifest, _etag) = ns.read_manifest().await?;
     let mut outcome = GcOutcome::default();
 
-    // The oldest generation still referenced. Keep it and everything at or above it.
-    let keep_from = manifest.prev_generation.unwrap_or(manifest.generation);
-
-    // Delete stale generation prefixes.
-    for g in 0..keep_from {
-        let prefix = generation_prefix(&ns.name, g);
-        let paths = ns.store.list(&prefix).await?;
-        for path in paths {
-            ns.store.delete(&path).await?;
-            outcome.generation_files_deleted += 1;
+    // The live object set: everything the current and previous generations reference.
+    let mut referenced: HashSet<String> = HashSet::new();
+    for path in manifest.files.all_paths() {
+        referenced.insert(path.to_string());
+    }
+    if let Some(prev) = &manifest.prev_files {
+        for path in prev.all_paths() {
+            referenced.insert(path.to_string());
         }
     }
 
-    // Delete folded WAL entries. Everything at or below the cursor is in the generation;
-    // the query node only ever scans strictly past the cursor.
-    let wal_prefix = format!("{}/wal/", ns.name);
-    for path in ns.store.list(&wal_prefix).await? {
-        if let Some(seq) = parse_wal_seq(&path) {
-            if seq <= manifest.wal_index_cursor {
-                ns.store.delete(&path).await?;
-                outcome.wal_entries_deleted += 1;
-            }
+    let cutoff = chrono::Utc::now() - chrono::Duration::from_std(min_age).unwrap_or_default();
+
+    // Collect unreferenced generation objects that are old enough to be safe.
+    //
+    // Object-store `list` matches on path *segments*, so a prefix like `ns/gen-` would not
+    // match `ns/gen-1-{nonce}/…` (the segment is `gen-1-{nonce}`). List the namespace root
+    // and filter by string prefix instead.
+    let gen_string_prefix = format!("{}/gen-", ns.name);
+    for (path, modified) in ns.store.list_with_age(&ns.name).await? {
+        if !path.starts_with(&gen_string_prefix) {
+            continue;
         }
+        if referenced.contains(&path) {
+            continue;
+        }
+        if modified > cutoff {
+            continue; // too young: an index run may still be writing this attempt
+        }
+        ns.store.delete(&path).await?;
+        outcome.generation_files_deleted += 1;
+    }
+
+    // Delete folded WAL entries, but keep everything a reader on the previous manifest
+    // still needs: retain entries above the *previous* generation's cursor.
+    let wal_keep_above = manifest.prev_wal_index_cursor;
+    let wal_prefix = format!("{}/wal/", ns.name);
+    for (path, modified) in ns.store.list_with_age(&wal_prefix).await? {
+        let Some(seq) = parse_wal_seq(&path) else {
+            continue;
+        };
+        if seq > wal_keep_above {
+            continue; // still inside a previous-manifest reader's scan window
+        }
+        if modified > cutoff {
+            continue;
+        }
+        ns.store.delete(&path).await?;
+        outcome.wal_entries_deleted += 1;
     }
 
     Ok(outcome)

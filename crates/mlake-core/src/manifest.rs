@@ -21,6 +21,24 @@ pub struct GenerationFiles {
     pub stats: String,
 }
 
+impl GenerationFiles {
+    /// Every object path this generation references, deduplicated. GC keeps exactly these
+    /// (for the current and previous generations) and reclaims everything else.
+    pub fn all_paths(&self) -> impl Iterator<Item = &str> {
+        [
+            self.pk.as_str(),
+            self.centroids.as_str(),
+            self.radj_csr.as_str(),
+            self.radj_idx.as_str(),
+            self.fts_split.as_str(),
+            self.stats.as_str(),
+        ]
+        .into_iter()
+        .chain(self.clusters.iter().map(|s| s.as_str()))
+        .filter(|s| !s.is_empty())
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 pub struct Manifest {
     pub format_version: u32,
@@ -37,6 +55,16 @@ pub struct Manifest {
     /// Kept alive for the GC grace period so in-flight readers holding the previous
     /// manifest do not observe deleted files.
     pub prev_generation: Option<u64>,
+    /// The previous generation's file set, retained so GC can keep exactly those objects
+    /// alive as the grace window for a reader still holding the previous manifest —
+    /// without it, GC would have to guess the previous generation's (nonce-suffixed) paths.
+    #[serde(default)]
+    pub prev_files: Option<GenerationFiles>,
+    /// The previous generation's WAL cursor. WAL entries at or below the *current* cursor
+    /// are folded, but a strong reader that read the previous manifest is scanning
+    /// `(prev_wal_index_cursor, head]`, so GC must keep entries above this watermark.
+    #[serde(default)]
+    pub prev_wal_index_cursor: u64,
 }
 
 impl Manifest {
@@ -58,6 +86,8 @@ impl Manifest {
             },
             tokenizer_config_hash: tokenizer_config_hash.into(),
             prev_generation: None,
+            prev_files: None,
+            prev_wal_index_cursor: 0,
         }
     }
 

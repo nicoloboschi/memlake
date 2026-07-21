@@ -266,7 +266,8 @@ async fn full_pipeline_against_minio() {
 
 // ---------------------------------------------------------------- compaction & GC (M6)
 
-use mlake_index::{gc, GcOutcome};
+use mlake_index::{gc_with_min_age, GcOutcome};
+use std::time::Duration as GcDuration;
 
 /// After GC, folded WAL entries and superseded generation files are gone, but queries
 /// still return the same results — GC touches only unreferenced files (INV-4).
@@ -288,7 +289,7 @@ async fn gc_reclaims_folded_wal_and_old_generations_without_changing_results() {
     let before = QueryNode::open(&ns, Tokenizer::default(), Consistency::Strong).await.unwrap();
     assert_eq!(before.doc_count(), 3);
 
-    let outcome = gc(&ns).await.unwrap();
+    let outcome = gc_with_min_age(&ns, GcDuration::ZERO).await.unwrap();
     assert!(outcome.wal_entries_deleted > 0, "folded WAL entries should be reclaimed");
     assert!(outcome.generation_files_deleted > 0, "an old generation should be reclaimed");
 
@@ -309,7 +310,7 @@ async fn gc_keeps_the_current_generation_intact() {
     writer.commit(vec![Op::Upsert(item("a", vec![1.0, 0.0], "alpha"))]).await.unwrap();
     index(&ns, &Tokenizer::default(), IndexOptions::default()).await.unwrap();
 
-    gc(&ns).await.unwrap();
+    gc_with_min_age(&ns, GcDuration::ZERO).await.unwrap();
 
     let node = QueryNode::open(&ns, Tokenizer::default(), Consistency::Strong).await.unwrap();
     assert_eq!(node.doc_count(), 1, "current generation must survive GC");
@@ -326,8 +327,8 @@ async fn gc_is_idempotent() {
     writer.commit(vec![Op::Upsert(item("b", vec![0.0, 1.0], "beta"))]).await.unwrap();
     index(&ns, &Tokenizer::default(), IndexOptions::default()).await.unwrap();
 
-    let first = gc(&ns).await.unwrap();
-    let second = gc(&ns).await.unwrap();
+    let first = gc_with_min_age(&ns, GcDuration::ZERO).await.unwrap();
+    let second = gc_with_min_age(&ns, GcDuration::ZERO).await.unwrap();
     assert_eq!(second, GcOutcome::default(), "second GC pass must find nothing new");
     assert!(first != GcOutcome::default(), "first GC pass should reclaim something");
 }
@@ -352,7 +353,7 @@ async fn tombstone_survives_compaction_and_wal_gc() {
     writer.commit(vec![Op::Tombstone { id: ItemId::from_key("drop") }]).await.unwrap();
     // Fold the tombstone into a new generation, then GC the tombstone's WAL entry.
     index(&ns, &Tokenizer::default(), IndexOptions::default()).await.unwrap();
-    gc(&ns).await.unwrap();
+    gc_with_min_age(&ns, GcDuration::ZERO).await.unwrap();
 
     let node = QueryNode::open(&ns, Tokenizer::default(), Consistency::Strong).await.unwrap();
     assert_eq!(node.doc_count(), 1, "the deleted item must stay gone after compaction");
@@ -383,10 +384,10 @@ async fn crash_before_manifest_swap_leaves_the_old_generation_serving() {
         mlake_fts::Tokenizer::default(),
     )
     .unwrap();
+    let orphan_prefix = format!("{}/gen-99-orphanattempt", ns.name);
     let orphan_files = mlake_index::write_generation(
         &ns.store,
-        &ns.name,
-        99, // a generation number the manifest will never reference
+        &orphan_prefix,
         &mlake_ivf::train_centroids(&[vec![0.0, 1.0]], 42),
         &[],
         empty_split.split_bytes(),
@@ -522,4 +523,92 @@ async fn default_indexing_preserves_the_graph_across_reruns() {
         hits2.iter().any(|h| h.id == ItemId::from_key("a2")),
         "a second index run must not wipe the graph carried from the first"
     );
+}
+
+/// Regression for the immutability race (review bug 1): two index attempts building the
+/// same generation number write to disjoint object keys, so neither can overwrite the
+/// other's files. This tests the mechanism directly and deterministically — a genuine
+/// concurrent race would serialize under a single-threaded runtime and miss the point.
+#[tokio::test]
+async fn concurrent_generation_builds_write_disjoint_files() {
+    use mlake_index::write_generation;
+
+    let store = Store::in_memory();
+    let ns = namespace(store, "ns").await;
+
+    // Two attempts at generation 1, each under its own nonce prefix, with *different*
+    // content (as two nodes working from different WAL heads would produce).
+    let empty_split = mlake_fts::TantivyFts::build(
+        std::iter::empty::<(ItemId, &str)>(),
+        Tokenizer::default(),
+    )
+    .unwrap();
+    let prefix_a = mlake_index::generation::attempt_prefix("ns", 1, "attemptA");
+    let prefix_b = mlake_index::generation::attempt_prefix("ns", 1, "attemptB");
+
+    let files_a = write_generation(
+        &ns.store,
+        &prefix_a,
+        &mlake_ivf::train_centroids(&[vec![1.0, 0.0]], 42),
+        &[],
+        empty_split.split_bytes(),
+        &mlake_graph::ReverseAdjacency::build(vec![]),
+        &mlake_index::PkIndex { entries: vec![(ItemId::from_key("a"), 0)] },
+    )
+    .await
+    .unwrap();
+    let files_b = write_generation(
+        &ns.store,
+        &prefix_b,
+        &mlake_ivf::train_centroids(&[vec![0.0, 1.0], vec![1.0, 1.0]], 42),
+        &[],
+        empty_split.split_bytes(),
+        &mlake_graph::ReverseAdjacency::build(vec![]),
+        &mlake_index::PkIndex { entries: vec![(ItemId::from_key("b"), 0)] },
+    )
+    .await
+    .unwrap();
+
+    // Disjoint key sets: no path is shared, so one attempt physically cannot overwrite the
+    // other (INV-2 holds even for the same generation number).
+    let paths_a: std::collections::HashSet<&str> = files_a.all_paths().collect();
+    let paths_b: std::collections::HashSet<&str> = files_b.all_paths().collect();
+    assert!(paths_a.is_disjoint(&paths_b), "attempts must not share any object key");
+
+    // Both file sets remain intact and independently readable — neither clobbered the other.
+    let a_centroids = ns.store.get(&files_a.centroids, None).await.unwrap();
+    let b_centroids = ns.store.get(&files_b.centroids, None).await.unwrap();
+    assert_ne!(a_centroids.bytes, b_centroids.bytes, "each attempt kept its own bytes");
+}
+
+/// Regression for the missing WAL grace window (review bug 3): after an index run folds
+/// the tail and GC reclaims folded WAL, a reader still holding the *previous* manifest can
+/// complete its tail scan, because GC keeps entries above the previous cursor.
+#[tokio::test]
+async fn wal_gc_keeps_entries_a_previous_manifest_reader_still_needs() {
+    let store = Store::in_memory();
+    let ns = namespace(store, "ns").await;
+    let mut writer = Writer::new(ns.clone());
+
+    writer.commit(vec![Op::Upsert(item("a", vec![1.0, 0.0], "alpha"))]).await.unwrap();
+    index(&ns, &Tokenizer::default(), IndexOptions::default()).await.unwrap();
+    // Capture the previous manifest, as an in-flight reader would hold it.
+    let (prev_manifest, _) = ns.read_manifest().await.unwrap();
+
+    // More writes land in the tail, then a second index run folds them and advances the cursor.
+    writer.commit(vec![Op::Upsert(item("b", vec![0.0, 1.0], "beta"))]).await.unwrap();
+    writer.commit(vec![Op::Upsert(item("c", vec![1.0, 1.0], "gamma"))]).await.unwrap();
+    index(&ns, &Tokenizer::default(), IndexOptions::default()).await.unwrap();
+
+    // GC runs.
+    gc_with_min_age(&ns, GcDuration::ZERO).await.unwrap();
+
+    // A reader holding the previous manifest scans (prev_cursor, head]. Those entries must
+    // still be present — GC kept everything above the previous cursor.
+    let tail = mlake_wal::WalTail::new(&ns)
+        .scan_from_manifest(prev_manifest.wal_index_cursor)
+        .await
+        .expect("a previous-manifest reader's tail scan must not hit a GC'd entry");
+    assert!(tail.upserts.contains_key(&ItemId::from_key("b")));
+    assert!(tail.upserts.contains_key(&ItemId::from_key("c")));
 }

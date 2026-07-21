@@ -12,7 +12,7 @@ pub mod query_node;
 
 pub use engine::{Engine, QueryConfig};
 pub use fusion::{rrf, weighted_rrf, FusedHit, RankedArm, DEFAULT_RRF_K};
-pub use gc::{gc, GcOutcome};
+pub use gc::{gc, gc_with_min_age, GcOutcome, DEFAULT_MIN_AGE};
 pub use generation::{read_fts_split, read_generation, write_generation, Generation, PkIndex};
 pub use indexer::{index, IndexOptions, IndexOutcome};
 pub use query_node::{Consistency, QueryNode};

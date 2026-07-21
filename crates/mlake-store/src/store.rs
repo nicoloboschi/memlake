@@ -243,6 +243,22 @@ impl Store {
         Ok(paths)
     }
 
+    /// List object paths under a prefix together with each object's last-modified time, so
+    /// GC can apply an age-based grace window before deleting.
+    pub async fn list_with_age(
+        &self,
+        prefix: &str,
+    ) -> Result<Vec<(String, chrono::DateTime<chrono::Utc>)>> {
+        let mut out: Vec<(String, chrono::DateTime<chrono::Utc>)> = self
+            .inner
+            .list(Some(&Path::from(prefix)))
+            .map_ok(|meta| (meta.location.to_string(), meta.last_modified))
+            .try_collect()
+            .await?;
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(out)
+    }
+
     /// Size of an object without fetching it.
     pub async fn head(&self, path: &str) -> Result<u64> {
         match self.inner.head(&Path::from(path)).await {
