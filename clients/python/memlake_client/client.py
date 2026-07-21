@@ -8,6 +8,7 @@ front and center.
 
 from __future__ import annotations
 
+import hashlib
 import struct
 import uuid
 from dataclasses import dataclass
@@ -148,16 +149,88 @@ class Hit:
         return str(uuid.UUID(bytes=self.id))
 
 
-class MemlakeClient:
-    """A blocking gRPC client. Reuse one instance across calls (it holds a channel)."""
+def _rendezvous_key(namespace: str, node: str) -> int:
+    """Highest-random-weight (rendezvous) score for (namespace, node). A stable, process-
+    independent hash so every client agrees on the same preferred node for a namespace, and
+    adding/removing a node reshuffles only its share of namespaces (unlike modulo hashing)."""
+    h = hashlib.blake2b(f"{namespace}\x00{node}".encode(), digest_size=8)
+    return int.from_bytes(h.digest(), "big")
 
-    def __init__(self, target: str = "localhost:50051", *, channel: Optional[grpc.Channel] = None):
-        self._channel = channel or grpc.insecure_channel(target)
-        self._stub = rpc.MemlakeStub(self._channel)
+
+class MemlakeClient:
+    """A blocking gRPC client over one or more server nodes.
+
+    Pass a single address (`"localhost:50051"`) or a list (`["n1:50051", "n2:50051", ...]`).
+    With several nodes the client rendezvous-hashes each namespace to a *preferred* node for
+    both reads and writes: reads get cache affinity (a namespace's hot data stays warm on one
+    node's cache), writes get commit affinity (one node batches a namespace's writes, so
+    concurrent committers don't churn the WAL-sequence CAS). Affinity is only a hint — every
+    node can serve every request (all coordination is in object storage), so on a node failure
+    the client transparently fails over to the next-preferred node. Correctness never depends
+    on routing; it only makes the common case cheaper.
+    """
+
+    def __init__(
+        self,
+        target: "str | Sequence[str]" = "localhost:50051",
+        *,
+        channel: Optional[grpc.Channel] = None,
+    ):
+        if channel is not None:
+            # Legacy/testing single injected channel: one synthetic node.
+            self._nodes: list[str] = ["<injected>"]
+            self._channels = {"<injected>": channel}
+        else:
+            nodes = [target] if isinstance(target, str) else list(target)
+            if not nodes:
+                raise ValueError("MemlakeClient needs at least one node address")
+            # De-dup while preserving order.
+            self._nodes = list(dict.fromkeys(nodes))
+            self._channels = {n: grpc.insecure_channel(n) for n in self._nodes}
+        self._stubs = {n: rpc.MemlakeStub(ch) for n, ch in self._channels.items()}
         self.last_roundtrips: int = 0  # object-storage roundtrips of the last query()
+        self.last_node: str = ""       # which node served the last call (for debugging/tests)
+
+    @property
+    def nodes(self) -> list[str]:
+        return list(self._nodes)
+
+    def _ordered_nodes(self, namespace: str) -> list[str]:
+        """Nodes for `namespace`, preferred first (descending rendezvous score). The tail is
+        the failover order."""
+        if len(self._nodes) == 1:
+            return self._nodes
+        return sorted(self._nodes, key=lambda n: _rendezvous_key(namespace, n), reverse=True)
+
+    def preferred_node(self, namespace: str) -> str:
+        """The node this client routes `namespace` to first. Exposed so a test/LB can assert
+        the same mapping the client uses."""
+        return self._ordered_nodes(namespace)[0]
+
+    def _call(self, method: str, request):
+        """Invoke `method` on the namespace's preferred node, failing over to the next node on
+        an UNAVAILABLE (a node that is down or unreachable — the RPC provably did not execute,
+        so retrying elsewhere cannot double-apply a write). Any other error is the server's
+        considered answer and is raised as-is."""
+        namespace = getattr(request, "namespace", "") or ""
+        ordered = self._ordered_nodes(namespace)
+        last_err: Optional[grpc.RpcError] = None
+        for node in ordered:
+            try:
+                result = getattr(self._stubs[node], method)(request)
+                self.last_node = node
+                return result
+            except grpc.RpcError as e:
+                if e.code() == grpc.StatusCode.UNAVAILABLE:
+                    last_err = e
+                    continue  # node down/unreachable — try the next-preferred
+                raise
+        # Every node was unreachable.
+        raise last_err  # type: ignore[misc]
 
     def close(self) -> None:
-        self._channel.close()
+        for ch in self._channels.values():
+            ch.close()
 
     def __enter__(self) -> "MemlakeClient":
         return self
@@ -168,13 +241,13 @@ class MemlakeClient:
     # -- namespace -----------------------------------------------------------
 
     def create_namespace(self, namespace: str) -> None:
-        self._stub.CreateNamespace(pb.CreateNamespaceRequest(namespace=namespace))
+        self._call("CreateNamespace", pb.CreateNamespaceRequest(namespace=namespace))
 
     def delete_namespace(self, namespace: str) -> int:
         """Drop a whole namespace — delete every object under its prefix (manifest, WAL, all
         generations). Irreversible; returns the number of objects removed. Do not call while
         the namespace is being written."""
-        return self._stub.DeleteNamespace(
+        return self._call("DeleteNamespace", 
             pb.DeleteNamespaceRequest(namespace=namespace)
         ).objects_deleted
 
@@ -191,7 +264,7 @@ class MemlakeClient:
         returning — a heavier, synchronous call; use it after a bulk load or when you need the
         write in the generation before proceeding (e.g. tests, benchmarks)."""
         ops = [pb.Op(upsert=m) for m in memories]
-        resp = self._stub.Write(
+        resp = self._call("Write", 
             pb.WriteRequest(namespace=namespace, ops=ops, wait_for_index=wait_for_index)
         )
         return resp.seq
@@ -201,7 +274,7 @@ class MemlakeClient:
     ) -> pb.WriteResponse:
         """Lower-level write for mixed op batches (tombstones, patches, guards). See `write`
         for `wait_for_index`."""
-        return self._stub.Write(
+        return self._call("Write", 
             pb.WriteRequest(namespace=namespace, ops=list(ops), wait_for_index=wait_for_index)
         )
 
@@ -210,7 +283,7 @@ class MemlakeClient:
         tombstone hides the memory from reads immediately and removes it from the index at the
         next indexer run. One-way — there is no revert."""
         ops = [pb.Op(tombstone=i) for i in ids]
-        return self._stub.Write(pb.WriteRequest(namespace=namespace, ops=ops)).seq
+        return self._call("Write", pb.WriteRequest(namespace=namespace, ops=ops)).seq
 
     def _predicate(self, metadata_equals, tags, tags_mode, memory_types) -> pb.Predicate:
         p = pb.Predicate(
@@ -250,7 +323,7 @@ class MemlakeClient:
         )
         if tags:
             req.tags.CopyFrom(pb.TagFilter(tags=list(tags), mode=tags_mode))
-        return self._stub.DeleteByPredicate(req).deleted
+        return self._call("DeleteByPredicate", req).deleted
 
     def tombstone_where(
         self,
@@ -317,7 +390,7 @@ class MemlakeClient:
         """Partial update of one memory (see `patch` for the fields). Returns the WAL sequence.
         Visible immediately for a still-un-indexed memory (tail); for an already-indexed one it
         takes retrieval effect at the next indexer run (the embedding/text are re-indexed then)."""
-        return self._stub.Write(
+        return self._call("Write", 
             pb.WriteRequest(namespace=namespace, ops=[self.patch(id16, **fields)])
         ).seq
 
@@ -367,6 +440,71 @@ class MemlakeClient:
             req.temporal_from = temporal_from
         if temporal_to is not None:
             req.temporal_to = temporal_to
-        resp = self._stub.Query(req)
+        resp = self._call("Query", req)
         self.last_roundtrips = resp.load_roundtrips
         return _hits(resp.hits)
+
+    # -- admin / introspection ----------------------------------------------
+    # Thin wrappers over the operator RPCs. They route like everything else (rendezvous +
+    # failover). The chaos/correctness suite leans on these to assert acked-write visibility
+    # and manifest/generation state without reaching into the raw stubs.
+
+    def stats(self, namespace: str) -> pb.StatsResponse:
+        """Index state for a namespace: generation, wal_head, wal_index_cursor, live
+        doc_count, through_seq, and per-memory_type counts. One manifest read + one WAL LIST;
+        does not fetch cluster data."""
+        return self._call("Stats", pb.StatsRequest(namespace=namespace))
+
+    def get(self, namespace: str, ids: Iterable[bytes], *, include_vector: bool = False) -> list:
+        """Fetch memories by 16-byte id, bypassing ranking. Returns the resolved
+        `StoredMemoryRecord`s in request order; a missing or tombstoned id is simply absent (so
+        `len(result) < len(ids)` means some ids are gone). This is the visibility oracle: after
+        an acked write, a `get` of its ids must return them."""
+        resp = self._call(
+            "Get",
+            pb.GetRequest(namespace=namespace, ids=list(ids), include_vector=include_vector),
+        )
+        return list(resp.memories)
+
+    def exists(self, namespace: str, ids: Iterable[bytes]) -> set:
+        """The subset of `ids` currently visible (present and not tombstoned)."""
+        return {m.id for m in self.get(namespace, ids)}
+
+    def scan(
+        self,
+        namespace: str,
+        *,
+        memory_types: Optional[Sequence[int]] = None,
+        page_token: str = "",
+        limit: int = 0,
+        include_vector: bool = False,
+    ) -> pb.ScanResponse:
+        """One page of a full scan in cluster order. Follow `next_page_token` until empty. A
+        scan is eventually-complete browsing, not a consistent iterator (writes mid-walk can
+        shift later pages)."""
+        return self._call(
+            "Scan",
+            pb.ScanRequest(
+                namespace=namespace,
+                memory_types=list(memory_types or []),
+                page_token=page_token,
+                limit=limit,
+                include_vector=include_vector,
+            ),
+        )
+
+    def scan_all_ids(self, namespace: str, *, memory_types: Optional[Sequence[int]] = None) -> list:
+        """Every visible id in a namespace, walking all scan pages. O(corpus) — for tests and
+        audits, never the hot path."""
+        ids, token = [], ""
+        while True:
+            page = self.scan(namespace, memory_types=memory_types, page_token=token)
+            ids.extend(m.id for m in page.memories)
+            token = page.next_page_token
+            if not token:
+                return ids
+
+    def list_namespaces(self) -> list:
+        """Every namespace in the bucket (one LIST). Not routed to a preferred node — any node
+        answers identically."""
+        return list(self._call("ListNamespaces", pb.ListNamespacesRequest()).namespaces)
