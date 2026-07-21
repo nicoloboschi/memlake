@@ -174,6 +174,14 @@ class MemlakeClient:
     def create_namespace(self, namespace: str) -> None:
         self._stub.CreateNamespace(pb.CreateNamespaceRequest(namespace=namespace))
 
+    def delete_namespace(self, namespace: str) -> int:
+        """Drop a whole namespace — delete every object under its prefix (manifest, WAL, all
+        generations). Irreversible; returns the number of objects removed. Do not call while
+        the namespace is being written."""
+        return self._stub.DeleteNamespace(
+            pb.DeleteNamespaceRequest(namespace=namespace)
+        ).objects_deleted
+
     # -- write ---------------------------------------------------------------
 
     def write(self, namespace: str, memories: Iterable[pb.Memory]) -> int:

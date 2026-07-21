@@ -72,6 +72,26 @@ impl Namespace {
         }
     }
 
+    /// Delete every object under this namespace's prefix — manifest, WAL, all generations —
+    /// dropping the namespace entirely. Returns the number of objects removed. Irreversible
+    /// and not atomic: a concurrent write can recreate objects, so callers must not delete a
+    /// namespace that is being written.
+    pub async fn delete_all(&self) -> Result<usize> {
+        use futures::stream::{StreamExt, TryStreamExt};
+        // The trailing slash keeps a sibling namespace whose name is a prefix (e.g. `foo` vs
+        // `foo-bar`) from being swept in.
+        let prefix = format!("{}/", self.name);
+        let paths = self.store.list(&prefix).await?;
+        let count = paths.len();
+        let store = &self.store;
+        futures::stream::iter(paths)
+            .map(|p| async move { store.delete(&p).await })
+            .buffer_unordered(32)
+            .try_collect::<Vec<_>>()
+            .await?;
+        Ok(count)
+    }
+
     /// Read the manifest together with its etag, which a later swap must present.
     pub async fn read_manifest(&self) -> Result<(Manifest, Option<Etag>)> {
         let path = manifest_path(&self.name);

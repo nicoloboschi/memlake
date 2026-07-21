@@ -230,8 +230,23 @@ of it participates in retrieval:
 - [ ] **`updated_at` range push-down.** Same problem: recall's
       `created_after`/`created_before` window is applied post-ranking
       (`memlake.py:_in_updated_range`).
+- [ ] **IVF trains 0 clusters on real-dimension vectors — the dense arm is dead.**
+      Found running LoComo end to end. A namespace of 344 Hindsight memories
+      (384-dim, all-MiniLM) indexes cleanly — indexer publishes, `has_index=true`,
+      `train_count` equals `doc_count` — but `cluster_count` is **0** for every
+      memory_type, so the dense arm has nothing to probe and returns no hits.
+      Reproduction: query with a memory's *own* vector (fetched via
+      `Scan(include_vector=true)`) and `dense.present` is false for every hit;
+      only the text arm returns anything. The graph arm is empty too, since it
+      seeds off the dense probe.
+      Suspected trigger: `n < dim`. The namespaces that do have clusters use toy
+      8-dim vectors (`admin-ui-smoke`: 30 docs, dim 8 → 5 clusters); ours is 239
+      docs at dim 384 → 0 clusters. Worth an assertion that training either
+      produces clusters or fails loudly — silently publishing a vector index with
+      no clusters looks healthy from `Stats` while serving nothing.
 - [ ] Confirm dense scores are cosine similarity on the same scale Postgres
-      produces (`1 - (embedding <=> query)`). The provider applies Hindsight's
+      produces (`1 - (embedding <=> query)`). Blocked on the above — no dense hit
+      has been observed yet to compare. The provider applies Hindsight's
       `semantic_min_similarity` / `bm25_min_score` floors to memlake's raw arm
       scores on that assumption; if the scales differ, the floors silently cut
       the wrong things.

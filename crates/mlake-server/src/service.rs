@@ -144,6 +144,22 @@ impl Memlake for MemlakeService {
         Ok(Response::new(pb::CreateNamespaceResponse {}))
     }
 
+    async fn delete_namespace(
+        &self,
+        req: Request<pb::DeleteNamespaceRequest>,
+    ) -> Result<Response<pb::DeleteNamespaceResponse>, Status> {
+        let name = req.into_inner().namespace;
+        if name.is_empty() {
+            return Err(Status::invalid_argument("namespace is required"));
+        }
+        let objects_deleted = self.namespace(&name).delete_all().await.map_err(internal)? as u64;
+        // Drop this process's cached state for the namespace: its Writer's cached WAL sequence
+        // is now meaningless, and the snapshot points at deleted objects.
+        self.writers.lock().unwrap().remove(&name);
+        self.invalidate(&name);
+        Ok(Response::new(pb::DeleteNamespaceResponse { objects_deleted }))
+    }
+
     async fn write(
         &self,
         req: Request<pb::WriteRequest>,

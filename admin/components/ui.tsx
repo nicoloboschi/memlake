@@ -473,11 +473,11 @@ export function TableShell({
 }
 
 export function Th({
-  children,
+  children = null,
   className = "",
   title,
 }: {
-  children: ReactNode;
+  children?: ReactNode;
   className?: string;
   title?: string;
 }) {

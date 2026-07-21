@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { isAbort, postJson } from "@/lib/client";
-import { fmtMs, groupDigits } from "@/lib/format";
+import { cmpU64, fmtMs, groupDigits, sharePct } from "@/lib/format";
 import {
   CONSISTENCIES,
   type Consistency,
@@ -25,7 +25,7 @@ import {
   TableShell,
   Th,
 } from "@/components/ui";
-import { ClusterScatter, cmpU64, sharePct } from "@/components/ClusterScatter";
+import { ClusterScatter } from "@/components/ClusterScatter";
 import { useKnownTypes } from "@/components/filters";
 
 const CONSISTENCY_OPTIONS = CONSISTENCIES.map((c) => ({ value: c, label: c }));

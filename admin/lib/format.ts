@@ -46,6 +46,29 @@ export function fmtEpochGuess(raw: string): string {
   return d.toISOString().replace("T", " ").replace(".000Z", "Z");
 }
 
+/** Compare two u64 decimal strings. They exceed Number range, so go via BigInt. */
+export function cmpU64(a: string, b: string): number {
+  try {
+    const x = BigInt(a);
+    const y = BigInt(b);
+    return x < y ? -1 : x > y ? 1 : 0;
+  } catch {
+    return 0;
+  }
+}
+
+/** `size / total` as a percentage string. BigInt division truncates, so scale first. */
+export function sharePct(size: string, total: string): string {
+  try {
+    const t = BigInt(total);
+    if (t === 0n) return "—";
+    const share = Number((BigInt(size) * 10000n) / t) / 100;
+    return `${share.toFixed(share < 10 ? 1 : 0)}%`;
+  } catch {
+    return "—";
+  }
+}
+
 export function truncate(s: string, max: number): string {
   if (s.length <= max) return s;
   return `${s.slice(0, max - 1)}…`;

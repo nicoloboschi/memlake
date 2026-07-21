@@ -21,7 +21,7 @@
 
 import { useId, useMemo, useRef, useState } from "react";
 
-import { groupDigits } from "@/lib/format";
+import { cmpU64, groupDigits, sharePct } from "@/lib/format";
 import { shortId } from "@/lib/ids";
 import { pca2, pcaStatusMessage, type PcaResult } from "@/lib/pca";
 import type { ClusterJson, ClusterMemberJson } from "@/lib/types";
@@ -533,26 +533,6 @@ function pct(fraction: number): string {
   return `${p.toFixed(p < 10 ? 1 : 0)}%`;
 }
 
-export function sharePct(size: string, total: string): string {
-  try {
-    const t = BigInt(total);
-    if (t === 0n) return "—";
-    // Scale before dividing: BigInt division truncates.
-    const share = Number((BigInt(size) * 10000n) / t) / 100;
-    return `${share.toFixed(share < 10 ? 1 : 0)}%`;
-  } catch {
-    return "—";
-  }
-}
 
-export function cmpU64(a: string, b: string): number {
-  try {
-    const x = BigInt(a);
-    const y = BigInt(b);
-    return x < y ? -1 : x > y ? 1 : 0;
-  } catch {
-    return 0;
-  }
-}
 
 export type { PcaResult };

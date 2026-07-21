@@ -39,6 +39,11 @@ class MemlakeStub:
                 request_serializer=memlake_dot_v1_dot_memlake__pb2.CreateNamespaceRequest.SerializeToString,
                 response_deserializer=memlake_dot_v1_dot_memlake__pb2.CreateNamespaceResponse.FromString,
                 _registered_method=True)
+        self.DeleteNamespace = channel.unary_unary(
+                '/memlake.v1.Memlake/DeleteNamespace',
+                request_serializer=memlake_dot_v1_dot_memlake__pb2.DeleteNamespaceRequest.SerializeToString,
+                response_deserializer=memlake_dot_v1_dot_memlake__pb2.DeleteNamespaceResponse.FromString,
+                _registered_method=True)
         self.Write = channel.unary_unary(
                 '/memlake.v1.Memlake/Write',
                 request_serializer=memlake_dot_v1_dot_memlake__pb2.WriteRequest.SerializeToString,
@@ -91,6 +96,16 @@ class MemlakeServicer:
 
     def CreateNamespace(self, request, context):
         """Ensure a namespace (bank) exists. Idempotent: safe to call on every startup.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def DeleteNamespace(self, request, context):
+        """Drop a whole namespace: delete every object under its prefix (manifest, WAL, all
+        generations). Irreversible and unconditional — there is no snapshot atomicity across the
+        deletes, so do not run it concurrently with writes to the same namespace. Returns the
+        number of objects removed.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -194,6 +209,11 @@ def add_MemlakeServicer_to_server(servicer, server):
                     request_deserializer=memlake_dot_v1_dot_memlake__pb2.CreateNamespaceRequest.FromString,
                     response_serializer=memlake_dot_v1_dot_memlake__pb2.CreateNamespaceResponse.SerializeToString,
             ),
+            'DeleteNamespace': grpc.unary_unary_rpc_method_handler(
+                    servicer.DeleteNamespace,
+                    request_deserializer=memlake_dot_v1_dot_memlake__pb2.DeleteNamespaceRequest.FromString,
+                    response_serializer=memlake_dot_v1_dot_memlake__pb2.DeleteNamespaceResponse.SerializeToString,
+            ),
             'Write': grpc.unary_unary_rpc_method_handler(
                     servicer.Write,
                     request_deserializer=memlake_dot_v1_dot_memlake__pb2.WriteRequest.FromString,
@@ -267,6 +287,33 @@ class Memlake:
             '/memlake.v1.Memlake/CreateNamespace',
             memlake_dot_v1_dot_memlake__pb2.CreateNamespaceRequest.SerializeToString,
             memlake_dot_v1_dot_memlake__pb2.CreateNamespaceResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def DeleteNamespace(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/memlake.v1.Memlake/DeleteNamespace',
+            memlake_dot_v1_dot_memlake__pb2.DeleteNamespaceRequest.SerializeToString,
+            memlake_dot_v1_dot_memlake__pb2.DeleteNamespaceResponse.FromString,
             options,
             channel_credentials,
             insecure,

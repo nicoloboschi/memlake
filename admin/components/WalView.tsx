@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { isAbort, postJson } from "@/lib/client";
-import { fmtEpochGuess, fmtMs, groupDigits, truncate } from "@/lib/format";
+import { cmpU64, fmtEpochGuess, fmtMs, groupDigits, truncate } from "@/lib/format";
 import { shortId } from "@/lib/ids";
 import type {
   ListWalJson,
@@ -102,6 +102,19 @@ export function WalView({ namespace }: { namespace: string }) {
   const allFolded = entries.length > 0 && firstUnfolded === -1;
   const allUnfolded = entries.length > 0 && firstUnfolded === 0;
 
+  /**
+   * The backlog tile is derived from `wal_head`, but the entry list is
+   * authoritative about what is actually un-folded. When the two disagree —
+   * an entry exists whose seq is past the reported head — say so instead of
+   * rendering "backlog 0" directly above four un-folded rows.
+   */
+  const maxSeqSeen = entries.reduce(
+    (m, e) => (cmpU64(e.seq, m) > 0 ? e.seq : m),
+    "0",
+  );
+  const unfoldedOnPage = entries.filter((e) => !e.folded).length;
+  const headLags = data ? cmpU64(maxSeqSeen, data.walHead) > 0 : false;
+
   function toggleRow(seq: string) {
     if (!includeOps) return;
     setExpanded((prev) => {
@@ -179,6 +192,18 @@ export function WalView({ namespace }: { namespace: string }) {
                 hint={`${entries.length} entr${entries.length === 1 ? "y" : "ies"} on this page`}
               />
             </div>
+
+            {headLags && (
+              <p className="mt-2 border border-warn/40 bg-warn/5 rounded-sm px-2.5 py-1.5 text-[11px] text-warn leading-relaxed">
+                <span className="font-mono">wal_head = {data.walHead}</span>, but
+                this page enumerated entries up to{" "}
+                <span className="font-mono">seq {maxSeqSeen}</span>, of which{" "}
+                <span className="font-mono">{unfoldedOnPage}</span>{" "}
+                {unfoldedOnPage === 1 ? "is" : "are"} un-folded. The backlog tile
+                is derived from wal_head and therefore under-reports here; the
+                per-entry folded flags below are the ones to trust.
+              </p>
+            )}
 
             <div className="mt-3 flex items-center gap-4 flex-wrap">
               <Toggle

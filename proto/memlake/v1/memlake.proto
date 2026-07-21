@@ -10,6 +10,12 @@ service Memlake {
   // Ensure a namespace (bank) exists. Idempotent: safe to call on every startup.
   rpc CreateNamespace(CreateNamespaceRequest) returns (CreateNamespaceResponse);
 
+  // Drop a whole namespace: delete every object under its prefix (manifest, WAL, all
+  // generations). Irreversible and unconditional — there is no snapshot atomicity across the
+  // deletes, so do not run it concurrently with writes to the same namespace. Returns the
+  // number of objects removed.
+  rpc DeleteNamespace(DeleteNamespaceRequest) returns (DeleteNamespaceResponse);
+
   // Write a batch of ops as one atomic WAL entry. Returns once the entry is durably
   // persisted to object storage under a uniquely-claimed sequence number — NOT after
   // indexing. The write is immediately visible to any STRONG-consistency Query.
@@ -261,6 +267,14 @@ message CreateNamespaceRequest {
 }
 
 message CreateNamespaceResponse {}
+
+message DeleteNamespaceRequest {
+  string namespace = 1;
+}
+
+message DeleteNamespaceResponse {
+  uint64 objects_deleted = 1;
+}
 
 // ---- Delete by predicate ---------------------------------------------------
 
