@@ -29,4 +29,12 @@ pub enum Error {
     Core(#[from] mlake_core::Error),
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("fts: {0}")]
+    Fts(String),
+}
+
+impl From<tantivy::TantivyError> for Error {
+    fn from(e: tantivy::TantivyError) -> Self {
+        Error::Fts(e.to_string())
+    }
 }

@@ -66,12 +66,12 @@ async fn write_index_then_query_from_a_fresh_node() {
     assert_eq!(node.doc_count(), 3);
 
     // A pure-vector query returns the nearest item.
-    let vec_hits = node.query(Some(&[1.0, 0.0, 0.0]), None, 10, QueryConfig::default());
+    let vec_hits = node.query(Some(&[1.0, 0.0, 0.0]), None, 10, QueryConfig::default()).await.unwrap();
     assert_eq!(vec_hits[0].id, ItemId::from_key("cats"), "nearest vector should lead");
 
     // A fused query blends the text signal: `dogs` is nearest-but-one by vector *and*
     // the text match, so convergent evidence puts it and `cats` at the top.
-    let hits = node.query(Some(&[1.0, 0.0, 0.0]), Some("loyal canine"), 10, QueryConfig::default());
+    let hits = node.query(Some(&[1.0, 0.0, 0.0]), Some("loyal canine"), 10, QueryConfig::default()).await.unwrap();
     let top2: Vec<_> = hits.iter().take(2).map(|h| h.id).collect();
     assert!(top2.contains(&ItemId::from_key("cats")));
     assert!(top2.contains(&ItemId::from_key("dogs")));
@@ -93,7 +93,7 @@ async fn writes_after_indexing_are_visible_under_strong_consistency() {
 
     let node = QueryNode::open(&ns, Tokenizer::default(), Consistency::Strong).await.unwrap();
     assert_eq!(node.doc_count(), 2, "the un-indexed write must be visible");
-    let hits = node.query(Some(&[0.0, 1.0]), None, 10, QueryConfig::default());
+    let hits = node.query(Some(&[0.0, 1.0]), None, 10, QueryConfig::default()).await.unwrap();
     assert_eq!(hits[0].id, ItemId::from_key("b"), "the tail write must be queryable");
 }
 
@@ -118,7 +118,7 @@ async fn deletes_after_indexing_take_effect_immediately() {
 
     let node = QueryNode::open(&ns, Tokenizer::default(), Consistency::Strong).await.unwrap();
     assert_eq!(node.doc_count(), 1);
-    let hits = node.query(Some(&[0.0, 1.0]), None, 10, QueryConfig::default());
+    let hits = node.query(Some(&[0.0, 1.0]), None, 10, QueryConfig::default()).await.unwrap();
     assert!(
         !hits.iter().any(|h| h.id == ItemId::from_key("drop")),
         "a tombstoned item must not appear in strong-consistency results"
@@ -211,7 +211,7 @@ async fn graph_arm_works_through_the_full_pipeline() {
         graph_weight: 1.0,
         ..QueryConfig::default()
     };
-    let hits = node.query(Some(&[1.0, 0.0, 0.0]), None, 10, cfg);
+    let hits = node.query(Some(&[1.0, 0.0, 0.0]), None, 10, cfg).await.unwrap();
     let ids: Vec<_> = hits.iter().map(|h| h.id).collect();
     assert!(ids.contains(&ItemId::from_key("a")));
     assert!(ids.contains(&ItemId::from_key("a2")), "graph expansion should surface the neighbour");
@@ -260,7 +260,7 @@ async fn full_pipeline_against_minio() {
     );
     let node = QueryNode::open(&other, Tokenizer::default(), Consistency::Strong).await.unwrap();
     assert_eq!(node.doc_count(), 2);
-    let hits = node.query(Some(&[1.0, 0.0, 0.0]), Some("fox"), 10, QueryConfig::default());
+    let hits = node.query(Some(&[1.0, 0.0, 0.0]), Some("fox"), 10, QueryConfig::default()).await.unwrap();
     assert_eq!(hits[0].id, ItemId::from_key("x"));
 }
 
@@ -296,7 +296,7 @@ async fn gc_reclaims_folded_wal_and_old_generations_without_changing_results() {
     // Results are unchanged: GC only removed files nothing references.
     let after = QueryNode::open(&ns, Tokenizer::default(), Consistency::Strong).await.unwrap();
     assert_eq!(after.doc_count(), 3);
-    let hits = after.query(Some(&[0.0, 1.0]), None, 10, QueryConfig::default());
+    let hits = after.query(Some(&[0.0, 1.0]), None, 10, QueryConfig::default()).await.unwrap();
     assert_eq!(hits[0].id, ItemId::from_key("b"));
 }
 
@@ -358,6 +358,8 @@ async fn tombstone_survives_compaction_and_wal_gc() {
     let node = QueryNode::open(&ns, Tokenizer::default(), Consistency::Strong).await.unwrap();
     assert_eq!(node.doc_count(), 1, "the deleted item must stay gone after compaction");
     assert!(node.query(Some(&[0.0, 1.0]), None, 10, QueryConfig::default())
+        .await
+        .unwrap()
         .iter()
         .all(|h| h.id != ItemId::from_key("drop")));
 }
@@ -507,7 +509,7 @@ async fn default_indexing_preserves_the_graph_across_reruns() {
 
     let cfg = QueryConfig { graph_weight: 1.0, ..QueryConfig::default() };
     let node = QueryNode::open(&ns, Tokenizer::default(), Consistency::Strong).await.unwrap();
-    let hits = node.query(Some(&[1.0, 0.0, 0.0]), None, 10, cfg);
+    let hits = node.query(Some(&[1.0, 0.0, 0.0]), None, 10, cfg).await.unwrap();
     assert!(
         hits.iter().any(|h| h.id == ItemId::from_key("a2")),
         "default indexing must leave the graph arm working (links derived)"
@@ -518,7 +520,7 @@ async fn default_indexing_preserves_the_graph_across_reruns() {
     index(&ns, &Tokenizer::default(), IndexOptions::default()).await.unwrap();
 
     let node2 = QueryNode::open(&ns, Tokenizer::default(), Consistency::Strong).await.unwrap();
-    let hits2 = node2.query(Some(&[1.0, 0.0, 0.0]), None, 10, cfg);
+    let hits2 = node2.query(Some(&[1.0, 0.0, 0.0]), None, 10, cfg).await.unwrap();
     assert!(
         hits2.iter().any(|h| h.id == ItemId::from_key("a2")),
         "a second index run must not wipe the graph carried from the first"
@@ -611,4 +613,71 @@ async fn wal_gc_keeps_entries_a_previous_manifest_reader_still_needs() {
         .expect("a previous-manifest reader's tail scan must not hit a GC'd entry");
     assert!(tail.upserts.contains_key(&ItemId::from_key("b")));
     assert!(tail.upserts.contains_key(&ItemId::from_key("c")));
+}
+
+// ---------------------------------------------------------------- lazy per-probe reads (SCALE.md Phase 1)
+
+use mlake_store::{DiskCache, QueryMetrics};
+use std::sync::Arc as ArcLazy;
+
+/// The lazy query node fetches only the clusters a query probes — not the whole
+/// generation — and serves warm queries from the NVMe cache. This is the property that
+/// makes 10M items viable: query cost scales with nprobe, not with the corpus.
+#[tokio::test]
+async fn query_fetches_only_probed_clusters_and_warms_the_cache() {
+    // A cache-backed store, so warm reads are served locally.
+    let cache_dir = tempfile::tempdir().unwrap();
+    let cache = ArcLazy::new(DiskCache::new(cache_dir.path(), 256 * 1024 * 1024).unwrap());
+    let backing = ArcLazy::new(object_store::memory::InMemory::new());
+    let store = Store::new(ArcLazy::clone(&backing) as _).with_cache(ArcLazy::clone(&cache));
+    let ns = namespace(store, "ns").await;
+
+    // Enough distinct vectors to produce many clusters (√400 ≈ 20 clusters).
+    let mut writer = Writer::new(ns.clone());
+    for i in 0..400 {
+        let a = i as f32 * 0.31;
+        writer
+            .commit(vec![Op::Upsert(item(
+                &format!("item-{i}"),
+                vec![a.sin(), a.cos(), (a * 0.5).sin()],
+                &format!("document {i}"),
+            ))])
+            .await
+            .unwrap();
+    }
+    // No links, so the graph arm stays off and we isolate the vector arm's cluster reads.
+    index(&ns, &Tokenizer::default(), IndexOptions { derive_links: false, seed: 42 })
+        .await
+        .unwrap();
+
+    let node = QueryNode::open(&ns, Tokenizer::default(), Consistency::Strong).await.unwrap();
+    let cluster_count = {
+        let (m, _) = ns.read_manifest().await.unwrap();
+        m.files.clusters.len()
+    };
+    assert!(cluster_count >= 15, "test needs many clusters, got {cluster_count}");
+
+    let cfg = QueryConfig { nprobe: 4, ..QueryConfig::default() };
+    let q = vec![0.5f32, 0.5, 0.5];
+
+    // Cold query: fetches only the probed clusters (≤ nprobe requests), far fewer than the
+    // total, and stays within the roundtrip budget.
+    let cold = QueryMetrics::new();
+    let hits = node.query_metered(Some(&q), None, 10, cfg, &cold).await.unwrap();
+    assert!(!hits.is_empty());
+    assert!(
+        cold.requests() <= cfg.nprobe,
+        "a query must fetch at most nprobe={} clusters, fetched {} (of {cluster_count})",
+        cfg.nprobe,
+        cold.requests()
+    );
+    assert!(cold.requests() < cluster_count, "must not fetch the whole generation");
+    assert!(cold.within_budget(), "cold query exceeded the roundtrip budget");
+    assert!(cold.cache_misses() > 0, "cold query should miss the cache");
+
+    // Warm query: same probed clusters, now served from the NVMe cache.
+    let warm = QueryMetrics::new();
+    node.query_metered(Some(&q), None, 10, cfg, &warm).await.unwrap();
+    assert!(warm.cache_hits() > 0, "warm query should hit the cache");
+    assert_eq!(warm.cache_misses(), 0, "warm query should not miss");
 }

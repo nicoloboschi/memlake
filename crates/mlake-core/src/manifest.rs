@@ -65,6 +65,12 @@ pub struct Manifest {
     /// `(prev_wal_index_cursor, head]`, so GC must keep entries above this watermark.
     #[serde(default)]
     pub prev_wal_index_cursor: u64,
+    /// Forward-compat sharding escape hatch (SCALE.md, Phase 0). `files` is the single
+    /// index (conceptually shard 0). A namespace that outgrows one index (~30M+) will
+    /// populate additional `shards`, each a self-contained `GenerationFiles` behind the
+    /// same WAL. Empty today — present so the schema never has to break to add it.
+    #[serde(default)]
+    pub shards: Vec<GenerationFiles>,
 }
 
 impl Manifest {
@@ -88,6 +94,7 @@ impl Manifest {
             prev_generation: None,
             prev_files: None,
             prev_wal_index_cursor: 0,
+            shards: Vec::new(),
         }
     }
 

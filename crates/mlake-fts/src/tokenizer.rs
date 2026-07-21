@@ -106,9 +106,18 @@ impl TokenizerConfig {
     }
 }
 
-/// The tokenizer. Cheap to construct; holds only config (jieba is a shared static).
+/// The tokenizer. Cheap to construct and clone; holds only config (jieba is a shared
+/// static), so a query node can spin up matching tokenizers for several splits freely.
+#[derive(Clone)]
 pub struct Tokenizer {
     config: TokenizerConfig,
+}
+
+impl Tokenizer {
+    /// Its configuration, for constructing a matching tokenizer elsewhere.
+    pub fn config(&self) -> &TokenizerConfig {
+        &self.config
+    }
 }
 
 impl Default for Tokenizer {

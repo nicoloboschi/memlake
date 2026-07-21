@@ -33,11 +33,26 @@ pub struct Versioned {
 #[derive(Clone)]
 pub struct Store {
     inner: Arc<dyn ObjectStore>,
+    /// Optional NVMe read cache for immutable objects. This is the warm path: a query node
+    /// materializes generation files here once and serves subsequent reads from local disk
+    /// (INV-4 — the cache only ever changes latency, never results).
+    cache: Option<Arc<crate::cache::DiskCache>>,
 }
 
 impl Store {
     pub fn new(inner: Arc<dyn ObjectStore>) -> Self {
-        Self { inner }
+        Self { inner, cache: None }
+    }
+
+    /// Attach an NVMe read cache. Immutable reads ([`Store::get_immutable`]) are served
+    /// from it on a hit and admitted on a miss.
+    pub fn with_cache(mut self, cache: Arc<crate::cache::DiskCache>) -> Self {
+        self.cache = Some(cache);
+        self
+    }
+
+    pub fn cache(&self) -> Option<&Arc<crate::cache::DiskCache>> {
+        self.cache.as_ref()
     }
 
     /// An in-memory store, for fast unit tests. `object_store`'s `InMemory` implements the
@@ -93,6 +108,35 @@ impl Store {
             metrics.record_request(rt, bytes.len() as u64, start.elapsed());
         }
         Ok(Versioned { bytes, etag })
+    }
+
+    /// Read an *immutable* object, through the NVMe cache if one is attached.
+    ///
+    /// Generation files live under a per-attempt nonce prefix, so their path uniquely
+    /// identifies their bytes for all time — the cache is keyed by path alone, no etag
+    /// revalidation needed. A hit is a local-disk read counted as a cache hit (zero
+    /// roundtrips); a miss fetches once, admits to the cache, and counts a roundtrip.
+    pub async fn get_immutable(
+        &self,
+        path: &str,
+        ctx: Option<(&QueryMetrics, usize)>,
+    ) -> Result<bytes::Bytes> {
+        if let Some(cache) = &self.cache {
+            let key = crate::cache::CacheKey::new("", path, "immutable");
+            if let Some(bytes) = cache.get(&key) {
+                if let Some((metrics, _)) = ctx {
+                    metrics.record_cache_hit();
+                }
+                return Ok(bytes);
+            }
+            let versioned = self.get(path, ctx).await?;
+            if let Some((metrics, _)) = ctx {
+                metrics.record_cache_miss();
+            }
+            cache.put(key, versioned.bytes.clone());
+            return Ok(versioned.bytes);
+        }
+        Ok(self.get(path, ctx).await?.bytes)
     }
 
     /// Read a byte range. This is the workhorse of the warm path: the hotcache and
