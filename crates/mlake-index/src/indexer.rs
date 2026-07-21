@@ -24,8 +24,11 @@ use crate::Result;
 /// Options controlling a generation build.
 #[derive(Clone, Copy)]
 pub struct IndexOptions {
-    /// Derive the semantic kNN link graph (SPEC §5.2). Off by default because it is
-    /// O(N²) brute force here; the query-quality demonstration turns it on.
+    /// Derive the semantic kNN link graph (SPEC §5.2). **On by default** — the graph arm
+    /// is a first-class signal, so deriving its links is core behaviour, not opt-in.
+    /// Derivation is incremental (only new items are linked, against the current corpus),
+    /// so the steady-state cost is `O(new · N)`, not a full `O(N²)` rebuild. Disable only
+    /// for a throughput benchmark that deliberately excludes graph work.
     pub derive_links: bool,
     /// Deterministic seed for centroid training (G-6).
     pub seed: u64,
@@ -34,7 +37,7 @@ pub struct IndexOptions {
 impl Default for IndexOptions {
     fn default() -> Self {
         Self {
-            derive_links: false,
+            derive_links: true,
             seed: 42,
         }
     }
@@ -81,27 +84,37 @@ pub async fn index(ns: &Namespace, tokenizer: &Tokenizer, opts: IndexOptions) ->
     for id in &scan.tombstones {
         by_id.remove(&id.0);
     }
+    // Items introduced or replaced by this WAL slice are "new": their semantic links have
+    // not been derived yet. Carried-over items keep the links they were indexed with —
+    // derived data is expensive, so it is recomputed incrementally for new items, never
+    // wholesale-deleted (which would silently empty the graph on every plain index run).
+    let mut new_ids: std::collections::HashSet<[u8; 16]> = std::collections::HashSet::new();
     for (id, item) in scan.upserts {
-        by_id.insert(id.0, item);
+        new_ids.insert(id.0);
+        by_id.insert(id.0, item); // an upsert arrives with empty semantic_out
     }
     // Deferred patches apply to items carried from the previous generation.
     for item in by_id.values_mut() {
-        if let Some(deltas) = scan.pending_patches
-            .get(&ItemId(item.id.0)) { item.proof_count =
-                    mlake_core::wal::fold_proof_count(item.proof_count, deltas.iter().copied()); }
+        if let Some(deltas) = scan.pending_patches.get(&ItemId(item.id.0)) {
+            item.proof_count =
+                mlake_core::wal::fold_proof_count(item.proof_count, deltas.iter().copied());
+        }
     }
 
     // BTreeMap iteration is id-sorted, so the item order — and thus the build — is
     // deterministic and replayable (G-6).
     let mut items: Vec<StoredItem> = by_id.into_values().collect();
-    // semantic_out is derived, not carried: recompute it if requested, else clear stale
-    // links from the previous generation so they cannot dangle.
+
+    // Drop carried links whose target was tombstoned in this slice, so radj never carries
+    // an edge to something no longer present (retrieval would filter it, but keeping the
+    // files clean is cheaper than relying on that downstream).
+    let live: std::collections::HashSet<[u8; 16]> = items.iter().map(|i| i.id.0).collect();
     for item in items.iter_mut() {
-        item.semantic_out.clear();
+        item.semantic_out.retain(|e| live.contains(&e.target.0));
     }
 
     if opts.derive_links {
-        derive_semantic_links(&mut items);
+        derive_semantic_links(&mut items, &new_ids);
     }
 
     let generation = manifest.generation + 1;
@@ -190,15 +203,21 @@ pub async fn index(ns: &Namespace, tokenizer: &Tokenizer, opts: IndexOptions) ->
     })
 }
 
-/// Derive each item's top-5 semantic kNN links (cosine ≥ 0.7), as SPEC §5.2 specifies.
+/// Derive top-5 semantic kNN links (cosine ≥ 0.7) for the *new* items only, over the full
+/// current corpus, as SPEC §5.2 specifies ("for each new item in the WAL slice").
 ///
-/// Brute force O(N²): acceptable at the prototype's scale; the production path queries the
-/// warm IVF index for neighbours instead. Deterministic (ties broken by id) for G-6.
-fn derive_semantic_links(items: &mut [StoredItem]) {
+/// Carried-over items keep the links they were indexed with — this is incremental
+/// derivation (`O(new · N)`), not a full `O(N²)` rebuild. Deterministic (ties broken by
+/// id) for G-6. The production path queries the warm IVF index for neighbours instead of
+/// scanning; that is the O(N)-per-item optimization, not a behavioural change.
+fn derive_semantic_links(items: &mut [StoredItem], new_ids: &std::collections::HashSet<[u8; 16]>) {
     let vectors: Vec<Vec<f32>> = items.iter().map(|i| i.vector.clone()).collect();
     let ids: Vec<ItemId> = items.iter().map(|i| i.id).collect();
 
     for (i, item) in items.iter_mut().enumerate() {
+        if !new_ids.contains(&item.id.0) {
+            continue; // carried item: its links are already derived and preserved
+        }
         let mut scored: BTreeMap<[u8; 16], f32> = BTreeMap::new();
         for (j, v) in vectors.iter().enumerate() {
             if i == j {

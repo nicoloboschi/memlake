@@ -483,3 +483,43 @@ async fn tantivy_fts_split_loads_from_storage_and_serves_queries() {
     let cn = fts.search("北京大学", 10);
     assert_eq!(cn[0].id, ItemId::from_key("cn"), "CJK retrieval over the loaded split");
 }
+
+/// Regression for the graph-wipe bug: a *plain* index run (default options) must derive
+/// links so the graph arm works, and a *second* index run must not wipe the links carried
+/// from the first. Derived data is recomputed incrementally, never wholesale-deleted.
+#[tokio::test]
+async fn default_indexing_preserves_the_graph_across_reruns() {
+    let store = Store::in_memory();
+    let ns = namespace(store, "ns").await;
+    let mut writer = Writer::new(ns.clone());
+
+    // Two near-identical vectors → kNN neighbours (cosine ≥ 0.7).
+    writer
+        .commit(vec![
+            Op::Upsert(item("a", vec![1.0, 0.0, 0.0], "alpha document")),
+            Op::Upsert(item("a2", vec![0.98, 0.02, 0.0], "closely related to alpha")),
+        ])
+        .await
+        .unwrap();
+    // Default options — no explicit derive_links flag.
+    index(&ns, &Tokenizer::default(), IndexOptions::default()).await.unwrap();
+
+    let cfg = QueryConfig { graph_weight: 1.0, ..QueryConfig::default() };
+    let node = QueryNode::open(&ns, Tokenizer::default(), Consistency::Strong).await.unwrap();
+    let hits = node.query(Some(&[1.0, 0.0, 0.0]), None, 10, cfg);
+    assert!(
+        hits.iter().any(|h| h.id == ItemId::from_key("a2")),
+        "default indexing must leave the graph arm working (links derived)"
+    );
+
+    // Add an unrelated item and re-index. The a↔a2 links must survive.
+    writer.commit(vec![Op::Upsert(item("z", vec![0.0, 0.0, 1.0], "unrelated"))]).await.unwrap();
+    index(&ns, &Tokenizer::default(), IndexOptions::default()).await.unwrap();
+
+    let node2 = QueryNode::open(&ns, Tokenizer::default(), Consistency::Strong).await.unwrap();
+    let hits2 = node2.query(Some(&[1.0, 0.0, 0.0]), None, 10, cfg);
+    assert!(
+        hits2.iter().any(|h| h.id == ItemId::from_key("a2")),
+        "a second index run must not wipe the graph carried from the first"
+    );
+}
