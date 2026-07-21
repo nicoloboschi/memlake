@@ -74,16 +74,29 @@ writes, range-readable secondary structures, filtered ANN, and priced benchmarks
 
 ## Sequence
 
-- **Phase 0** — manifest schema forward-compat (`shards[]`), so nothing later is blocked.
-- **Phase 1** — lazy per-probe query node: load centroids only, ranged-GET the probed
-  clusters, use the *published* centroid geometry (also fixes measured-recall ≠
-  published-recall), WAL tail as a small brute-forced overlay. Wire `DiskCache` into
-  `Store` for the warm path.
-- **Phase 2** — range-readable binary `pk.idx` and `radj` (sorted + sparse block index),
-  lazily read via `get_range`.
-- **Phase 3** — copy-forward-by-reference + assign-only indexing + SPFresh-lite local split;
-  incremental link derivation via warm IVF; recall-vs-churn benchmark at 10M synthetic.
+- **Phase 0 — DONE** — manifest forward-compat (`shards[]`), so nothing later is blocked.
+- **Phase 1 — DONE** — lazy per-probe query node: loads centroids + FTS split + pk/radj
+  sparse indexes only, ranged-GETs the probed clusters, uses the *published* centroid
+  geometry (fixes measured-recall ≠ published-recall). `DiskCache` wired into `Store` for
+  the warm path. Test: a query fetches ≤ nprobe clusters and warms the cache.
+- **Phase 2 — DONE** — `pk` and `radj` are SSTables (small sorted-block `.idx` loaded
+  whole + `.data`/`.csr` read by range). A point lookup is one cached-index search + one
+  ranged GET. The graph arm now materializes candidates exactly across clusters via
+  pk/radj range reads.
+- **Phase 3 — DONE** — assign-only folds (retrain only on 2× growth), copy-forward-by-
+  reference (only dirty clusters rewritten; unchanged ones referenced by their old path),
+  SPFresh-lite local split of oversized clusters, incremental link derivation via the IVF
+  (`O(new·nprobe·cluster)` not `O(new·N)`). Tests: copy-forward keeps ~all cluster files on
+  a small fold; assign-only holds recall across folds without retraining.
+  - **Phase 3 remaining (deferred, noted):** the fold still (a) *reads* all prev cluster
+    items to rebuild pk/radj/fts, and (b) *rewrites* pk/radj/fts whole. The big win — not
+    rewriting the ~17 GB of cluster files — is delivered; making pk/radj/fts incremental
+    (LSM-style delta + base, tantivy segment-add) and the fold read-lazy are the next
+    write/read-amplification steps.
+
+### Discuss before starting
+
 - **Phase 4** — filtered ANN: (a) fact_type partition, (b) tag/time roaring bitmaps,
-  (c) per-cluster filter summaries in centroids.
+  (c) per-cluster filter summaries in centroids. *(requirements discussion pending)*
 - **Phase 5** — cost metrics in the bench harness, gated.
 - **Phase 6** — scheduled compaction + purge SLA.

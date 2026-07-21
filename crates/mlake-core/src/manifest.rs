@@ -77,6 +77,11 @@ pub struct Manifest {
     /// same WAL. Empty today — present so the schema never has to break to add it.
     #[serde(default)]
     pub shards: Vec<GenerationFiles>,
+    /// Item count when the centroids were last trained. Assign-only folds reuse the
+    /// existing centroids; a full retrain is triggered only once the corpus has grown 2×
+    /// past this (SPEC §5.1, SCALE.md Phase 3), so retraining is a rare, amortized event.
+    #[serde(default)]
+    pub train_count: u64,
 }
 
 impl Manifest {
@@ -102,6 +107,7 @@ impl Manifest {
             prev_files: None,
             prev_wal_index_cursor: 0,
             shards: Vec::new(),
+            train_count: 0,
         }
     }
 

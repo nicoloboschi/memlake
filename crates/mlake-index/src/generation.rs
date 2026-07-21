@@ -72,11 +72,29 @@ pub struct Stats {
 /// map. Every file is genuinely write-once: because `prefix` is unique per attempt, no
 /// other index run ever writes these keys, so the immutability invariant holds even when
 /// two nodes build the same generation number concurrently (INV-2).
+/// Write one cluster file and return its object path. Used directly by the incremental
+/// indexer, which writes only the *dirty* clusters and references unchanged ones by their
+/// existing path (copy-forward-by-reference, SCALE.md Phase 3).
+pub async fn write_cluster_file(
+    store: &Store,
+    prefix: &str,
+    index: usize,
+    cluster: &ClusterFile,
+) -> Result<String> {
+    let key = cluster_key(prefix, index);
+    store.put(&key, cluster.to_bytes()?).await?;
+    Ok(key)
+}
+
+/// Write a generation's metadata files given the (already written) `cluster_paths` — some
+/// freshly written this fold, some copied forward from a previous generation. Every file
+/// is write-once under the unique attempt `prefix` (INV-2).
+#[allow(clippy::too_many_arguments)]
 pub async fn write_generation(
     store: &Store,
     prefix: &str,
     centroids: &Centroids,
-    clusters: &[ClusterFile],
+    cluster_paths: Vec<String>,
     fts_split: &[u8],
     radj_tables: SsTablePair,
     pk_tables: SsTablePair,
@@ -85,13 +103,6 @@ pub async fn write_generation(
     store
         .put(&centroids_key(prefix), centroids.to_bytes()?)
         .await?;
-
-    let mut cluster_paths = Vec::with_capacity(clusters.len());
-    for (i, cluster) in clusters.iter().enumerate() {
-        let key = cluster_key(prefix, i);
-        store.put(&key, cluster.to_bytes()?).await?;
-        cluster_paths.push(key);
-    }
 
     // The FTS file is the packed tantivy split — a self-contained index a query node
     // materializes into its NVMe/mmap tier (SPEC §6.1).
@@ -106,7 +117,7 @@ pub async fn write_generation(
 
     let stats = Stats {
         doc_count,
-        cluster_count: clusters.len(),
+        cluster_count: cluster_paths.len(),
         edge_count: 0,
     };
     store

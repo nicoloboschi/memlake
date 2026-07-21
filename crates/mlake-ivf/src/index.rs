@@ -91,6 +91,20 @@ impl Centroids {
         scored.into_iter().take(nprobe).map(|(i, _)| i).collect()
     }
 
+    /// The centroid a vector is assigned to: its single nearest. This is the assign-only
+    /// path — new items are placed against the *existing* centroids without retraining, so
+    /// a fold does not reshuffle the whole corpus (SCALE.md Phase 3).
+    pub fn assign(&self, v: &[f32]) -> usize {
+        crate::kmeans::nearest(&self.vectors, v)
+    }
+
+    /// Append a centroid (used by a local split) and return its index.
+    pub fn push(&mut self, vector: Vec<f32>) -> usize {
+        self.vectors.push(vector);
+        self.sizes.push(0);
+        self.vectors.len() - 1
+    }
+
     pub fn to_bytes(&self) -> Result<Vec<u8>, serde_json::Error> {
         serde_json::to_vec(self)
     }
