@@ -504,6 +504,16 @@ class MemlakeClient:
             if not token:
                 return ids
 
+    def list_wal(self, namespace: str, *, start_seq: int = 0, limit: int = 0,
+                 include_ops: bool = False) -> pb.ListWalResponse:
+        """Operator view of the WAL: committed sequences, which are folded, optionally the ops.
+        A window on the live log (folded+GC'd entries drop off), not full history."""
+        return self._call(
+            "ListWal",
+            pb.ListWalRequest(namespace=namespace, start_seq=start_seq, limit=limit,
+                              include_ops=include_ops),
+        )
+
     def list_namespaces(self) -> list:
         """Every namespace in the bucket (one LIST). Not routed to a preferred node — any node
         answers identically."""

@@ -78,6 +78,22 @@ and the routing/lease/identity changes that surround it. Read this first tomorro
   present/absent assertion (at-least-once semantics). With ≥3 nodes and one-at-a-time kills,
   failover almost always finds a live node, so ambiguity is rare.
 
+- **FIXED (harness bug, not engine) — cross-run namespace pollution.** The harness first
+  reused deterministic seed-based namespace names (`chaos-{seed}-{i}`); since `create_namespace`
+  is idempotent (never clears), every run accumulated on top of prior runs' data, so a scan saw
+  hundreds of "phantom" memories from earlier runs (including tombstones from runs that had
+  deletes enabled). Raw `list_wal` dumps exposed it (tombstones present with `delete_frac=0`).
+  Fixed: each run uses a `uuid`-unique namespace token and deletes its namespaces on success.
+  With that, the suite PASSES under node kills — phantom=0, lost=0, cross-node consistent.
+  **The engine survived every kill correctly; this was a test-isolation bug.** Lesson baked
+  into the harness: always dump raw storage state before blaming the engine.
+
+## Status
+
+- **Chaos suite passes under kills.** e.g. 3 nodes, 2 indexers, 600 ops, 6 SIGKILLs: no lost
+  writes, no resurrection, all live nodes agree, manifests well-formed. `CHAOS_DEBUG=1` dumps
+  per-namespace oracle-vs-scan counts and raw WAL entries.
+
 ## Open questions / blockers
 
-- _(none blocking — updated as the harness lands)_
+- _(none blocking)_

@@ -104,6 +104,27 @@ def cmd_recall(args) -> int:
     return 0
 
 
+def cmd_chaos(args) -> int:
+    from . import chaos
+
+    cfg = chaos.ChaosConfig.from_env()
+    # CLI flags override env for the common knobs.
+    if args.nodes:
+        cfg.nodes = args.nodes
+    if args.docs:
+        cfg.docs = args.docs
+    if args.secs:
+        cfg.secs = args.secs
+    if args.no_kill:
+        cfg.kill_every = 0.0
+    try:
+        chaos.run(cfg)
+        return 0
+    except AssertionError as e:
+        print(str(e))
+        return 1
+
+
 def cmd_perf(args) -> int:
     from . import perf
     from .perf_datagen import GenConfig
@@ -216,6 +237,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sp.add_argument("--keep", action="store_true", help="use a fixed namespace instead of a fresh one")
     sp.set_defaults(func=cmd_recall)
+
+    sp = sub.add_parser(
+        "chaos",
+        help="multi-node chaos & correctness suite (spawns N nodes, kills them, asserts no data loss)",
+    )
+    sp.add_argument("--nodes", type=int, default=0, help="serve nodes (0 = env CHAOS_NODES or 3)")
+    sp.add_argument("--docs", type=int, default=0, help="total ops (0 = env CHAOS_DOCS or 5000)")
+    sp.add_argument("--secs", type=int, default=0, help="wall-clock cap (0 = env CHAOS_SECS or 60)")
+    sp.add_argument("--no-kill", action="store_true", help="disable node kills (happy-path run)")
+    sp.set_defaults(func=cmd_chaos)
 
     sp = sub.add_parser(
         "perf",
