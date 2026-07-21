@@ -86,9 +86,14 @@ impl<'a> WalTail<'a> {
         // earlier upsert of the same id.
         paths.sort_by_key(|(seq, _)| *seq);
 
-        // Fetch with bounded concurrency, preserving sequence order in the output.
-        let objects: Vec<_> = futures::stream::iter(paths.iter())
-            .map(|(_, path)| self.namespace.store.get(path, None))
+        // Fetch with bounded concurrency, preserving sequence order in the output. The
+        // stream owns plain `String` paths (not a borrow of `paths` behind a destructuring
+        // closure): a borrowing closure here hits a higher-ranked-lifetime limitation once
+        // this scan is awaited from inside the gRPC server's `Send` future.
+        let ordered: Vec<String> = paths.into_iter().map(|(_, p)| p).collect();
+        let store = &self.namespace.store;
+        let objects: Vec<_> = futures::stream::iter(ordered)
+            .map(|path| async move { store.get(&path, None).await })
             .buffered(FETCH_CONCURRENCY)
             .try_collect()
             .await?;

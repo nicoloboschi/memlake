@@ -125,6 +125,21 @@ let hits = node.query(
 Set `Consistency::Eventual` to skip the WAL-head check and serve from the cached manifest;
 set a `QueryConfig` arm weight to `0.0` to drop an arm from fusion.
 
+### As a service (gRPC)
+
+The same operations are exposed over gRPC by `mlake-server`, the drop-in for a Postgres
+connection: point clients at a k8s `Service` instead of a DB. It runs in two modes — `serve`
+(stateless API, N replicas) and `index` (the async indexer, its own Deployment). The contract
+is [`proto/memlake/v1/memlake.proto`](proto/memlake/v1/memlake.proto), there's a
+[Python client](clients/python/README.md), and the full topology + protocol rationale is in
+[`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).
+
+```bash
+cargo run --release -p mlake-server -- serve --addr 0.0.0.0:50051
+cargo run --release -p mlake-server -- index --namespaces my-bank --interval-secs 5
+uv run --project clients/python clients/python/scripts/smoke.py   # end-to-end demo
+```
+
 ## Running it
 
 Prerequisites: Rust, Docker (MinIO for real S3 conditional-write semantics), and `uv` for

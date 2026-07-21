@@ -1,0 +1,27 @@
+[package]
+name = "mlake-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "mlake-server"
+path = "src/main.rs"
+
+[dependencies]
+mlake-core.workspace = true
+mlake-store.workspace = true
+mlake-wal.workspace = true
+mlake-index.workspace = true
+mlake-fts.workspace = true
+tokio.workspace = true
+futures.workspace = true
+tonic.workspace = true
+prost.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+
+[build-dependencies]
+tonic-build.workspace = true
+protoc-bin-vendored = "3"

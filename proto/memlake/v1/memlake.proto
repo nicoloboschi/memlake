@@ -1,0 +1,157 @@
+syntax = "proto3";
+
+// memlake gRPC API. Internal, service-to-service (east-west): this replaces a direct
+// Postgres connection in Hindsight. Every RPC is answerable by any stateless server
+// replica — all coordination happens in object storage — so the deployment is N identical
+// `serve` pods behind one k8s Service, plus a separate `index` Deployment.
+package memlake.v1;
+
+service Memlake {
+  // Ensure a namespace (bank) exists. Idempotent: safe to call on every startup.
+  rpc CreateNamespace(CreateNamespaceRequest) returns (CreateNamespaceResponse);
+
+  // Write a batch of ops as one atomic WAL entry. Returns once the entry is durably
+  // persisted to object storage under a uniquely-claimed sequence number — NOT after
+  // indexing. The write is immediately visible to any STRONG-consistency Query.
+  rpc Write(WriteRequest) returns (WriteResponse);
+
+  // Answer a query for a single memory_type. memory_types are independent sub-indexes;
+  // results are never fused across types, so a caller queries each type it cares about.
+  rpc Query(QueryRequest) returns (QueryResponse);
+}
+
+// ---- Value types -----------------------------------------------------------
+
+// A dense embedding as raw little-endian float32, length = dim * 4 bytes. Sent as bytes
+// (not `repeated float`) so it is zero-copy on both ends and ~4x smaller than JSON floats.
+message Vector {
+  bytes f32le = 1;
+}
+
+message Timestamps {
+  optional int64 event_date = 1;
+  optional int64 occurred_start = 2;
+  optional int64 occurred_end = 3;
+  optional int64 mentioned_at = 4;
+}
+
+enum LinkType {
+  CAUSES = 0;
+  CAUSED_BY = 1;
+  ENABLES = 2;
+  PREVENTS = 3;
+}
+
+// A causal edge is intrinsic to a memory and travels in the WAL (semantic edges, by
+// contrast, are derived by the indexer and never sent by clients).
+message CausalEdge {
+  bytes target = 1;     // 16-byte MemoryId
+  LinkType link_type = 2;
+  float weight = 3;
+}
+
+message Memory {
+  // 16-byte MemoryId. Leave empty and set `key` to have the server derive a stable id.
+  bytes id = 1;
+  // Optional external key; if `id` is empty the server derives id = uuidv5(key).
+  string key = 2;
+  Vector vector = 3;
+  string text = 4;
+  uint32 memory_type = 5;   // fits u8; values > 255 are rejected
+  repeated string tags = 6;
+  uint32 proof_count = 7;
+  repeated uint64 entity_ids = 8;
+  Timestamps timestamps = 9;
+  repeated CausalEdge causal_out = 10;
+}
+
+message Patch {
+  bytes id = 1;               // 16-byte MemoryId
+  int32 proof_count_delta = 2;
+}
+
+message Op {
+  oneof kind {
+    Memory upsert = 1;
+    bytes tombstone = 2;          // 16-byte MemoryId to delete
+    Patch patch = 3;
+    uint64 guard_expect_seq_lt = 4;   // optimistic precondition (compare-and-set)
+  }
+}
+
+// ---- Write -----------------------------------------------------------------
+
+message WriteRequest {
+  string namespace = 1;
+  repeated Op ops = 2;          // applied atomically as one WAL entry
+}
+
+message WriteResponse {
+  uint64 seq = 1;               // the claimed WAL sequence (the write's order point)
+  uint32 attempts = 2;          // conditional-PUT attempts it took to claim the slot
+}
+
+// ---- Query -----------------------------------------------------------------
+
+enum Consistency {
+  STRONG = 0;     // reflect every acked write (checks WAL head, scans the tail)
+  EVENTUAL = 1;   // serve from the cached manifest; staleness bounded by index interval
+}
+
+enum TagsMatch {
+  ANY = 0;         // memory has at least one of the tags (untagged allowed)
+  ALL = 1;         // memory has all of the tags (untagged allowed)
+  ANY_STRICT = 2;  // ANY, but exclude untagged memories
+  ALL_STRICT = 3;  // ALL, but exclude untagged memories
+  EXACT = 4;       // memory's tag set equals the filter exactly
+}
+
+message TagFilter {
+  repeated string tags = 1;
+  TagsMatch mode = 2;
+}
+
+// Fusion knobs. All-zero means "use server defaults" (equal-weight RRF, default nprobe).
+message QueryConfig {
+  uint32 nprobe = 1;
+  float rrf_k = 2;
+  float vector_weight = 3;
+  float fts_weight = 4;
+  float graph_weight = 5;      // 0 drops the graph arm
+  uint32 arm_depth = 6;
+}
+
+message QueryRequest {
+  string namespace = 1;
+  uint32 memory_type = 2;
+  Vector vector = 3;           // omit for no vector arm
+  string text = 4;             // empty for no full-text arm
+  TagFilter tags = 5;          // omit for no tag filter
+  uint32 top_k = 6;
+  Consistency consistency = 7;
+  QueryConfig config = 8;      // omit for defaults
+}
+
+message Contribution {
+  string arm = 1;              // "vector" | "fts" | "graph"
+  float score = 2;             // this arm's reciprocal-rank contribution
+}
+
+message Hit {
+  bytes id = 1;                // 16-byte MemoryId
+  float score = 2;
+  repeated Contribution contributions = 3;   // per-arm breakdown, for explainability
+}
+
+message QueryResponse {
+  repeated Hit hits = 1;
+  uint32 load_roundtrips = 2;  // object-storage roundtrips this query consumed
+}
+
+// ---- Namespace -------------------------------------------------------------
+
+message CreateNamespaceRequest {
+  string namespace = 1;
+}
+
+message CreateNamespaceResponse {}
