@@ -82,6 +82,38 @@ pub fn cosine_opt(a: &[f32], b: &[f32]) -> f32 {
     cosine(a, b)
 }
 
+/// L2 norm of a vector — for precomputing a query's norm once before a rerank loop.
+pub fn norm(a: &[f32]) -> f32 {
+    a.iter().map(|x| x * x).sum::<f32>().sqrt()
+}
+
+/// [`cosine_opt`] with `a`'s L2 norm precomputed. The rerank scores thousands of candidate
+/// vectors against one fixed query, so recomputing the query's norm per candidate (as
+/// `cosine` does) is ~a third of the loop's work wasted. `a_norm` must be `norm(a)` — then the
+/// result is identical to `cosine_opt(a, b)`. Absent (empty) `b`, or a zero norm on either
+/// side, scores 0.0.
+///
+/// # Panics
+/// If `a` and `b` have different non-zero lengths (same invariant as [`cosine`]).
+pub fn cosine_opt_prenorm(a: &[f32], a_norm: f32, b: &[f32]) -> f32 {
+    if a.is_empty() || b.is_empty() {
+        return 0.0;
+    }
+    assert_eq!(a.len(), b.len(), "cosine over mismatched dimensions");
+    let mut dot = 0.0f32;
+    let mut nb = 0.0f32;
+    for i in 0..a.len() {
+        dot += a[i] * b[i];
+        nb += b[i] * b[i];
+    }
+    let denom = a_norm * nb.sqrt();
+    if denom == 0.0 {
+        0.0
+    } else {
+        dot / denom
+    }
+}
+
 /// The single embedding dimension shared by `vectors`, or `None` if none carry one.
 /// Absent (empty) embeddings are skipped — a memory may legitimately be text-only.
 ///
@@ -162,6 +194,22 @@ mod tests {
         normalize(&mut a);
         normalize(&mut b);
         assert!((dot(&a, &b) - expected).abs() < 1e-6);
+    }
+
+    #[test]
+    fn prenorm_matches_cosine_opt() {
+        let cases = [
+            (vec![1.0, 2.0, 3.0], vec![4.0, 5.0, 6.0]),
+            (vec![0.3, -0.7, 0.1, 0.9], vec![-0.2, 0.5, 0.5, 0.1]),
+            (vec![1.0, 0.0], vec![0.0, 0.0]),   // zero-norm b
+        ];
+        for (a, b) in cases {
+            let expected = cosine_opt(&a, &b);
+            let got = cosine_opt_prenorm(&a, norm(&a), &b);
+            assert_eq!(got, expected, "prenorm must equal cosine_opt bit-for-bit");
+        }
+        // absent b (text-only memory) scores 0
+        assert_eq!(cosine_opt_prenorm(&[1.0, 2.0], norm(&[1.0, 2.0]), &[]), 0.0);
     }
 
     #[test]

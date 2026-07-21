@@ -199,13 +199,16 @@ pub fn train_centroids(vectors: &[Vec<f32>], seed: u64) -> Centroids {
 /// Exact search over a set of items — the re-rank step, and the ground truth the recall
 /// gate measures against.
 pub fn exact_search(items: &[StoredMemory], query: &[f32], k: usize) -> Vec<Hit> {
+    // The query is fixed across every candidate, so compute its norm once rather than letting
+    // `cosine` recompute it per item (a third of the loop's work). Result is identical.
+    let qn = mlake_core::norm(query);
     let mut hits: Vec<Hit> = items
         .iter()
         .map(|item| Hit {
             id: item.id,
             // `_opt`: a text-only memory carries no embedding and scores 0 rather than
             // being an error. A genuine dimension mismatch still panics.
-            score: mlake_core::cosine_opt(query, &item.vector),
+            score: mlake_core::cosine_opt_prenorm(query, qn, &item.vector),
         })
         .collect();
     sort_hits(&mut hits);
