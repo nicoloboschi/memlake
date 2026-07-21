@@ -676,11 +676,16 @@ fn parse_page_token(token: &str, generation: u64) -> Result<Option<(u8, ScanCurs
 
 /// Run the indexer over the given namespaces (or all discovered ones) on a fixed interval.
 /// Idempotent by construction, so running more than one replica is safe.
+/// TTL for the index lease. A fold is normally seconds; this leaves comfortable headroom, and
+/// a crashed holder's lease becomes stealable this long after its last acquire.
+const INDEX_LEASE_TTL_SECS: u64 = 60;
+
 pub async fn run_indexer(
     store: Store,
     tokenizer: Tokenizer,
     namespaces: Vec<String>,
     interval: std::time::Duration,
+    lease_holder: String,
 ) -> anyhow::Result<()> {
     loop {
         let targets = if namespaces.is_empty() {
@@ -690,6 +695,13 @@ pub async fn run_indexer(
         };
         for name in &targets {
             let ns = Namespace::new(name, store.clone());
+            // Soft lease: skip a namespace a peer is actively folding, so N indexers don't all
+            // fold every namespace (doubled compute + doubled S3 PUTs). Best-effort — it fails
+            // open, so at worst two nodes fold once and one wins the manifest CAS (safe).
+            if !ns.acquire_index_lease(&lease_holder, INDEX_LEASE_TTL_SECS).await {
+                tracing::debug!(namespace = name, "index skipped (peer holds lease)");
+                continue;
+            }
             match index(&ns, &tokenizer, IndexOptions::default()).await {
                 Ok(outcome) => tracing::info!(
                     namespace = name,
@@ -700,6 +712,7 @@ pub async fn run_indexer(
                 ),
                 Err(e) => tracing::warn!(namespace = name, error = %e, "index failed"),
             }
+            ns.release_index_lease(&lease_holder).await;
         }
         tokio::time::sleep(interval).await;
     }

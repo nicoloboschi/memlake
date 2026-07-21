@@ -185,6 +185,15 @@ pub fn manifest_path(namespace: &str) -> String {
     format!("{namespace}/manifest.json")
 }
 
+/// Object key for a namespace's index lease — a best-effort marker that one node is currently
+/// folding this namespace, so the other nodes' periodic indexers skip it and don't duplicate
+/// the compute and S3 PUTs. Lives under the namespace prefix so `delete_all` reclaims it. It
+/// is only an optimization: losing or ignoring it costs a wasted (but safe) duplicate fold,
+/// never correctness — the nonce'd generation prefixes already make concurrent folds safe.
+pub fn index_lease_path(namespace: &str) -> String {
+    format!("{namespace}/index-lease.json")
+}
+
 /// Object key for a WAL entry. Zero-padded so lexicographic listing is sequence order —
 /// this is what makes "find the head" a single LIST with a start-after cursor.
 pub fn wal_path(namespace: &str, seq: u64) -> String {

@@ -15,7 +15,7 @@ pub mod tail;
 pub use commit::{CommitResult, Writer};
 pub use tail::{TailScan, WalTail};
 
-use mlake_core::manifest::{manifest_path, wal_path};
+use mlake_core::manifest::{index_lease_path, manifest_path, wal_path};
 use mlake_core::{Manifest, WalEntry};
 use mlake_store::{Error as StoreError, Etag, Store};
 
@@ -109,6 +109,62 @@ impl Namespace {
         Ok(count)
     }
 
+    /// Best-effort attempt to become the folder for this namespace, so peer indexers skip it.
+    ///
+    /// Returns `true` if this holder may fold (the lease was free, expired, or a storage error
+    /// left us unsure), `false` only when a *live* lease is held by someone else. It FAILS
+    /// OPEN by design: a wasted duplicate fold is safe (nonce'd generation prefixes, INV-6),
+    /// while wrongly skipping a needed fold would stall indexing — so every ambiguous outcome
+    /// resolves to "go ahead and fold". `ttl_secs` should comfortably exceed one fold; if a
+    /// holder crashes, the lease is stealable once it expires.
+    ///
+    /// Pair every `true` with [`release_index_lease`] when the fold finishes.
+    pub async fn acquire_index_lease(&self, holder: &str, ttl_secs: u64) -> bool {
+        let now = now_secs();
+        let path = index_lease_path(&self.name);
+        let bytes = lease_bytes(holder, now + ttl_secs);
+        match self.store.put_if_absent(&path, bytes.clone()).await {
+            Ok(_) => true, // acquired a free lease
+            Err(e) if e.is_conflict() => {
+                // A lease exists. Read it: skip only if it is live and someone else's.
+                let Ok(cur) = self.store.get(&path, None).await else {
+                    return true; // can't read it — fail open
+                };
+                match parse_lease(&cur.bytes) {
+                    Some((cur_holder, expires_at)) if expires_at > now && cur_holder != holder => {
+                        false // a peer is actively folding — skip
+                    }
+                    // Expired, ours, or unparseable: try to (re)claim it with a CAS so two
+                    // stealers don't both proceed. Whoever wins the swap folds; the loser skips.
+                    _ => match cur.etag {
+                        Some(etag) => match self.store.cas_swap(&path, &etag, bytes).await {
+                            Ok(_) => true,
+                            Err(e) if e.is_conflict() => false, // lost the steal race
+                            Err(_) => true,                     // storage error — fail open
+                        },
+                        None => true, // no etag to CAS against — fail open
+                    },
+                }
+            }
+            Err(_) => true, // storage error acquiring — fail open
+        }
+    }
+
+    /// Release a lease acquired by `holder`, so a fresh fold need not wait out the TTL.
+    /// Best-effort and holder-guarded: only deletes the lease if `holder` still owns it, so a
+    /// peer that stole an expired lease is not disturbed. Any error is ignored — the lease
+    /// will simply expire on its own.
+    pub async fn release_index_lease(&self, holder: &str) {
+        let path = index_lease_path(&self.name);
+        if let Ok(cur) = self.store.get(&path, None).await {
+            if let Some((cur_holder, _)) = parse_lease(&cur.bytes) {
+                if cur_holder == holder {
+                    let _ = self.store.delete(&path).await;
+                }
+            }
+        }
+    }
+
     /// Read the manifest together with its etag, which a later swap must present.
     pub async fn read_manifest(&self) -> Result<(Manifest, Option<Etag>)> {
         let path = manifest_path(&self.name);
@@ -191,6 +247,31 @@ pub fn parse_wal_seq(path: &str) -> Option<u64> {
         .strip_suffix(".bin")?
         .parse::<u64>()
         .ok()
+}
+
+/// Wall-clock seconds since the Unix epoch, for lease expiry. A clock skew between nodes only
+/// changes how eagerly an expired lease is stolen — never correctness — so a plain wall clock
+/// is fine here.
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Serialize an index lease. Hand-rolled JSON (two scalar fields) so `mlake-wal` needs no
+/// `serde` derive dependency.
+fn lease_bytes(holder: &str, expires_at: u64) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({ "holder": holder, "expires_at": expires_at }))
+        .unwrap_or_default()
+}
+
+/// Parse `(holder, expires_at)` from a lease object, or `None` if it is malformed.
+fn parse_lease(bytes: &[u8]) -> Option<(String, u64)> {
+    let v: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    let holder = v.get("holder")?.as_str()?.to_string();
+    let expires_at = v.get("expires_at")?.as_u64()?;
+    Some((holder, expires_at))
 }
 
 /// Object key for a WAL sequence in a namespace.

@@ -34,14 +34,44 @@ async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let mode = args.get(1).map(String::as_str).unwrap_or("serve");
 
+    // A stable-ish identity for this process, stamped on every log line so two- or three-node
+    // behavior is debuggable (whose fold, whose ack, whose skip). `--node-id` / MEMLAKE_NODE_ID
+    // override; otherwise it is `{host}-{pid}`.
+    let node = node_id(&args);
+    let span = tracing::info_span!("node", id = %node);
+
+    use tracing::Instrument;
     match mode {
-        "serve" => serve(&args).await,
-        "index" => indexer(&args).await,
+        "serve" => serve(&args, node).instrument(span).await,
+        "index" => indexer(&args, node).instrument(span).await,
         other => {
             eprintln!("unknown mode '{other}'. usage: mlake-server [serve|index] [flags]");
             std::process::exit(2);
         }
     }
+}
+
+/// This process's node identity: `--node-id`, else `MEMLAKE_NODE_ID`, else `{host}-{pid}`.
+fn node_id(args: &[String]) -> String {
+    if let Some(id) = flag(args, "--node-id") {
+        return id;
+    }
+    if let Ok(id) = std::env::var("MEMLAKE_NODE_ID") {
+        if !id.is_empty() {
+            return id;
+        }
+    }
+    let host = std::env::var("HOSTNAME")
+        .ok()
+        .filter(|h| !h.is_empty())
+        .unwrap_or_else(|| "node".into());
+    format!("{host}-{}", std::process::id())
+}
+
+/// The lease holder for this process: the node id plus the pid, so two processes that happen
+/// to share a `--node-id` still hold distinct leases (and each only releases its own).
+fn lease_holder(node: &str) -> String {
+    format!("{node}#{}", std::process::id())
 }
 
 /// Build the base object store from the environment. Same knobs as the perf harness so a
@@ -59,7 +89,7 @@ fn build_store() -> Result<Store> {
         .context("building object store (check MEMLAKE_S3_* env)")
 }
 
-async fn serve(args: &[String]) -> Result<()> {
+async fn serve(args: &[String], node: String) -> Result<()> {
     let addr = flag(args, "--addr")
         .unwrap_or_else(|| "0.0.0.0:50051".into())
         .parse()
@@ -81,7 +111,7 @@ async fn serve(args: &[String]) -> Result<()> {
     store = store.with_cache(cache);
     let svc = MemlakeService::new(store, Tokenizer::default());
 
-    tracing::info!(%addr, mem_mb, disk_mb, "memlake serving gRPC");
+    tracing::info!(%addr, mem_mb, disk_mb, node = %node, "memlake serving gRPC");
     Server::builder()
         .add_service(MemlakeServer::new(svc))
         .serve(addr)
@@ -90,7 +120,7 @@ async fn serve(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-async fn indexer(args: &[String]) -> Result<()> {
+async fn indexer(args: &[String], node: String) -> Result<()> {
     let namespaces: Vec<String> = flag(args, "--namespaces")
         .map(|s| s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect())
         .unwrap_or_default();
@@ -116,6 +146,7 @@ async fn indexer(args: &[String]) -> Result<()> {
         Tokenizer::default(),
         namespaces,
         Duration::from_secs(interval),
+        lease_holder(&node),
     )
     .await
 }
