@@ -44,8 +44,9 @@ async fn main() -> Result<()> {
         "read" => {
             let cfg = parse_gen(&args);
             let queries = flag_usize(&args, "--queries", 200);
+            let (mem_b, disk_b) = budgets(&args);
             let store = new_store(store_metrics())?;
-            let r = read_bench(&store, &bank_name(cfg.scale), cfg, queries).await?;
+            let r = read_bench(&store, &bank_name(cfg.scale), cfg, queries, mem_b, disk_b).await?;
             println!("\n{}", r.render());
         }
         "suite" => {
@@ -57,8 +58,9 @@ async fn main() -> Result<()> {
                 eprintln!("=== scale {scale}: write ===");
                 let w = write_bench(&store, &bank_name(scale), cfg).await?;
                 eprintln!("=== scale {scale}: read ===");
+                let (mem_b, disk_b) = budgets(&args);
                 let store = new_store(store_metrics())?;
-                let rd = read_bench(&store, &bank_name(scale), cfg, 200).await?;
+                let rd = read_bench(&store, &bank_name(scale), cfg, 200, mem_b, disk_b).await?;
                 reports.push((w, rd));
             }
             println!("\n{}", render_suite(&reports));
@@ -193,6 +195,10 @@ struct ReadReport {
     memory_types: Vec<u8>,
     cold: Vec<WorkloadResult>,
     warm: Vec<WorkloadResult>,
+    mem_used: u64,
+    mem_budget: u64,
+    disk_used: u64,
+    disk_budget: u64,
 }
 
 impl ReadReport {
@@ -206,6 +212,13 @@ impl ReadReport {
         for w in &self.warm {
             s.push_str(&fmt_workload(w));
         }
+        s.push_str(&format!(
+            "  cache:   mem {:.1}/{:.0} MB   disk {:.1}/{:.0} MB\n",
+            self.mem_used as f64 / 1e6,
+            self.mem_budget as f64 / 1e6,
+            self.disk_used as f64 / 1e6,
+            self.disk_budget as f64 / 1e6,
+        ));
         s
     }
 }
@@ -234,15 +247,24 @@ fn fmt_workload(w: &WorkloadResult) -> String {
     )
 }
 
-async fn read_bench(store: &Store, bank: &str, cfg: GenConfig, queries: usize) -> Result<ReadReport> {
-    // A cache-backed store so the warm pass is served locally. Wiped up front so the cold
-    // pass is genuinely cold (the cache dir persists across runs).
-    let cache = Arc::new(DiskCache::new(
+async fn read_bench(
+    store: &Store,
+    bank: &str,
+    cfg: GenConfig,
+    queries: usize,
+    mem_budget: u64,
+    disk_budget: u64,
+) -> Result<ReadReport> {
+    // A cache-backed store so the warm pass is served locally, with independent, bounded
+    // memory and disk budgets (predictable resource usage). Wiped up front so the cold pass
+    // is genuinely cold (the cache dir persists across runs).
+    let cache = Arc::new(DiskCache::with_budgets(
         std::env::temp_dir().join(format!("mlake-perf-cache-{}", cfg.scale)),
-        1 << 30,
+        mem_budget,
+        disk_budget,
     )?);
     cache.wipe().ok();
-    let store = store.clone().with_cache(cache);
+    let store = store.clone().with_cache(cache.clone());
     let ns = Namespace::new(bank, store.clone());
     let node = QueryNode::open(&ns, Tokenizer::default(), Consistency::Strong).await?;
     let gen = Generator::new(cfg);
@@ -275,7 +297,16 @@ async fn read_bench(store: &Store, bank: &str, cfg: GenConfig, queries: usize) -
         warm.push(run_workload(&node, mt, &qs, build, store.store_metrics().unwrap(), name).await?);
     }
 
-    Ok(ReadReport { scale: cfg.scale, memory_types, cold, warm })
+    Ok(ReadReport {
+        scale: cfg.scale,
+        memory_types,
+        cold,
+        warm,
+        mem_used: cache.bytes(),
+        mem_budget: cache.mem_budget(),
+        disk_used: cache.disk_bytes(),
+        disk_budget: cache.disk_budget(),
+    })
 }
 
 #[allow(clippy::type_complexity)]
@@ -350,6 +381,13 @@ fn render_suite(reports: &[(WriteReport, ReadReport)]) -> String {
 }
 
 // ---------------------------------------------------------------- arg parsing
+
+/// Cache budgets (bytes): --mem-mb (default 256), --disk-mb (default 4096).
+fn budgets(args: &[String]) -> (u64, u64) {
+    let mem = flag_usize(args, "--mem-mb", 256) as u64 * 1_000_000;
+    let disk = flag_usize(args, "--disk-mb", 4096) as u64 * 1_000_000;
+    (mem, disk)
+}
 
 fn parse_gen(args: &[String]) -> GenConfig {
     GenConfig {

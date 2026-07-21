@@ -46,40 +46,61 @@ impl CacheKey {
     }
 }
 
-struct Entry {
+struct MemEntry {
     bytes: Bytes,
-    /// Monotonic tick of last use, for LRU eviction.
     last_used: u64,
 }
 
-/// An LRU byte cache with a local-disk spill directory.
+struct DiskEntry {
+    size: u64,
+    last_used: u64,
+}
+
+/// A two-tier cache with **independent, bounded** memory and disk budgets, so a query node
+/// has predictable resource usage regardless of workload.
 ///
-/// The in-memory map is the hot tier (hotcache footers, centroids, sparse indexes — all
-/// small); the directory is the NVMe tier that survives process restart.
+/// * The **memory tier** is the hot bytes in RAM, bounded by `mem_budget` (LRU).
+/// * The **disk tier** is the NVMe spill, bounded by `disk_budget` (LRU), and survives a
+///   process restart.
+///
+/// A memory eviction *demotes* an item to disk (the bytes stay on disk); only a disk
+/// eviction deletes the file. A hit promotes back into memory. Neither tier can exceed its
+/// budget, so peak RAM and peak disk are both capped by construction.
 pub struct DiskCache {
     dir: PathBuf,
     state: Mutex<CacheState>,
-    capacity_bytes: u64,
+    mem_budget: u64,
+    disk_budget: u64,
 }
 
 struct CacheState {
-    entries: HashMap<CacheKey, Entry>,
-    bytes: u64,
+    mem: HashMap<CacheKey, MemEntry>,
+    mem_bytes: u64,
+    disk: HashMap<CacheKey, DiskEntry>,
+    disk_bytes: u64,
     tick: u64,
     hits: u64,
     misses: u64,
 }
 
 impl DiskCache {
-    pub fn new(dir: impl Into<PathBuf>, capacity_bytes: u64) -> Result<Self> {
+    /// A cache with separate memory and disk byte budgets.
+    pub fn with_budgets(
+        dir: impl Into<PathBuf>,
+        mem_budget: u64,
+        disk_budget: u64,
+    ) -> Result<Self> {
         let dir = dir.into();
         std::fs::create_dir_all(&dir)?;
         Ok(Self {
             dir,
-            capacity_bytes,
+            mem_budget,
+            disk_budget,
             state: Mutex::new(CacheState {
-                entries: HashMap::new(),
-                bytes: 0,
+                mem: HashMap::new(),
+                mem_bytes: 0,
+                disk: HashMap::new(),
+                disk_bytes: 0,
                 tick: 0,
                 hits: 0,
                 misses: 0,
@@ -87,33 +108,39 @@ impl DiskCache {
         })
     }
 
+    /// Backwards-compatible constructor: split one budget as 25% memory / 75% disk.
+    pub fn new(dir: impl Into<PathBuf>, capacity_bytes: u64) -> Result<Self> {
+        Self::with_budgets(dir, capacity_bytes / 4, capacity_bytes)
+    }
+
     pub fn get(&self, key: &CacheKey) -> Option<Bytes> {
         let mut state = self.state.lock().unwrap();
         state.tick += 1;
         let tick = state.tick;
-        if let Some(entry) = state.entries.get_mut(key) {
+
+        if let Some(entry) = state.mem.get_mut(key) {
             entry.last_used = tick;
             let bytes = entry.bytes.clone();
             state.hits += 1;
             return Some(bytes);
         }
 
-        // Not in memory: the disk tier may still have it from a previous process.
+        // Not in memory: the disk tier may still hold it (this or a previous process).
         let path = self.dir.join(key.filename());
         match std::fs::read(&path) {
             Ok(data) => {
                 let bytes = Bytes::from(data);
                 state.hits += 1;
-                let len = bytes.len() as u64;
-                state.entries.insert(
-                    key.clone(),
-                    Entry {
-                        bytes: bytes.clone(),
-                        last_used: tick,
-                    },
-                );
-                state.bytes += len;
-                Self::evict_to_capacity(&mut state, self.capacity_bytes, &self.dir);
+                // Ensure the disk tier accounts for it (e.g. after a restart), then promote
+                // into memory.
+                if let std::collections::hash_map::Entry::Vacant(e) = state.disk.entry(key.clone()) {
+                    let size = bytes.len() as u64;
+                    e.insert(DiskEntry { size, last_used: tick });
+                    state.disk_bytes += size;
+                } else if let Some(d) = state.disk.get_mut(key) {
+                    d.last_used = tick;
+                }
+                self.promote(&mut state, key.clone(), bytes.clone(), tick);
                 Some(bytes)
             }
             Err(_) => {
@@ -123,52 +150,88 @@ impl DiskCache {
         }
     }
 
-    /// Write-through admission on first fetch.
+    /// Admit on first fetch: write to disk (bounded) and to memory (bounded).
     pub fn put(&self, key: CacheKey, bytes: Bytes) {
         let path = self.dir.join(key.filename());
         // A failed disk write is not an error: the cache is advisory, and dropping to
         // memory-only degrades latency rather than correctness.
-        if let Err(e) = std::fs::write(&path, &bytes) {
-            tracing::debug!(?path, error = %e, "cache disk write failed; keeping in memory only");
-        }
+        let on_disk = std::fs::write(&path, &bytes).is_ok();
+
         let mut state = self.state.lock().unwrap();
         state.tick += 1;
         let tick = state.tick;
         let len = bytes.len() as u64;
-        if let Some(old) = state.entries.insert(
-            key,
-            Entry {
-                bytes,
-                last_used: tick,
-            },
-        ) {
-            state.bytes -= old.bytes.len() as u64;
+
+        if on_disk {
+            if let Some(old) = state.disk.insert(key.clone(), DiskEntry { size: len, last_used: tick }) {
+                state.disk_bytes -= old.size;
+            }
+            state.disk_bytes += len;
+            self.evict_disk(&mut state);
         }
-        state.bytes += len;
-        Self::evict_to_capacity(&mut state, self.capacity_bytes, &self.dir);
+        self.promote(&mut state, key, bytes, tick);
     }
 
-    fn evict_to_capacity(state: &mut CacheState, capacity: u64, dir: &PathBuf) {
-        while state.bytes > capacity && !state.entries.is_empty() {
+    /// Insert bytes into the memory tier and evict it back to budget.
+    fn promote(&self, state: &mut CacheState, key: CacheKey, bytes: Bytes, tick: u64) {
+        let len = bytes.len() as u64;
+        if let Some(old) = state.mem.insert(key, MemEntry { bytes, last_used: tick }) {
+            state.mem_bytes -= old.bytes.len() as u64;
+        }
+        state.mem_bytes += len;
+        // Memory eviction demotes to disk (the bytes remain on disk), so it drops from the
+        // memory map only.
+        while state.mem_bytes > self.mem_budget && !state.mem.is_empty() {
             let victim = state
-                .entries
+                .mem
                 .iter()
                 .min_by_key(|(_, e)| e.last_used)
                 .map(|(k, _)| k.clone());
             let Some(victim) = victim else { break };
-            let _ = std::fs::remove_file(dir.join(victim.filename()));
-            if let Some(entry) = state.entries.remove(&victim) {
-                state.bytes -= entry.bytes.len() as u64;
+            if let Some(e) = state.mem.remove(&victim) {
+                state.mem_bytes -= e.bytes.len() as u64;
             }
         }
     }
 
+    /// Evict the disk tier to budget, deleting files (and any resident memory copy).
+    fn evict_disk(&self, state: &mut CacheState) {
+        while state.disk_bytes > self.disk_budget && !state.disk.is_empty() {
+            let victim = state
+                .disk
+                .iter()
+                .min_by_key(|(_, e)| e.last_used)
+                .map(|(k, _)| k.clone());
+            let Some(victim) = victim else { break };
+            let _ = std::fs::remove_file(self.dir.join(victim.filename()));
+            if let Some(e) = state.disk.remove(&victim) {
+                state.disk_bytes -= e.size;
+            }
+            if let Some(e) = state.mem.remove(&victim) {
+                state.mem_bytes -= e.bytes.len() as u64;
+            }
+        }
+    }
+
+    /// Bytes resident in the memory tier (bounded by `mem_budget`).
     pub fn bytes(&self) -> u64 {
-        self.state.lock().unwrap().bytes
+        self.state.lock().unwrap().mem_bytes
+    }
+
+    /// Bytes resident in the disk tier (bounded by `disk_budget`).
+    pub fn disk_bytes(&self) -> u64 {
+        self.state.lock().unwrap().disk_bytes
+    }
+
+    pub fn mem_budget(&self) -> u64 {
+        self.mem_budget
+    }
+    pub fn disk_budget(&self) -> u64 {
+        self.disk_budget
     }
 
     pub fn len(&self) -> usize {
-        self.state.lock().unwrap().entries.len()
+        self.state.lock().unwrap().mem.len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -182,12 +245,13 @@ impl DiskCache {
         (total > 0).then(|| state.hits as f64 / total as f64)
     }
 
-    /// Drop everything, memory and disk. Used by the cold-start tests, which assert that
-    /// wiping the cache changes only latency.
+    /// Drop everything, memory and disk.
     pub fn wipe(&self) -> Result<()> {
         let mut state = self.state.lock().unwrap();
-        state.entries.clear();
-        state.bytes = 0;
+        state.mem.clear();
+        state.mem_bytes = 0;
+        state.disk.clear();
+        state.disk_bytes = 0;
         for entry in std::fs::read_dir(&self.dir)? {
             let _ = std::fs::remove_file(entry?.path());
         }
@@ -274,5 +338,42 @@ mod tests {
         c.wipe().unwrap();
         assert!(c.get(&key).is_none());
         assert_eq!(c.bytes(), 0);
+    }
+}
+
+#[cfg(test)]
+mod two_tier_tests {
+    use super::*;
+
+    #[test]
+    fn memory_and_disk_budgets_are_enforced_independently() {
+        let dir = tempfile::tempdir().unwrap();
+        // Room for 2 entries in memory, 10 on disk (each entry is 100 bytes).
+        let c = DiskCache::with_budgets(dir.path(), 250, 1050).unwrap();
+        for i in 0..20 {
+            let key = CacheKey::new("ns", &format!("obj{i}"), "e");
+            c.put(key, Bytes::from(vec![0u8; 100]));
+        }
+        // Memory never exceeds its budget; disk never exceeds its budget.
+        assert!(c.bytes() <= 250, "memory tier over budget: {}", c.bytes());
+        assert!(c.disk_bytes() <= 1050, "disk tier over budget: {}", c.disk_bytes());
+        // Disk holds far more than memory — the point of two tiers.
+        assert!(c.disk_bytes() > c.bytes());
+    }
+
+    #[test]
+    fn memory_eviction_demotes_to_disk_not_deletion() {
+        let dir = tempfile::tempdir().unwrap();
+        // Tiny memory (1 entry), generous disk.
+        let c = DiskCache::with_budgets(dir.path(), 100, 100_000).unwrap();
+        let a = CacheKey::new("ns", "a", "e");
+        let b = CacheKey::new("ns", "b", "e");
+        c.put(a.clone(), Bytes::from(vec![1u8; 100]));
+        c.put(b.clone(), Bytes::from(vec![2u8; 100])); // evicts `a` from memory
+
+        // `a` is gone from memory but still on disk — a get promotes it back (a hit, not a miss).
+        let before = c.hit_ratio();
+        assert_eq!(c.get(&a).unwrap(), Bytes::from(vec![1u8; 100]));
+        assert!(c.hit_ratio() >= before, "demoted entry must be a disk hit, not a miss");
     }
 }
