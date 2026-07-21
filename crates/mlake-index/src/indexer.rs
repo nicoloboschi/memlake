@@ -324,6 +324,17 @@ async fn build_memory_type_index(
     }
     let entity_tables = crate::sstable::EntityTable::build(entity_pairs);
 
+    // Time index: effective_ts = COALESCE(occurred_start, mentioned_at, occurred_end) -> id.
+    // Entry-point selection for the temporal arm is one ranged scan of this key range.
+    let mut time_pairs: Vec<(i64, MemoryId)> = Vec::new();
+    for item in &items {
+        let t = &item.timestamps;
+        if let Some(ts) = t.occurred_start.or(t.mentioned_at).or(t.occurred_end) {
+            time_pairs.push((ts, item.id));
+        }
+    }
+    let time_tables = crate::sstable::TimeTable::build(time_pairs);
+
     // Per-cluster tag summaries: the union of each cluster's tags + an untagged flag, so a
     // query can prune clusters that cannot contain a matching memory (SCALE.md Phase 4b).
     let tag_summary: crate::generation::TagSummary = clusters
@@ -355,6 +366,7 @@ async fn build_memory_type_index(
         radj_tables.into(),
         pk_tables.into(),
         entity_tables.into(),
+        time_tables.into(),
         &tag_summary,
         doc_count,
     )

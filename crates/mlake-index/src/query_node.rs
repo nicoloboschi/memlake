@@ -24,7 +24,7 @@ use mlake_wal::{Namespace, WalTail};
 
 use crate::fusion::{rrf, weighted_rrf, FusedHit, RankedArm};
 use crate::generation::{read_fts_split, TagSummary};
-use crate::sstable::{EntityTable, PkTable, RadjTable};
+use crate::sstable::{EntityTable, PkTable, RadjTable, TimeTable};
 use crate::{QueryConfig, Result};
 
 /// One arm's contribution to a hit: its 0-based rank within that arm and its raw score
@@ -84,6 +84,7 @@ struct FactTypeState {
     radj: RadjTable,
     pk: PkTable,
     entity: EntityTable,
+    time: TimeTable,
     tail_items: Vec<StoredMemory>,
     tail_fts: TantivyFts,
     doc_count: usize,
@@ -96,8 +97,21 @@ pub struct QueryNode {
     tombstones: HashSet<MemoryId>,
     /// The WAL sequence this snapshot reflects.
     pub through_seq: u64,
+    /// The generation this snapshot's indexed files belong to. Part of the snapshot's
+    /// identity: a `ScanCursor` is only meaningful against the generation that issued it,
+    /// since cluster paths and ordering change when the indexer publishes a new one.
+    pub generation: u64,
     /// Roundtrips consumed opening this snapshot (loading the metadata), for the budget.
     pub load_roundtrips: usize,
+}
+
+/// A position in a [`QueryNode::scan`]: which cluster of a fact type, and how far into it.
+/// The un-indexed WAL tail is walked as one virtual cluster just past the real ones, so a
+/// scan covers exactly what a query can see.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ScanCursor {
+    pub cluster: usize,
+    pub offset: usize,
 }
 
 impl QueryNode {
@@ -185,9 +199,19 @@ impl QueryNode {
                                 .map_err(crate::Error::from)
                         }
                     };
+                    let time_f = async {
+                        if files.time_idx.is_empty() {
+                            Ok(bytes::Bytes::new())
+                        } else {
+                            ns.store
+                                .get_immutable(&files.time_idx, Some((&metrics, 2)))
+                                .await
+                                .map_err(crate::Error::from)
+                        }
+                    };
                     let fts_f = read_fts_split(&ns.store, files, tokenizer.clone(), Some(&metrics));
-                    let (centroids_bytes, tag_bytes, radj_idx, pk_idx, entity_idx, gen_fts) =
-                        futures::try_join!(centroids_f, tag_f, radj_f, pk_f, entity_f, fts_f)?;
+                    let (centroids_bytes, tag_bytes, radj_idx, pk_idx, entity_idx, time_idx, gen_fts) =
+                        futures::try_join!(centroids_f, tag_f, radj_f, pk_f, entity_f, time_f, fts_f)?;
 
                     let tag_summary: TagSummary = if tag_bytes.is_empty() {
                         Vec::new()
@@ -195,11 +219,16 @@ impl QueryNode {
                         serde_json::from_slice(&tag_bytes).unwrap_or_default()
                     };
                     let pk = PkTable::open(&pk_idx, files.pk_data.clone())?;
-                    // Old generations have no entity index (back-compat): treat as empty.
+                    // Old generations have no entity/time index (back-compat): treat as empty.
                     let entity = if entity_idx.is_empty() {
                         EntityTable::open(&[0u8; 16], String::new())?
                     } else {
                         EntityTable::open(&entity_idx, files.entity_data.clone())?
+                    };
+                    let time = if time_idx.is_empty() {
+                        TimeTable::open(&[0u8; 16], String::new())?
+                    } else {
+                        TimeTable::open(&time_idx, files.time_data.clone())?
                     };
 
                     // Live doc count for this fact type: its pk record count minus tombstones
@@ -224,6 +253,7 @@ impl QueryNode {
                         radj: RadjTable::open(&radj_idx, files.radj_csr.clone())?,
                         pk,
                         entity,
+                        time,
                         doc_count,
                         tail_items,
                         tail_fts,
@@ -243,6 +273,7 @@ impl QueryNode {
                         radj: RadjTable::open(&[0u8; 16], String::new())?,
                         pk: PkTable::open(&[0u8; 16], String::new())?,
                         entity: EntityTable::open(&[0u8; 16], String::new())?,
+                        time: TimeTable::open(&[0u8; 16], String::new())?,
                         doc_count,
                         tail_items,
                         tail_fts,
@@ -257,6 +288,7 @@ impl QueryNode {
             per_type,
             tombstones,
             through_seq: head,
+            generation: manifest.generation,
             load_roundtrips: metrics.roundtrips(),
         })
     }
@@ -274,6 +306,115 @@ impl QueryNode {
     /// Fact types this snapshot can answer.
     pub fn memory_types(&self) -> Vec<u8> {
         self.per_type.keys().copied().collect()
+    }
+
+    /// Cluster files backing one fact type's current generation. Zero for a type that
+    /// exists only in the un-indexed tail.
+    pub fn cluster_count_of(&self, memory_type: u8) -> usize {
+        self.per_type.get(&memory_type).map(|s| s.cluster_paths.len()).unwrap_or(0)
+    }
+
+    /// Fetch memories by id, without ranking anything. Each id is resolved through its fact
+    /// type's pk SSTable to a cluster, then the distinct clusters are read in one coalesced
+    /// wave — so the cost is bounded by the number of *clusters* touched, not the corpus.
+    ///
+    /// The tail overlay is consulted first and wins: it is strictly newer than the indexed
+    /// generation. Tombstoned and unknown ids are simply absent from the result — this is a
+    /// lookup, not an existence assertion.
+    pub async fn get_many(&self, ids: &[MemoryId]) -> Result<Vec<StoredMemory>> {
+        let metrics = QueryMetrics::new();
+        let wanted: HashSet<MemoryId> =
+            ids.iter().copied().filter(|id| !self.tombstones.contains(id)).collect();
+        if wanted.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut found: HashMap<MemoryId, StoredMemory> = HashMap::new();
+        for state in self.per_type.values() {
+            for item in &state.tail_items {
+                if wanted.contains(&item.id) {
+                    found.insert(item.id, item.clone());
+                }
+            }
+        }
+
+        // Anything the tail did not answer must come from an indexed generation. Each fact
+        // type is a separate index, so an id is resolved against every type's pk table.
+        for state in self.per_type.values() {
+            let missing: Vec<MemoryId> =
+                wanted.iter().copied().filter(|id| !found.contains_key(id)).collect();
+            if missing.is_empty() {
+                break;
+            }
+            let by_cluster = state.pk.lookup_batch(&self.ns.store, &missing, Some((&metrics, 1))).await?;
+            if by_cluster.is_empty() {
+                continue;
+            }
+            let mut clusters: Vec<usize> = by_cluster.values().map(|&c| c as usize).collect();
+            clusters.sort_unstable();
+            clusters.dedup();
+            for item in self.fetch_clusters(state, &clusters, &metrics, 2).await? {
+                if wanted.contains(&item.id) {
+                    found.entry(item.id).or_insert(item);
+                }
+            }
+        }
+
+        // Return in the caller's requested order, skipping ids that did not resolve.
+        Ok(ids.iter().filter_map(|id| found.get(id).cloned()).collect())
+    }
+
+    /// Page through one fact type's stored memories in cluster order, resuming from
+    /// `cursor`. Returns the page and the cursor to pass next, or `None` when exhausted.
+    ///
+    /// This is a full scan by construction — unlike every other read path here, its total
+    /// cost DOES grow with the corpus. It exists for browsing and debugging; retrieval uses
+    /// [`QueryNode::query`]. One cluster file is read per step, so a single page costs at
+    /// most `limit`-bounded work, but walking the whole type reads the whole type.
+    pub async fn scan(
+        &self,
+        memory_type: u8,
+        cursor: ScanCursor,
+        limit: usize,
+        tags: &TagFilter,
+    ) -> Result<(Vec<StoredMemory>, Option<ScanCursor>)> {
+        let Some(state) = self.per_type.get(&memory_type) else {
+            return Ok((Vec::new(), None));
+        };
+        let metrics = QueryMetrics::new();
+        // The virtual tail cluster sits just past the real ones, so one walk covers both the
+        // indexed generation and the un-indexed overlay a query would also see.
+        let tail_cluster = state.cluster_paths.len();
+        let (mut cluster, mut offset) = (cursor.cluster, cursor.offset);
+        let mut out = Vec::new();
+
+        while out.len() < limit && cluster <= tail_cluster {
+            let items = if cluster == tail_cluster {
+                state
+                    .tail_items
+                    .iter()
+                    .filter(|m| !self.tombstones.contains(&m.id))
+                    .cloned()
+                    .collect()
+            } else {
+                self.fetch_clusters(state, &[cluster], &metrics, 3).await?
+            };
+            // Filtering is deterministic for a fixed generation, so `offset` indexes the
+            // filtered list stably across calls — the cursor stays valid between pages.
+            let matching: Vec<StoredMemory> =
+                items.into_iter().filter(|m| tags.matches(&m.tags)).collect();
+
+            let take = (limit - out.len()).min(matching.len().saturating_sub(offset));
+            out.extend(matching.iter().skip(offset).take(take).cloned());
+            offset += take;
+            if offset >= matching.len() {
+                cluster += 1;
+                offset = 0;
+            }
+        }
+
+        let next = (cluster <= tail_cluster).then_some(ScanCursor { cluster, offset });
+        Ok((out, next))
     }
 
     /// Convenience: run the query and fuse the arms with (weighted) RRF into a single ranked

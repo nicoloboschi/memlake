@@ -35,6 +35,12 @@ pub struct GenerationFiles {
     pub entity_idx: String,
     #[serde(default)]
     pub entity_data: String,
+    /// `time.idx` / `time.data`: the time index SSTable (effective_ts -> [MemoryId]),
+    /// range-scanned by the temporal arm's entry-point selection.
+    #[serde(default)]
+    pub time_idx: String,
+    #[serde(default)]
+    pub time_data: String,
 }
 
 impl GenerationFiles {
@@ -52,6 +58,8 @@ impl GenerationFiles {
             self.tag_summary.as_str(),
             self.entity_idx.as_str(),
             self.entity_data.as_str(),
+            self.time_idx.as_str(),
+            self.time_data.as_str(),
         ]
         .into_iter()
         .chain(self.clusters.iter().map(|s| s.as_str()))

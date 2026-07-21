@@ -62,6 +62,12 @@ fn entity_idx_key(prefix: &str) -> String {
 fn entity_data_key(prefix: &str) -> String {
     format!("{prefix}/entity.data")
 }
+fn time_idx_key(prefix: &str) -> String {
+    format!("{prefix}/time.idx")
+}
+fn time_data_key(prefix: &str) -> String {
+    format!("{prefix}/time.data")
+}
 
 /// A unique per-attempt generation prefix. The nonce ensures two nodes building the same
 /// generation number never collide on object keys.
@@ -120,6 +126,7 @@ pub async fn write_generation(
     radj_tables: SsTablePair,
     pk_tables: SsTablePair,
     entity_tables: SsTablePair,
+    time_tables: SsTablePair,
     tag_summary: &TagSummary,
     doc_count: usize,
 ) -> Result<GenerationFiles> {
@@ -145,6 +152,7 @@ pub async fn write_generation(
         entity_idx_key(prefix),
         entity_data_key(prefix),
     );
+    let (kti, ktd) = (time_idx_key(prefix), time_data_key(prefix));
     // All metadata objects are independent, immutable, and unique to this prefix, so write
     // them concurrently rather than one sequential PUT at a time.
     futures::try_join!(
@@ -158,6 +166,8 @@ pub async fn write_generation(
         store.put(&ks, stats_bytes),
         store.put(&kei, entity_tables.idx),
         store.put(&ked, entity_tables.data),
+        store.put(&kti, time_tables.idx),
+        store.put(&ktd, time_tables.data),
     )?;
 
     Ok(GenerationFiles {
@@ -172,6 +182,8 @@ pub async fn write_generation(
         tag_summary: tag_summary_key(prefix),
         entity_idx: entity_idx_key(prefix),
         entity_data: entity_data_key(prefix),
+        time_idx: time_idx_key(prefix),
+        time_data: time_data_key(prefix),
     })
 }
 
