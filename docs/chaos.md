@@ -52,6 +52,32 @@ and the routing/lease/identity changes that surround it. Read this first tomorro
 - Scale knobs (env): `CHAOS_NODES` (default 3), `CHAOS_DOCS`, `CHAOS_SECS`, `CHAOS_WORKERS`,
   `CHAOS_SEED`. CI gate runs small/bounded; soak runs large.
 
-## Open questions / blockers (fix or flag)
+## Findings (bugs found while building the suite)
 
-- _(none yet — updated as the harness lands)_
+- **FIXED — `scan`/`get_many` did not hide all deletes.** `scan`'s indexed-cluster branch
+  filtered only tail-*superseded* ids, so a memory that was indexed and then tombstoned via
+  the tail leaked back into scans (browsing showed deleted memories, and it would have broken
+  the oracle's "actual present" set). `get_many` filtered id-tombstones but ignored
+  predicate-tombstones. Both now use the canonical `hidden()` filter (id-tombstone OR
+  predicate-tombstone-by-write_seq), so `get`/`scan`/`query` agree on visibility. Regression
+  tests: `scan_hides_tombstoned_indexed_memories`, `get_and_scan_hide_predicate_deleted_memories`
+  in `mlake-index/tests/end_to_end.rs`.
+
+## Oracle notes / constraints
+
+- The concurrent workload uses only **idempotent-under-retry** ops: upsert (by id) and
+  tombstone (by id / by predicate). It avoids relative `proof_count_delta`, because the smart
+  client's UNAVAILABLE failover can create a second WAL entry for the same logical write, which
+  would double-apply a *relative* delta (upserts/tombstones are unaffected — last-seq wins /
+  idempotent). Relative-delta correctness under failover is tested separately, single-node.
+- **Seq-replay oracle**: every acked write returns its WAL seq. The expected final state is
+  computed by replaying all acked (seq, op) in seq order — the WAL's own total order, exactly
+  what the fold sees — so the oracle is concurrency-free and matches the engine's ordering.
+- **Ambiguous ops**: a write that *raised* (all fallbacks failed / non-UNAVAILABLE error) may
+  or may not have committed. Ids it touched are marked ambiguous and excluded from the exact
+  present/absent assertion (at-least-once semantics). With ≥3 nodes and one-at-a-time kills,
+  failover almost always finds a live node, so ambiguity is rare.
+
+## Open questions / blockers
+
+- _(none blocking — updated as the harness lands)_

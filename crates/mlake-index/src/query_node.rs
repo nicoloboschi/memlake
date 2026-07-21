@@ -448,8 +448,16 @@ impl QueryNode {
             }
         }
 
-        // Return in the caller's requested order, skipping ids that did not resolve.
-        Ok(ids.iter().filter_map(|id| found.get(id).cloned()).collect())
+        // Return in the caller's requested order, skipping ids that did not resolve or that a
+        // query would hide. The `wanted` set already dropped id-tombstoned ids up front (so
+        // their clusters were never fetched); this additionally drops predicate-tombstoned
+        // memories, which can only be judged once the `StoredMemory` (its `write_seq`) is in
+        // hand — so a `get` never returns something `query`/`scan` would hide.
+        Ok(ids
+            .iter()
+            .filter_map(|id| found.get(id).cloned())
+            .filter(|m| !self.hidden(m))
+            .collect())
     }
 
     /// Page through one fact type's stored memories in cluster order, resuming from
@@ -485,13 +493,16 @@ impl QueryNode {
                 state
                     .tail_items
                     .iter()
-                    .filter(|m| !self.tombstones.contains(&m.id))
+                    .filter(|m| !self.hidden(m))
                     .cloned()
                     .collect()
             } else {
+                // Hide anything a query would hide: a tail upsert supersedes the indexed copy,
+                // and a tail id-tombstone or predicate-tombstone hides it entirely. Without the
+                // `hidden` check a deleted-but-still-indexed memory would surface in a scan.
                 self.fetch_clusters(state, &[cluster], &metrics, 3).await?
                     .into_iter()
-                    .filter(|m| !superseded.contains(&m.id))
+                    .filter(|m| !superseded.contains(&m.id) && !self.hidden(m))
                     .collect()
             };
             // Filtering is deterministic for a fixed generation, so `offset` indexes the

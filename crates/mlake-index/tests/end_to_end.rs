@@ -1208,6 +1208,95 @@ async fn scan_pages_over_every_memory_exactly_once() {
     );
 }
 
+/// A tombstoned memory that is still physically in an indexed cluster must not surface in a
+/// scan — `scan` has to apply the same tombstone overlay as `query`/`get_many`, not just the
+/// tail-supersedes rule. (Regression: the indexed-cluster branch previously filtered only
+/// tail-superseded ids, so a deleted-but-indexed memory leaked into scans.)
+#[tokio::test]
+async fn scan_hides_tombstoned_indexed_memories() {
+    let store = Store::in_memory();
+    let ns = namespace(store, "ns").await;
+    let mut writer = Writer::new(ns.clone());
+
+    writer
+        .commit(vec![
+            Op::Upsert(item("keep", vec![1.0, 0.0], "keep me")),
+            Op::Upsert(item("drop", vec![0.0, 1.0], "delete me")),
+        ])
+        .await
+        .unwrap();
+    // Index both, so `drop` lives in a real cluster, then tombstone it via the tail.
+    index(&ns, &Tokenizer::default(), IndexOptions::default()).await.unwrap();
+    writer.commit(vec![Op::Tombstone { id: MemoryId::from_key("drop") }]).await.unwrap();
+
+    let node = QueryNode::open(&ns, Tokenizer::default()).await.unwrap();
+    let mut seen = std::collections::HashSet::new();
+    let mut cursor = ScanCursor::default();
+    loop {
+        let (items, next) = node.scan(1, cursor, 10, &tf()).await.unwrap();
+        seen.extend(items.iter().map(|m| m.id));
+        match next {
+            Some(c) => cursor = c,
+            None => break,
+        }
+    }
+    assert!(seen.contains(&MemoryId::from_key("keep")));
+    assert!(
+        !seen.contains(&MemoryId::from_key("drop")),
+        "a tombstoned indexed memory must not appear in a scan"
+    );
+    assert_eq!(seen.len(), node.doc_count(), "scan and doc_count must agree after a delete");
+}
+
+/// A predicate-tombstoned memory (delete-by-predicate) is hidden from BOTH `get_many` and
+/// `scan`, exactly as `query` hides it — so no addressed or browsed read ever returns
+/// something retrieval would suppress.
+#[tokio::test]
+async fn get_and_scan_hide_predicate_deleted_memories() {
+    use mlake_core::Predicate;
+
+    let store = Store::in_memory();
+    let ns = namespace(store, "ns").await;
+    let mut writer = Writer::new(ns.clone());
+
+    // Two memories tagged with a document id in metadata; index them.
+    let mut doc = item("d1c0", vec![1.0, 0.0], "doc one chunk zero");
+    doc.metadata = vec![("document_id".into(), "d1".into())];
+    let mut other = item("d2c0", vec![0.0, 1.0], "doc two chunk zero");
+    other.metadata = vec![("document_id".into(), "d2".into())];
+    writer.commit(vec![Op::Upsert(doc), Op::Upsert(other)]).await.unwrap();
+    index(&ns, &Tokenizer::default(), IndexOptions::default()).await.unwrap();
+
+    // Delete-by-predicate everything in document d1 (lazy tail tombstone-where).
+    let pred = Predicate {
+        memory_types: vec![],
+        metadata_equals: vec![("document_id".into(), "d1".into())],
+        tags: vec![],
+        tags_mode: 0,
+    };
+    writer.commit(vec![Op::TombstoneWhere { predicate: pred }]).await.unwrap();
+
+    let node = QueryNode::open(&ns, Tokenizer::default()).await.unwrap();
+    // get_many must not resolve the predicate-deleted id...
+    let got = node.get_many(&[MemoryId::from_key("d1c0"), MemoryId::from_key("d2c0")]).await.unwrap();
+    let got_ids: std::collections::HashSet<_> = got.iter().map(|m| m.id).collect();
+    assert!(!got_ids.contains(&MemoryId::from_key("d1c0")), "get must hide a predicate-deleted memory");
+    assert!(got_ids.contains(&MemoryId::from_key("d2c0")), "a non-matching memory stays addressable");
+    // ...and neither must a scan.
+    let mut seen = std::collections::HashSet::new();
+    let mut cursor = ScanCursor::default();
+    loop {
+        let (items, next) = node.scan(1, cursor, 10, &tf()).await.unwrap();
+        seen.extend(items.iter().map(|m| m.id));
+        match next {
+            Some(c) => cursor = c,
+            None => break,
+        }
+    }
+    assert!(!seen.contains(&MemoryId::from_key("d1c0")), "scan must hide a predicate-deleted memory");
+    assert!(seen.contains(&MemoryId::from_key("d2c0")));
+}
+
 /// A tag filter narrows a scan the same way it narrows a query.
 #[tokio::test]
 async fn scan_respects_the_tag_filter() {
