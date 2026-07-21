@@ -1,92 +1,96 @@
 # Benchmarks
 
-Performance numbers from the `mlake-perf` harness against **real MinIO** (`docker compose up
--d`), plus the BEIR accuracy comparison from `mlake-bench`. Reproduce with the commands in
-each section. Latency/throughput vary with hardware — these were taken on a 14-core machine.
+All performance numbers are **end-to-end through the deployed path**: the Python client →
+gRPC → `mlake-server` → S3 (real MinIO, `docker compose up -d`). Nothing here is an
+in-process micro-benchmark. Reproduce:
 
-Update this page when a run materially changes a number; note the date and what changed.
+```bash
+uv run --project bench memlake-bench perf --scales 10000,100000 --queries 200 --mem-mb 64 --disk-mb 512
+```
+
+The BEIR accuracy comparison (also e2e via the client-server) is at the bottom. Latency and
+throughput vary with hardware — these were taken on a 14-core machine against a local MinIO.
+Update this page when a run materially changes a number.
 
 ---
 
-## Write & index throughput
+## Write & index throughput (100k, 3 memory_types)
 
-`cargo run --release -p mlake-perf -- write --scale N` (add `MEMLAKE_TIMING=1` for the
-per-phase breakdown).
+| Phase | Result | Notes |
+|---|---|---|
+| **write** | 9.1s — **10,900 memories/s** | 196 batches via the client; group-committed to the WAL. Acks on durable PUT, not on indexing. |
+| **index (first build)** | **56s** — 1,780 memories/s | k-means train + kNN link derivation + FTS + writes, one generation. Varies ~55–75s run-to-run (MinIO + scheduling). |
+| **index (incremental re-index)** | ~30s | folding new WAL entries onto an existing generation reuses trained centroids (train ≈ 0). |
 
-### 100k, 3 memory_types — index-build optimization history
+The indexer runs as its own process (`index --once` here; a Deployment in prod), so its cost
+is off the write path entirely.
 
-Each row is the same workload after a successive optimization; the diagnostics (per-phase
-timing) drove each step.
+### First-build index breakdown (summed across 3 memory_types, from a `MEMLAKE_TIMING` run)
 
-| Version | Index time | Throughput | What changed |
-|---|---:|---:|---|
-| Baseline | 275.5s | 363 mem/s | sequential cluster + metadata PUTs, sequential link derivation |
-| + parallel writes | 148.5s | 673 mem/s | cluster PUTs `buffer_unordered(32)`, metadata PUTs `try_join!` |
-| **+ parallel link derivation** | **30.7s** | **3256 mem/s** | `derive_links_ivf` across all cores (rayon) |
-
-**9× faster** end-to-end. Commit phase (WAL group-commit) is ~1.8s (56k mem/s) and was never
-the bottleneck.
-
-Per-phase breakdown at the current version (100k, summed across 3 types):
-
-| Phase | Time | Notes |
+| Phase | Time | Parallelized? |
 |---|---:|---|
-| `derive_links` | ~24s | 16-probe × cluster-member cosine per new memory; now core-scaled |
-| `cluster_write` | ~1.2s | parallel PUTs |
-| `fts_build` | ~1.1s | tantivy split per type |
-| `write_meta` | ~0.2s | centroids/tags/radj/pk/stats, one `try_join!` |
-| `train` | ~0s | mini-batch k-means (samples ≤50k) |
+| `train` (k-means) | ~28s | ✅ assignment + k-means++ seeding across cores |
+| `derive_links` (semantic kNN) | ~35s | ✅ per-memory neighbour search across cores |
+| `cluster_write` | ~1.9s | ✅ concurrent PUTs |
+| `fts_build` | ~1.4s | tantivy split per type |
+| `write_meta` | ~0.4s | one `try_join!` |
 
-`derive_links` is the remaining bottleneck; further gains would be algorithmic (SIMD cosine,
-fewer probes) with diminishing returns.
+Both dominant phases (`train`, `derive_links`) are CPU-bound and scale with cores. They were
+serial originally (~140s each ≈ 300s total); parallelizing them (rayon, determinism preserved
+for G-6) is what brought a fresh 100k build down to ~55–75s. The k-means output stays
+byte-identical for a given seed — only the assignment/seeding compute is parallel; the f64
+accumulation order is fixed.
 
 ### Cost (100k)
 
-594 PUTs, 3 LISTs, 0.19 GB written → **$0.0032 ingest requests, $0.032/1M memories**,
-$0.0086/GB-month stored. S3-op-count based (AWS S3 Standard us-east-1 pricing).
+Write ~197 PUTs, index 574 PUTs / 0.19 GB → **~$0.0039 ingest requests, ~$0.039/1M memories**,
+$0.0043/GB-month stored. S3 Standard us-east-1, from counted store ops.
 
 ---
 
-## Read latency & roundtrips
+## Read latency & roundtrips (100k, bounded 64MB/512MB cache)
 
-`cargo run --release -p mlake-perf -- read --scale N --queries 200 --mem-mb 64 --disk-mb 512`
+Measured through the client with `EVENTUAL` consistency (retrieval reads don't need
+read-your-writes). The server caches the open snapshot per namespace, so a warm read is pure
+in-memory fusion over the local cache — **0 object-storage roundtrips**.
 
-### 100k, 3 memory_types, bounded 64MB/512MB cache
-
-| Workload | cold p50 | cold p99 | cold RT | cold GET/q | warm p50 | warm p99 |
+| Workload | cold p50 | cold p99 | cold rt | warm p50 | warm p99 | warm rt |
 |---|---:|---:|---:|---:|---:|---:|
-| vector | 1.6ms | 12.3ms | 0.9 | 0.9 | 1.0ms | 1.2ms |
-| fts | 0.9ms | 1.1ms | 0.0 | 0.0 | 0.9ms | 1.1ms |
-| hybrid | 1.5ms | 1.7ms | 0.0 | 0.0 | 1.5ms | 6.0ms |
-| graph | 2.2ms | 16.4ms | 0.8 | 0.2 | 1.9ms | 2.9ms |
-| tags-any | 3.8ms | 4.9ms | 0.0 | 0.0 | 4.0ms | 8.9ms |
-| tags-strict | 3.4ms | 21.4ms | 0.0 | 0.0 | 3.4ms | 7.3ms |
+| vector | 1.18ms | 14.4ms | 0.9 | 1.16ms | 1.40ms | 0.0 |
+| fts | 1.05ms | 1.51ms | 0.0 | 1.13ms | 8.59ms | 0.0 |
+| hybrid | 1.79ms | 3.18ms | 0.0 | 1.75ms | 6.49ms | 0.0 |
+| graph | 1.96ms | 8.31ms | 0.0 | 2.05ms | 10.3ms | 0.0 |
+| tags-any | 4.12ms | 5.10ms | 0.0 | 4.14ms | 15.3ms | 0.0 |
+| tags-strict | 3.53ms | 4.58ms | 0.0 | 3.62ms | 22.5ms | 0.0 |
 
-Observations:
+p99 tails are first-touch cluster fetches / GC pauses; p50/p90 are the steady state.
 
-* **Roundtrips are bounded** (≤0.9 GET/query cold, 0 warm) independent of corpus size — INV-7
-  holds at 100k.
-* The graph arm's ranged-block cache pays off warm: `graph_pk` 795µs → 2µs, `graph_radj`
-  72µs → 11µs, `graph_fetch` 291µs → 57µs.
-* `vector`/`tags` are dominated by `fetch_clusters` + `rerank`; `tags-*` fetch more clusters
-  because Zipfian tags admit many clusters under pruning.
+Single-digit-ms p50 across every arm, and **roundtrips are bounded** (≤1 cold, 0 warm)
+independent of corpus size — INV-7, now verified through the network path. `tags-*` cost more
+because Zipfian tags admit many clusters under pruning (`fetch_clusters` + `rerank`).
+
+### 10k, same cache
+
+Sub-millisecond p50 across all workloads (vector 0.5ms, fts 0.3ms, hybrid 0.6ms, graph 0.8ms,
+tags ~0.9–1.1ms), 0 roundtrips warm. Write 11.5k memories/s, index 3.2s.
 
 ### Predictable resources
 
 ```
-cache:   mem 63.1/64 MB   disk 63.1/512 MB
+cache budget: mem 64 MB   disk 512 MB (enforced by construction)
 ```
 
-Both cache tiers stay under their configured budgets by construction (two-tier cache: memory
-eviction demotes to disk, disk eviction deletes). To exercise the demote-to-disk eviction
-path, run with a smaller mem budget (e.g. `--mem-mb 16 --disk-mb 512`).
+The server's read cache is two-tier with independent, bounded memory and disk budgets, both
+capped by construction (memory eviction demotes to disk, disk eviction deletes). Set via
+`serve --mem-mb --disk-mb`. To exercise the demote-to-disk path, lower `--mem-mb`.
 
 ---
 
-## Accuracy — BEIR vs Qdrant
+## Accuracy — BEIR vs Qdrant (e2e via the client-server)
 
-`mlake-bench` embeds each corpus once (shared vector cache, so the comparison isolates
-retrieval) and scores every engine with identical metric code. nDCG@10:
+The `memlake` engine writes the corpus through the client, runs the indexer, and queries each
+arm over the wire; every engine is scored with identical metric code, so only the ranking
+differs. nDCG@10:
 
 | Dataset  | Arm    | memlake | qdrant | |
 |----------|--------|--------:|-------:|-|
@@ -102,7 +106,7 @@ retrieval) and scores every engine with identical metric code. nDCG@10:
 uv run --project bench memlake-bench all scifact
 uv run --project bench memlake-bench all nfcorpus
 uv run --project bench memlake-bench baseline memlake nfcorpus --graph
-uv run --project bench memlake-bench report        # renders bench/results/report.md
+uv run --project bench memlake-bench report
 ```
 
 Full analysis in [`DECISIONS.md`](DECISIONS.md).

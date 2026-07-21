@@ -10,7 +10,11 @@ dependencies = [
     "tqdm>=4.66",
     "fastembed>=0.4.2",
     "qdrant-client>=1.12",
+    "memlake-client",
 ]
+
+[tool.uv.sources]
+memlake-client = { path = "../clients/python", editable = true }
 
 [project.scripts]
 memlake-bench = "memlake_bench.cli:main"

@@ -152,10 +152,53 @@ class MemlakeClient:
                 arm_depth=arm_depth,
             ),
         )
+        hits, _ = self.query_metered(
+            namespace, memory_type,
+            vector=vector, text=text, tags=tags, tags_mode=tags_mode,
+            top_k=top_k, consistency=consistency, nprobe=nprobe,
+            vector_weight=vector_weight, fts_weight=fts_weight,
+            graph_weight=graph_weight, arm_depth=arm_depth,
+        )
+        return hits
+
+    def query_metered(
+        self,
+        namespace: str,
+        memory_type: int,
+        *,
+        vector: Optional[Sequence[float]] = None,
+        text: Optional[str] = None,
+        tags: Optional[Sequence[str]] = None,
+        tags_mode: int = ANY,
+        top_k: int = 10,
+        consistency: int = STRONG,
+        nprobe: int = 0,
+        vector_weight: float = 0.0,
+        fts_weight: float = 0.0,
+        graph_weight: float = 1.0,
+        arm_depth: int = 0,
+    ) -> tuple[list[Hit], int]:
+        """Like `query`, but also returns the object-storage roundtrips the query consumed
+        server-side (0 == fully served from the server's cache)."""
+        req = pb.QueryRequest(
+            namespace=namespace,
+            memory_type=memory_type,
+            vector=_pack(vector),
+            text=text or "",
+            top_k=top_k,
+            consistency=consistency,
+            config=pb.QueryConfig(
+                nprobe=nprobe,
+                vector_weight=vector_weight,
+                fts_weight=fts_weight,
+                graph_weight=graph_weight,
+                arm_depth=arm_depth,
+            ),
+        )
         if tags:
             req.tags.CopyFrom(pb.TagFilter(tags=list(tags), mode=tags_mode))
         resp = self._stub.Query(req)
-        return [
+        hits = [
             Hit(
                 id=h.id,
                 score=h.score,
@@ -163,3 +206,4 @@ class MemlakeClient:
             )
             for h in resp.hits
         ]
+        return hits, resp.load_roundtrips

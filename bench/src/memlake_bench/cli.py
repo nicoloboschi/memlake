@@ -64,27 +64,17 @@ def cmd_baseline_qdrant(args) -> int:
 
 
 def cmd_baseline_memlake(args) -> int:
-    from .engines import memlake_engine
+    from .engines import memlake_grpc
 
     beir = _load(args.dataset, args.split)
-    # Ensure embeddings exist; memlake reads the same cache as every other engine.
-    embed.load(args.dataset)
-    env = {}
-    if args.nprobe is not None:
-        env["MEMLAKE_NPROBE"] = args.nprobe
-    if args.vec_weight is not None:
-        env["MEMLAKE_VEC_WEIGHT"] = args.vec_weight
-    if args.fts_weight is not None:
-        env["MEMLAKE_FTS_WEIGHT"] = args.fts_weight
-    if getattr(args, "graph", False):
-        # Synthesize the semantic kNN link graph and add the graph arm to fusion. Saved as
-        # a distinct engine so the report shows the graph arm's effect side by side.
-        env["MEMLAKE_GRAPH"] = 1
-        payload = memlake_engine.run(beir, env=env, engine_name="memlake+graph")
-        results.save(args.dataset, "memlake+graph", payload)
-    else:
-        payload = memlake_engine.run(beir, env=env or None)
-        results.save(args.dataset, "memlake", payload)
+    # memlake reads the same cached embeddings as every other engine; only the retrieval
+    # path differs. Accuracy is now measured e2e through the gRPC server (client -> server
+    # -> S3), the deployed path.
+    emb = embed.load(args.dataset)
+    graph = bool(getattr(args, "graph", False))
+    engine_name = "memlake+graph" if graph else "memlake"
+    payload = memlake_grpc.run(beir, emb, top_k=args.top_k, graph=graph, engine_name=engine_name)
+    results.save(args.dataset, engine_name, payload)
     _print_summary(payload)
     return 0
 
@@ -104,6 +94,28 @@ def cmd_report(args) -> int:
     report.write()
     print()
     print(report.render())
+    return 0
+
+
+def cmd_perf(args) -> int:
+    from . import perf
+    from .perf_datagen import GenConfig
+
+    scales = [int(s) for s in str(args.scales).split(",") if s.strip()]
+    reports = []
+    for scale in scales:
+        print(f"=== perf @ {scale} (e2e via python client) ===")
+        cfg = GenConfig(scale=scale, memory_types=args.types, seed=args.seed)
+        rep = perf.run(
+            cfg,
+            queries=args.queries,
+            mem_mb=args.mem_mb,
+            disk_mb=args.disk_mb,
+        )
+        print()
+        print(rep.render())
+        print()
+        reports.append(rep)
     return 0
 
 
@@ -168,9 +180,10 @@ def build_parser() -> argparse.ArgumentParser:
             help="synthesize kNN links and add the graph-expansion arm to fusion",
         )
 
-    e = bsub.add_parser("memlake", help="in-process memlake IVF + BM25 + RRF over the shared cache")
+    e = bsub.add_parser("memlake", help="e2e memlake via gRPC server (client -> server -> S3)")
     add_common(e)
     add_memlake_tuning(e)
+    e.add_argument("--top-k", type=int, default=100)
     e.set_defaults(func=cmd_baseline_memlake)
 
     sp = sub.add_parser("all", help="download -> embed -> exact -> qdrant -> memlake -> report")
@@ -189,6 +202,18 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("report", help="render bench/results/report.md")
     sp.set_defaults(func=cmd_report)
+
+    sp = sub.add_parser(
+        "perf",
+        help="e2e performance: python client -> gRPC server -> S3 (write/index/read)",
+    )
+    sp.add_argument("--scales", default="10000", help="comma list, e.g. 10000,100000,1000000")
+    sp.add_argument("--types", type=int, default=3, help="memory_types")
+    sp.add_argument("--queries", type=int, default=200)
+    sp.add_argument("--mem-mb", type=int, default=64, help="server read-cache memory budget")
+    sp.add_argument("--disk-mb", type=int, default=512, help="server read-cache disk budget")
+    sp.add_argument("--seed", type=int, default=42)
+    sp.set_defaults(func=cmd_perf)
 
     return p
 

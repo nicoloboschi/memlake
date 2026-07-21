@@ -11,11 +11,12 @@ mod convert;
 mod pb;
 mod service;
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use mlake_fts::Tokenizer;
-use mlake_store::Store;
+use mlake_store::{DiskCache, Store, StoreMetrics};
 use tonic::transport::Server;
 
 use pb::memlake_server::MemlakeServer;
@@ -43,7 +44,7 @@ async fn main() -> Result<()> {
     }
 }
 
-/// Build the shared object store from the environment. Same knobs as the perf harness so a
+/// Build the base object store from the environment. Same knobs as the perf harness so a
 /// local MinIO works out of the box.
 fn build_store() -> Result<Store> {
     let endpoint = std::env::var("MEMLAKE_S3_ENDPOINT").ok();
@@ -63,10 +64,24 @@ async fn serve(args: &[String]) -> Result<()> {
         .unwrap_or_else(|| "0.0.0.0:50051".into())
         .parse()
         .context("parsing --addr")?;
-    let store = build_store()?;
+
+    // Attach a bounded two-tier read cache so the process has predictable memory + disk
+    // footprint (both capped by construction). Defaults are conservative; a benchmark or a
+    // memory-constrained pod tunes them down.
+    let mut store = build_store()?;
+    let mem_mb = flag(args, "--mem-mb").and_then(|s| s.parse::<u64>().ok()).unwrap_or(256);
+    let disk_mb = flag(args, "--disk-mb").and_then(|s| s.parse::<u64>().ok()).unwrap_or(4096);
+    let cache_dir = flag(args, "--cache-dir")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join("memlake-cache"));
+    let cache = Arc::new(
+        DiskCache::with_budgets(cache_dir, mem_mb * 1_000_000, disk_mb * 1_000_000)
+            .context("opening read cache")?,
+    );
+    store = store.with_cache(cache);
     let svc = MemlakeService::new(store, Tokenizer::default());
 
-    tracing::info!(%addr, "memlake serving gRPC");
+    tracing::info!(%addr, mem_mb, disk_mb, "memlake serving gRPC");
     Server::builder()
         .add_service(MemlakeServer::new(svc))
         .serve(addr)
@@ -79,11 +94,18 @@ async fn indexer(args: &[String]) -> Result<()> {
     let namespaces: Vec<String> = flag(args, "--namespaces")
         .map(|s| s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect())
         .unwrap_or_default();
+    let store = build_store()?;
+
+    // `--once`: run a single metered index pass, print a JSON summary, and exit. This is the
+    // benchmark's index phase — the harness reads the summary for build time and cost, so it
+    // never needs an in-process Rust engine.
+    if args.iter().any(|a| a == "--once") {
+        return index_once(store, namespaces).await;
+    }
+
     let interval = flag(args, "--interval-secs")
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(5);
-    let store = build_store()?;
-
     tracing::info!(
         ?namespaces,
         interval_secs = interval,
@@ -96,6 +118,37 @@ async fn indexer(args: &[String]) -> Result<()> {
         Duration::from_secs(interval),
     )
     .await
+}
+
+/// One metered index pass over the given namespaces (or all discovered), printing a single
+/// JSON line the benchmark parses: elapsed, store ops, stored bytes, docs.
+async fn index_once(store: Store, namespaces: Vec<String>) -> Result<()> {
+    use mlake_index::{index, IndexOptions};
+    use mlake_wal::Namespace;
+
+    let metrics = StoreMetrics::new();
+    let store = store.with_store_metrics(metrics.clone());
+    let base = metrics.snapshot();
+    let start = std::time::Instant::now();
+
+    let targets = if namespaces.is_empty() {
+        service::discover_namespaces(&store).await?
+    } else {
+        namespaces
+    };
+    let mut docs = 0usize;
+    for name in &targets {
+        let ns = Namespace::new(name, store.clone());
+        let outcome = index(&ns, &Tokenizer::default(), IndexOptions::default()).await?;
+        docs += outcome.doc_count;
+    }
+    let elapsed = start.elapsed().as_secs_f64();
+    let s = metrics.since(&base);
+    println!(
+        "{{\"elapsed_s\":{:.4},\"puts\":{},\"lists\":{},\"gets\":{},\"put_bytes\":{},\"get_bytes\":{},\"docs\":{}}}",
+        elapsed, s.puts, s.lists, s.gets, s.put_bytes, s.get_bytes, docs
+    );
+    Ok(())
 }
 
 /// Minimal `--flag value` lookup; keeps the binary dependency-light.

@@ -88,57 +88,78 @@ range)`, so a warm graph or cluster read costs zero roundtrips.
 | `mlake-fts`    | tokenizer chain (NFKC/OpenCC/jieba dual-emission) + tantivy BM25 |
 | `mlake-graph`  | reverse-adjacency CSR, link-expansion retriever, scorer |
 | `mlake-index`  | indexer, generation IO, GC, RRF fusion, `QueryNode` |
-| `mlake-perf`   | data generator + write/read performance harness (real MinIO) |
+| `mlake-server` | gRPC API (`serve`) + indexer loop (`index`) over the crates above |
+| `mlake-perf`   | in-process micro-benchmark (library-level; the e2e suite is Python) |
 | `mlake-bench`  | BEIR accuracy runner producing per-query rankings |
 
 ## Using it
 
-```rust
-use mlake_wal::{Namespace, Writer};
-use mlake_index::{index, Consistency, IndexOptions, QueryConfig, QueryNode};
-use mlake_fts::Tokenizer;
-use mlake_core::{Memory, Op, TagFilter, TagsMatch};
+memlake is used as a **service**: a client talks gRPC to `mlake-server` (the drop-in for a
+Postgres connection — point it at a k8s `Service` instead of a DB). The Python client:
 
-// A namespace is a bank on the shared store.
-let ns = Namespace::new("my-bank", store);
-ns.create_if_absent(&Tokenizer::default().config_hash()).await?;
+```python
+from memlake_client import MemlakeClient, memory, ANY_STRICT
 
-// Write: group-commit a batch of memories to the WAL.
-let mut writer = Writer::new(ns.clone());
-writer.commit(memories.into_iter().map(Op::Upsert).collect()).await?;
+with MemlakeClient("memlake:50051") as c:
+    c.create_namespace("my-bank")
 
-// Index: fold the WAL tail into a new immutable generation (async, idempotent).
-index(&ns, &Tokenizer::default(), IndexOptions::default()).await?;
+    # Write a batch of memories. Returns once the batch is durable in object storage
+    # (a claimed WAL sequence) — not after indexing.
+    c.write("my-bank", [
+        memory("s3-native retrieval engine", vector=embedding,
+               memory_type=1, tags=["prod"], key="doc-42"),
+    ])
 
-// Query: open a stateless snapshot, then ask one memory_type at a time.
-let node = QueryNode::open(&ns, Tokenizer::default(), Consistency::Strong).await?;
-let hits = node.query(
-    /* memory_type */ 1,
-    Some(&query_vector),                 // vector arm (or None)
-    Some("s3 native retrieval"),         // FTS arm (or None)
-    &TagFilter::new(vec!["prod".into()], TagsMatch::AnyStrict),
-    /* top_k */ 10,
-    QueryConfig::default(),              // per-arm RRF weights, nprobe, arm_depth
-).await?;
+    # Query one memory_type. Omit an arm by leaving vector/text out; graph_weight=0 drops
+    # the graph arm. Under STRONG consistency (default) the write above is already visible.
+    hits = c.query("my-bank", memory_type=1,
+                   vector=query_embedding, text="retrieval",
+                   tags=["prod"], tags_mode=ANY_STRICT, top_k=10)
+    for h in hits:
+        print(h.id_uuid, h.score, h.contributions)   # per-arm RRF breakdown
 ```
 
-Set `Consistency::Eventual` to skip the WAL-head check and serve from the cached manifest;
-set a `QueryConfig` arm weight to `0.0` to drop an arm from fusion.
+The contract is [`proto/memlake/v1/memlake.proto`](proto/memlake/v1/memlake.proto); generate a
+client for any language from it. See the [Python client](clients/python/README.md) and the
+end-to-end demo `uv run --project clients/python clients/python/scripts/smoke.py`.
 
-### As a service (gRPC)
+## Deployment topology
 
-The same operations are exposed over gRPC by `mlake-server`, the drop-in for a Postgres
-connection: point clients at a k8s `Service` instead of a DB. It runs in two modes — `serve`
-(stateless API, N replicas) and `index` (the async indexer, its own Deployment). The contract
-is [`proto/memlake/v1/memlake.proto`](proto/memlake/v1/memlake.proto), there's a
-[Python client](clients/python/README.md), and the full topology + protocol rationale is in
-[`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).
+Two Deployments, one image. Everything stateful lives in object storage, so every `serve`
+replica is interchangeable — no leader, no per-pod data to lose.
+
+```
+     Hindsight (or any client)
+             │  gRPC (HTTP/2 + protobuf)
+             ▼
+   ┌──────── k8s Service ────────┐
+   │  serve   serve   serve  ...  │   mlake-server serve   — stateless API, N replicas,
+   │  (pod)   (pod)   (pod)       │                          bounded local read cache
+   └──────────────┬──────────────┘
+                  │ reads + writes (conditional PUT / ranged GET)
+                  ▼
+          ┌───────────────┐          mlake-server index    — async, idempotent indexer,
+          │  S3 / bucket  │ ◀──────     its OWN Deployment (1+ replicas), off the request path
+          └───────────────┘
+```
+
+| Component | What it is | Depends on |
+|---|---|---|
+| **Client** | your service (e.g. Hindsight) using the generated gRPC stubs | the `serve` Service endpoint |
+| **`serve`** | stateless gRPC API; N replicas behind one k8s Service | **S3 only** (+ a local, bounded read cache) |
+| **`index`** | the indexer loop; separate Deployment, idempotent | **S3 only** |
+| **S3 / bucket** | the sole source of truth: WAL, generations, manifest | — |
 
 ```bash
-cargo run --release -p mlake-server -- serve --addr 0.0.0.0:50051
-cargo run --release -p mlake-server -- index --namespaces my-bank --interval-secs 5
-uv run --project clients/python clients/python/scripts/smoke.py   # end-to-end demo
+mlake-server serve --addr 0.0.0.0:50051 --mem-mb 256 --disk-mb 4096   # API pods
+mlake-server index --namespaces my-bank --interval-secs 5             # indexer Deployment
 ```
+
+A write acks only once its WAL object is durable in S3 (a claimed sequence), never waiting on
+the indexer; a `STRONG` query still sees it immediately by scanning the WAL tail. gRPC over a
+plain L4 Service load-balances poorly (one long-lived HTTP/2 connection) — front the pods with
+a headless Service + client-side LB or an L7/gRPC-aware proxy. Full rationale, env vars, and
+routing/cache-affinity notes are in [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).
 
 ## Running it
 

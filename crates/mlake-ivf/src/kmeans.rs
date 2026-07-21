@@ -107,9 +107,13 @@ fn seed_centroids(vectors: &[Vec<f32>], k: usize, rng: &mut Rng) -> Vec<Vec<f32>
 
         centroids.push(vectors[next].clone());
         let newest = centroids.last().unwrap();
-        for (i, v) in vectors.iter().enumerate() {
-            closest[i] = closest[i].min(sq_dist(v, newest));
-        }
+        // Refresh each point's distance-to-nearest-centre in parallel. `min` is
+        // order-independent, so this stays deterministic.
+        use rayon::prelude::*;
+        closest
+            .par_iter_mut()
+            .zip(vectors.par_iter())
+            .for_each(|(c, v)| *c = c.min(sq_dist(v, newest)));
     }
     centroids
 }
@@ -129,8 +133,14 @@ pub fn train(vectors: &[Vec<f32>], k: usize, max_iters: usize, seed: u64) -> Vec
         let mut sums = vec![vec![0.0f64; dim]; k];
         let mut counts = vec![0usize; k];
 
-        for v in vectors {
-            let c = nearest(&centroids, v);
+        // Assignment is the dominant cost (O(N·k·dim) per iteration), so compute each
+        // vector's nearest centroid across all cores. Accumulation stays sequential in index
+        // order below, so the f64 sums are summed in a fixed order — the training output is
+        // still byte-identical for a given seed (G-6), just computed faster.
+        use rayon::prelude::*;
+        let assignments: Vec<usize> = vectors.par_iter().map(|v| nearest(&centroids, v)).collect();
+
+        for (v, &c) in vectors.iter().zip(&assignments) {
             counts[c] += 1;
             for (d, x) in v.iter().enumerate().take(dim) {
                 sums[c][d] += *x as f64;

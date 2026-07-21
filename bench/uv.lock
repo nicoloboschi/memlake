@@ -441,6 +441,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "fastembed" },
+    { name = "memlake-client" },
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.11.*'" },
     { name = "numpy", version = "2.5.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
@@ -452,11 +453,29 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "fastembed", specifier = ">=0.4.2" },
+    { name = "memlake-client", editable = "../clients/python" },
     { name = "numpy", specifier = ">=1.26" },
     { name = "qdrant-client", specifier = ">=1.12" },
     { name = "requests", specifier = ">=2.31" },
     { name = "tqdm", specifier = ">=4.66" },
 ]
+
+[[package]]
+name = "memlake-client"
+version = "0.1.0"
+source = { editable = "../clients/python" }
+dependencies = [
+    { name = "grpcio" },
+    { name = "protobuf" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "grpcio", specifier = ">=1.60" },
+    { name = "grpcio-tools", marker = "extra == 'dev'", specifier = ">=1.60" },
+    { name = "protobuf", specifier = ">=4.25" },
+]
+provides-extras = ["dev"]
 
 [[package]]
 name = "mmh3"

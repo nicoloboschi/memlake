@@ -1566,6 +1566,7 @@ dependencies = [
  "mlake-store",
  "rand 0.8.7",
  "rand_chacha",
+ "rayon",
  "rkyv 0.7.46",
  "serde",
  "serde_json",
