@@ -63,7 +63,7 @@ message Memory {
   uint32 memory_type = 5;   // fits u8; values > 255 are rejected
   repeated string tags = 6;
   uint32 proof_count = 7;
-  repeated uint64 entity_ids = 8;
+  repeated bytes entity_ids = 8;    // 16-byte EntityIds (UUIDs)
   Timestamps timestamps = 9;
   repeated CausalEdge causal_out = 10;
   // Opaque client key→value metadata. memlake never indexes or interprets it — it is stored
@@ -153,7 +153,7 @@ message MemoryPayload {
   string text = 1;
   repeated string tags = 2;
   uint32 proof_count = 3;
-  repeated uint64 entity_ids = 4;
+  repeated bytes entity_ids = 4;    // 16-byte EntityIds
   Timestamps timestamps = 5;
   repeated CausalEdge causal_out = 6;
   map<string, string> metadata = 7;   // the opaque metadata, verbatim

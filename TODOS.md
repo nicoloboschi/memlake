@@ -119,8 +119,8 @@ of it participates in retrieval:
 - [ ] **`entity_ids` width.** Hindsight entity ids are UUIDs; memlake wants `u64`.
       The provider narrows to the top 8 bytes
       (`memlake.py:_entity_id_to_u64`) — lossy, and a collision silently merges
-      two entities in the graph arm. Either widen to 16 bytes or define the
-      narrowing (and its collision budget) as part of the contract.
+      two entities in the graph arm. → Widen to a 16-byte `EntityId`
+      (§3 Plan **A**), the clean fix.
 - [ ] **`memory_type` is a `u8`**; Hindsight's `fact_type` is a string enum
       (`world` / `experience` / `observation`). The mapping lives in
       `engine/memories/base.py:FACT_TYPE_TO_MEMORY_TYPE`. Fine for now, but it
@@ -136,11 +136,37 @@ of it participates in retrieval:
       spread over links with BFS, and score by temporal proximity with coverage
       buckets across the window. memlake stores `Timestamps` but exposes no
       time-window query at all. This arm still runs against Postgres.
-- [ ] **Entity-expansion arm.** Hindsight's graph arm fans out over
-      `unit_entities` (units sharing an entity) *and* `memory_links` (semantic
-      + causal), then expands observations via `source_memory_ids`. memlake's
-      graph arm is causal edges + indexer-derived semantic kNN. Not the same
-      relation, so results will not be comparable until entity expansion exists.
+- [ ] **Entity-expansion arm — the central graph gap.** Hindsight fans out over
+      `unit_entities` (a persisted entity→unit posting, LATERAL-capped) *and*
+      `memory_links`, then expands observations via `source_memory_ids`. memlake
+      has **no persisted entity index at all**: `query_node.rs:580` builds the
+      entity map in-memory from `by_id` (only the already-fetched memories), so
+      the entity arm can only reconnect the vector-probe neighborhood, never find
+      an entity-sharer in an unprobed cluster. Plan below.
+
+  ### Plan: make the graph arm real (entities + observation edges)
+
+  - **A. Widen entity ids to 16 bytes.** `entity_ids: Vec<u64>` → a 16-byte
+        `EntityId` (mirrors `MemoryId`), killing the lossy UUID→u64 narrowing and
+        its silent collisions. Touches core, graph, indexer, datagen. Format
+        change (indexes rebuild). Mechanical, low-risk. *Do first.*
+  - **B. Persisted entity posting SSTable — the keystone.** At index time build
+        `entity.idx` + `entity.data` mapping `EntityId → sorted [MemoryId]`, the
+        same SSTable shape as radj/pk. The query node's `entity_candidates` reads
+        it range-bounded with the per-entity cap (SPEC §7.2's bounded prefix).
+        This turns the degenerate entity arm into a true entity-expansion arm that
+        finds sharers anywhere in the corpus. Adds one bounded roundtrip wave, like
+        radj. Rebuilt per fold from the corpus (as radj is).
+  - **C. Observation↔fact edges (`source_memory_ids`).** A new relation: carry
+        `source_memory_ids` inline on the memory (forward) + reverse adjacency
+        (like radj) for the backward walk, exposed as a bidirectional expansion in
+        the graph arm. Needed for `expand_observations` parity.
+  - **D. Semantic-link provenance + differential.** Decide whether memlake keeps
+        deriving kNN links or ingests Hindsight's explicit `memory_links` (as
+        client-supplied edges). Then wire the G-2 differential of memlake's graph
+        arm against Hindsight's `LinkExpansionRetriever` on identical input — the
+        scorer is already a G-3-verified port, so only the candidate sources need
+        to converge.
 - [ ] **Tag groups.** memlake has five flat modes (`ANY/ALL/ANY_STRICT/
       ALL_STRICT/EXACT`). Hindsight also supports nested AND/OR/NOT tag *groups*.
       The provider applies those in Python after hydration, which means they

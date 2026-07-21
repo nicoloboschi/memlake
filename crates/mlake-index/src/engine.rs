@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 
-use mlake_core::{MemoryId, StoredMemory};
+use mlake_core::{EntityId, MemoryId, StoredMemory};
 use mlake_fts::{TantivyFts, Tokenizer, TokenizerConfig};
 use mlake_graph::radj::{EdgeKind, InEdge, LinkTypeTag, ReverseAdjacency};
 use mlake_graph::{GraphParams, GraphSource};
@@ -51,7 +51,7 @@ pub struct Engine {
     items: HashMap<MemoryId, StoredMemory>,
     fts: TantivyFts,
     radj: ReverseAdjacency,
-    entity_index: HashMap<u64, Vec<MemoryId>>,
+    entity_index: HashMap<EntityId, Vec<MemoryId>>,
 }
 
 impl Engine {
@@ -76,7 +76,7 @@ impl Engine {
         let _ = tokenizer;
 
         let mut map = HashMap::new();
-        let mut entity_index: HashMap<u64, Vec<MemoryId>> = HashMap::new();
+        let mut entity_index: HashMap<EntityId, Vec<MemoryId>> = HashMap::new();
         let mut radj_pairs: Vec<(MemoryId, InEdge)> = Vec::new();
 
         for item in &items {
@@ -235,7 +235,7 @@ impl Engine {
 }
 
 impl GraphSource for Engine {
-    fn entity_candidates(&self, entity_id: u64, memory_type: Option<u8>, cap: usize) -> Vec<MemoryId> {
+    fn entity_candidates(&self, entity_id: EntityId, memory_type: Option<u8>, cap: usize) -> Vec<MemoryId> {
         self.entity_index
             .get(&entity_id)
             .into_iter()

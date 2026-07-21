@@ -10,7 +10,7 @@ pub mod tags;
 pub mod manifest;
 pub mod wal;
 
-pub use id::MemoryId;
+pub use id::{EntityId, MemoryId};
 pub use memory::{
     CausalEdge, MemoryType, Memory, LinkType, SemanticEdge, StoredMemory, Timestamps,
     MAX_SEMANTIC_OUT, SEMANTIC_LINK_THRESHOLD,

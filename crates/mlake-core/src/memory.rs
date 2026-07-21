@@ -6,7 +6,7 @@
 
 use rkyv::{Archive, Deserialize, Serialize};
 
-use crate::id::MemoryId;
+use crate::id::{EntityId, MemoryId};
 
 /// Classification of a memory item. Fusion may combine across fact types, so the
 /// discriminants are stable and stored as `u8`.
@@ -123,7 +123,7 @@ pub struct StoredMemory {
     pub proof_count: u32,
     /// Dictionary-encoded entity ids, sorted ascending so shared-entity counting between
     /// two items is a linear merge rather than a hash-set intersection.
-    pub entity_ids: Vec<u64>,
+    pub entity_ids: Vec<EntityId>,
     pub semantic_out: Vec<SemanticEdge>,
     pub causal_out: Vec<CausalEdge>,
     /// Opaque client key→value metadata. memlake never indexes or interprets it — it is
@@ -136,13 +136,13 @@ pub struct StoredMemory {
 
 impl StoredMemory {
     /// Count of entity ids shared with another item. Both sides must be sorted.
-    pub fn shared_entity_count(&self, other: &[u64]) -> usize {
+    pub fn shared_entity_count(&self, other: &[EntityId]) -> usize {
         merge_count(&self.entity_ids, other)
     }
 }
 
 /// Count elements present in both sorted slices, ignoring duplicates within a side.
-pub fn merge_count(a: &[u64], b: &[u64]) -> usize {
+pub fn merge_count(a: &[EntityId], b: &[EntityId]) -> usize {
     let (mut i, mut j, mut n) = (0, 0, 0);
     while i < a.len() && j < b.len() {
         match a[i].cmp(&b[j]) {
@@ -169,7 +169,7 @@ pub struct Memory {
     pub tags: Vec<String>,
     pub timestamps: Timestamps,
     pub proof_count: u32,
-    pub entity_ids: Vec<u64>,
+    pub entity_ids: Vec<EntityId>,
     /// Causal edges are intrinsic and travel in the WAL. Semantic edges are absent here
     /// by construction: they are derived by the indexer (SPEC §3.2).
     pub causal_out: Vec<CausalEdge>,
@@ -206,6 +206,12 @@ impl Memory {
 mod tests {
     use super::*;
 
+    fn eid(n: u64) -> EntityId {
+        let mut b = [0u8; 16];
+        b[..8].copy_from_slice(&n.to_le_bytes());
+        EntityId(b)
+    }
+
     #[test]
     fn shared_entities_counts_intersection() {
         let item = StoredMemory {
@@ -216,13 +222,13 @@ mod tests {
             tags: vec![],
             timestamps: Timestamps::default(),
             proof_count: 0,
-            entity_ids: vec![1, 3, 5, 7],
+            entity_ids: [1, 3, 5, 7].map(eid).to_vec(),
             semantic_out: vec![],
             causal_out: vec![],
             metadata: vec![],
         };
-        assert_eq!(item.shared_entity_count(&[3, 5, 9]), 2);
-        assert_eq!(item.shared_entity_count(&[2, 4]), 0);
+        assert_eq!(item.shared_entity_count(&[3, 5, 9].map(eid)), 2);
+        assert_eq!(item.shared_entity_count(&[2, 4].map(eid)), 0);
         assert_eq!(item.shared_entity_count(&[]), 0);
     }
 
@@ -236,12 +242,12 @@ mod tests {
             tags: vec![],
             timestamps: Timestamps::default(),
             proof_count: 0,
-            entity_ids: vec![5, 1, 5, 3],
+            entity_ids: [5, 1, 5, 3].map(eid).to_vec(),
             causal_out: vec![],
             metadata: vec![],
         };
         let stored = item.into_stored();
-        assert_eq!(stored.entity_ids, vec![1, 3, 5]);
+        assert_eq!(stored.entity_ids, [1, 3, 5].map(eid).to_vec());
         // Semantic links are derived, never client-supplied.
         assert!(stored.semantic_out.is_empty());
     }

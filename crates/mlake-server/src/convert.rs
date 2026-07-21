@@ -3,7 +3,7 @@
 //! conversion returns `tonic::Status` so it maps straight onto a gRPC error.
 
 use mlake_core::memory::{CausalEdge, LinkType, Timestamps, Weight};
-use mlake_core::{Delta, Memory, MemoryId, Op, StoredMemory, TagFilter, TagsMatch};
+use mlake_core::{Delta, EntityId, Memory, MemoryId, Op, StoredMemory, TagFilter, TagsMatch};
 use mlake_index::{ArmDepths, ArmScore, Consistency, RawHit};
 use tonic::Status;
 
@@ -53,6 +53,22 @@ fn id_exact(bytes: &[u8]) -> Result<MemoryId, Status> {
     Ok(MemoryId::from_bytes(arr))
 }
 
+fn entity_ids_in(raw: &[Vec<u8>]) -> Result<Vec<EntityId>, Status> {
+    raw.iter()
+        .map(|b| {
+            let arr: [u8; 16] = b
+                .as_slice()
+                .try_into()
+                .map_err(|_| Status::invalid_argument("entity_id must be exactly 16 bytes"))?;
+            Ok(EntityId::from_bytes(arr))
+        })
+        .collect()
+}
+
+fn entity_ids_out(ids: &[EntityId]) -> Vec<Vec<u8>> {
+    ids.iter().map(|e| e.0.to_vec()).collect()
+}
+
 pub fn memory_type_u8(v: u32) -> Result<u8, Status> {
     u8::try_from(v).map_err(|_| Status::invalid_argument("memory_type must be 0..=255"))
 }
@@ -97,7 +113,7 @@ pub fn memory(m: pb::Memory) -> Result<Memory, Status> {
         tags: m.tags,
         timestamps: timestamps(m.timestamps),
         proof_count: m.proof_count,
-        entity_ids: m.entity_ids,
+        entity_ids: entity_ids_in(&m.entity_ids)?,
         causal_out,
         metadata: m.metadata.into_iter().collect(),
     })
@@ -134,7 +150,7 @@ fn payload(m: StoredMemory) -> pb::MemoryPayload {
         text: m.text,
         tags: m.tags,
         proof_count: m.proof_count,
-        entity_ids: m.entity_ids,
+        entity_ids: entity_ids_out(&m.entity_ids),
         timestamps: Some(timestamps_out(&m.timestamps)),
         causal_out: m.causal_out.iter().map(causal_edge_out).collect(),
         metadata: m.metadata.into_iter().collect(),

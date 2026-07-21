@@ -74,6 +74,55 @@ impl<'de> serde::Deserialize<'de> for MemoryId {
     }
 }
 
+/// An entity identity. Like [`MemoryId`], a full 16-byte value (Hindsight's entity ids are
+/// UUIDs) stored as a fixed array so archived records stay zero-copy readable. Kept a
+/// distinct type from `MemoryId` so the two can never be confused in the graph arm.
+#[derive(
+    Archive, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default,
+)]
+#[archive(check_bytes)]
+#[archive_attr(derive(PartialEq, Eq, PartialOrd, Ord, Hash, Debug))]
+pub struct EntityId(pub [u8; 16]);
+
+impl EntityId {
+    pub const fn from_bytes(bytes: [u8; 16]) -> Self {
+        Self(bytes)
+    }
+
+    /// Deterministic id from an external string key (used by the benchmark harness).
+    pub fn from_key(key: &str) -> Self {
+        Self(*Uuid::new_v5(&Uuid::NAMESPACE_OID, key.as_bytes()).as_bytes())
+    }
+
+    pub fn as_uuid(&self) -> Uuid {
+        Uuid::from_bytes(self.0)
+    }
+}
+
+impl From<Uuid> for EntityId {
+    fn from(u: Uuid) -> Self {
+        Self(*u.as_bytes())
+    }
+}
+
+impl fmt::Debug for EntityId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.as_uuid())
+    }
+}
+
+impl serde::Serialize for EntityId {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        serde::Serialize::serialize(&self.as_uuid(), s)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for EntityId {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        <Uuid as serde::Deserialize>::deserialize(d).map(Self::from)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

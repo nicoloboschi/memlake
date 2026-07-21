@@ -9,7 +9,14 @@
 //! Generation is batched by id range so a 1M+ run never holds the whole corpus in RAM.
 
 use mlake_core::memory::{CausalEdge, LinkType, Timestamps, Weight};
-use mlake_core::{Memory, MemoryId};
+use mlake_core::{EntityId, Memory, MemoryId};
+
+/// A 16-byte entity id from a small integer (synthetic corpus only).
+fn entity_id(n: u64) -> EntityId {
+    let mut b = [0u8; 16];
+    b[..8].copy_from_slice(&n.to_le_bytes());
+    EntityId::from_bytes(b)
+}
 use rand::prelude::*;
 use rand_chacha::ChaCha8Rng;
 
@@ -113,8 +120,8 @@ impl Generator {
                 ts.into_iter().collect()
             };
 
-            let mut entity_ids: Vec<u64> = (0..self.cfg.entities_per_memory)
-                .map(|_| zipf_sample(&self.zipf_entity, &mut rng) as u64)
+            let mut entity_ids: Vec<EntityId> = (0..self.cfg.entities_per_memory)
+                .map(|_| entity_id(zipf_sample(&self.zipf_entity, &mut rng) as u64))
                 .collect();
             entity_ids.sort_unstable();
             entity_ids.dedup();

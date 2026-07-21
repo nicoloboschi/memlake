@@ -15,7 +15,7 @@
 
 use std::collections::BTreeSet;
 
-use mlake_core::{MemoryId, StoredMemory};
+use mlake_core::{EntityId, MemoryId, StoredMemory};
 
 use crate::radj::EdgeKind;
 use crate::scorer::ScoreAccumulator;
@@ -27,7 +27,7 @@ pub trait GraphSource {
     /// Memory ids that mention `entity_id`, filtered to `memory_type` if given, capped at
     /// `cap` candidates. The cap is the bounded posting-prefix read of SPEC §7.2 — it
     /// stops a high-fan-out entity from blowing the budget.
-    fn entity_candidates(&self, entity_id: u64, memory_type: Option<u8>, cap: usize) -> Vec<MemoryId>;
+    fn entity_candidates(&self, entity_id: EntityId, memory_type: Option<u8>, cap: usize) -> Vec<MemoryId>;
 
     /// Materialize an item by id, or `None` if it is tombstoned or absent. This is where
     /// dangling edges become invisible without any cleanup (SPEC §7.7).
@@ -106,11 +106,11 @@ fn expand_entities(
 ) {
     // Union of all seed entities. Sorted (StoredMemory keeps entity_ids sorted) so shared
     // counting is a linear merge.
-    let mut seed_entities: BTreeSet<u64> = BTreeSet::new();
+    let mut seed_entities: BTreeSet<EntityId> = BTreeSet::new();
     for seed in seeds {
         seed_entities.extend(seed.entity_ids.iter().copied());
     }
-    let seed_entities: Vec<u64> = seed_entities.into_iter().collect();
+    let seed_entities: Vec<EntityId> = seed_entities.into_iter().collect();
     let seed_set: BTreeSet<MemoryId> = seeds.iter().map(|s| s.id).collect();
 
     // Gather candidate ids across every seed entity, deduplicated. The per-entity cap is
@@ -180,17 +180,24 @@ mod tests {
     use mlake_core::{CausalEdge, LinkType, SemanticEdge};
     use std::collections::HashMap;
 
+    /// A 16-byte entity id from a small integer, for readable tests.
+    fn eid(n: u64) -> EntityId {
+        let mut b = [0u8; 16];
+        b[..8].copy_from_slice(&n.to_le_bytes());
+        EntityId(b)
+    }
+
     /// A simple in-memory graph source for tests.
     struct MemGraph {
         items: HashMap<MemoryId, StoredMemory>,
         tombstoned: BTreeSet<MemoryId>,
-        entity_index: HashMap<u64, Vec<MemoryId>>,
+        entity_index: HashMap<EntityId, Vec<MemoryId>>,
         radj: ReverseAdjacency,
     }
 
     impl MemGraph {
         fn new(items: Vec<StoredMemory>, radj_pairs: Vec<(MemoryId, InEdge)>) -> Self {
-            let mut entity_index: HashMap<u64, Vec<MemoryId>> = HashMap::new();
+            let mut entity_index: HashMap<EntityId, Vec<MemoryId>> = HashMap::new();
             let mut map = HashMap::new();
             for item in items {
                 for e in &item.entity_ids {
@@ -211,7 +218,7 @@ mod tests {
     }
 
     impl GraphSource for MemGraph {
-        fn entity_candidates(&self, entity_id: u64, memory_type: Option<u8>, cap: usize) -> Vec<MemoryId> {
+        fn entity_candidates(&self, entity_id: EntityId, memory_type: Option<u8>, cap: usize) -> Vec<MemoryId> {
             self.entity_index
                 .get(&entity_id)
                 .into_iter()
@@ -248,7 +255,7 @@ mod tests {
             timestamps: Timestamps::default(),
             proof_count: 0,
             entity_ids: {
-                let mut e = entities;
+                let mut e: Vec<EntityId> = entities.into_iter().map(eid).collect();
                 e.sort_unstable();
                 e
             },

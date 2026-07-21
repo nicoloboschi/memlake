@@ -78,12 +78,13 @@ def memory(
     id: bytes = b"",
     tags: Optional[Sequence[str]] = None,
     proof_count: int = 0,
-    entity_ids: Optional[Sequence[int]] = None,
+    entity_ids: Optional[Sequence[bytes]] = None,
     metadata: Optional[dict[str, str]] = None,
 ) -> pb.Memory:
     """Build a Memory. Pass `key` (and leave `id` empty) to let the server derive a stable
-    16-byte id from the key; or pass a 16-byte `id` directly. `metadata` is opaque str->str
-    the server stores and returns verbatim (never indexed) — e.g. context, document_id."""
+    16-byte id from the key; or pass a 16-byte `id` directly. `entity_ids` are 16-byte ids
+    (e.g. `uuid.UUID(...).bytes`). `metadata` is opaque str->str the server stores and returns
+    verbatim (never indexed) — e.g. context, document_id."""
     return pb.Memory(
         id=id,
         key=key,

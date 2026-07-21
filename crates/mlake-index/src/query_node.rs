@@ -14,7 +14,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Instant;
 
-use mlake_core::{MemoryId, StoredMemory, TagFilter};
+use mlake_core::{EntityId, MemoryId, StoredMemory, TagFilter};
 use mlake_fts::{TantivyFts, Tokenizer};
 use mlake_graph::radj::InEdge;
 use mlake_graph::{GraphParams, GraphSource};
@@ -577,7 +577,7 @@ impl QueryNode {
         }
 
         let te = Instant::now();
-        let mut entity_index: HashMap<u64, Vec<MemoryId>> = HashMap::new();
+        let mut entity_index: HashMap<EntityId, Vec<MemoryId>> = HashMap::new();
         for item in by_id.values() {
             for e in &item.entity_ids {
                 entity_index.entry(*e).or_default().push(item.id);
@@ -638,13 +638,13 @@ fn fuse_raw(raw: &[RawHit], top_k: usize, config: QueryConfig) -> Vec<FusedHit> 
 
 struct LazyGraphSource<'a> {
     by_id: &'a HashMap<MemoryId, StoredMemory>,
-    entity_index: &'a HashMap<u64, Vec<MemoryId>>,
+    entity_index: &'a HashMap<EntityId, Vec<MemoryId>>,
     incoming: &'a HashMap<MemoryId, Vec<InEdge>>,
     tombstones: &'a HashSet<MemoryId>,
 }
 
 impl GraphSource for LazyGraphSource<'_> {
-    fn entity_candidates(&self, entity_id: u64, memory_type: Option<u8>, cap: usize) -> Vec<MemoryId> {
+    fn entity_candidates(&self, entity_id: EntityId, memory_type: Option<u8>, cap: usize) -> Vec<MemoryId> {
         self.entity_index
             .get(&entity_id)
             .into_iter()

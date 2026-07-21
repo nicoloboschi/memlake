@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use mlake_core::memory::Timestamps;
-use mlake_core::{Memory, MemoryId, Op};
+use mlake_core::{EntityId, Memory, MemoryId, Op};
 use mlake_store::Store;
 use mlake_wal::{Namespace, WalTail, Writer};
 
@@ -20,7 +20,7 @@ fn item(key: &str, proof: u32) -> Memory {
         tags: vec!["tag".into()],
         timestamps: Timestamps::default(),
         proof_count: proof,
-        entity_ids: vec![1, 2],
+        entity_ids: vec![EntityId::from_bytes([1; 16]), EntityId::from_bytes([2; 16])],
         causal_out: vec![],
         metadata: vec![],
     }

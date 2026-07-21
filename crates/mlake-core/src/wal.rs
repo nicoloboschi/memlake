@@ -88,6 +88,7 @@ pub fn fold_proof_count(start: u32, deltas: impl Iterator<Item = Delta>) -> u32 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::id::EntityId;
     use crate::memory::Timestamps;
 
     fn item(key: &str) -> Memory {
@@ -99,7 +100,7 @@ mod tests {
             tags: vec!["t".into()],
             timestamps: Timestamps::default(),
             proof_count: 0,
-            entity_ids: vec![1, 2],
+            entity_ids: vec![EntityId::from_bytes([1; 16]), EntityId::from_bytes([2; 16])],
             causal_out: vec![],
             metadata: vec![],
         }
