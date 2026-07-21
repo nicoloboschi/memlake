@@ -27,7 +27,8 @@ pub enum Error {
     Encode(String),
     #[error("failed to decode: {0}")]
     Decode(String),
-    #[error("unsupported format version {found} (this build expects {expected})")]
+    #[error("on-disk format version {found} is incompatible with this build (expects {expected}); \
+             the namespace was written by a different version — delete and re-ingest it")]
     FormatVersion { found: u32, expected: u32 },
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),

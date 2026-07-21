@@ -8,7 +8,12 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-pub const FORMAT_VERSION: u32 = 1;
+/// On-disk format version. **Bump this on any change to a serialized on-disk layout** —
+/// `StoredMemory` / `Memory` (rkyv cluster + WAL records), the SSTable encodings, or the
+/// manifest schema — so a generation written by an older build is rejected at the manifest
+/// read with a clear error instead of failing deep in an rkyv decode ("pointer overran
+/// buffer"). Bumped to 2 for the `write_seq` + opaque `metadata` + 16-byte `EntityId` changes.
+pub const FORMAT_VERSION: u32 = 2;
 
 /// Paths to the files making up a generation. Stored as an explicit struct rather than a
 /// map so a missing file is a deserialization error rather than a runtime surprise.
