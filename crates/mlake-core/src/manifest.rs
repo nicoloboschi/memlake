@@ -15,10 +15,15 @@ pub struct GenerationFiles {
     pub pk: String,
     pub centroids: String,
     pub clusters: Vec<String>,
+    /// `radj.csr`: the reverse-adjacency SSTable data blocks (range-read per lookup).
     pub radj_csr: String,
+    /// `radj.idx`: the reverse-adjacency SSTable sparse index (loaded whole, small).
     pub radj_idx: String,
     pub fts_split: String,
     pub stats: String,
+    /// `pk.data`: the primary-key SSTable data blocks. `pk` above is its sparse index.
+    #[serde(default)]
+    pub pk_data: String,
 }
 
 impl GenerationFiles {
@@ -27,6 +32,7 @@ impl GenerationFiles {
     pub fn all_paths(&self) -> impl Iterator<Item = &str> {
         [
             self.pk.as_str(),
+            self.pk_data.as_str(),
             self.centroids.as_str(),
             self.radj_csr.as_str(),
             self.radj_idx.as_str(),
@@ -83,6 +89,7 @@ impl Manifest {
             wal_head: 0,
             files: GenerationFiles {
                 pk: String::new(),
+                pk_data: String::new(),
                 centroids: String::new(),
                 clusters: Vec::new(),
                 radj_csr: String::new(),

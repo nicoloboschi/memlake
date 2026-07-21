@@ -14,11 +14,11 @@ use std::collections::BTreeMap;
 use mlake_core::item::{SemanticEdge, Weight, MAX_SEMANTIC_OUT, SEMANTIC_LINK_THRESHOLD};
 use mlake_core::{ItemId, StoredItem};
 use mlake_fts::Tokenizer;
-use mlake_graph::radj::{EdgeKind, InEdge, LinkTypeTag, ReverseAdjacency};
+use mlake_graph::radj::{EdgeKind, InEdge, LinkTypeTag};
 use mlake_ivf::{build_clusters, train_centroids, ClusterFile};
 use mlake_wal::{Namespace, WalTail};
 
-use crate::generation::{write_generation, PkIndex};
+use crate::generation::write_generation;
 use crate::Result;
 
 /// Options controlling a generation build.
@@ -125,15 +125,14 @@ pub async fn index(ns: &Namespace, tokenizer: &Tokenizer, opts: IndexOptions) ->
     let centroids = train_centroids(&vectors, opts.seed);
     let clusters: Vec<ClusterFile> = build_clusters(items.clone(), &centroids);
 
-    // Build the pk index: id → cluster, sorted for binary search.
+    // Build the pk index as an SSTable: id → cluster, range-readable at scale.
     let mut pk_entries: Vec<(ItemId, u32)> = Vec::with_capacity(doc_count);
     for (ci, cluster) in clusters.iter().enumerate() {
         for item in &cluster.items {
             pk_entries.push((item.id, ci as u32));
         }
     }
-    pk_entries.sort_by_key(|a| a.0);
-    let pk = PkIndex { entries: pk_entries };
+    let pk_tables = crate::sstable::PkTable::build(pk_entries);
 
     // Build the tantivy FTS split, packed into one object for storage (SPEC §5.3).
     let fts = mlake_fts::TantivyFts::build(
@@ -143,7 +142,7 @@ pub async fn index(ns: &Namespace, tokenizer: &Tokenizer, opts: IndexOptions) ->
     .map_err(|e| crate::Error::Core(mlake_core::Error::Encode(e.to_string())))?;
     let fts_split = fts.split_bytes().to_vec();
 
-    // Build reverse adjacency from inline outgoing links.
+    // Build reverse adjacency as an SSTable from inline outgoing links.
     let mut radj_pairs: Vec<(ItemId, InEdge)> = Vec::new();
     for item in &items {
         for edge in &item.semantic_out {
@@ -167,14 +166,21 @@ pub async fn index(ns: &Namespace, tokenizer: &Tokenizer, opts: IndexOptions) ->
             ));
         }
     }
-    let radj = ReverseAdjacency::build(radj_pairs);
+    let radj_tables = crate::sstable::RadjTable::build(radj_pairs);
 
     // Write the generation files under a prefix unique to this attempt, so concurrent
     // builders of the same generation number never overwrite each other's files (INV-2).
     let nonce = mlake_core::ItemId::new_v4().as_uuid().simple().to_string();
     let prefix = crate::generation::attempt_prefix(&ns.name, generation, &nonce);
     let files = write_generation(
-        &ns.store, &prefix, &centroids, &clusters, &fts_split, &radj, &pk,
+        &ns.store,
+        &prefix,
+        &centroids,
+        &clusters,
+        &fts_split,
+        radj_tables.into(),
+        pk_tables.into(),
+        doc_count,
     )
     .await?;
 

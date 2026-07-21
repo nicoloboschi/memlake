@@ -6,46 +6,23 @@
 //! generation or the entire new one, never a mixture.
 
 use mlake_core::manifest::generation_prefix;
-use mlake_core::{GenerationFiles, ItemId, StoredItem};
+use mlake_core::{GenerationFiles, StoredItem};
 use mlake_fts::{TantivyFts, Tokenizer};
-use mlake_graph::ReverseAdjacency;
 use mlake_ivf::{Centroids, ClusterFile};
 use mlake_store::{QueryMetrics, Store};
 use serde::{Deserialize, Serialize};
 
 use crate::Result;
 
-/// The primary-key index: maps an item id to the cluster file it lives in, so a graph
-/// candidate found by id can be materialized without scanning every cluster. Tombstoned
-/// ids are absent, which is how dangling edges stay invisible (SPEC §7.7).
-#[derive(Default, Serialize, Deserialize)]
-pub struct PkIndex {
-    /// id → cluster index. Sorted-map semantics via a Vec of pairs keeps the file small
-    /// and deterministic.
-    pub entries: Vec<(ItemId, u32)>,
-}
-
-impl PkIndex {
-    pub fn lookup(&self, id: &ItemId) -> Option<u32> {
-        self.entries
-            .binary_search_by(|(k, _)| k.cmp(id))
-            .ok()
-            .map(|i| self.entries[i].1)
-    }
-}
-
-/// The structural state of one generation loaded from storage: the vector index, the
-/// items, the graph adjacency, and the pk index.
+/// The items of one generation, loaded for the incremental indexer to fold the next
+/// generation from. Only what the indexer needs: the centroids and the cluster items.
 ///
-/// The FTS split is *not* loaded here — it is a self-contained tantivy artifact loaded on
-/// demand via [`read_fts_split`], so callers that only need items (the incremental
-/// indexer) do not pay to materialize it.
+/// The FTS split, pk, and radj are *not* loaded here — they are rebuilt by the indexer and
+/// range-read by the query node, so materializing them for a fold would be pure waste.
 pub struct Generation {
     pub generation: u64,
     pub centroids: Centroids,
     pub clusters: Vec<Vec<StoredItem>>,
-    pub radj: ReverseAdjacency,
-    pub pk: PkIndex,
 }
 
 /// File names within a generation *attempt* prefix. The prefix is unique per index
@@ -61,11 +38,17 @@ fn cluster_key(prefix: &str, i: usize) -> String {
 fn fts_key(prefix: &str) -> String {
     format!("{prefix}/fts/split.bin")
 }
-fn radj_key(prefix: &str) -> String {
-    format!("{prefix}/radj.json")
+fn radj_idx_key(prefix: &str) -> String {
+    format!("{prefix}/radj.idx")
 }
-fn pk_key(prefix: &str) -> String {
+fn radj_csr_key(prefix: &str) -> String {
+    format!("{prefix}/radj.csr")
+}
+fn pk_idx_key(prefix: &str) -> String {
     format!("{prefix}/pk.idx")
+}
+fn pk_data_key(prefix: &str) -> String {
+    format!("{prefix}/pk.data")
 }
 fn stats_key(prefix: &str) -> String {
     format!("{prefix}/stats.json")
@@ -95,8 +78,9 @@ pub async fn write_generation(
     centroids: &Centroids,
     clusters: &[ClusterFile],
     fts_split: &[u8],
-    radj: &ReverseAdjacency,
-    pk: &PkIndex,
+    radj_tables: SsTablePair,
+    pk_tables: SsTablePair,
+    doc_count: usize,
 ) -> Result<GenerationFiles> {
     store
         .put(&centroids_key(prefix), centroids.to_bytes()?)
@@ -112,55 +96,60 @@ pub async fn write_generation(
     // The FTS file is the packed tantivy split — a self-contained index a query node
     // materializes into its NVMe/mmap tier (SPEC §6.1).
     store.put(&fts_key(prefix), fts_split.to_vec()).await?;
-    store.put(&radj_key(prefix), radj.to_bytes()?).await?;
-    store.put(&pk_key(prefix), serde_json::to_vec(pk)?).await?;
+
+    // pk and radj are SSTables: a small `.idx` (loaded whole) and a large `.data`/`.csr`
+    // (range-read per lookup), so neither is ever whole-fetched at 10M scale (SCALE.md #3).
+    store.put(&radj_idx_key(prefix), radj_tables.idx).await?;
+    store.put(&radj_csr_key(prefix), radj_tables.data).await?;
+    store.put(&pk_idx_key(prefix), pk_tables.idx).await?;
+    store.put(&pk_data_key(prefix), pk_tables.data).await?;
 
     let stats = Stats {
-        doc_count: pk.entries.len(),
+        doc_count,
         cluster_count: clusters.len(),
-        edge_count: radj.edge_count(),
+        edge_count: 0,
     };
     store
         .put(&stats_key(prefix), serde_json::to_vec(&stats)?)
         .await?;
 
     Ok(GenerationFiles {
-        pk: pk_key(prefix),
+        pk: pk_idx_key(prefix),
+        pk_data: pk_data_key(prefix),
         centroids: centroids_key(prefix),
         clusters: cluster_paths,
-        radj_csr: radj_key(prefix),
-        radj_idx: radj_key(prefix),
+        radj_csr: radj_csr_key(prefix),
+        radj_idx: radj_idx_key(prefix),
         fts_split: fts_key(prefix),
         stats: stats_key(prefix),
     })
 }
 
-/// Load a whole generation from the store, counting each fetch against the budget.
-///
-/// This loads every cluster, which is the correct behaviour for the indexer's own reads
-/// and for small namespaces. The query node's roundtrip-budget path instead loads only the
-/// probed clusters; both go through the same file layout.
+/// The two byte streams of an SSTable: the small sparse index and the block data.
+pub struct SsTablePair {
+    pub idx: Vec<u8>,
+    pub data: Vec<u8>,
+}
+
+impl From<(Vec<u8>, Vec<u8>)> for SsTablePair {
+    fn from((idx, data): (Vec<u8>, Vec<u8>)) -> Self {
+        Self { idx, data }
+    }
+}
+
+/// Load a generation's centroids and cluster items — everything the incremental indexer
+/// needs to fold the next generation. pk/radj/fts are deliberately not loaded (the indexer
+/// rebuilds them), so a fold never whole-reads the range-readable secondary indexes.
 pub async fn read_generation(
     store: &Store,
     files: &GenerationFiles,
     generation: u64,
     metrics: Option<&QueryMetrics>,
 ) -> Result<Generation> {
-    // RT2: the small metadata files — centroids, reverse adjacency, pk index — fetched
-    // concurrently, so they cost one roundtrip of latency (INV-7). The FTS split is not
-    // fetched here; it is loaded on demand via `read_fts_split` only when the FTS arm is
-    // needed, so the incremental indexer (which only wants items) does not pay for it.
-    let (centroids_bytes, radj_bytes, pk_bytes) = futures::try_join!(
-        store.get(&files.centroids, metrics.map(|m| (m, 2))),
-        store.get(&files.radj_csr, metrics.map(|m| (m, 2))),
-        store.get(&files.pk, metrics.map(|m| (m, 2))),
-    )?;
+    let centroids_bytes = store.get(&files.centroids, metrics.map(|m| (m, 2))).await?;
     let centroids = Centroids::from_bytes(&centroids_bytes.bytes)?;
-    let radj = ReverseAdjacency::from_bytes(&radj_bytes.bytes)?;
-    let pk: PkIndex = serde_json::from_slice(&pk_bytes.bytes)?;
 
-    // RT3: the cluster files, all fetched concurrently — the spec's "parallel ranged GETs"
-    // step, which is one roundtrip regardless of how many clusters are selected.
+    // Cluster files fetched concurrently — one roundtrip regardless of count.
     let cluster_futures = files
         .clusters
         .iter()
@@ -175,8 +164,6 @@ pub async fn read_generation(
         generation,
         centroids,
         clusters,
-        radj,
-        pk,
     })
 }
 

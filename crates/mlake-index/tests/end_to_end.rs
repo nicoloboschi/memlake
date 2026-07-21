@@ -393,8 +393,9 @@ async fn crash_before_manifest_swap_leaves_the_old_generation_serving() {
         &mlake_ivf::train_centroids(&[vec![0.0, 1.0]], 42),
         &[],
         empty_split.split_bytes(),
-        &mlake_graph::ReverseAdjacency::build(vec![]),
-        &mlake_index::PkIndex::default(),
+        mlake_index::RadjTable::build(vec![]).into(),
+        mlake_index::PkTable::build(vec![]).into(),
+        0,
     )
     .await
     .unwrap();
@@ -554,8 +555,9 @@ async fn concurrent_generation_builds_write_disjoint_files() {
         &mlake_ivf::train_centroids(&[vec![1.0, 0.0]], 42),
         &[],
         empty_split.split_bytes(),
-        &mlake_graph::ReverseAdjacency::build(vec![]),
-        &mlake_index::PkIndex { entries: vec![(ItemId::from_key("a"), 0)] },
+        mlake_index::RadjTable::build(vec![]).into(),
+        mlake_index::PkTable::build(vec![(ItemId::from_key("a"), 0)]).into(),
+        1,
     )
     .await
     .unwrap();
@@ -565,8 +567,9 @@ async fn concurrent_generation_builds_write_disjoint_files() {
         &mlake_ivf::train_centroids(&[vec![0.0, 1.0], vec![1.0, 1.0]], 42),
         &[],
         empty_split.split_bytes(),
-        &mlake_graph::ReverseAdjacency::build(vec![]),
-        &mlake_index::PkIndex { entries: vec![(ItemId::from_key("b"), 0)] },
+        mlake_index::RadjTable::build(vec![]).into(),
+        mlake_index::PkTable::build(vec![(ItemId::from_key("b"), 0)]).into(),
+        1,
     )
     .await
     .unwrap();
@@ -680,4 +683,39 @@ async fn query_fetches_only_probed_clusters_and_warms_the_cache() {
     node.query_metered(Some(&q), None, 10, cfg, &warm).await.unwrap();
     assert!(warm.cache_hits() > 0, "warm query should hit the cache");
     assert_eq!(warm.cache_misses(), 0, "warm query should not miss");
+}
+
+/// Phase 2: the graph arm materializes candidates exactly across clusters via the pk/radj
+/// SSTables. A semantic neighbour that lands in a cluster the query did NOT probe is still
+/// found — the Phase 1 "probed clusters only" approximation is gone.
+#[tokio::test]
+async fn graph_arm_materializes_neighbours_from_unprobed_clusters() {
+    let store = Store::in_memory();
+    let ns = namespace(store, "ns").await;
+    let mut writer = Writer::new(ns.clone());
+
+    // A seed cluster near the query, plus many filler items far away so there are many
+    // clusters and a low nprobe won't probe the neighbour's cluster.
+    let mut ops = vec![
+        Op::Upsert(item("seed", vec![1.0, 0.0, 0.0], "seed document")),
+        Op::Upsert(item("neighbour", vec![0.985, 0.0, 0.17], "closely related to the seed")),
+    ];
+    for i in 0..300 {
+        let a = (i as f32) * 0.37 + 2.0;
+        ops.push(Op::Upsert(item(&format!("f{i}"), vec![a.cos(), a.sin(), (a * 0.3).cos()], "filler")));
+    }
+    writer.commit(ops).await.unwrap();
+    index(&ns, &Tokenizer::default(), IndexOptions::default()).await.unwrap();
+
+    let node = QueryNode::open(&ns, Tokenizer::default(), Consistency::Strong).await.unwrap();
+    // Low nprobe so only a couple of clusters are probed.
+    let cfg = QueryConfig { nprobe: 2, graph_weight: 1.0, ..QueryConfig::default() };
+    let hits = node.query(Some(&[1.0, 0.0, 0.0]), None, 20, cfg).await.unwrap();
+    let ids: Vec<_> = hits.iter().map(|h| h.id).collect();
+
+    assert!(ids.contains(&ItemId::from_key("seed")));
+    assert!(
+        ids.contains(&ItemId::from_key("neighbour")),
+        "graph expansion must find the seed's kNN neighbour even in an unprobed cluster"
+    );
 }
