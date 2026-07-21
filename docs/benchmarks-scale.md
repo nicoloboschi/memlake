@@ -97,9 +97,28 @@ text arm) — fixing FTS drops graph toward the vector arm's ~5ms. Correctness h
 still surfaces the entity-sharer at the identical 0.462 score; mlake-graph (25) + mlake-index (69)
 tests pass; postings-count matches `shared_entity_count` under the LATERAL cap.
 
-## Next: FTS overhead (#2)
+## Next: point-read materialization (#2) — the last systemic cost
 
-`fts`, `hybrid`, and `graph` workloads all sit at ~44ms warm while their internal `fts` timer is
-~8ms and the vector arm is ~5ms — a fixed ~35ms per-query overhead that appears whenever the text
-arm runs. Likely the tantivy split being re-opened/mmapped per query instead of reused warm.
-Fixing it drops fts/hybrid/graph to single-digit ms. (Not yet done.)
+`fts`, `hybrid`, and `graph` all sit at ~44ms warm while their internal search timers are single-
+digit ms. The overhead is **not** tantivy (the `IndexReader` is reused, not re-opened) — it is
+**materialization**. The final pass hydrates every hit not already in a probed cluster by calling
+`fetch_clusters`, which **deserializes the entire cluster file** (~577 items at 1M) to extract the
+handful of hit memories in it. FTS/graph hits are spread across many clusters, so a text query can
+deserialize ~100 whole clusters (~110 MB warm) to return ~100 rows.
+
+Proof from the data: the **vector** arm materializes from the clusters it already probed → 4.8ms;
+every workload that materializes hits *outside* the probed set (`fts`, `hybrid`, `graph`) pays the
+same ~40ms, regardless of arm. So the cost tracks "hits needing out-of-probe hydration", i.e.
+whole-cluster reads for point lookups.
+
+This is the same root cause the graph fix dodged by hydrating only ≤`budget` results. The general
+fix is a **row-addressable payload** so a point read fetches one memory, not its whole cluster:
+- **Option A (systemic): a payload SSTable** `id -> memory bytes`, range-read per id (mirrors
+  pk/radj/entity). Fixes fts/graph/get/temporal at once; costs a second copy of the payload, or a
+  storage-layout split (vectors stay in clusters for rerank, the rest moves to the payload store).
+- **Option B (FTS-targeted): store the non-vector payload in the tantivy split** (text+tags are
+  already there; add metadata/entity_ids/timestamps as STORED fields). FTS hits hydrate straight
+  from the split — no cluster read. Smaller blast radius, doesn't help graph/get.
+
+Recommended: Option A, since it also removes the residual ~40ms from the graph arm and speeds
+`get`. Not yet implemented — this is the next drastic-perf item after the graph arm.
