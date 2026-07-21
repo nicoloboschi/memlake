@@ -737,6 +737,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn in_window_caps_to_a_spread_sample() {
+        let store = Store::in_memory();
+        // 1000 distinct-time memories, one per second.
+        let pairs: Vec<(i64, MemoryId)> =
+            (0..1000).map(|i| (i, MemoryId::from_key(&format!("m{i:04}")))).collect();
+        let (idx, data) = TimeTable::build(pairs);
+        store.put("c/time.data", data).await.unwrap();
+        let tt = TimeTable::open(&idx, "c/time.data").unwrap();
+
+        // Capped: the whole window (1000) sampled down to 100, evenly strided over time.
+        let got = tt.in_window(&store, 0, 999, 100, None).await.unwrap();
+        assert_eq!(got.len(), 100, "cap bounds the entry-point pool regardless of window width");
+        // Uncapped returns everything.
+        assert_eq!(tt.in_window(&store, 0, 999, usize::MAX, None).await.unwrap().len(), 1000);
+    }
+
+    #[tokio::test]
+    async fn payload_store_roundtrips_content_without_the_vector() {
+        use mlake_core::memory::Timestamps;
+        let store = Store::in_memory();
+        let m = StoredMemory {
+            id: MemoryId::from_key("m1"),
+            vector: vec![0.1, 0.2, 0.3],
+            text: "the platypus lays eggs".into(),
+            memory_type: 2,
+            tags: vec!["bio".into(), "zoo".into()],
+            timestamps: Timestamps { occurred_start: Some(5000), ..Default::default() },
+            proof_count: 7,
+            entity_ids: vec![EntityId::from_bytes([3; 16])],
+            semantic_out: vec![],
+            causal_out: vec![],
+            metadata: vec![("document_id".into(), "d-1".into())],
+            write_seq: 42,
+        };
+        let (idx, data) = PayloadTable::build(&[m.clone()]);
+        store.put("p/payload.data", data).await.unwrap();
+        let pt = PayloadTable::open(&idx, "p/payload.data").unwrap();
+
+        let got = pt.lookup_batch(&store, &[m.id], None).await.unwrap();
+        let r = got.get(&m.id).expect("payload must resolve the id");
+        // The embedding is stripped; everything a hit returns round-trips exactly.
+        assert!(r.vector.is_empty(), "payload store omits the embedding");
+        assert_eq!(r.text, m.text);
+        assert_eq!(r.memory_type, m.memory_type);
+        assert_eq!(r.tags, m.tags);
+        assert_eq!(r.timestamps.occurred_start, m.timestamps.occurred_start);
+        assert_eq!(r.proof_count, m.proof_count);
+        assert_eq!(r.entity_ids, m.entity_ids);
+        assert_eq!(r.metadata, m.metadata);
+        assert_eq!(r.write_seq, m.write_seq);
+        // A miss resolves to nothing.
+        assert!(pt
+            .lookup_batch(&store, &[MemoryId::from_key("nope")], None)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
     async fn point_lookups_hit_the_right_block() {
         let mut b = SsTableBuilder::new();
         // Many records so the table spans several blocks.
