@@ -13,7 +13,7 @@ use std::collections::HashMap;
 
 use futures::future::try_join_all;
 use mlake_core::wal::fold_proof_count;
-use mlake_core::{Delta, ItemId, Op, StoredItem, WalEntry};
+use mlake_core::{Delta, MemoryId, Op, StoredMemory, WalEntry};
 
 use crate::{parse_wal_seq, Namespace, Result};
 
@@ -21,13 +21,13 @@ use crate::{parse_wal_seq, Namespace, Result};
 #[derive(Default, Debug)]
 pub struct TailScan {
     /// Items created or replaced in the tail, in final form with patches folded in.
-    pub upserts: HashMap<ItemId, StoredItem>,
+    pub upserts: HashMap<MemoryId, StoredMemory>,
     /// Items deleted in the tail. These must be subtracted from generation results even
     /// though the generation still contains them.
-    pub tombstones: Vec<ItemId>,
+    pub tombstones: Vec<MemoryId>,
     /// Patches for items that live in the generation rather than the tail. The query
     /// layer applies these after materializing the indexed item.
-    pub pending_patches: HashMap<ItemId, Vec<Delta>>,
+    pub pending_patches: HashMap<MemoryId, Vec<Delta>>,
     /// Highest sequence included in this scan — the consistency point of the read.
     pub through_seq: u64,
     pub entries_scanned: usize,
@@ -35,12 +35,12 @@ pub struct TailScan {
 
 impl TailScan {
     /// Whether an id was deleted in the tail.
-    pub fn is_tombstoned(&self, id: &ItemId) -> bool {
+    pub fn is_tombstoned(&self, id: &MemoryId) -> bool {
         self.tombstones.contains(id)
     }
 
     /// Apply any tail patches to an item materialized from the generation.
-    pub fn apply_patches(&self, item: &mut StoredItem) {
+    pub fn apply_patches(&self, item: &mut StoredMemory) {
         if let Some(deltas) = self.pending_patches.get(&item.id) {
             item.proof_count = fold_proof_count(item.proof_count, deltas.iter().copied());
         }
@@ -157,15 +157,15 @@ pub fn fold_entries(entries: &[WalEntry]) -> TailScan {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mlake_core::item::Timestamps;
-    use mlake_core::Item;
+    use mlake_core::memory::Timestamps;
+    use mlake_core::Memory;
 
-    fn item(key: &str, proof: u32) -> Item {
-        Item {
-            id: ItemId::from_key(key),
+    fn item(key: &str, proof: u32) -> Memory {
+        Memory {
+            id: MemoryId::from_key(key),
             vector: vec![1.0, 0.0],
             text: key.to_string(),
-            fact_type: 1,
+            memory_type: 1,
             tags: vec![],
             timestamps: Timestamps::default(),
             proof_count: proof,
@@ -180,7 +180,7 @@ mod tests {
 
     #[test]
     fn later_tombstone_beats_earlier_upsert() {
-        let id = ItemId::from_key("a");
+        let id = MemoryId::from_key("a");
         let scan = fold_entries(&[
             entry(1, vec![Op::Upsert(item("a", 0))]),
             entry(2, vec![Op::Tombstone { id }]),
@@ -191,7 +191,7 @@ mod tests {
 
     #[test]
     fn later_upsert_revives_a_tombstoned_id() {
-        let id = ItemId::from_key("a");
+        let id = MemoryId::from_key("a");
         let scan = fold_entries(&[
             entry(1, vec![Op::Upsert(item("a", 0))]),
             entry(2, vec![Op::Tombstone { id }]),
@@ -203,7 +203,7 @@ mod tests {
 
     #[test]
     fn patches_fold_into_a_tail_resident_item() {
-        let id = ItemId::from_key("a");
+        let id = MemoryId::from_key("a");
         let scan = fold_entries(&[
             entry(1, vec![Op::Upsert(item("a", 5))]),
             entry(2, vec![Op::Patch { id, deltas: vec![Delta::ProofCount(3)] }]),
@@ -216,7 +216,7 @@ mod tests {
 
     #[test]
     fn patches_for_indexed_items_are_deferred() {
-        let id = ItemId::from_key("indexed");
+        let id = MemoryId::from_key("indexed");
         let scan = fold_entries(&[
             entry(1, vec![Op::Patch { id, deltas: vec![Delta::ProofCount(2)] }]),
             entry(2, vec![Op::Patch { id, deltas: vec![Delta::ProofCount(3)] }]),
@@ -233,7 +233,7 @@ mod tests {
     fn an_upsert_discards_earlier_patches_for_the_same_id() {
         // The patches applied to a version of the item that no longer exists; carrying
         // them forward would double-count against the new value.
-        let id = ItemId::from_key("a");
+        let id = MemoryId::from_key("a");
         let scan = fold_entries(&[
             entry(1, vec![Op::Patch { id, deltas: vec![Delta::ProofCount(100)] }]),
             entry(2, vec![Op::Upsert(item("a", 1))]),
@@ -244,7 +244,7 @@ mod tests {
 
     #[test]
     fn patching_a_tombstoned_item_does_not_resurrect_it() {
-        let id = ItemId::from_key("a");
+        let id = MemoryId::from_key("a");
         let scan = fold_entries(&[
             entry(1, vec![Op::Tombstone { id }]),
             entry(2, vec![Op::Patch { id, deltas: vec![Delta::ProofCount(5)] }]),

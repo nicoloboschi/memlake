@@ -8,19 +8,19 @@
 
 use std::sync::Arc;
 
-use mlake_core::item::Timestamps;
-use mlake_core::{Item, ItemId, Op};
+use mlake_core::memory::Timestamps;
+use mlake_core::{Memory, MemoryId, Op};
 use mlake_fts::Tokenizer;
 use mlake_index::{index, Consistency, IndexOptions, QueryConfig, QueryNode};
 use mlake_store::Store;
 use mlake_wal::{Namespace, Writer};
 
-fn item(key: &str, vector: Vec<f32>, text: &str) -> Item {
-    Item {
-        id: ItemId::from_key(key),
+fn item(key: &str, vector: Vec<f32>, text: &str) -> Memory {
+    Memory {
+        id: MemoryId::from_key(key),
         vector,
         text: text.to_string(),
-        fact_type: 1,
+        memory_type: 1,
         tags: vec![],
         timestamps: Timestamps::default(),
         proof_count: 0,
@@ -67,14 +67,14 @@ async fn write_index_then_query_from_a_fresh_node() {
 
     // A pure-vector query returns the nearest item.
     let vec_hits = node.query(1, Some(&[1.0, 0.0, 0.0]), None, 10, QueryConfig::default()).await.unwrap();
-    assert_eq!(vec_hits[0].id, ItemId::from_key("cats"), "nearest vector should lead");
+    assert_eq!(vec_hits[0].id, MemoryId::from_key("cats"), "nearest vector should lead");
 
     // A fused query blends the text signal: `dogs` is nearest-but-one by vector *and*
     // the text match, so convergent evidence puts it and `cats` at the top.
     let hits = node.query(1, Some(&[1.0, 0.0, 0.0]), Some("loyal canine"), 10, QueryConfig::default()).await.unwrap();
     let top2: Vec<_> = hits.iter().take(2).map(|h| h.id).collect();
-    assert!(top2.contains(&ItemId::from_key("cats")));
-    assert!(top2.contains(&ItemId::from_key("dogs")));
+    assert!(top2.contains(&MemoryId::from_key("cats")));
+    assert!(top2.contains(&MemoryId::from_key("dogs")));
 }
 
 /// INV-5 across the index boundary: a write committed *after* the last index run is still
@@ -94,7 +94,7 @@ async fn writes_after_indexing_are_visible_under_strong_consistency() {
     let node = QueryNode::open(&ns, Tokenizer::default(), Consistency::Strong).await.unwrap();
     assert_eq!(node.doc_count(), 2, "the un-indexed write must be visible");
     let hits = node.query(1, Some(&[0.0, 1.0]), None, 10, QueryConfig::default()).await.unwrap();
-    assert_eq!(hits[0].id, ItemId::from_key("b"), "the tail write must be queryable");
+    assert_eq!(hits[0].id, MemoryId::from_key("b"), "the tail write must be queryable");
 }
 
 /// A delete committed after indexing removes the item from strongly-consistent results,
@@ -114,13 +114,13 @@ async fn deletes_after_indexing_take_effect_immediately() {
         .unwrap();
     index(&ns, &Tokenizer::default(), IndexOptions::default()).await.unwrap();
 
-    writer.commit(vec![Op::Tombstone { id: ItemId::from_key("drop") }]).await.unwrap();
+    writer.commit(vec![Op::Tombstone { id: MemoryId::from_key("drop") }]).await.unwrap();
 
     let node = QueryNode::open(&ns, Tokenizer::default(), Consistency::Strong).await.unwrap();
     assert_eq!(node.doc_count(), 1);
     let hits = node.query(1, Some(&[0.0, 1.0]), None, 10, QueryConfig::default()).await.unwrap();
     assert!(
-        !hits.iter().any(|h| h.id == ItemId::from_key("drop")),
+        !hits.iter().any(|h| h.id == MemoryId::from_key("drop")),
         "a tombstoned item must not appear in strong-consistency results"
     );
 }
@@ -213,8 +213,8 @@ async fn graph_arm_works_through_the_full_pipeline() {
     };
     let hits = node.query(1, Some(&[1.0, 0.0, 0.0]), None, 10, cfg).await.unwrap();
     let ids: Vec<_> = hits.iter().map(|h| h.id).collect();
-    assert!(ids.contains(&ItemId::from_key("a")));
-    assert!(ids.contains(&ItemId::from_key("a2")), "graph expansion should surface the neighbour");
+    assert!(ids.contains(&MemoryId::from_key("a")));
+    assert!(ids.contains(&MemoryId::from_key("a2")), "graph expansion should surface the neighbour");
 }
 
 /// The full pipeline against a real S3 implementation (MinIO), skipped when it is down.
@@ -261,7 +261,7 @@ async fn full_pipeline_against_minio() {
     let node = QueryNode::open(&other, Tokenizer::default(), Consistency::Strong).await.unwrap();
     assert_eq!(node.doc_count(), 2);
     let hits = node.query(1, Some(&[1.0, 0.0, 0.0]), Some("fox"), 10, QueryConfig::default()).await.unwrap();
-    assert_eq!(hits[0].id, ItemId::from_key("x"));
+    assert_eq!(hits[0].id, MemoryId::from_key("x"));
 }
 
 // ---------------------------------------------------------------- compaction & GC (M6)
@@ -297,7 +297,7 @@ async fn gc_reclaims_folded_wal_and_old_generations_without_changing_results() {
     let after = QueryNode::open(&ns, Tokenizer::default(), Consistency::Strong).await.unwrap();
     assert_eq!(after.doc_count(), 3);
     let hits = after.query(1, Some(&[0.0, 1.0]), None, 10, QueryConfig::default()).await.unwrap();
-    assert_eq!(hits[0].id, ItemId::from_key("b"));
+    assert_eq!(hits[0].id, MemoryId::from_key("b"));
 }
 
 /// GC keeps the current and previous generations, so a query still works immediately after
@@ -350,7 +350,7 @@ async fn tombstone_survives_compaction_and_wal_gc() {
         .unwrap();
     index(&ns, &Tokenizer::default(), IndexOptions::default()).await.unwrap();
 
-    writer.commit(vec![Op::Tombstone { id: ItemId::from_key("drop") }]).await.unwrap();
+    writer.commit(vec![Op::Tombstone { id: MemoryId::from_key("drop") }]).await.unwrap();
     // Fold the tombstone into a new generation, then GC the tombstone's WAL entry.
     index(&ns, &Tokenizer::default(), IndexOptions::default()).await.unwrap();
     gc_with_min_age(&ns, GcDuration::ZERO).await.unwrap();
@@ -361,7 +361,7 @@ async fn tombstone_survives_compaction_and_wal_gc() {
         .await
         .unwrap()
         .iter()
-        .all(|h| h.id != ItemId::from_key("drop")));
+        .all(|h| h.id != MemoryId::from_key("drop")));
 }
 
 use std::sync::Arc as ArcChaos;
@@ -382,7 +382,7 @@ async fn crash_before_manifest_swap_leaves_the_old_generation_serving() {
     writer.commit(vec![Op::Upsert(item("b", vec![0.0, 1.0], "beta"))]).await.unwrap();
     let (manifest, _) = ns.read_manifest().await.unwrap();
     let empty_split = mlake_fts::TantivyFts::build(
-        std::iter::empty::<(ItemId, &str)>(),
+        std::iter::empty::<(MemoryId, &str)>(),
         mlake_fts::Tokenizer::default(),
     )
     .unwrap();
@@ -481,11 +481,11 @@ async fn tantivy_fts_split_loads_from_storage_and_serves_queries() {
         .unwrap();
 
     let en = fts.search("brown fox", 10);
-    assert_eq!(en[0].id, ItemId::from_key("fox"), "English BM25 over the loaded split");
+    assert_eq!(en[0].id, MemoryId::from_key("fox"), "English BM25 over the loaded split");
 
     // Chinese query works through the same persisted split (tokenizer chain preserved).
     let cn = fts.search("北京大学", 10);
-    assert_eq!(cn[0].id, ItemId::from_key("cn"), "CJK retrieval over the loaded split");
+    assert_eq!(cn[0].id, MemoryId::from_key("cn"), "CJK retrieval over the loaded split");
 }
 
 /// Regression for the graph-wipe bug: a *plain* index run (default options) must derive
@@ -512,7 +512,7 @@ async fn default_indexing_preserves_the_graph_across_reruns() {
     let node = QueryNode::open(&ns, Tokenizer::default(), Consistency::Strong).await.unwrap();
     let hits = node.query(1, Some(&[1.0, 0.0, 0.0]), None, 10, cfg).await.unwrap();
     assert!(
-        hits.iter().any(|h| h.id == ItemId::from_key("a2")),
+        hits.iter().any(|h| h.id == MemoryId::from_key("a2")),
         "default indexing must leave the graph arm working (links derived)"
     );
 
@@ -523,7 +523,7 @@ async fn default_indexing_preserves_the_graph_across_reruns() {
     let node2 = QueryNode::open(&ns, Tokenizer::default(), Consistency::Strong).await.unwrap();
     let hits2 = node2.query(1, Some(&[1.0, 0.0, 0.0]), None, 10, cfg).await.unwrap();
     assert!(
-        hits2.iter().any(|h| h.id == ItemId::from_key("a2")),
+        hits2.iter().any(|h| h.id == MemoryId::from_key("a2")),
         "a second index run must not wipe the graph carried from the first"
     );
 }
@@ -542,7 +542,7 @@ async fn concurrent_generation_builds_write_disjoint_files() {
     // Two attempts at generation 1, each under its own nonce prefix, with *different*
     // content (as two nodes working from different WAL heads would produce).
     let empty_split = mlake_fts::TantivyFts::build(
-        std::iter::empty::<(ItemId, &str)>(),
+        std::iter::empty::<(MemoryId, &str)>(),
         Tokenizer::default(),
     )
     .unwrap();
@@ -556,7 +556,7 @@ async fn concurrent_generation_builds_write_disjoint_files() {
         Vec::new(),
         empty_split.split_bytes(),
         mlake_index::RadjTable::build(vec![]).into(),
-        mlake_index::PkTable::build(vec![(ItemId::from_key("a"), 0)]).into(),
+        mlake_index::PkTable::build(vec![(MemoryId::from_key("a"), 0)]).into(),
         1,
     )
     .await
@@ -568,7 +568,7 @@ async fn concurrent_generation_builds_write_disjoint_files() {
         Vec::new(),
         empty_split.split_bytes(),
         mlake_index::RadjTable::build(vec![]).into(),
-        mlake_index::PkTable::build(vec![(ItemId::from_key("b"), 0)]).into(),
+        mlake_index::PkTable::build(vec![(MemoryId::from_key("b"), 0)]).into(),
         1,
     )
     .await
@@ -614,8 +614,8 @@ async fn wal_gc_keeps_entries_a_previous_manifest_reader_still_needs() {
         .scan_from_manifest(prev_manifest.wal_index_cursor)
         .await
         .expect("a previous-manifest reader's tail scan must not hit a GC'd entry");
-    assert!(tail.upserts.contains_key(&ItemId::from_key("b")));
-    assert!(tail.upserts.contains_key(&ItemId::from_key("c")));
+    assert!(tail.upserts.contains_key(&MemoryId::from_key("b")));
+    assert!(tail.upserts.contains_key(&MemoryId::from_key("c")));
 }
 
 // ---------------------------------------------------------------- lazy per-probe reads (SCALE.md Phase 1)
@@ -713,9 +713,9 @@ async fn graph_arm_materializes_neighbours_from_unprobed_clusters() {
     let hits = node.query(1, Some(&[1.0, 0.0, 0.0]), None, 20, cfg).await.unwrap();
     let ids: Vec<_> = hits.iter().map(|h| h.id).collect();
 
-    assert!(ids.contains(&ItemId::from_key("seed")));
+    assert!(ids.contains(&MemoryId::from_key("seed")));
     assert!(
-        ids.contains(&ItemId::from_key("neighbour")),
+        ids.contains(&MemoryId::from_key("neighbour")),
         "graph expansion must find the seed's kNN neighbour even in an unprobed cluster"
     );
 }
@@ -774,7 +774,7 @@ async fn incremental_fold_copies_unchanged_clusters_forward() {
     assert_eq!(node.doc_count(), 401);
     let cfg = QueryConfig { graph_weight: 0.0, ..QueryConfig::default() };
     let hits = node.query(1, Some(&[1.0, 0.0, 0.0]), None, 10, cfg).await.unwrap();
-    assert_eq!(hits[0].id, ItemId::from_key("newcomer"), "the new item must be the nearest hit");
+    assert_eq!(hits[0].id, MemoryId::from_key("newcomer"), "the new item must be the nearest hit");
 }
 
 /// Assign-only folds do not retrain centroids until the corpus doubles, and the recall of
@@ -849,18 +849,18 @@ async fn assign_only_recall_stays_close_to_a_retrain() {
     assert!(total_recall / queries.len() as f64 > 0.9);
 }
 
-// ---------------------------------------------------------------- fact_type sub-indexes (SCALE.md Phase 4.0)
+// ---------------------------------------------------------------- memory_type sub-indexes (SCALE.md Phase 4.0)
 
-fn item_ft(key: &str, fact_type: u8, vector: Vec<f32>, text: &str) -> Item {
+fn item_ft(key: &str, memory_type: u8, vector: Vec<f32>, text: &str) -> Memory {
     let mut it = item(key, vector, text);
-    it.fact_type = fact_type;
+    it.memory_type = memory_type;
     it
 }
 
 /// A bank namespace holds several fully-independent fact-type indexes behind one WAL and
 /// one manifest. A query is scoped to a fact type and never sees another type's items.
 #[tokio::test]
-async fn fact_types_are_independent_indexes_in_one_bank() {
+async fn memory_types_are_independent_indexes_in_one_bank() {
     let store = Store::in_memory();
     let ns = namespace(store, "bank").await;
     let mut writer = Writer::new(ns.clone());
@@ -895,13 +895,13 @@ async fn fact_types_are_independent_indexes_in_one_bank() {
     let cfg = QueryConfig { graph_weight: 0.0, ..QueryConfig::default() };
     let ft1 = node.query(1, Some(&[1.0, 0.0, 0.0]), None, 10, cfg).await.unwrap();
     let ids1: std::collections::HashSet<_> = ft1.iter().map(|h| h.id).collect();
-    assert!(ids1.contains(&ItemId::from_key("s1")));
-    assert!(!ids1.contains(&ItemId::from_key("e1")), "fact type 1 must not return an episodic item");
+    assert!(ids1.contains(&MemoryId::from_key("s1")));
+    assert!(!ids1.contains(&MemoryId::from_key("e1")), "fact type 1 must not return an episodic item");
 
     let ft2 = node.query(2, Some(&[1.0, 0.0, 0.0]), None, 10, cfg).await.unwrap();
     let ids2: std::collections::HashSet<_> = ft2.iter().map(|h| h.id).collect();
-    assert!(ids2.contains(&ItemId::from_key("e1")));
-    assert!(!ids2.contains(&ItemId::from_key("s1")), "fact type 2 must not return a semantic item");
+    assert!(ids2.contains(&MemoryId::from_key("e1")));
+    assert!(!ids2.contains(&MemoryId::from_key("s1")), "fact type 2 must not return a semantic item");
 
     // A fact type the bank doesn't have returns nothing, not an error.
     assert!(node.query(9, Some(&[1.0, 0.0, 0.0]), None, 10, cfg).await.unwrap().is_empty());
@@ -910,7 +910,7 @@ async fn fact_types_are_independent_indexes_in_one_bank() {
 /// One WAL, one manifest read: a bank with several fact types still opens with a bounded,
 /// size-independent number of roundtrips (the round-trip optimization).
 #[tokio::test]
-async fn multi_fact_type_open_reads_one_manifest() {
+async fn multi_memory_type_open_reads_one_manifest() {
     let store = Store::in_memory();
     let ns = namespace(store, "bank").await;
     let mut writer = Writer::new(ns.clone());
@@ -925,6 +925,6 @@ async fn multi_fact_type_open_reads_one_manifest() {
     index(&ns, &Tokenizer::default(), IndexOptions::default()).await.unwrap();
 
     let node = QueryNode::open(&ns, Tokenizer::default(), Consistency::Strong).await.unwrap();
-    assert_eq!(node.fact_types().len(), 3, "three fact types under one bank");
+    assert_eq!(node.memory_types().len(), 3, "three fact types under one bank");
     assert_eq!(node.doc_count(), 60);
 }

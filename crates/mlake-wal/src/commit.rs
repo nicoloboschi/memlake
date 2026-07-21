@@ -125,17 +125,17 @@ impl Writer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mlake_core::item::Timestamps;
-    use mlake_core::{Item, ItemId};
+    use mlake_core::memory::Timestamps;
+    use mlake_core::{Memory, MemoryId};
     use mlake_store::Store;
     use std::sync::Arc;
 
-    fn item(key: &str) -> Item {
-        Item {
-            id: ItemId::from_key(key),
+    fn item(key: &str) -> Memory {
+        Memory {
+            id: MemoryId::from_key(key),
             vector: vec![0.1, 0.2],
             text: key.to_string(),
-            fact_type: 1,
+            memory_type: 1,
             tags: vec![],
             timestamps: Timestamps::default(),
             proof_count: 0,

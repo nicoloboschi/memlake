@@ -6,8 +6,8 @@
 //! measures only what partitioning costs — the embedding model and the corpus are held
 //! identical between the two sides.
 
-use mlake_core::item::Timestamps;
-use mlake_core::{ItemId, StoredItem};
+use mlake_core::memory::Timestamps;
+use mlake_core::{MemoryId, StoredMemory};
 use mlake_ivf::{build_clusters, exact_search, train_centroids, Centroids, Hit};
 use rand::prelude::*;
 use rand_chacha::ChaCha8Rng;
@@ -15,7 +15,7 @@ use rand_chacha::ChaCha8Rng;
 /// Synthetic corpus with cluster structure, which is what real embeddings look like —
 /// uniform random vectors would make any partitioning look equally good and the gate
 /// meaningless.
-fn corpus(n: usize, dim: usize, seed: u64) -> Vec<StoredItem> {
+fn corpus(n: usize, dim: usize, seed: u64) -> Vec<StoredMemory> {
     let mut rng = ChaCha8Rng::seed_from_u64(seed);
     let n_centres = (n as f64).sqrt() as usize;
     let centres: Vec<Vec<f32>> = (0..n_centres)
@@ -30,11 +30,11 @@ fn corpus(n: usize, dim: usize, seed: u64) -> Vec<StoredItem> {
                 .map(|c| c + rng.gen_range(-0.35..0.35))
                 .collect();
             mlake_core::normalize(&mut v);
-            StoredItem {
-                id: ItemId::from_key(&format!("item-{i}")),
+            StoredMemory {
+                id: MemoryId::from_key(&format!("item-{i}")),
                 vector: v,
                 text: format!("item {i}"),
-                fact_type: 1,
+                memory_type: 1,
                 tags: vec![],
                 timestamps: Timestamps::default(),
                 proof_count: 0,
@@ -59,14 +59,14 @@ fn queries(count: usize, dim: usize, seed: u64) -> Vec<Vec<f32>> {
 
 /// Search by probing `nprobe` clusters and re-ranking exactly over what was fetched.
 fn ivf_search(
-    clusters: &[Vec<StoredItem>],
+    clusters: &[Vec<StoredMemory>],
     centroids: &Centroids,
     query: &[f32],
     k: usize,
     nprobe: usize,
 ) -> Vec<Hit> {
     let probed = centroids.probe(query, nprobe);
-    let mut candidates: Vec<StoredItem> = Vec::new();
+    let mut candidates: Vec<StoredMemory> = Vec::new();
     for c in probed {
         candidates.extend_from_slice(&clusters[c]);
     }
@@ -78,7 +78,7 @@ fn recall_at_k(approx: &[Hit], truth: &[Hit]) -> f64 {
     if truth.is_empty() {
         return 1.0;
     }
-    let found: std::collections::HashSet<ItemId> = approx.iter().map(|h| h.id).collect();
+    let found: std::collections::HashSet<MemoryId> = approx.iter().map(|h| h.id).collect();
     let hits = truth.iter().filter(|t| found.contains(&t.id)).count();
     hits as f64 / truth.len() as f64
 }
@@ -92,7 +92,7 @@ fn measure(n: usize, dim: usize, nprobe: usize, k: usize) -> Measurement {
     let items = corpus(n, dim, 42);
     let vectors: Vec<Vec<f32>> = items.iter().map(|i| i.vector.clone()).collect();
     let centroids = train_centroids(&vectors, 42);
-    let clusters: Vec<Vec<StoredItem>> = build_clusters(items.clone(), &centroids)
+    let clusters: Vec<Vec<StoredMemory>> = build_clusters(items.clone(), &centroids)
         .into_iter()
         .map(|c| c.items)
         .collect();
@@ -154,7 +154,7 @@ fn probing_every_cluster_is_exhaustive() {
     let items = corpus(1_000, 32, 3);
     let vectors: Vec<Vec<f32>> = items.iter().map(|i| i.vector.clone()).collect();
     let centroids = train_centroids(&vectors, 3);
-    let clusters: Vec<Vec<StoredItem>> = build_clusters(items.clone(), &centroids)
+    let clusters: Vec<Vec<StoredMemory>> = build_clusters(items.clone(), &centroids)
         .into_iter()
         .map(|c| c.items)
         .collect();

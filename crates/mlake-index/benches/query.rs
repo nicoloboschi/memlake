@@ -8,8 +8,8 @@
 use std::time::Instant;
 
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
-use mlake_core::item::Timestamps;
-use mlake_core::{ItemId, StoredItem};
+use mlake_core::memory::Timestamps;
+use mlake_core::{MemoryId, StoredMemory};
 use mlake_fts::Tokenizer;
 use mlake_index::{Engine, QueryConfig};
 use rand::prelude::*;
@@ -18,7 +18,7 @@ use rand_chacha::ChaCha8Rng;
 const DIM: usize = 128;
 
 /// A clustered synthetic corpus, so IVF has real structure to work with.
-fn corpus(n: usize, seed: u64) -> Vec<StoredItem> {
+fn corpus(n: usize, seed: u64) -> Vec<StoredMemory> {
     let mut rng = ChaCha8Rng::seed_from_u64(seed);
     let centres = (n as f64).sqrt() as usize;
     let centroids: Vec<Vec<f32>> = (0..centres)
@@ -31,11 +31,11 @@ fn corpus(n: usize, seed: u64) -> Vec<StoredItem> {
             let mut v: Vec<f32> = c.iter().map(|x| x + rng.gen_range(-0.3..0.3)).collect();
             mlake_core::normalize(&mut v);
             let text: String = (0..8).map(|_| *words.choose(&mut rng).unwrap()).collect::<Vec<_>>().join(" ");
-            StoredItem {
-                id: ItemId::from_key(&format!("item-{i}")),
+            StoredMemory {
+                id: MemoryId::from_key(&format!("item-{i}")),
                 vector: v,
                 text,
-                fact_type: 1,
+                memory_type: 1,
                 tags: vec![],
                 timestamps: Timestamps::default(),
                 proof_count: 0,

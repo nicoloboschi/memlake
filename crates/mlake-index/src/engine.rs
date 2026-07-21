@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 
-use mlake_core::{ItemId, StoredItem};
+use mlake_core::{MemoryId, StoredMemory};
 use mlake_fts::{TantivyFts, Tokenizer, TokenizerConfig};
 use mlake_graph::radj::{EdgeKind, InEdge, LinkTypeTag, ReverseAdjacency};
 use mlake_graph::{GraphParams, GraphSource};
@@ -46,22 +46,22 @@ impl Default for QueryConfig {
 pub struct Engine {
     centroids: Centroids,
     /// Cluster i's items, parallel to `centroids.vectors`.
-    clusters: Vec<Vec<StoredItem>>,
+    clusters: Vec<Vec<StoredMemory>>,
     /// All items by id, for graph materialization and result hydration.
-    items: HashMap<ItemId, StoredItem>,
+    items: HashMap<MemoryId, StoredMemory>,
     fts: TantivyFts,
     radj: ReverseAdjacency,
-    entity_index: HashMap<u64, Vec<ItemId>>,
+    entity_index: HashMap<u64, Vec<MemoryId>>,
 }
 
 impl Engine {
     /// Build a generation from a set of items. Mirrors what the indexer does, minus the
     /// S3 write: train centroids, assign clusters, build the FTS index, derive nothing
     /// (semantic links, if any, are already inline on the items).
-    pub fn build(items: Vec<StoredItem>, tokenizer: Tokenizer) -> Self {
+    pub fn build(items: Vec<StoredMemory>, tokenizer: Tokenizer) -> Self {
         let vectors: Vec<Vec<f32>> = items.iter().map(|i| i.vector.clone()).collect();
         let centroids = train_centroids(&vectors, 42);
-        let clusters: Vec<Vec<StoredItem>> = build_clusters(items.clone(), &centroids)
+        let clusters: Vec<Vec<StoredMemory>> = build_clusters(items.clone(), &centroids)
             .into_iter()
             .map(|c| c.items)
             .collect();
@@ -76,8 +76,8 @@ impl Engine {
         let _ = tokenizer;
 
         let mut map = HashMap::new();
-        let mut entity_index: HashMap<u64, Vec<ItemId>> = HashMap::new();
-        let mut radj_pairs: Vec<(ItemId, InEdge)> = Vec::new();
+        let mut entity_index: HashMap<u64, Vec<MemoryId>> = HashMap::new();
+        let mut radj_pairs: Vec<(MemoryId, InEdge)> = Vec::new();
 
         for item in &items {
             for e in &item.entity_ids {
@@ -129,12 +129,12 @@ impl Engine {
     }
 
     /// The vector arm: probe clusters, re-rank exactly, return a ranked id list.
-    pub fn vector_arm(&self, query: &[f32], depth: usize, nprobe: usize) -> Vec<ItemId> {
+    pub fn vector_arm(&self, query: &[f32], depth: usize, nprobe: usize) -> Vec<MemoryId> {
         if self.centroids.is_empty() {
             return Vec::new();
         }
         let probed = self.centroids.probe(query, nprobe);
-        let mut candidates: Vec<StoredItem> = Vec::new();
+        let mut candidates: Vec<StoredMemory> = Vec::new();
         for c in probed {
             candidates.extend_from_slice(&self.clusters[c]);
         }
@@ -145,7 +145,7 @@ impl Engine {
     }
 
     /// The FTS arm: tantivy BM25 over the split (standard k1=1.2, b=0.75).
-    pub fn fts_arm(&self, query_text: &str, depth: usize) -> Vec<ItemId> {
+    pub fn fts_arm(&self, query_text: &str, depth: usize) -> Vec<MemoryId> {
         self.fts
             .search(query_text, depth)
             .into_iter()
@@ -154,11 +154,11 @@ impl Engine {
     }
 
     /// The graph arm: link expansion from vector-chosen seeds.
-    pub fn graph_arm(&self, query: &[f32], depth: usize, nprobe: usize) -> Vec<ItemId> {
+    pub fn graph_arm(&self, query: &[f32], depth: usize, nprobe: usize) -> Vec<MemoryId> {
         // Seeds are the vector arm's top hits, materialized to full records so their
         // inline links are available (SPEC §7.1).
         let seed_ids = self.vector_arm(query, 20, nprobe);
-        let seeds: Vec<StoredItem> = seed_ids
+        let seeds: Vec<StoredMemory> = seed_ids
             .iter()
             .filter_map(|id| self.items.get(id).cloned())
             .collect();
@@ -229,19 +229,19 @@ impl Engine {
     }
 
     /// Resolve an id to its item, for hydrating results.
-    pub fn item(&self, id: &ItemId) -> Option<&StoredItem> {
+    pub fn item(&self, id: &MemoryId) -> Option<&StoredMemory> {
         self.items.get(id)
     }
 }
 
 impl GraphSource for Engine {
-    fn entity_candidates(&self, entity_id: u64, fact_type: Option<u8>, cap: usize) -> Vec<ItemId> {
+    fn entity_candidates(&self, entity_id: u64, memory_type: Option<u8>, cap: usize) -> Vec<MemoryId> {
         self.entity_index
             .get(&entity_id)
             .into_iter()
             .flatten()
-            .filter(|id| match (fact_type, self.items.get(id)) {
-                (Some(ft), Some(item)) => item.fact_type == ft,
+            .filter(|id| match (memory_type, self.items.get(id)) {
+                (Some(ft), Some(item)) => item.memory_type == ft,
                 _ => true,
             })
             .take(cap)
@@ -249,11 +249,11 @@ impl GraphSource for Engine {
             .collect()
     }
 
-    fn item(&self, id: &ItemId) -> Option<StoredItem> {
+    fn item(&self, id: &MemoryId) -> Option<StoredMemory> {
         self.items.get(id).cloned()
     }
 
-    fn incoming(&self, target: &ItemId) -> Vec<InEdge> {
+    fn incoming(&self, target: &MemoryId) -> Vec<InEdge> {
         self.radj.incoming(target).to_vec()
     }
 }
@@ -261,14 +261,14 @@ impl GraphSource for Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mlake_core::item::Timestamps;
+    use mlake_core::memory::Timestamps;
 
-    fn item(key: &str, vector: Vec<f32>, text: &str) -> StoredItem {
-        StoredItem {
-            id: ItemId::from_key(key),
+    fn item(key: &str, vector: Vec<f32>, text: &str) -> StoredMemory {
+        StoredMemory {
+            id: MemoryId::from_key(key),
             vector,
             text: text.to_string(),
-            fact_type: 1,
+            memory_type: 1,
             tags: vec![],
             timestamps: Timestamps::default(),
             proof_count: 0,
@@ -292,14 +292,14 @@ mod tests {
     fn vector_arm_ranks_by_similarity() {
         let e = engine();
         let hits = e.vector_arm(&[1.0, 0.0, 0.0], 10, 8);
-        assert_eq!(hits[0], ItemId::from_key("cats"));
+        assert_eq!(hits[0], MemoryId::from_key("cats"));
     }
 
     #[test]
     fn fts_arm_matches_text() {
         let e = engine();
         let hits = e.fts_arm("loyal canine", 10);
-        assert_eq!(hits[0], ItemId::from_key("dogs"));
+        assert_eq!(hits[0], MemoryId::from_key("dogs"));
     }
 
     #[test]
@@ -312,23 +312,23 @@ mod tests {
             10,
             QueryConfig::default(),
         );
-        let top2: Vec<ItemId> = fused.iter().take(2).map(|h| h.id).collect();
-        assert!(top2.contains(&ItemId::from_key("cats")));
-        assert!(top2.contains(&ItemId::from_key("dogs")));
+        let top2: Vec<MemoryId> = fused.iter().take(2).map(|h| h.id).collect();
+        assert!(top2.contains(&MemoryId::from_key("cats")));
+        assert!(top2.contains(&MemoryId::from_key("dogs")));
     }
 
     #[test]
     fn pure_vector_query_ignores_missing_text() {
         let e = engine();
         let fused = e.query(Some(&[0.0, 0.0, 1.0]), None, 10, QueryConfig::default());
-        assert_eq!(fused[0].id, ItemId::from_key("cars"));
+        assert_eq!(fused[0].id, MemoryId::from_key("cars"));
     }
 
     #[test]
     fn pure_text_query_ignores_missing_vector() {
         let e = engine();
         let fused = e.query(None, Some("swim water tanks"), 10, QueryConfig::default());
-        assert_eq!(fused[0].id, ItemId::from_key("fish"));
+        assert_eq!(fused[0].id, MemoryId::from_key("fish"));
     }
 
     #[test]

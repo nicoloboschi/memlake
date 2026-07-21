@@ -13,7 +13,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use mlake_core::{ItemId, StoredItem};
+use mlake_core::{MemoryId, StoredMemory};
 use mlake_fts::{TantivyFts, Tokenizer};
 use mlake_graph::radj::InEdge;
 use mlake_graph::{GraphParams, GraphSource};
@@ -43,7 +43,7 @@ struct FactTypeState {
     gen_fts: TantivyFts,
     radj: RadjTable,
     pk: PkTable,
-    tail_items: Vec<StoredItem>,
+    tail_items: Vec<StoredMemory>,
     tail_fts: TantivyFts,
     doc_count: usize,
 }
@@ -51,8 +51,8 @@ struct FactTypeState {
 /// A loaded, queryable snapshot of a bank namespace across its fact types.
 pub struct QueryNode {
     ns: Namespace,
-    per_ft: BTreeMap<u8, FactTypeState>,
-    tombstones: HashSet<ItemId>,
+    per_type: BTreeMap<u8, FactTypeState>,
+    tombstones: HashSet<MemoryId>,
     /// The WAL sequence this snapshot reflects.
     pub through_seq: u64,
     /// Roundtrips consumed opening this snapshot (loading the metadata), for the budget.
@@ -81,18 +81,18 @@ impl QueryNode {
         let scan = WalTail::new(ns)
             .scan(manifest.wal_index_cursor, Some(head))
             .await?;
-        let tombstones: HashSet<ItemId> = scan.tombstones.iter().copied().collect();
-        let mut tail_by_ft: BTreeMap<u8, Vec<StoredItem>> = BTreeMap::new();
+        let tombstones: HashSet<MemoryId> = scan.tombstones.iter().copied().collect();
+        let mut tail_by_ft: BTreeMap<u8, Vec<StoredMemory>> = BTreeMap::new();
         for item in scan.upserts.into_values() {
-            tail_by_ft.entry(item.fact_type).or_default().push(item);
+            tail_by_ft.entry(item.memory_type).or_default().push(item);
         }
 
         // Fact types to load: those with an index, plus any that appear only in the tail.
-        let mut fact_types: HashSet<u8> = manifest.fact_types().collect();
-        fact_types.extend(tail_by_ft.keys().copied());
+        let mut memory_types: HashSet<u8> = manifest.memory_types().collect();
+        memory_types.extend(tail_by_ft.keys().copied());
 
-        let mut per_ft = BTreeMap::new();
-        for ft in fact_types {
+        let mut per_type = BTreeMap::new();
+        for ft in memory_types {
             let tail_items = tail_by_ft.remove(&ft).unwrap_or_default();
             let tail_fts = TantivyFts::build(
                 tail_items.iter().map(|i| (i.id, i.text.as_str())),
@@ -147,7 +147,7 @@ impl QueryNode {
                         centroids: Centroids::default(),
                         cluster_paths: Vec::new(),
                         gen_fts: TantivyFts::build(
-                            std::iter::empty::<(ItemId, &str)>(),
+                            std::iter::empty::<(MemoryId, &str)>(),
                             tokenizer.clone(),
                         )?,
                         radj: RadjTable::open(&[0u8; 16], String::new())?,
@@ -158,12 +158,12 @@ impl QueryNode {
                     }
                 }
             };
-            per_ft.insert(ft, state);
+            per_type.insert(ft, state);
         }
 
         Ok(Self {
             ns: ns.clone(),
-            per_ft,
+            per_type,
             tombstones,
             through_seq: head,
             load_roundtrips: metrics.roundtrips(),
@@ -172,44 +172,44 @@ impl QueryNode {
 
     /// Total live items across all fact types.
     pub fn doc_count(&self) -> usize {
-        self.per_ft.values().map(|s| s.doc_count).sum()
+        self.per_type.values().map(|s| s.doc_count).sum()
     }
 
     /// Live items of one fact type.
-    pub fn doc_count_of(&self, fact_type: u8) -> usize {
-        self.per_ft.get(&fact_type).map(|s| s.doc_count).unwrap_or(0)
+    pub fn doc_count_of(&self, memory_type: u8) -> usize {
+        self.per_type.get(&memory_type).map(|s| s.doc_count).unwrap_or(0)
     }
 
     /// Fact types this snapshot can answer.
-    pub fn fact_types(&self) -> Vec<u8> {
-        self.per_ft.keys().copied().collect()
+    pub fn memory_types(&self) -> Vec<u8> {
+        self.per_type.keys().copied().collect()
     }
 
     /// Answer a query for a single fact type. Returns an empty list if the bank has no such
     /// fact type. (Fact types share nothing, so callers query each and keep them grouped.)
     pub async fn query(
         &self,
-        fact_type: u8,
+        memory_type: u8,
         vector: Option<&[f32]>,
         text: Option<&str>,
         top_k: usize,
         config: QueryConfig,
     ) -> Result<Vec<FusedHit>> {
         let metrics = QueryMetrics::new();
-        self.query_metered(fact_type, vector, text, top_k, config, &metrics).await
+        self.query_metered(memory_type, vector, text, top_k, config, &metrics).await
     }
 
     /// Like [`query`], but records object-storage usage into `metrics`.
     pub async fn query_metered(
         &self,
-        fact_type: u8,
+        memory_type: u8,
         vector: Option<&[f32]>,
         text: Option<&str>,
         top_k: usize,
         config: QueryConfig,
         metrics: &QueryMetrics,
     ) -> Result<Vec<FusedHit>> {
-        let Some(state) = self.per_ft.get(&fact_type) else {
+        let Some(state) = self.per_type.get(&memory_type) else {
             return Ok(Vec::new());
         };
 
@@ -219,7 +219,7 @@ impl QueryNode {
                 let probed = state.centroids.probe(q, config.nprobe);
                 let mut items = self.fetch_clusters(state, &probed, metrics, 3).await?;
                 items.extend(state.tail_items.iter().cloned());
-                let ranking: Vec<ItemId> = exact_search(&items, q, config.arm_depth)
+                let ranking: Vec<MemoryId> = exact_search(&items, q, config.arm_depth)
                     .into_iter()
                     .map(|h| h.id)
                     .collect();
@@ -251,7 +251,7 @@ impl QueryNode {
         cluster_ids: &[usize],
         metrics: &QueryMetrics,
         roundtrip: usize,
-    ) -> Result<Vec<StoredItem>> {
+    ) -> Result<Vec<StoredMemory>> {
         let futures = cluster_ids.iter().filter_map(|&c| {
             state
                 .cluster_paths
@@ -271,7 +271,7 @@ impl QueryNode {
         Ok(items)
     }
 
-    fn fts_arm(&self, state: &FactTypeState, text: &str, depth: usize) -> Vec<ItemId> {
+    fn fts_arm(&self, state: &FactTypeState, text: &str, depth: usize) -> Vec<MemoryId> {
         let mut hits = state.gen_fts.search(text, depth);
         hits.extend(
             state
@@ -294,15 +294,15 @@ impl QueryNode {
     async fn graph_arm(
         &self,
         state: &FactTypeState,
-        vector_ranking: &[ItemId],
-        probed_items: &[StoredItem],
+        vector_ranking: &[MemoryId],
+        probed_items: &[StoredMemory],
         depth: usize,
         metrics: &QueryMetrics,
-    ) -> Result<Vec<ItemId>> {
-        let mut by_id: HashMap<ItemId, StoredItem> =
+    ) -> Result<Vec<MemoryId>> {
+        let mut by_id: HashMap<MemoryId, StoredMemory> =
             probed_items.iter().map(|i| (i.id, i.clone())).collect();
 
-        let seeds: Vec<StoredItem> = vector_ranking
+        let seeds: Vec<StoredMemory> = vector_ranking
             .iter()
             .take(20)
             .filter_map(|id| by_id.get(id).cloned())
@@ -311,13 +311,13 @@ impl QueryNode {
             return Ok(Vec::new());
         }
 
-        let mut incoming: HashMap<ItemId, Vec<InEdge>> = HashMap::new();
+        let mut incoming: HashMap<MemoryId, Vec<InEdge>> = HashMap::new();
         for seed in &seeds {
             let edges = state.radj.incoming(&self.ns.store, &seed.id, Some((metrics, 4))).await?;
             incoming.insert(seed.id, edges);
         }
 
-        let mut wanted: HashSet<ItemId> = HashSet::new();
+        let mut wanted: HashSet<MemoryId> = HashSet::new();
         for seed in &seeds {
             for e in &seed.semantic_out {
                 wanted.insert(e.target);
@@ -344,7 +344,7 @@ impl QueryNode {
             }
         }
 
-        let mut entity_index: HashMap<u64, Vec<ItemId>> = HashMap::new();
+        let mut entity_index: HashMap<u64, Vec<MemoryId>> = HashMap::new();
         for item in by_id.values() {
             for e in &item.entity_ids {
                 entity_index.entry(*e).or_default().push(item.id);
@@ -370,9 +370,9 @@ impl QueryNode {
 
 /// Combine the arm rankings with (weighted) RRF.
 fn fuse(
-    vector: &[ItemId],
-    fts: &[ItemId],
-    graph: &[ItemId],
+    vector: &[MemoryId],
+    fts: &[MemoryId],
+    graph: &[MemoryId],
     top_k: usize,
     config: QueryConfig,
 ) -> Vec<FusedHit> {
@@ -394,21 +394,21 @@ fn fuse(
 }
 
 struct LazyGraphSource<'a> {
-    by_id: &'a HashMap<ItemId, StoredItem>,
-    entity_index: &'a HashMap<u64, Vec<ItemId>>,
-    incoming: &'a HashMap<ItemId, Vec<InEdge>>,
-    tombstones: &'a HashSet<ItemId>,
+    by_id: &'a HashMap<MemoryId, StoredMemory>,
+    entity_index: &'a HashMap<u64, Vec<MemoryId>>,
+    incoming: &'a HashMap<MemoryId, Vec<InEdge>>,
+    tombstones: &'a HashSet<MemoryId>,
 }
 
 impl GraphSource for LazyGraphSource<'_> {
-    fn entity_candidates(&self, entity_id: u64, fact_type: Option<u8>, cap: usize) -> Vec<ItemId> {
+    fn entity_candidates(&self, entity_id: u64, memory_type: Option<u8>, cap: usize) -> Vec<MemoryId> {
         self.entity_index
             .get(&entity_id)
             .into_iter()
             .flatten()
             .filter(|id| !self.tombstones.contains(id))
-            .filter(|id| match (fact_type, self.by_id.get(id)) {
-                (Some(ft), Some(item)) => item.fact_type == ft,
+            .filter(|id| match (memory_type, self.by_id.get(id)) {
+                (Some(ft), Some(item)) => item.memory_type == ft,
                 _ => true,
             })
             .take(cap)
@@ -416,14 +416,14 @@ impl GraphSource for LazyGraphSource<'_> {
             .collect()
     }
 
-    fn item(&self, id: &ItemId) -> Option<StoredItem> {
+    fn item(&self, id: &MemoryId) -> Option<StoredMemory> {
         if self.tombstones.contains(id) {
             return None;
         }
         self.by_id.get(id).cloned()
     }
 
-    fn incoming(&self, target: &ItemId) -> Vec<InEdge> {
+    fn incoming(&self, target: &MemoryId) -> Vec<InEdge> {
         self.incoming.get(target).cloned().unwrap_or_default()
     }
 }

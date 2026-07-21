@@ -5,13 +5,13 @@
 //! without depending on each other.
 
 pub mod id;
-pub mod item;
+pub mod memory;
 pub mod manifest;
 pub mod wal;
 
-pub use id::ItemId;
-pub use item::{
-    CausalEdge, FactType, Item, LinkType, SemanticEdge, StoredItem, Timestamps,
+pub use id::MemoryId;
+pub use memory::{
+    CausalEdge, MemoryType, Memory, LinkType, SemanticEdge, StoredMemory, Timestamps,
     MAX_SEMANTIC_OUT, SEMANTIC_LINK_THRESHOLD,
 };
 pub use manifest::{GenerationFiles, Manifest};

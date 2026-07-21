@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 
-use mlake_core::ItemId;
+use mlake_core::MemoryId;
 
 /// Entity arm: a shared-entity *count* maps to [0, 1) via `tanh(count * 0.5)`.
 ///
@@ -28,9 +28,9 @@ pub fn max_weight(current: f32, candidate: f32) -> f32 {
 /// a candidate surfaced by several arms accumulates them, rewarding convergent evidence.
 #[derive(Default, Clone, Debug)]
 pub struct ScoreAccumulator {
-    entity: HashMap<ItemId, f32>,
-    semantic: HashMap<ItemId, f32>,
-    causal: HashMap<ItemId, f32>,
+    entity: HashMap<MemoryId, f32>,
+    semantic: HashMap<MemoryId, f32>,
+    causal: HashMap<MemoryId, f32>,
 }
 
 impl ScoreAccumulator {
@@ -39,7 +39,7 @@ impl ScoreAccumulator {
     }
 
     /// Record the entity arm's contribution for a candidate: `tanh(count * 0.5)`.
-    pub fn add_entity(&mut self, id: ItemId, shared_count: u32) {
+    pub fn add_entity(&mut self, id: MemoryId, shared_count: u32) {
         // A candidate can be reached from several seeds; the shared-entity count is
         // computed once against the whole seed set, so the last write is authoritative
         // rather than accumulated.
@@ -47,20 +47,20 @@ impl ScoreAccumulator {
     }
 
     /// Record a semantic edge to a candidate, keeping the strongest seen.
-    pub fn add_semantic(&mut self, id: ItemId, weight: f32) {
+    pub fn add_semantic(&mut self, id: MemoryId, weight: f32) {
         let e = self.semantic.entry(id).or_insert(0.0);
         *e = max_weight(*e, weight);
     }
 
     /// Record a causal edge to a candidate, keeping the strongest seen.
-    pub fn add_causal(&mut self, id: ItemId, weight: f32) {
+    pub fn add_causal(&mut self, id: MemoryId, weight: f32) {
         let e = self.causal.entry(id).or_insert(0.0);
         *e = max_weight(*e, weight);
     }
 
     /// Final additive score per candidate, in [0, 3].
-    pub fn merged(&self) -> HashMap<ItemId, f32> {
-        let mut all: HashMap<ItemId, f32> = HashMap::new();
+    pub fn merged(&self) -> HashMap<MemoryId, f32> {
+        let mut all: HashMap<MemoryId, f32> = HashMap::new();
         for (id, s) in &self.entity {
             *all.entry(*id).or_insert(0.0) += s;
         }
@@ -77,9 +77,9 @@ impl ScoreAccumulator {
     ///
     /// Sorted by score descending, ties broken by id so the order is deterministic and
     /// differential-testable against the reference (G-2).
-    pub fn ranked(&self, seeds: &[ItemId], budget: usize) -> Vec<(ItemId, f32)> {
-        let seed_set: std::collections::HashSet<ItemId> = seeds.iter().copied().collect();
-        let mut ranked: Vec<(ItemId, f32)> = self
+    pub fn ranked(&self, seeds: &[MemoryId], budget: usize) -> Vec<(MemoryId, f32)> {
+        let seed_set: std::collections::HashSet<MemoryId> = seeds.iter().copied().collect();
+        let mut ranked: Vec<(MemoryId, f32)> = self
             .merged()
             .into_iter()
             .filter(|(id, _)| !seed_set.contains(id))
@@ -129,7 +129,7 @@ mod tests {
     #[test]
     fn semantic_and_causal_keep_the_maximum_weight() {
         let mut acc = ScoreAccumulator::new();
-        let id = ItemId::from_key("a");
+        let id = MemoryId::from_key("a");
         acc.add_semantic(id, 0.7);
         acc.add_semantic(id, 0.95);
         acc.add_semantic(id, 0.8);
@@ -140,7 +140,7 @@ mod tests {
     fn arms_accumulate_for_convergent_candidates() {
         // A candidate reached by all three arms scores higher than any single arm.
         let mut acc = ScoreAccumulator::new();
-        let id = ItemId::from_key("converged");
+        let id = MemoryId::from_key("converged");
         acc.add_entity(id, 2); // 0.762
         acc.add_semantic(id, 0.9);
         acc.add_causal(id, 0.8);
@@ -152,7 +152,7 @@ mod tests {
     #[test]
     fn merged_score_never_exceeds_three() {
         let mut acc = ScoreAccumulator::new();
-        let id = ItemId::from_key("max");
+        let id = MemoryId::from_key("max");
         acc.add_entity(id, 1000); // → ~1.0
         acc.add_semantic(id, 1.0);
         acc.add_causal(id, 1.0);
@@ -162,8 +162,8 @@ mod tests {
     #[test]
     fn ranking_excludes_seeds() {
         let mut acc = ScoreAccumulator::new();
-        let seed = ItemId::from_key("seed");
-        let cand = ItemId::from_key("cand");
+        let seed = MemoryId::from_key("seed");
+        let cand = MemoryId::from_key("cand");
         acc.add_semantic(seed, 1.0); // seed reached via a link, must still be excluded
         acc.add_semantic(cand, 0.9);
         let ranked = acc.ranked(&[seed], 10);
@@ -174,9 +174,9 @@ mod tests {
     #[test]
     fn ranking_is_score_descending_then_stable() {
         let mut acc = ScoreAccumulator::new();
-        let a = ItemId::from_key("a");
-        let b = ItemId::from_key("b");
-        let c = ItemId::from_key("c");
+        let a = MemoryId::from_key("a");
+        let b = MemoryId::from_key("b");
+        let c = MemoryId::from_key("c");
         acc.add_semantic(a, 0.7);
         acc.add_semantic(b, 0.9);
         acc.add_semantic(c, 0.9); // tie with b
@@ -192,7 +192,7 @@ mod tests {
     fn budget_truncates_the_ranking() {
         let mut acc = ScoreAccumulator::new();
         for i in 0..10 {
-            acc.add_semantic(ItemId::from_key(&format!("i{i}")), 0.7 + i as f32 * 0.01);
+            acc.add_semantic(MemoryId::from_key(&format!("i{i}")), 0.7 + i as f32 * 0.01);
         }
         assert_eq!(acc.ranked(&[], 3).len(), 3);
     }

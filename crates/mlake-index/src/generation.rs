@@ -6,7 +6,7 @@
 //! generation or the entire new one, never a mixture.
 
 use mlake_core::manifest::generation_prefix;
-use mlake_core::{GenerationFiles, StoredItem};
+use mlake_core::{GenerationFiles, StoredMemory};
 use mlake_fts::{TantivyFts, Tokenizer};
 use mlake_ivf::{Centroids, ClusterFile};
 use mlake_store::{QueryMetrics, Store};
@@ -22,7 +22,7 @@ use crate::Result;
 pub struct Generation {
     pub generation: u64,
     pub centroids: Centroids,
-    pub clusters: Vec<Vec<StoredItem>>,
+    pub clusters: Vec<Vec<StoredMemory>>,
 }
 
 /// File names within a generation *attempt* prefix. The prefix is unique per index

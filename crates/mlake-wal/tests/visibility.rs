@@ -6,17 +6,17 @@
 
 use std::sync::Arc;
 
-use mlake_core::item::Timestamps;
-use mlake_core::{Item, ItemId, Op};
+use mlake_core::memory::Timestamps;
+use mlake_core::{Memory, MemoryId, Op};
 use mlake_store::Store;
 use mlake_wal::{Namespace, WalTail, Writer};
 
-fn item(key: &str, proof: u32) -> Item {
-    Item {
-        id: ItemId::from_key(key),
+fn item(key: &str, proof: u32) -> Memory {
+    Memory {
+        id: MemoryId::from_key(key),
         vector: vec![1.0, 0.0, 0.0],
         text: format!("body of {key}"),
-        fact_type: 1,
+        memory_type: 1,
         tags: vec!["tag".into()],
         timestamps: Timestamps::default(),
         proof_count: proof,
@@ -46,7 +46,7 @@ async fn acked_write_is_immediately_visible_without_indexing() {
         .scan_from_manifest(manifest.wal_index_cursor)
         .await
         .unwrap();
-    assert!(scan.upserts.contains_key(&ItemId::from_key("a")));
+    assert!(scan.upserts.contains_key(&MemoryId::from_key("a")));
 }
 
 /// INV-4: a node with no local state returns the same answer. Data lives on S3 alone, so
@@ -78,7 +78,7 @@ async fn a_node_with_no_local_state_sees_all_committed_data() {
 
     assert_eq!(scan.upserts.len(), 5);
     for i in 0..5 {
-        let id = ItemId::from_key(&format!("item-{i}"));
+        let id = MemoryId::from_key(&format!("item-{i}"));
         assert_eq!(scan.upserts[&id].proof_count, i, "item-{i} must round-trip");
     }
 }
@@ -116,7 +116,7 @@ async fn no_committed_write_is_lost_under_concurrency() {
     for w in 0..WRITERS {
         for i in 0..PER_WRITER {
             assert!(
-                scan.upserts.contains_key(&ItemId::from_key(&format!("w{w}-i{i}"))),
+                scan.upserts.contains_key(&MemoryId::from_key(&format!("w{w}-i{i}"))),
                 "w{w}-i{i} was lost"
             );
         }
@@ -134,7 +134,7 @@ async fn state_survives_a_crash_before_indexing() {
     writer.commit(vec![Op::Upsert(item("a", 1))]).await.unwrap();
     writer.commit(vec![Op::Upsert(item("b", 2))]).await.unwrap();
     writer
-        .commit(vec![Op::Tombstone { id: ItemId::from_key("a") }])
+        .commit(vec![Op::Tombstone { id: MemoryId::from_key("a") }])
         .await
         .unwrap();
 
@@ -145,10 +145,10 @@ async fn state_survives_a_crash_before_indexing() {
     let recovered = Namespace::new("ns", Store::new(backing as _));
     let scan = WalTail::new(&recovered).scan(0, None).await.unwrap();
     assert!(
-        scan.is_tombstoned(&ItemId::from_key("a")),
+        scan.is_tombstoned(&MemoryId::from_key("a")),
         "the delete must survive the crash"
     );
-    assert!(scan.upserts.contains_key(&ItemId::from_key("b")));
+    assert!(scan.upserts.contains_key(&MemoryId::from_key("b")));
 }
 
 /// Reading `through_seq` gives a stable snapshot: writes committed afterwards are
@@ -161,9 +161,9 @@ async fn a_bounded_scan_is_a_stable_snapshot() {
     writer.commit(vec![Op::Upsert(item("b", 0))]).await.unwrap();
 
     let snapshot = WalTail::new(&ns).scan(0, Some(first.seq)).await.unwrap();
-    assert!(snapshot.upserts.contains_key(&ItemId::from_key("a")));
+    assert!(snapshot.upserts.contains_key(&MemoryId::from_key("a")));
     assert!(
-        !snapshot.upserts.contains_key(&ItemId::from_key("b")),
+        !snapshot.upserts.contains_key(&MemoryId::from_key("b")),
         "a write past the consistency point must not leak into the snapshot"
     );
 }
@@ -200,5 +200,5 @@ async fn writes_are_durable_on_s3() {
         Store::s3("memlake", Some(&endpoint), "memlake", "memlake123", "us-east-1").unwrap(),
     );
     let scan = WalTail::new(&other).scan(0, None).await.unwrap();
-    assert_eq!(scan.upserts[&ItemId::from_key("s3")].proof_count, 42);
+    assert_eq!(scan.upserts[&MemoryId::from_key("s3")].proof_count, 42);
 }

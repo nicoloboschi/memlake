@@ -15,7 +15,7 @@
 
 use std::collections::BTreeSet;
 
-use mlake_core::{ItemId, StoredItem};
+use mlake_core::{MemoryId, StoredMemory};
 
 use crate::radj::EdgeKind;
 use crate::scorer::ScoreAccumulator;
@@ -24,17 +24,17 @@ use crate::scorer::ScoreAccumulator;
 /// implements this over entity postings, the pk index, and reverse adjacency; tests
 /// implement it over in-memory maps.
 pub trait GraphSource {
-    /// Item ids that mention `entity_id`, filtered to `fact_type` if given, capped at
+    /// Memory ids that mention `entity_id`, filtered to `memory_type` if given, capped at
     /// `cap` candidates. The cap is the bounded posting-prefix read of SPEC §7.2 — it
     /// stops a high-fan-out entity from blowing the budget.
-    fn entity_candidates(&self, entity_id: u64, fact_type: Option<u8>, cap: usize) -> Vec<ItemId>;
+    fn entity_candidates(&self, entity_id: u64, memory_type: Option<u8>, cap: usize) -> Vec<MemoryId>;
 
     /// Materialize an item by id, or `None` if it is tombstoned or absent. This is where
     /// dangling edges become invisible without any cleanup (SPEC §7.7).
-    fn item(&self, id: &ItemId) -> Option<StoredItem>;
+    fn item(&self, id: &MemoryId) -> Option<StoredMemory>;
 
     /// Incoming edges for a target, from reverse adjacency.
-    fn incoming(&self, target: &ItemId) -> Vec<crate::radj::InEdge>;
+    fn incoming(&self, target: &MemoryId) -> Vec<crate::radj::InEdge>;
 }
 
 /// Retrieval parameters. Defaults match SPEC §7.
@@ -62,7 +62,7 @@ impl Default for GraphParams {
 /// A graph-expansion result: a candidate and its additive activation score in [0, 3].
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct GraphResult {
-    pub id: ItemId,
+    pub id: MemoryId,
     pub activation: f32,
 }
 
@@ -72,19 +72,19 @@ pub struct GraphResult {
 /// inline links come for free). Seed ids are excluded from the output.
 pub fn retrieve(
     source: &dyn GraphSource,
-    seeds: &[StoredItem],
+    seeds: &[StoredMemory],
     params: GraphParams,
 ) -> Vec<GraphResult> {
     if seeds.is_empty() {
         return Vec::new();
     }
 
-    let seed_ids: Vec<ItemId> = seeds.iter().map(|s| s.id).collect();
-    let fact_type = seeds.first().map(|s| s.fact_type);
+    let seed_ids: Vec<MemoryId> = seeds.iter().map(|s| s.id).collect();
+    let memory_type = seeds.first().map(|s| s.memory_type);
     let mut acc = ScoreAccumulator::new();
 
     if params.include_entity_arm {
-        expand_entities(source, seeds, fact_type, params.per_entity_cap, &mut acc);
+        expand_entities(source, seeds, memory_type, params.per_entity_cap, &mut acc);
     }
     expand_semantic(source, seeds, &mut acc);
     expand_causal(source, seeds, &mut acc);
@@ -99,25 +99,25 @@ pub fn retrieve(
 /// seed set as a whole.
 fn expand_entities(
     source: &dyn GraphSource,
-    seeds: &[StoredItem],
-    fact_type: Option<u8>,
+    seeds: &[StoredMemory],
+    memory_type: Option<u8>,
     cap: usize,
     acc: &mut ScoreAccumulator,
 ) {
-    // Union of all seed entities. Sorted (StoredItem keeps entity_ids sorted) so shared
+    // Union of all seed entities. Sorted (StoredMemory keeps entity_ids sorted) so shared
     // counting is a linear merge.
     let mut seed_entities: BTreeSet<u64> = BTreeSet::new();
     for seed in seeds {
         seed_entities.extend(seed.entity_ids.iter().copied());
     }
     let seed_entities: Vec<u64> = seed_entities.into_iter().collect();
-    let seed_set: BTreeSet<ItemId> = seeds.iter().map(|s| s.id).collect();
+    let seed_set: BTreeSet<MemoryId> = seeds.iter().map(|s| s.id).collect();
 
     // Gather candidate ids across every seed entity, deduplicated. The per-entity cap is
     // applied to each posting read, not to the union, matching the reference's LATERAL cap.
-    let mut candidates: BTreeSet<ItemId> = BTreeSet::new();
+    let mut candidates: BTreeSet<MemoryId> = BTreeSet::new();
     for entity in &seed_entities {
-        for id in source.entity_candidates(*entity, fact_type, cap) {
+        for id in source.entity_candidates(*entity, memory_type, cap) {
             if !seed_set.contains(&id) {
                 candidates.insert(id);
             }
@@ -138,7 +138,7 @@ fn expand_entities(
 
 /// Semantic arm: seeds' inline outgoing kNN links plus incoming kNN edges from reverse
 /// adjacency. The two directions together mirror the reference's bidirectional check.
-fn expand_semantic(source: &dyn GraphSource, seeds: &[StoredItem], acc: &mut ScoreAccumulator) {
+fn expand_semantic(source: &dyn GraphSource, seeds: &[StoredMemory], acc: &mut ScoreAccumulator) {
     for seed in seeds {
         // Outgoing: free, already inline in the seed record.
         for edge in &seed.semantic_out {
@@ -156,7 +156,7 @@ fn expand_semantic(source: &dyn GraphSource, seeds: &[StoredItem], acc: &mut Sco
 }
 
 /// Causal arm: same mechanics as semantic, over causal edge types.
-fn expand_causal(source: &dyn GraphSource, seeds: &[StoredItem], acc: &mut ScoreAccumulator) {
+fn expand_causal(source: &dyn GraphSource, seeds: &[StoredMemory], acc: &mut ScoreAccumulator) {
     for seed in seeds {
         for edge in &seed.causal_out {
             if source.item(&edge.target).is_some() {
@@ -176,21 +176,21 @@ fn expand_causal(source: &dyn GraphSource, seeds: &[StoredItem], acc: &mut Score
 mod tests {
     use super::*;
     use crate::radj::{InEdge, ReverseAdjacency};
-    use mlake_core::item::{Timestamps, Weight};
+    use mlake_core::memory::{Timestamps, Weight};
     use mlake_core::{CausalEdge, LinkType, SemanticEdge};
     use std::collections::HashMap;
 
     /// A simple in-memory graph source for tests.
     struct MemGraph {
-        items: HashMap<ItemId, StoredItem>,
-        tombstoned: BTreeSet<ItemId>,
-        entity_index: HashMap<u64, Vec<ItemId>>,
+        items: HashMap<MemoryId, StoredMemory>,
+        tombstoned: BTreeSet<MemoryId>,
+        entity_index: HashMap<u64, Vec<MemoryId>>,
         radj: ReverseAdjacency,
     }
 
     impl MemGraph {
-        fn new(items: Vec<StoredItem>, radj_pairs: Vec<(ItemId, InEdge)>) -> Self {
-            let mut entity_index: HashMap<u64, Vec<ItemId>> = HashMap::new();
+        fn new(items: Vec<StoredMemory>, radj_pairs: Vec<(MemoryId, InEdge)>) -> Self {
+            let mut entity_index: HashMap<u64, Vec<MemoryId>> = HashMap::new();
             let mut map = HashMap::new();
             for item in items {
                 for e in &item.entity_ids {
@@ -211,14 +211,14 @@ mod tests {
     }
 
     impl GraphSource for MemGraph {
-        fn entity_candidates(&self, entity_id: u64, fact_type: Option<u8>, cap: usize) -> Vec<ItemId> {
+        fn entity_candidates(&self, entity_id: u64, memory_type: Option<u8>, cap: usize) -> Vec<MemoryId> {
             self.entity_index
                 .get(&entity_id)
                 .into_iter()
                 .flatten()
                 .filter(|id| !self.tombstoned.contains(id))
-                .filter(|id| match (fact_type, self.items.get(id)) {
-                    (Some(ft), Some(item)) => item.fact_type == ft,
+                .filter(|id| match (memory_type, self.items.get(id)) {
+                    (Some(ft), Some(item)) => item.memory_type == ft,
                     _ => true,
                 })
                 .take(cap)
@@ -226,24 +226,24 @@ mod tests {
                 .collect()
         }
 
-        fn item(&self, id: &ItemId) -> Option<StoredItem> {
+        fn item(&self, id: &MemoryId) -> Option<StoredMemory> {
             if self.tombstoned.contains(id) {
                 return None;
             }
             self.items.get(id).cloned()
         }
 
-        fn incoming(&self, target: &ItemId) -> Vec<InEdge> {
+        fn incoming(&self, target: &MemoryId) -> Vec<InEdge> {
             self.radj.incoming(target).to_vec()
         }
     }
 
-    fn item(key: &str, entities: Vec<u64>) -> StoredItem {
-        StoredItem {
-            id: ItemId::from_key(key),
+    fn item(key: &str, entities: Vec<u64>) -> StoredMemory {
+        StoredMemory {
+            id: MemoryId::from_key(key),
             vector: vec![1.0, 0.0],
             text: key.to_string(),
-            fact_type: 1,
+            memory_type: 1,
             tags: vec![],
             timestamps: Timestamps::default(),
             proof_count: 0,
@@ -267,22 +267,22 @@ mod tests {
         let graph = MemGraph::new(vec![seed.clone(), a, b, c], vec![]);
 
         let results = retrieve(&graph, &[seed], GraphParams::default());
-        let by_id: HashMap<ItemId, f32> =
+        let by_id: HashMap<MemoryId, f32> =
             results.iter().map(|r| (r.id, r.activation)).collect();
 
         // A (2 shared) ranks above B (1 shared); C (0 shared) is absent.
-        assert!(by_id[&ItemId::from_key("a")] > by_id[&ItemId::from_key("b")]);
-        assert!(!by_id.contains_key(&ItemId::from_key("c")));
+        assert!(by_id[&MemoryId::from_key("a")] > by_id[&MemoryId::from_key("b")]);
+        assert!(!by_id.contains_key(&MemoryId::from_key("c")));
         // Scores match the tanh table.
-        assert!((by_id[&ItemId::from_key("a")] - 0.762).abs() < 0.01);
-        assert!((by_id[&ItemId::from_key("b")] - 0.462).abs() < 0.01);
+        assert!((by_id[&MemoryId::from_key("a")] - 0.762).abs() < 0.01);
+        assert!((by_id[&MemoryId::from_key("b")] - 0.462).abs() < 0.01);
     }
 
     #[test]
     fn semantic_arm_uses_inline_outgoing_links() {
         let mut seed = item("seed", vec![]);
         seed.semantic_out = vec![SemanticEdge {
-            target: ItemId::from_key("neighbour"),
+            target: MemoryId::from_key("neighbour"),
             weight: Weight::from_f32(0.85),
         }];
         let neighbour = item("neighbour", vec![]);
@@ -290,7 +290,7 @@ mod tests {
 
         let results = retrieve(&graph, &[seed], GraphParams::default());
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].id, ItemId::from_key("neighbour"));
+        assert_eq!(results[0].id, MemoryId::from_key("neighbour"));
         assert!((results[0].activation - 0.85).abs() < 0.01);
     }
 
@@ -301,9 +301,9 @@ mod tests {
         let seed = item("seed", vec![]);
         let source = item("source", vec![]);
         let radj = vec![(
-            ItemId::from_key("seed"),
+            MemoryId::from_key("seed"),
             InEdge {
-                source: ItemId::from_key("source"),
+                source: MemoryId::from_key("source"),
                 kind: EdgeKind::Semantic,
                 weight: 0.9,
             },
@@ -312,7 +312,7 @@ mod tests {
 
         let results = retrieve(&graph, &[seed], GraphParams::default());
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].id, ItemId::from_key("source"));
+        assert_eq!(results[0].id, MemoryId::from_key("source"));
         assert!((results[0].activation - 0.9).abs() < 0.01);
     }
 
@@ -320,7 +320,7 @@ mod tests {
     fn causal_arm_expands_causal_edges() {
         let mut seed = item("seed", vec![]);
         seed.causal_out = vec![CausalEdge {
-            target: ItemId::from_key("effect"),
+            target: MemoryId::from_key("effect"),
             link_type: LinkType::Causes,
             weight: Weight::from_f32(0.75),
         }];
@@ -328,7 +328,7 @@ mod tests {
         let graph = MemGraph::new(vec![seed.clone(), effect], vec![]);
 
         let results = retrieve(&graph, &[seed], GraphParams::default());
-        assert_eq!(results[0].id, ItemId::from_key("effect"));
+        assert_eq!(results[0].id, MemoryId::from_key("effect"));
         assert!((results[0].activation - 0.75).abs() < 0.01);
     }
 
@@ -337,7 +337,7 @@ mod tests {
         // The same candidate is reached by both the entity arm and the semantic arm.
         let mut seed = item("seed", vec![1, 2]);
         seed.semantic_out = vec![SemanticEdge {
-            target: ItemId::from_key("both"),
+            target: MemoryId::from_key("both"),
             weight: Weight::from_f32(0.8),
         }];
         let both = item("both", vec![1, 2]); // shares 2 entities too
@@ -355,11 +355,11 @@ mod tests {
         let mut a = item("a", vec![1]);
         let mut b = item("b", vec![1]);
         a.semantic_out = vec![SemanticEdge {
-            target: ItemId::from_key("b"),
+            target: MemoryId::from_key("b"),
             weight: Weight::from_f32(0.9),
         }];
         b.semantic_out = vec![SemanticEdge {
-            target: ItemId::from_key("a"),
+            target: MemoryId::from_key("a"),
             weight: Weight::from_f32(0.9),
         }];
         let graph = MemGraph::new(vec![a.clone(), b.clone()], vec![]);
@@ -372,12 +372,12 @@ mod tests {
     fn tombstoned_candidates_are_invisible() {
         let mut seed = item("seed", vec![]);
         seed.semantic_out = vec![SemanticEdge {
-            target: ItemId::from_key("deleted"),
+            target: MemoryId::from_key("deleted"),
             weight: Weight::from_f32(0.9),
         }];
         let deleted = item("deleted", vec![]);
         let mut graph = MemGraph::new(vec![seed.clone(), deleted], vec![]);
-        graph.tombstoned.insert(ItemId::from_key("deleted"));
+        graph.tombstoned.insert(MemoryId::from_key("deleted"));
 
         let results = retrieve(&graph, &[seed], GraphParams::default());
         assert!(
@@ -391,7 +391,7 @@ mod tests {
         // Same graph, with and without the entity arm.
         let mut seed = item("seed", vec![1, 2]);
         seed.semantic_out = vec![SemanticEdge {
-            target: ItemId::from_key("sem"),
+            target: MemoryId::from_key("sem"),
             weight: Weight::from_f32(0.9),
         }];
         let entity_only = item("ent", vec![1, 2]);
@@ -399,7 +399,7 @@ mod tests {
         let graph = MemGraph::new(vec![seed.clone(), entity_only, sem], vec![]);
 
         let full = retrieve(&graph, &[seed.clone()], GraphParams::default());
-        assert!(full.iter().any(|r| r.id == ItemId::from_key("ent")));
+        assert!(full.iter().any(|r| r.id == MemoryId::from_key("ent")));
 
         let fallback = retrieve(
             &graph,
@@ -410,8 +410,8 @@ mod tests {
             },
         );
         // The entity-only candidate is gone; the semantic one remains.
-        assert!(!fallback.iter().any(|r| r.id == ItemId::from_key("ent")));
-        assert!(fallback.iter().any(|r| r.id == ItemId::from_key("sem")));
+        assert!(!fallback.iter().any(|r| r.id == MemoryId::from_key("ent")));
+        assert!(fallback.iter().any(|r| r.id == MemoryId::from_key("sem")));
     }
 
     #[test]

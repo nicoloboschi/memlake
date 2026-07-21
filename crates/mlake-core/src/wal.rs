@@ -6,8 +6,8 @@
 
 use rkyv::{Archive, Deserialize, Serialize};
 
-use crate::id::ItemId;
-use crate::item::Item;
+use crate::id::MemoryId;
+use crate::memory::Memory;
 
 /// Alignment rkyv requires to read an archived `WalEntry` in place.
 const ARCHIVE_ALIGNMENT: usize = 8;
@@ -25,9 +25,9 @@ pub enum Delta {
 #[derive(Archive, Deserialize, Serialize, Clone, PartialEq, Debug)]
 #[archive(check_bytes)]
 pub enum Op {
-    Upsert(Item),
-    Tombstone { id: ItemId },
-    Patch { id: ItemId, deltas: Vec<Delta> },
+    Upsert(Memory),
+    Tombstone { id: MemoryId },
+    Patch { id: MemoryId, deltas: Vec<Delta> },
     /// Optimistic precondition: the entry is only valid if the WAL head was below this
     /// sequence when it was written. Lets a client express compare-and-set without a lock.
     Guard { expect_seq_lt: u64 },
@@ -88,14 +88,14 @@ pub fn fold_proof_count(start: u32, deltas: impl Iterator<Item = Delta>) -> u32 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::item::Timestamps;
+    use crate::memory::Timestamps;
 
-    fn item(key: &str) -> Item {
-        Item {
-            id: ItemId::from_key(key),
+    fn item(key: &str) -> Memory {
+        Memory {
+            id: MemoryId::from_key(key),
             vector: vec![0.1, 0.2, 0.3],
             text: format!("text for {key}"),
-            fact_type: 1,
+            memory_type: 1,
             tags: vec!["t".into()],
             timestamps: Timestamps::default(),
             proof_count: 0,
@@ -110,9 +110,9 @@ mod tests {
             7,
             vec![
                 Op::Upsert(item("a")),
-                Op::Tombstone { id: ItemId::from_key("b") },
+                Op::Tombstone { id: MemoryId::from_key("b") },
                 Op::Patch {
-                    id: ItemId::from_key("c"),
+                    id: MemoryId::from_key("c"),
                     deltas: vec![Delta::ProofCount(1)],
                 },
                 Op::Guard { expect_seq_lt: 9 },

@@ -16,8 +16,8 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use mlake_core::item::Timestamps;
-use mlake_core::{ItemId, StoredItem};
+use mlake_core::memory::Timestamps;
+use mlake_core::{MemoryId, StoredMemory};
 use mlake_fts::Tokenizer;
 use mlake_index::{Engine, QueryConfig};
 use serde::Serialize;
@@ -93,19 +93,19 @@ fn main() -> Result<()> {
         corpus_ids.len()
     );
 
-    // Assemble stored items. The ItemId is derived from the external id so results can be
+    // Assemble stored items. The MemoryId is derived from the external id so results can be
     // mapped back for scoring.
     let mut items = Vec::with_capacity(corpus_vecs.rows);
-    let mut id_to_ext: HashMap<ItemId, String> = HashMap::new();
+    let mut id_to_ext: HashMap<MemoryId, String> = HashMap::new();
     for (i, ext_id) in corpus_ids.iter().enumerate() {
-        let item_id = ItemId::from_key(ext_id);
+        let item_id = MemoryId::from_key(ext_id);
         id_to_ext.insert(item_id, ext_id.clone());
         let text = doc_text.get(ext_id).cloned().unwrap_or_default();
-        items.push(StoredItem {
+        items.push(StoredMemory {
             id: item_id,
             vector: corpus_vecs.row(i).to_vec(),
             text,
-            fact_type: 1,
+            memory_type: 1,
             tags: vec![],
             timestamps: Timestamps::default(),
             proof_count: 0,
@@ -196,7 +196,7 @@ fn run_arm(
     qtext: Option<&str>,
     config: &QueryConfig,
     qid: &str,
-    id_to_ext: &HashMap<ItemId, String>,
+    id_to_ext: &HashMap<MemoryId, String>,
     arm: &mut ArmRun,
 ) {
     let start = Instant::now();
@@ -215,11 +215,11 @@ fn run_arm(
 /// Brute force O(N²): fine at BEIR scale (a few seconds), and the indexer would use the
 /// warm IVF index for this in production. Written to keep the accuracy demonstration
 /// self-contained rather than to be fast.
-fn derive_semantic_links(items: &mut [StoredItem]) {
-    use mlake_core::item::{SemanticEdge, Weight, MAX_SEMANTIC_OUT, SEMANTIC_LINK_THRESHOLD};
+fn derive_semantic_links(items: &mut [StoredMemory]) {
+    use mlake_core::memory::{SemanticEdge, Weight, MAX_SEMANTIC_OUT, SEMANTIC_LINK_THRESHOLD};
 
     let vectors: Vec<Vec<f32>> = items.iter().map(|i| i.vector.clone()).collect();
-    let ids: Vec<ItemId> = items.iter().map(|i| i.id).collect();
+    let ids: Vec<MemoryId> = items.iter().map(|i| i.id).collect();
 
     for (i, item) in items.iter_mut().enumerate() {
         let mut neighbours: Vec<(usize, f32)> = Vec::new();

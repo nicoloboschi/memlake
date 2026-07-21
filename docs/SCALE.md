@@ -39,10 +39,10 @@ that touches the whole generation per query or per fold.
 ## Two gaps that only appear at this scale
 
 4. **Filtered ANN — the biggest genuinely-missing piece.** Every real query filters (bank,
-   fact_type, tags, time). Post-filtering IVF collapses at 10M with a selective filter:
+   memory_type, tags, time). Post-filtering IVF collapses at 10M with a selective filter:
    nprobe=8 → ~25k candidates → ~250 survive a 1% tag filter → filtered recall dies, and
    cranking nprobe blows the byte budget. Fix, in order:
-   - (a) **partition IVF by fact_type** — retrieval is per-fact_type anyway, so this is free
+   - (a) **partition IVF by memory_type** — retrieval is per-memory_type anyway, so this is free
      selectivity; → **Phase 4a.**
    - (b) per-generation **tag/time roaring bitmaps**, intersected *before* cluster fetch so
      the planner skips zero-match clusters and raises nprobe cheaply when selective; → **4b.**
@@ -96,18 +96,18 @@ writes, range-readable secondary structures, filtered ANN, and priced benchmarks
 
 ### Phase 4 — filtered ANN (requirements locked)
 
-Hindsight workload: a **bank** = namespace_id; within a bank each **fact_type** is a fully
+Hindsight workload: a **bank** = namespace_id; within a bank each **memory_type** is a fully
 independent index (no shared links, vectors, or postings). The API passes
-`bank_id + [fact_types]`; keeping them under one namespace is a round-trip optimization.
+`bank_id + [memory_types]`; keeping them under one namespace is a round-trip optimization.
 The only filter (for now — temporal deferred) is **tags** with a `tags_match` mode.
 
 Decisions:
-- **fact_type = sub-index under one bank manifest + WAL.** The manifest maps
-  `fact_type → GenerationFiles`; one WAL per bank, items carry their fact_type; the indexer
-  folds once, partitions by fact_type, builds an independent generation per type. A
+- **memory_type = sub-index under one bank manifest + WAL.** The manifest maps
+  `memory_type → GenerationFiles`; one WAL per bank, items carry their memory_type; the indexer
+  folds once, partitions by memory_type, builds an independent generation per type. A
   `bank + [ft…]` query reads one manifest (RT1), then fans out per-type in parallel, staying
   inside the 4-roundtrip budget.
-- **Results grouped by fact_type** — a separate ranked list per requested type; no
+- **Results grouped by memory_type** — a separate ranked list per requested type; no
   cross-type fusion.
 - **All five `tags_match` modes**: `any`, `all`, `any_strict`, `all_strict`, `exact`.
   - any/all include untagged; the `_strict` variants exclude untagged; `exact` is tag-set
@@ -117,9 +117,14 @@ Decisions:
   planner probes only clusters that can match and scales nprobe cheaply. Tags also become a
   tantivy field for the FTS arm.
 
-Sub-sequence: **4.0** fact_type sub-index refactor · **4a** tags correctness (5 modes,
-inline filter + tantivy field) · **4b** selective pruning (per-cluster summaries +
-tag→cluster posting).
+Sub-sequence:
+- **4.0 — DONE** — memory_type sub-index refactor: manifest maps `memory_type →
+  MemoryTypeIndex`; one WAL per bank; the indexer folds once, partitions by memory_type,
+  builds an independent generation per type under `{ns}/mt{n}/gen-{G}-{nonce}/`; the query
+  node answers per memory_type (grouped). Tests: two types in one bank stay disjoint; a
+  multi-type bank opens with one manifest read.
+- **4a** — tags correctness (5 modes, inline filter + tantivy field).
+- **4b** — selective pruning (per-cluster tag summaries + tag→cluster posting).
 
 - **Phase 5** — cost metrics in the bench harness, gated.
 - **Phase 6** — scheduled compaction + purge SLA.

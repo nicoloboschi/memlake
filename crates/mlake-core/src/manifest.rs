@@ -47,7 +47,7 @@ impl GenerationFiles {
     }
 }
 
-/// One fact_type's independent index within a bank. Fact types share nothing — no links,
+/// One memory_type's independent index within a bank. Fact types share nothing — no links,
 /// vectors, or postings — so each carries its own generation files and its own assign-only
 /// retrain state (SCALE.md Phase 4).
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug, Default)]
@@ -56,7 +56,7 @@ pub struct FactTypeIndex {
     /// The previous generation's files for this fact type, retained as the GC grace window.
     #[serde(default)]
     pub prev_files: Option<GenerationFiles>,
-    /// Item count when this fact type's centroids were last trained (assign-only trigger).
+    /// Memory count when this fact type's centroids were last trained (assign-only trigger).
     #[serde(default)]
     pub train_count: u64,
 }
@@ -114,12 +114,12 @@ impl Manifest {
     }
 
     /// This fact type's index, or `None` if the bank has never indexed that type.
-    pub fn index(&self, fact_type: u8) -> Option<&FactTypeIndex> {
-        self.indexes.get(&fact_type)
+    pub fn index(&self, memory_type: u8) -> Option<&FactTypeIndex> {
+        self.indexes.get(&memory_type)
     }
 
     /// The fact types this bank currently has an index for.
-    pub fn fact_types(&self) -> impl Iterator<Item = u8> + '_ {
+    pub fn memory_types(&self) -> impl Iterator<Item = u8> + '_ {
         self.indexes.keys().copied()
     }
 

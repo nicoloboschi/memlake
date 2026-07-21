@@ -57,7 +57,7 @@ pub async fn gc_with_min_age(ns: &Namespace, min_age: Duration) -> Result<GcOutc
     let cutoff = chrono::Utc::now() - chrono::Duration::from_std(min_age).unwrap_or_default();
 
     // Collect unreferenced generation objects that are old enough to be safe. Generation
-    // files live at `{ns}/ft{ft}/gen-{G}-{nonce}/…`; the WAL is `{ns}/wal/…` and the
+    // files live at `{ns}/mt{ft}/gen-{G}-{nonce}/…`; the WAL is `{ns}/wal/…` and the
     // manifest is `{ns}/manifest.json`, neither of which contains `/gen-`. So a generation
     // object is any listed path under the namespace containing `/gen-`.
     let ns_prefix = format!("{}/", ns.name);

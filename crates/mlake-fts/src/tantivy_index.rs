@@ -12,7 +12,7 @@
 
 use std::path::Path;
 
-use mlake_core::ItemId;
+use mlake_core::MemoryId;
 use tantivy::collector::TopDocs;
 use tantivy::query::{BooleanQuery, Occur, Query, TermQuery};
 use tantivy::schema::{
@@ -28,7 +28,7 @@ use crate::tokenizer::{Field, Tokenizer};
 /// fusion and the benchmark are unaffected by which backend produced it.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct FtsHit {
-    pub id: ItemId,
+    pub id: MemoryId,
     pub score: f32,
 }
 
@@ -97,7 +97,7 @@ pub struct TantivyFts {
 impl TantivyFts {
     /// Build an index over `(id, text)` documents, tokenizing each with the shared chain.
     pub fn build<'a>(
-        docs: impl IntoIterator<Item = (ItemId, &'a str)>,
+        docs: impl IntoIterator<Item = (MemoryId, &'a str)>,
         tokenizer: Tokenizer,
     ) -> tantivy::Result<Self> {
         let (schema, fields) = build_schema();
@@ -220,7 +220,7 @@ impl TantivyFts {
             if let Some(id_str) = doc.get_first(self.schema_fields.id).and_then(|v| v.as_str()) {
                 if let Ok(uuid) = Uuid::parse_str(id_str) {
                     hits.push(FtsHit {
-                        id: ItemId::from(uuid),
+                        id: MemoryId::from(uuid),
                         score,
                     });
                 }
@@ -285,8 +285,8 @@ mod tests {
     use crate::tokenizer::Tokenizer;
 
     fn build(docs: &[(&str, &str)]) -> TantivyFts {
-        let items: Vec<(ItemId, &str)> =
-            docs.iter().map(|(id, text)| (ItemId::from_key(id), *text)).collect();
+        let items: Vec<(MemoryId, &str)> =
+            docs.iter().map(|(id, text)| (MemoryId::from_key(id), *text)).collect();
         TantivyFts::build(items, Tokenizer::default()).unwrap()
     }
 
@@ -298,16 +298,16 @@ mod tests {
             ("c", "the fox and the dog"),
         ]);
         let ids: Vec<_> = idx.search("fox", 10).into_iter().map(|h| h.id).collect();
-        assert!(ids.contains(&ItemId::from_key("a")));
-        assert!(ids.contains(&ItemId::from_key("c")));
-        assert!(!ids.contains(&ItemId::from_key("b")));
+        assert!(ids.contains(&MemoryId::from_key("a")));
+        assert!(ids.contains(&MemoryId::from_key("c")));
+        assert!(!ids.contains(&MemoryId::from_key("b")));
     }
 
     #[test]
     fn rarer_terms_score_higher() {
         let idx = build(&[("common", "the the the the"), ("rare", "the unicorn")]);
         let hits = idx.search("the unicorn", 10);
-        assert_eq!(hits[0].id, ItemId::from_key("rare"), "idf should favour the rare match");
+        assert_eq!(hits[0].id, MemoryId::from_key("rare"), "idf should favour the rare match");
     }
 
     #[test]
@@ -317,7 +317,7 @@ mod tests {
             ("other", "the weather is nice today"),
         ]);
         let hits = idx.search("北京大学", 10);
-        assert_eq!(hits[0].id, ItemId::from_key("cn"));
+        assert_eq!(hits[0].id, MemoryId::from_key("cn"));
     }
 
     #[test]
@@ -326,7 +326,7 @@ mod tests {
         let idx = build(&[("doc", "我在学习中文和数学")]);
         let hits = idx.search("數學", 10);
         assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].id, ItemId::from_key("doc"));
+        assert_eq!(hits[0].id, MemoryId::from_key("doc"));
     }
 
     #[test]
@@ -334,7 +334,7 @@ mod tests {
         let idx = build(&[("target", "购买闪迪存储卡"), ("noise", "今天天气很好")]);
         let hits = idx.search("存储卡", 10);
         assert!(!hits.is_empty());
-        assert_eq!(hits[0].id, ItemId::from_key("target"));
+        assert_eq!(hits[0].id, MemoryId::from_key("target"));
     }
 
     #[test]

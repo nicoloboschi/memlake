@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 
-use mlake_core::ItemId;
+use mlake_core::MemoryId;
 
 /// The RRF constant. 60 is the value from the original Cormack et al. paper and the spec
 /// default; a larger k flattens the contribution of top ranks, a smaller k sharpens it.
@@ -18,14 +18,14 @@ pub const DEFAULT_RRF_K: f32 = 60.0;
 /// sorted best-first.
 pub struct RankedArm<'a> {
     pub name: &'a str,
-    pub ranking: &'a [ItemId],
+    pub ranking: &'a [MemoryId],
 }
 
 /// A fused result: a document and its combined RRF score, plus which arms contributed and
 /// the arm scores for debugging and the API response.
 #[derive(Clone, Debug, PartialEq)]
 pub struct FusedHit {
-    pub id: ItemId,
+    pub id: MemoryId,
     pub score: f32,
     /// Per-arm reciprocal-rank contributions, for explainability.
     pub contributions: Vec<(String, f32)>,
@@ -36,8 +36,8 @@ pub struct FusedHit {
 /// A document present in more than one arm accumulates a contribution from each, which is
 /// the whole point: agreement across arms is the signal RRF rewards.
 pub fn rrf(arms: &[RankedArm<'_>], k: f32, top_k: usize) -> Vec<FusedHit> {
-    let mut scores: HashMap<ItemId, f32> = HashMap::new();
-    let mut contributions: HashMap<ItemId, Vec<(String, f32)>> = HashMap::new();
+    let mut scores: HashMap<MemoryId, f32> = HashMap::new();
+    let mut contributions: HashMap<MemoryId, Vec<(String, f32)>> = HashMap::new();
 
     for arm in arms {
         for (rank, id) in arm.ranking.iter().enumerate() {
@@ -80,8 +80,8 @@ pub fn weighted_rrf(
     k: f32,
     top_k: usize,
 ) -> Vec<FusedHit> {
-    let mut scores: HashMap<ItemId, f32> = HashMap::new();
-    let mut contributions: HashMap<ItemId, Vec<(String, f32)>> = HashMap::new();
+    let mut scores: HashMap<MemoryId, f32> = HashMap::new();
+    let mut contributions: HashMap<MemoryId, Vec<(String, f32)>> = HashMap::new();
 
     for (arm, weight) in arms {
         for (rank, id) in arm.ranking.iter().enumerate() {
@@ -116,8 +116,8 @@ pub fn weighted_rrf(
 mod tests {
     use super::*;
 
-    fn id(k: &str) -> ItemId {
-        ItemId::from_key(k)
+    fn id(k: &str) -> MemoryId {
+        MemoryId::from_key(k)
     }
 
     #[test]

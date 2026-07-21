@@ -13,7 +13,7 @@
 //! So a point lookup is "cached index binary-search + one ranged GET", independent of the
 //! table's size — the same discipline as the cluster files.
 
-use mlake_core::ItemId;
+use mlake_core::MemoryId;
 use mlake_store::{QueryMetrics, Store};
 
 use crate::{Error, Result};
@@ -171,7 +171,7 @@ impl SsTableIndex {
         &self,
         store: &Store,
         data_path: &str,
-        key: &ItemId,
+        key: &MemoryId,
         ctx: Option<(&QueryMetrics, usize)>,
     ) -> Result<Option<Vec<u8>>> {
         let Some(block) = self.block_for(&key.0) else {
@@ -219,7 +219,7 @@ pub struct PkTable {
 
 impl PkTable {
     /// Build the two objects from id→cluster entries (any order; sorted here).
-    pub fn build(mut entries: Vec<(ItemId, u32)>) -> (Vec<u8>, Vec<u8>) {
+    pub fn build(mut entries: Vec<(MemoryId, u32)>) -> (Vec<u8>, Vec<u8>) {
         entries.sort_by(|a, b| a.0.cmp(&b.0));
         let mut b = SsTableBuilder::new();
         for (id, cluster) in entries {
@@ -243,7 +243,7 @@ impl PkTable {
     pub async fn lookup(
         &self,
         store: &Store,
-        id: &ItemId,
+        id: &MemoryId,
         ctx: Option<(&QueryMetrics, usize)>,
     ) -> Result<Option<u32>> {
         Ok(self
@@ -263,7 +263,7 @@ pub struct RadjTable {
 
 impl RadjTable {
     /// Build from `(target, edge)` pairs (any order; grouped and sorted here).
-    pub fn build(mut pairs: Vec<(ItemId, InEdge)>) -> (Vec<u8>, Vec<u8>) {
+    pub fn build(mut pairs: Vec<(MemoryId, InEdge)>) -> (Vec<u8>, Vec<u8>) {
         pairs.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.source.cmp(&b.1.source)));
         let mut b = SsTableBuilder::new();
         let mut i = 0;
@@ -296,7 +296,7 @@ impl RadjTable {
     pub async fn incoming(
         &self,
         store: &Store,
-        target: &ItemId,
+        target: &MemoryId,
         ctx: Option<(&QueryMetrics, usize)>,
     ) -> Result<Vec<InEdge>> {
         match self.index.get(store, &self.data_path, target, ctx).await? {
@@ -348,7 +348,7 @@ fn decode_edges(bytes: &[u8]) -> Vec<InEdge> {
             })
         };
         edges.push(InEdge {
-            source: ItemId(source),
+            source: MemoryId(source),
             kind,
             weight,
         });
@@ -365,7 +365,7 @@ mod tests {
     async fn point_lookups_hit_the_right_block() {
         let mut b = SsTableBuilder::new();
         // Many records so the table spans several blocks.
-        let mut keys: Vec<ItemId> = (0..5000).map(|i| ItemId::from_key(&format!("k{i:05}"))).collect();
+        let mut keys: Vec<MemoryId> = (0..5000).map(|i| MemoryId::from_key(&format!("k{i:05}"))).collect();
         keys.sort();
         for (i, k) in keys.iter().enumerate() {
             b.add(k.0, format!("value-{i}").as_bytes());
@@ -388,7 +388,7 @@ mod tests {
     #[tokio::test]
     async fn absent_keys_return_none() {
         let mut b = SsTableBuilder::new();
-        let mut keys: Vec<ItemId> = (0..100).map(|i| ItemId::from_key(&format!("k{i}"))).collect();
+        let mut keys: Vec<MemoryId> = (0..100).map(|i| MemoryId::from_key(&format!("k{i}"))).collect();
         keys.sort();
         for k in &keys {
             b.add(k.0, b"x");
@@ -399,7 +399,7 @@ mod tests {
         let idx = SsTableIndex::parse(&idx_bytes).unwrap();
 
         assert!(idx
-            .get(&store, "t.data", &ItemId::from_key("absent"), None)
+            .get(&store, "t.data", &MemoryId::from_key("absent"), None)
             .await
             .unwrap()
             .is_none());
@@ -408,7 +408,7 @@ mod tests {
     #[tokio::test]
     async fn a_lookup_reads_only_one_block_not_the_whole_table() {
         let mut b = SsTableBuilder::new();
-        let mut keys: Vec<ItemId> = (0..20000).map(|i| ItemId::from_key(&format!("k{i:06}"))).collect();
+        let mut keys: Vec<MemoryId> = (0..20000).map(|i| MemoryId::from_key(&format!("k{i:06}"))).collect();
         keys.sort();
         for k in &keys {
             b.add(k.0, &[0u8; 64]); // fat values so the table is many blocks
@@ -446,8 +446,8 @@ mod typed_tests {
 
     #[tokio::test]
     async fn pk_table_round_trips_cluster_lookups() {
-        let entries: Vec<(ItemId, u32)> =
-            (0..3000).map(|i| (ItemId::from_key(&format!("i{i}")), (i % 50) as u32)).collect();
+        let entries: Vec<(MemoryId, u32)> =
+            (0..3000).map(|i| (MemoryId::from_key(&format!("i{i}")), (i % 50) as u32)).collect();
         let (idx, data) = PkTable::build(entries.clone());
         let store = Store::in_memory();
         store.put("pk.data", data).await.unwrap();
@@ -456,17 +456,17 @@ mod typed_tests {
         for (id, cluster) in &entries {
             assert_eq!(pk.lookup(&store, id, None).await.unwrap(), Some(*cluster));
         }
-        assert_eq!(pk.lookup(&store, &ItemId::from_key("nope"), None).await.unwrap(), None);
+        assert_eq!(pk.lookup(&store, &MemoryId::from_key("nope"), None).await.unwrap(), None);
     }
 
     #[tokio::test]
     async fn radj_table_round_trips_incoming_edges() {
-        let t1 = ItemId::from_key("t1");
-        let t2 = ItemId::from_key("t2");
+        let t1 = MemoryId::from_key("t1");
+        let t2 = MemoryId::from_key("t2");
         let pairs = vec![
-            (t1, InEdge { source: ItemId::from_key("a"), kind: EdgeKind::Semantic, weight: 0.8 }),
-            (t1, InEdge { source: ItemId::from_key("b"), kind: EdgeKind::Causal(LinkTypeTag::Prevents), weight: 0.6 }),
-            (t2, InEdge { source: ItemId::from_key("c"), kind: EdgeKind::Semantic, weight: 0.9 }),
+            (t1, InEdge { source: MemoryId::from_key("a"), kind: EdgeKind::Semantic, weight: 0.8 }),
+            (t1, InEdge { source: MemoryId::from_key("b"), kind: EdgeKind::Causal(LinkTypeTag::Prevents), weight: 0.6 }),
+            (t2, InEdge { source: MemoryId::from_key("c"), kind: EdgeKind::Semantic, weight: 0.9 }),
         ];
         let (idx, data) = RadjTable::build(pairs);
         let store = Store::in_memory();
@@ -478,8 +478,8 @@ mod typed_tests {
         assert!(in1.iter().any(|e| e.kind == EdgeKind::Causal(LinkTypeTag::Prevents) && (e.weight - 0.6).abs() < 1e-6));
         let in2 = radj.incoming(&store, &t2, None).await.unwrap();
         assert_eq!(in2.len(), 1);
-        assert_eq!(in2[0].source, ItemId::from_key("c"));
+        assert_eq!(in2[0].source, MemoryId::from_key("c"));
         // Unknown target: no edges, no error.
-        assert!(radj.incoming(&store, &ItemId::from_key("t9"), None).await.unwrap().is_empty());
+        assert!(radj.incoming(&store, &MemoryId::from_key("t9"), None).await.unwrap().is_empty());
     }
 }

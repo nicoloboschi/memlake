@@ -6,7 +6,7 @@
 
 use rkyv::{Archive, Deserialize, Serialize};
 
-use crate::id::ItemId;
+use crate::id::MemoryId;
 
 /// Classification of a memory item. Fusion may combine across fact types, so the
 /// discriminants are stable and stored as `u8`.
@@ -14,7 +14,7 @@ use crate::id::ItemId;
 #[archive(check_bytes)]
 #[archive_attr(derive(PartialEq, Eq, Debug))]
 #[repr(u8)]
-pub enum FactType {
+pub enum MemoryType {
     #[default]
     Unspecified = 0,
     Semantic = 1,
@@ -23,7 +23,7 @@ pub enum FactType {
     Observation = 4,
 }
 
-impl FactType {
+impl MemoryType {
     pub fn from_u8(v: u8) -> Self {
         match v {
             1 => Self::Semantic,
@@ -95,7 +95,7 @@ impl ArchivedWeight {
 #[archive(check_bytes)]
 #[archive_attr(derive(PartialEq, Eq, Debug))]
 pub struct SemanticEdge {
-    pub target: ItemId,
+    pub target: MemoryId,
     pub weight: Weight,
 }
 
@@ -104,7 +104,7 @@ pub struct SemanticEdge {
 #[archive(check_bytes)]
 #[archive_attr(derive(PartialEq, Eq, Debug))]
 pub struct CausalEdge {
-    pub target: ItemId,
+    pub target: MemoryId,
     pub link_type: LinkType,
     pub weight: Weight,
 }
@@ -113,11 +113,11 @@ pub struct CausalEdge {
 /// the warm path.
 #[derive(Archive, Deserialize, Serialize, Clone, PartialEq, Debug)]
 #[archive(check_bytes)]
-pub struct StoredItem {
-    pub id: ItemId,
+pub struct StoredMemory {
+    pub id: MemoryId,
     pub vector: Vec<f32>,
     pub text: String,
-    pub fact_type: u8,
+    pub memory_type: u8,
     pub tags: Vec<String>,
     pub timestamps: Timestamps,
     pub proof_count: u32,
@@ -128,7 +128,7 @@ pub struct StoredItem {
     pub causal_out: Vec<CausalEdge>,
 }
 
-impl StoredItem {
+impl StoredMemory {
     /// Count of entity ids shared with another item. Both sides must be sorted.
     pub fn shared_entity_count(&self, other: &[u64]) -> usize {
         merge_count(&self.entity_ids, other)
@@ -155,11 +155,11 @@ pub fn merge_count(a: &[u64], b: &[u64]) -> usize {
 /// An item as supplied by a client on the write path.
 #[derive(Archive, Deserialize, Serialize, Clone, PartialEq, Debug)]
 #[archive(check_bytes)]
-pub struct Item {
-    pub id: ItemId,
+pub struct Memory {
+    pub id: MemoryId,
     pub vector: Vec<f32>,
     pub text: String,
-    pub fact_type: u8,
+    pub memory_type: u8,
     pub tags: Vec<String>,
     pub timestamps: Timestamps,
     pub proof_count: u32,
@@ -169,17 +169,17 @@ pub struct Item {
     pub causal_out: Vec<CausalEdge>,
 }
 
-impl Item {
+impl Memory {
     /// Promote a client item into its stored form. `semantic_out` starts empty and is
     /// filled in by the indexer's kNN derivation pass.
-    pub fn into_stored(mut self) -> StoredItem {
+    pub fn into_stored(mut self) -> StoredMemory {
         self.entity_ids.sort_unstable();
         self.entity_ids.dedup();
-        StoredItem {
+        StoredMemory {
             id: self.id,
             vector: self.vector,
             text: self.text,
-            fact_type: self.fact_type,
+            memory_type: self.memory_type,
             tags: self.tags,
             timestamps: self.timestamps,
             proof_count: self.proof_count,
@@ -196,11 +196,11 @@ mod tests {
 
     #[test]
     fn shared_entities_counts_intersection() {
-        let item = StoredItem {
-            id: ItemId::from_key("a"),
+        let item = StoredMemory {
+            id: MemoryId::from_key("a"),
             vector: vec![],
             text: String::new(),
-            fact_type: 0,
+            memory_type: 0,
             tags: vec![],
             timestamps: Timestamps::default(),
             proof_count: 0,
@@ -215,11 +215,11 @@ mod tests {
 
     #[test]
     fn into_stored_sorts_and_dedups_entities() {
-        let item = Item {
-            id: ItemId::from_key("a"),
+        let item = Memory {
+            id: MemoryId::from_key("a"),
             vector: vec![1.0],
             text: "hi".into(),
-            fact_type: 1,
+            memory_type: 1,
             tags: vec![],
             timestamps: Timestamps::default(),
             proof_count: 0,

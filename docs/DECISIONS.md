@@ -8,6 +8,23 @@ The spec calls the project `pufferlite` with `plite-*` crates. **We use `memlake
 `mlake-*` crates**, matching the repository name. All `plite-*` paths in `SPEC.md` §9 map
 one-to-one onto `mlake-*`.
 
+### Domain vocabulary (memory-lake theme)
+
+The spec's generic/Postgres terms are renamed to fit "memory lake". This is the vocabulary
+the code and API use; `SPEC.md` keeps the original terms as historical:
+
+| concept | spec / Hindsight term | memlake term |
+|---|---|---|
+| the unit stored & retrieved | item / fact / memory_unit | **`Memory`** (`StoredMemory`, `MemoryId`) |
+| a unit's independent index category | `fact_type` | **`memory_type`** (`MemoryType`, `MemoryTypeIndex`) |
+| the top-level container (a bank) | bank_id | **`namespace`** |
+| the filter dimension | tags | **`tags`** |
+
+A namespace holds memories; each memory has a `memory_type`; memories of different types
+are indexed fully independently (no shared links/vectors/postings) and queried per type,
+grouped, never fused. `memory_type` stays a taxonomy word honestly — it is the type *of a
+memory*, and matches Hindsight's semantic / episodic / procedural / observation types.
+
 ## Language & layout
 
 Rust, as specified. Cargo workspace under `crates/`. The benchmark harness is the one

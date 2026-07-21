@@ -11,8 +11,8 @@
 
 use std::collections::BTreeMap;
 
-use mlake_core::item::{SemanticEdge, Weight, MAX_SEMANTIC_OUT, SEMANTIC_LINK_THRESHOLD};
-use mlake_core::{ItemId, StoredItem};
+use mlake_core::memory::{SemanticEdge, Weight, MAX_SEMANTIC_OUT, SEMANTIC_LINK_THRESHOLD};
+use mlake_core::{MemoryId, StoredMemory};
 use mlake_fts::Tokenizer;
 use mlake_graph::radj::{EdgeKind, InEdge, LinkTypeTag};
 use mlake_ivf::{train_centroids, ClusterFile};
@@ -60,9 +60,9 @@ pub struct IndexOutcome {
 /// Fold the bank's WAL into a new generation for each fact type and publish one manifest.
 ///
 /// Fact types are fully independent indexes (no shared links/vectors/postings), so the fold
-/// partitions the live item set by `fact_type` and builds a separate generation per type,
+/// partitions the live item set by `memory_type` and builds a separate generation per type,
 /// each with its own assign-only/copy-forward state (SCALE.md Phase 4). One WAL, one
-/// manifest — so a `bank + [fact_types]` query reads a single manifest and fans out.
+/// manifest — so a `bank + [memory_types]` query reads a single manifest and fans out.
 pub async fn index(ns: &Namespace, tokenizer: &Tokenizer, opts: IndexOptions) -> Result<IndexOutcome> {
     let (manifest, etag) = ns.read_manifest().await?;
     let head = ns.wal_head().await?;
@@ -70,7 +70,7 @@ pub async fn index(ns: &Namespace, tokenizer: &Tokenizer, opts: IndexOptions) ->
     // Load each existing fact type's previous items (for the fold + copy-forward).
     let mut prev_by_ft: std::collections::BTreeMap<u8, mlake_index_prev::Generation> =
         std::collections::BTreeMap::new();
-    for ft in manifest.fact_types() {
+    for ft in manifest.memory_types() {
         let fti = manifest.index(ft).unwrap();
         let gen =
             crate::generation::read_generation(&ns.store, &fti.files, manifest.generation, None)
@@ -79,7 +79,7 @@ pub async fn index(ns: &Namespace, tokenizer: &Tokenizer, opts: IndexOptions) ->
     }
 
     // Fold the whole live item set (across all fact types), applying the tail.
-    let mut by_id: std::collections::BTreeMap<[u8; 16], StoredItem> =
+    let mut by_id: std::collections::BTreeMap<[u8; 16], StoredMemory> =
         std::collections::BTreeMap::new();
     for gen in prev_by_ft.values() {
         for cluster in &gen.clusters {
@@ -102,14 +102,14 @@ pub async fn index(ns: &Namespace, tokenizer: &Tokenizer, opts: IndexOptions) ->
     }
     let mut touched: std::collections::HashSet<[u8; 16]> = new_ids.clone();
     for item in by_id.values_mut() {
-        if let Some(deltas) = scan.pending_patches.get(&ItemId(item.id.0)) {
+        if let Some(deltas) = scan.pending_patches.get(&MemoryId(item.id.0)) {
             item.proof_count =
                 mlake_core::wal::fold_proof_count(item.proof_count, deltas.iter().copied());
             touched.insert(item.id.0);
         }
     }
 
-    let mut items: Vec<StoredItem> = by_id.into_values().collect();
+    let mut items: Vec<StoredMemory> = by_id.into_values().collect();
     let live: std::collections::HashSet<[u8; 16]> = items.iter().map(|i| i.id.0).collect();
     for item in items.iter_mut() {
         item.semantic_out.retain(|e| live.contains(&e.target.0));
@@ -119,18 +119,18 @@ pub async fn index(ns: &Namespace, tokenizer: &Tokenizer, opts: IndexOptions) ->
     let doc_count = items.len();
 
     // Partition the live items by fact type (BTreeMap keeps a deterministic type order).
-    let mut items_by_ft: std::collections::BTreeMap<u8, Vec<StoredItem>> =
+    let mut items_by_ft: std::collections::BTreeMap<u8, Vec<StoredMemory>> =
         std::collections::BTreeMap::new();
     for item in items {
-        items_by_ft.entry(item.fact_type).or_default().push(item);
+        items_by_ft.entry(item.memory_type).or_default().push(item);
     }
 
     // Build an independent generation per fact type that still has items.
-    let nonce = mlake_core::ItemId::new_v4().as_uuid().simple().to_string();
+    let nonce = mlake_core::MemoryId::new_v4().as_uuid().simple().to_string();
     let mut indexes: std::collections::BTreeMap<u8, mlake_core::manifest::FactTypeIndex> =
         std::collections::BTreeMap::new();
     for (ft, ft_items) in items_by_ft {
-        let fti = build_fact_type_index(
+        let fti = build_memory_type_index(
             ns,
             generation,
             &nonce,
@@ -182,12 +182,12 @@ mod mlake_index_prev {
 /// Build one fact type's independent generation (assign-only + copy-forward + local split +
 /// IVF link derivation) from its slice of the live items, and return its manifest entry.
 #[allow(clippy::too_many_arguments)]
-async fn build_fact_type_index(
+async fn build_memory_type_index(
     ns: &Namespace,
     generation: u64,
     nonce: &str,
-    fact_type: u8,
-    mut items: Vec<StoredItem>,
+    memory_type: u8,
+    mut items: Vec<StoredMemory>,
     new_ids: &std::collections::HashSet<[u8; 16]>,
     touched: &std::collections::HashSet<[u8; 16]>,
     prev_gen: Option<&crate::generation::Generation>,
@@ -221,16 +221,16 @@ async fn build_fact_type_index(
     }
 
     let k = centroids.len().max(1);
-    let mut clusters: Vec<Vec<StoredItem>> = vec![Vec::new(); k];
+    let mut clusters: Vec<Vec<StoredMemory>> = vec![Vec::new(); k];
     for (item, &c) in items.iter().zip(assignments.iter()) {
         clusters[c].push(item.clone());
     }
 
     // Per-fact-type prefix so different types never collide on object keys.
-    let prefix = format!("{}/ft{fact_type}/gen-{generation}-{nonce}", ns.name);
+    let prefix = format!("{}/mt{memory_type}/gen-{generation}-{nonce}", ns.name);
 
     // Copy-forward unchanged clusters (skip their PUT); rewrite only dirty ones.
-    let empty: Vec<Vec<StoredItem>> = Vec::new();
+    let empty: Vec<Vec<StoredMemory>> = Vec::new();
     let old_clusters = prev_gen.map(|p| &p.clusters).unwrap_or(&empty);
     let empty_paths: Vec<String> = Vec::new();
     let old_paths = prev_index.map(|p| &p.files.clusters).unwrap_or(&empty_paths);
@@ -250,7 +250,7 @@ async fn build_fact_type_index(
     }
 
     // pk / radj / fts, scoped to this fact type.
-    let mut pk_entries: Vec<(ItemId, u32)> = Vec::with_capacity(doc_count);
+    let mut pk_entries: Vec<(MemoryId, u32)> = Vec::with_capacity(doc_count);
     for (ci, cluster) in clusters.iter().enumerate() {
         for item in cluster {
             pk_entries.push((item.id, ci as u32));
@@ -265,7 +265,7 @@ async fn build_fact_type_index(
     .map_err(|e| crate::Error::Core(mlake_core::Error::Encode(e.to_string())))?;
     let fts_split = fts.split_bytes().to_vec();
 
-    let mut radj_pairs: Vec<(ItemId, InEdge)> = Vec::new();
+    let mut radj_pairs: Vec<(MemoryId, InEdge)> = Vec::new();
     for item in &items {
         for edge in &item.semantic_out {
             radj_pairs.push((
@@ -309,8 +309,8 @@ async fn build_fact_type_index(
 /// slices are id-sorted, so a position-wise compare suffices; a member touched by this
 /// WAL slice (re-upserted or patched) also counts as changed.
 fn cluster_changed(
-    new: &[StoredItem],
-    old: &[StoredItem],
+    new: &[StoredMemory],
+    old: &[StoredMemory],
     touched: &std::collections::HashSet<[u8; 16]>,
 ) -> bool {
     if new.len() != old.len() {
@@ -330,7 +330,7 @@ fn cluster_changed(
 /// Returns the set of centroid indices that changed, which the caller marks dirty.
 fn local_split(
     centroids: &mut mlake_ivf::Centroids,
-    items: &[StoredItem],
+    items: &[StoredMemory],
     assignments: &mut [usize],
     seed: u64,
 ) -> std::collections::HashSet<usize> {
@@ -376,7 +376,7 @@ fn local_split(
 /// `O(new · nprobe · cluster_size)` instead of the `O(new · N)` full scan. Deterministic
 /// (ties by id) for G-6.
 fn derive_links_ivf(
-    items: &mut [StoredItem],
+    items: &mut [StoredMemory],
     new_ids: &std::collections::HashSet<[u8; 16]>,
     centroids: &mlake_ivf::Centroids,
     assignments: &[usize],
@@ -389,7 +389,7 @@ fn derive_links_ivf(
     }
     // Snapshot vectors/ids so we can read while mutating semantic_out.
     let vectors: Vec<Vec<f32>> = items.iter().map(|i| i.vector.clone()).collect();
-    let ids: Vec<ItemId> = items.iter().map(|i| i.id).collect();
+    let ids: Vec<MemoryId> = items.iter().map(|i| i.id).collect();
 
     for j in 0..items.len() {
         if !new_ids.contains(&items[j].id.0) {
@@ -415,7 +415,7 @@ fn derive_links_ivf(
         neighbours.truncate(MAX_SEMANTIC_OUT);
         items[j].semantic_out = neighbours
             .into_iter()
-            .map(|(id, sim)| SemanticEdge { target: ItemId(id), weight: Weight::from_f32(sim) })
+            .map(|(id, sim)| SemanticEdge { target: MemoryId(id), weight: Weight::from_f32(sim) })
             .collect();
     }
 }
@@ -427,9 +427,9 @@ fn derive_links_ivf(
 /// derivation (`O(new · N)`), not a full `O(N²)` rebuild. Deterministic (ties broken by
 /// id) for G-6. The production path queries the warm IVF index for neighbours instead of
 /// scanning; that is the O(N)-per-item optimization, not a behavioural change.
-fn derive_semantic_links(items: &mut [StoredItem], new_ids: &std::collections::HashSet<[u8; 16]>) {
+fn derive_semantic_links(items: &mut [StoredMemory], new_ids: &std::collections::HashSet<[u8; 16]>) {
     let vectors: Vec<Vec<f32>> = items.iter().map(|i| i.vector.clone()).collect();
-    let ids: Vec<ItemId> = items.iter().map(|i| i.id).collect();
+    let ids: Vec<MemoryId> = items.iter().map(|i| i.id).collect();
 
     for (i, item) in items.iter_mut().enumerate() {
         if !new_ids.contains(&item.id.0) {
@@ -455,7 +455,7 @@ fn derive_semantic_links(items: &mut [StoredItem], new_ids: &std::collections::H
         item.semantic_out = neighbours
             .into_iter()
             .map(|(id, sim)| SemanticEdge {
-                target: ItemId(id),
+                target: MemoryId(id),
                 weight: Weight::from_f32(sim),
             })
             .collect();
