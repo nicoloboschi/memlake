@@ -12,8 +12,10 @@ use serde::{Deserialize, Serialize};
 /// `StoredMemory` / `Memory` (rkyv cluster + WAL records), the SSTable encodings, or the
 /// manifest schema — so a generation written by an older build is rejected at the manifest
 /// read with a clear error instead of failing deep in an rkyv decode ("pointer overran
-/// buffer"). Bumped to 2 for the `write_seq` + opaque `metadata` + 16-byte `EntityId` changes.
-pub const FORMAT_VERSION: u32 = 2;
+/// buffer"). Bumped to 2 for the `write_seq` + opaque `metadata` + 16-byte `EntityId` changes;
+/// to 3 for the payload store (`payload.idx`/`payload.data`), which a reader must find to
+/// hydrate hits.
+pub const FORMAT_VERSION: u32 = 3;
 
 /// Paths to the files making up a generation. Stored as an explicit struct rather than a
 /// map so a missing file is a deserialization error rather than a runtime surprise.
@@ -46,6 +48,12 @@ pub struct GenerationFiles {
     pub time_idx: String,
     #[serde(default)]
     pub time_data: String,
+    /// `payload.idx` / `payload.data`: the payload store (MemoryId -> memory bytes without the
+    /// embedding), range-read to hydrate a hit or a `get` without deserializing its cluster.
+    #[serde(default)]
+    pub payload_idx: String,
+    #[serde(default)]
+    pub payload_data: String,
 }
 
 impl GenerationFiles {
@@ -65,6 +73,8 @@ impl GenerationFiles {
             self.entity_data.as_str(),
             self.time_idx.as_str(),
             self.time_data.as_str(),
+            self.payload_idx.as_str(),
+            self.payload_data.as_str(),
         ]
         .into_iter()
         .chain(self.clusters.iter().map(|s| s.as_str()))

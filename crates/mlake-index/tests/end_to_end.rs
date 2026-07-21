@@ -402,6 +402,7 @@ async fn crash_before_manifest_swap_leaves_the_old_generation_serving() {
         mlake_index::PkTable::build(vec![]).into(),
         mlake_index::EntityTable::build(vec![]).into(),
         mlake_index::TimeTable::build(vec![]).into(),
+        mlake_index::PayloadTable::build(&[]).into(),
         &Vec::new(),
         0,
     )
@@ -567,6 +568,7 @@ async fn concurrent_generation_builds_write_disjoint_files() {
         mlake_index::PkTable::build(vec![(MemoryId::from_key("a"), 0)]).into(),
         mlake_index::EntityTable::build(vec![]).into(),
         mlake_index::TimeTable::build(vec![]).into(),
+        mlake_index::PayloadTable::build(&[]).into(),
         &Vec::new(),
         1,
     )
@@ -582,6 +584,7 @@ async fn concurrent_generation_builds_write_disjoint_files() {
         mlake_index::PkTable::build(vec![(MemoryId::from_key("b"), 0)]).into(),
         mlake_index::EntityTable::build(vec![]).into(),
         mlake_index::TimeTable::build(vec![]).into(),
+        mlake_index::PayloadTable::build(&[]).into(),
         &Vec::new(),
         1,
     )

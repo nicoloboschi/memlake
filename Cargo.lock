@@ -1581,6 +1581,7 @@ name = "mlake-perf"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "futures",
  "mlake-core",
  "mlake-fts",
  "mlake-index",

@@ -13,7 +13,7 @@
 //! So a point lookup is "cached index binary-search + one ranged GET", independent of the
 //! table's size — the same discipline as the cluster files.
 
-use mlake_core::{EntityId, MemoryId};
+use mlake_core::{EntityId, MemoryId, StoredMemory};
 use mlake_store::{QueryMetrics, Store};
 
 use crate::{Error, Result};
@@ -361,6 +361,61 @@ impl PkTable {
         Ok(pairs
             .into_iter()
             .map(|(id, v)| (id, u32::from_le_bytes([v[0], v[1], v[2], v[3]])))
+            .collect())
+    }
+}
+
+/// The payload store: id → the memory's payload (everything but the embedding), serialized.
+///
+/// This is what makes a point read cheap. Hydrating a hit that is not already in a probed
+/// cluster (an FTS or graph result, a `get` by id) used to deserialize that memory's *entire*
+/// cluster file — ~√N other memories it did not need — because clusters are the only place a
+/// memory lived. The payload store gives each memory its own addressable row, fetched with one
+/// coalesced ranged GET. The embedding is intentionally omitted: query hits return
+/// `MemoryPayload` (no vector), and the two paths that do need the vector — the vector arm's
+/// rerank and `get --include_vector` — read the cluster file, which still holds it.
+pub struct PayloadTable {
+    index: SsTableIndex,
+    data_path: String,
+}
+
+impl PayloadTable {
+    /// Build from the generation's items (any order; sorted here). Each value is the item's
+    /// rkyv bytes with the embedding stripped.
+    pub fn build(items: &[StoredMemory]) -> (Vec<u8>, Vec<u8>) {
+        let mut entries: Vec<(MemoryId, Vec<u8>)> =
+            items.iter().map(|m| (m.id, m.to_payload_bytes())).collect();
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut b = SsTableBuilder::new();
+        for (id, bytes) in entries {
+            b.add(id.0, &bytes);
+        }
+        b.finish()
+    }
+
+    pub fn open(idx_bytes: &[u8], data_path: impl Into<String>) -> Result<Self> {
+        Ok(Self {
+            index: SsTableIndex::parse(idx_bytes)?,
+            data_path: data_path.into(),
+        })
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.index.is_empty()
+    }
+
+    /// Hydrate many ids in one coalesced request. Ids not in this generation are simply absent
+    /// from the map. Returned memories carry an empty `vector` (see the type docs).
+    pub async fn lookup_batch(
+        &self,
+        store: &Store,
+        ids: &[MemoryId],
+        ctx: Option<(&QueryMetrics, usize)>,
+    ) -> Result<std::collections::HashMap<MemoryId, StoredMemory>> {
+        let pairs = self.index.get_many(store, &self.data_path, ids, ctx).await?;
+        Ok(pairs
+            .into_iter()
+            .filter_map(|(id, bytes)| StoredMemory::from_payload_bytes(&bytes).map(|m| (id, m)))
             .collect())
     }
 }

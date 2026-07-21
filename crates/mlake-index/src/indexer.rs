@@ -354,6 +354,10 @@ async fn build_memory_type_index(
     }
     let time_tables = crate::sstable::TimeTable::build(time_pairs);
 
+    // Payload store: one addressable row per memory (embedding stripped), so a point read
+    // (FTS/graph hit, `get`) fetches one memory instead of its whole cluster file.
+    let payload_tables = crate::sstable::PayloadTable::build(&items);
+
     // Per-cluster tag summaries: the union of each cluster's tags + an untagged flag, so a
     // query can prune clusters that cannot contain a matching memory (SCALE.md Phase 4b).
     let tag_summary: crate::generation::TagSummary = clusters
@@ -386,6 +390,7 @@ async fn build_memory_type_index(
         pk_tables.into(),
         entity_tables.into(),
         time_tables.into(),
+        payload_tables.into(),
         &tag_summary,
         doc_count,
     )

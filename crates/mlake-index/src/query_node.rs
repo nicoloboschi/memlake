@@ -24,7 +24,7 @@ use mlake_wal::{Namespace, WalTail};
 
 use crate::fusion::{rrf, weighted_rrf, FusedHit, RankedArm};
 use crate::generation::{read_fts_split, TagSummary};
-use crate::sstable::{EntityTable, PkTable, RadjTable, TimeTable};
+use crate::sstable::{EntityTable, PayloadTable, PkTable, RadjTable, TimeTable};
 use crate::{QueryConfig, Result};
 
 /// One arm's contribution to a hit: its 0-based rank within that arm and its raw score
@@ -78,6 +78,7 @@ struct FactTypeState {
     pk: PkTable,
     entity: EntityTable,
     time: TimeTable,
+    payload: PayloadTable,
     tail_items: Vec<StoredMemory>,
     tail_fts: TantivyFts,
     doc_count: usize,
@@ -215,9 +216,19 @@ impl QueryNode {
                                 .map_err(crate::Error::from)
                         }
                     };
+                    let payload_f = async {
+                        if files.payload_idx.is_empty() {
+                            Ok(bytes::Bytes::new())
+                        } else {
+                            ns.store
+                                .get_immutable(&files.payload_idx, Some((&metrics, 2)))
+                                .await
+                                .map_err(crate::Error::from)
+                        }
+                    };
                     let fts_f = read_fts_split(&ns.store, files, tokenizer.clone(), Some(&metrics));
-                    let (centroids_bytes, tag_bytes, radj_idx, pk_idx, entity_idx, time_idx, gen_fts) =
-                        futures::try_join!(centroids_f, tag_f, radj_f, pk_f, entity_f, time_f, fts_f)?;
+                    let (centroids_bytes, tag_bytes, radj_idx, pk_idx, entity_idx, time_idx, payload_idx, gen_fts) =
+                        futures::try_join!(centroids_f, tag_f, radj_f, pk_f, entity_f, time_f, payload_f, fts_f)?;
 
                     let tag_summary: TagSummary = if tag_bytes.is_empty() {
                         Vec::new()
@@ -235,6 +246,13 @@ impl QueryNode {
                         TimeTable::open(&[0u8; 16], String::new())?
                     } else {
                         TimeTable::open(&time_idx, files.time_data.clone())?
+                    };
+                    // Old generations have no payload store: an empty table forces the fallback
+                    // (materialize from clusters), so a v2 generation still reads correctly.
+                    let payload = if payload_idx.is_empty() {
+                        PayloadTable::open(&[0u8; 16], String::new())?
+                    } else {
+                        PayloadTable::open(&payload_idx, files.payload_data.clone())?
                     };
 
                     // Live doc count for this fact type: its pk record count minus tombstones
@@ -260,6 +278,7 @@ impl QueryNode {
                         pk,
                         entity,
                         time,
+                        payload,
                         doc_count,
                         tail_items,
                         tail_fts,
@@ -280,6 +299,7 @@ impl QueryNode {
                         pk: PkTable::open(&[0u8; 16], String::new())?,
                         entity: EntityTable::open(&[0u8; 16], String::new())?,
                         time: TimeTable::open(&[0u8; 16], String::new())?,
+                        payload: PayloadTable::open(&[0u8; 16], String::new())?,
                         doc_count,
                         tail_items,
                         tail_fts,
@@ -658,22 +678,19 @@ impl QueryNode {
         // — a deleted memory must never appear in results, regardless of which arm found it.
         by_id.retain(|id, _| !self.tombstones.contains(id));
 
-        // Materialize any hit not already in hand — FTS-only hits that fell outside the
-        // probed clusters. One coalesced pk lookup + cluster fetch covers them all; the
-        // graph arm's candidates are usually cache-warm from its own fetch.
+        // Materialize any hit not already in hand — FTS/graph hits that fell outside the
+        // probed clusters. One coalesced ranged GET over the payload store hydrates them all
+        // by id, instead of deserializing a whole cluster file per hit (the old cost that made
+        // an FTS query ~40ms warm at 1M). The payload has no embedding, which query hits never
+        // return anyway. Every v3 generation has the payload store (older ones are rejected at
+        // the manifest read), so an indexed hit always resolves here.
         let missing: Vec<MemoryId> =
             by_id.keys().filter(|id| !materialized.contains_key(id)).copied().collect();
         if !missing.is_empty() {
-            let clusters_map = state.pk.lookup_batch(&self.ns.store, &missing, Some((metrics, 3))).await?;
-            let clusters: std::collections::HashSet<usize> =
-                clusters_map.values().map(|c| *c as usize).collect();
-            if !clusters.is_empty() {
-                let cids: Vec<usize> = clusters.into_iter().collect();
-                for item in self.fetch_clusters(state, &cids, metrics, 3).await? {
-                    if by_id.contains_key(&item.id) {
-                        materialized.entry(item.id).or_insert(item);
-                    }
-                }
+            for (id, item) in
+                state.payload.lookup_batch(&self.ns.store, &missing, Some((metrics, 3))).await?
+            {
+                materialized.entry(id).or_insert(item);
             }
         }
         metrics.check_budget(&self.ns.name, "query");
@@ -1084,17 +1101,12 @@ impl QueryNode {
             return Ok(ranked.into_iter().map(|r| (r.id, r.activation)).collect());
         }
         let tf = Instant::now();
-        let ranked_ids: Vec<MemoryId> = ranked.iter().map(|r| r.id).collect();
-        let clusters_map = state
-            .pk
-            .lookup_batch(&self.ns.store, &ranked_ids, Some((metrics, 4)))
-            .await?;
-        let clusters: HashSet<usize> = clusters_map.values().map(|c| *c as usize).collect();
-        if !clusters.is_empty() {
-            let cids: Vec<usize> = clusters.into_iter().collect();
-            for item in self.fetch_clusters(state, &cids, metrics, 4).await? {
-                by_id.entry(item.id).or_insert(item);
-            }
+        let ranked_ids: Vec<MemoryId> =
+            ranked.iter().map(|r| r.id).filter(|id| !by_id.contains_key(id)).collect();
+        for (id, item) in
+            state.payload.lookup_batch(&self.ns.store, &ranked_ids, Some((metrics, 4))).await?
+        {
+            by_id.entry(id).or_insert(item);
         }
         metrics.record_phase(Phase::GraphFetch, tf.elapsed());
         let out = ranked
