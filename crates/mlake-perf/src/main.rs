@@ -38,7 +38,7 @@ async fn main() -> Result<()> {
         "write" => {
             let cfg = parse_gen(&args);
             let store = new_store(store_metrics())?;
-            let r = write_bench(&store, &bank_name(cfg.scale), cfg).await?;
+            let r = write_bench(&store, &bank_name(cfg.scale), cfg, index_opts(&args)).await?;
             println!("\n{}", r.render());
         }
         "read" => {
@@ -56,7 +56,7 @@ async fn main() -> Result<()> {
                 let cfg = GenConfig { scale, ..parse_gen(&args) };
                 let store = new_store(store_metrics())?;
                 eprintln!("=== scale {scale}: write ===");
-                let w = write_bench(&store, &bank_name(scale), cfg).await?;
+                let w = write_bench(&store, &bank_name(scale), cfg, index_opts(&args)).await?;
                 eprintln!("=== scale {scale}: read ===");
                 let (mem_b, disk_b) = budgets(&args);
                 let store = new_store(store_metrics())?;
@@ -75,6 +75,16 @@ async fn main() -> Result<()> {
 
 fn bank_name(scale: usize) -> String {
     format!("perf-{scale}")
+}
+
+/// Index options from flags. `--no-links` skips semantic kNN link derivation — the graph arm's
+/// build cost is O(N·√N) and dominates a very-large first build, so a pure vector/FTS scale run
+/// turns it off and characterizes the graph build separately.
+fn index_opts(args: &[String]) -> IndexOptions {
+    IndexOptions {
+        derive_links: !args.iter().any(|a| a == "--no-links"),
+        ..IndexOptions::default()
+    }
 }
 
 fn store_metrics() -> Arc<StoreMetrics> {
@@ -127,7 +137,12 @@ impl WriteReport {
     }
 }
 
-async fn write_bench(store: &Store, bank: &str, cfg: GenConfig) -> Result<WriteReport> {
+async fn write_bench(
+    store: &Store,
+    bank: &str,
+    cfg: GenConfig,
+    opts: IndexOptions,
+) -> Result<WriteReport> {
     let metrics = store.store_metrics().unwrap().clone();
     let ns = Namespace::new(bank, store.clone());
     ns.create_if_absent(&Tokenizer::default().config_hash()).await?;
@@ -148,7 +163,7 @@ async fn write_bench(store: &Store, bank: &str, cfg: GenConfig) -> Result<WriteR
 
     // Index phase (full first build).
     let ti = Instant::now();
-    index(&ns, &Tokenizer::default(), IndexOptions::default()).await?;
+    index(&ns, &Tokenizer::default(), opts).await?;
     let index_secs = ti.elapsed().as_secs_f64();
 
     let phase = metrics.since(&base);

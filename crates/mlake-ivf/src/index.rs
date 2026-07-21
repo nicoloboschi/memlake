@@ -178,9 +178,16 @@ pub fn train_centroids(vectors: &[Vec<f32>], seed: u64) -> Centroids {
 
     let iters = if vectors.len() > TRAIN_SAMPLE_CAP { 15 } else { 25 };
     let trained = kmeans::train(train_set, k, iters, seed);
+    // Cluster-size histogram over *every* vector (not the sample): this O(N·k) pass is one of
+    // the two dominant fold costs at scale, and each vector's nearest-centroid is independent,
+    // so compute the assignments in parallel and only the (cheap) tally is serial.
     let mut sizes = vec![0usize; trained.len()];
-    for v in vectors {
-        sizes[nearest(&trained, v)] += 1;
+    {
+        use rayon::prelude::*;
+        let assigns: Vec<usize> = vectors.par_iter().map(|v| nearest(&trained, v)).collect();
+        for a in assigns {
+            sizes[a] += 1;
+        }
     }
     Centroids {
         dim: vectors[0].len(),

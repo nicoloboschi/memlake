@@ -224,10 +224,13 @@ async fn build_memory_type_index(
     };
     phase_log("train", tt);
 
+    // Assign every item to its nearest centroid. The other dominant O(N·k) fold pass; each
+    // assignment is independent, so run it across cores (deterministic — nearest is pure).
     let mut assignments: Vec<usize> = if centroids.is_empty() {
         vec![0; items.len()]
     } else {
-        items.iter().map(|i| centroids.assign(&i.vector)).collect()
+        use rayon::prelude::*;
+        items.par_iter().map(|i| centroids.assign(&i.vector)).collect()
     };
 
     let split_clusters = local_split(&mut centroids, &items, &mut assignments, opts.seed);
