@@ -71,8 +71,11 @@ class MemlakeServicer:
         raise NotImplementedError('Method not implemented!')
 
     def Query(self, request, context):
-        """Answer a query for a single memory_type. memory_types are independent sub-indexes;
-        results are never fused across types, so a caller queries each type it cares about.
+        """Answer a query across one or more memory_types in a single call. Always runs all three
+        arms (dense vector + BM25 full-text + graph expansion) over one shared snapshot, so the
+        storage reads coalesce into common roundtrip waves. Returns each candidate with its raw
+        per-arm scores; the client fuses. memory_types are independent — hits are never fused
+        across types.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')

@@ -27,6 +27,41 @@ use crate::generation::{read_fts_split, TagSummary};
 use crate::sstable::{PkTable, RadjTable};
 use crate::{QueryConfig, Result};
 
+/// One arm's contribution to a hit: its 0-based rank within that arm and its raw score
+/// (dense cosine similarity, BM25 score, or graph activation).
+#[derive(Clone, Copy, Debug)]
+pub struct ArmScore {
+    pub rank: u32,
+    pub score: f32,
+}
+
+/// A query candidate carrying the **raw** signal from each arm that surfaced it; an arm that
+/// did not is `None`. memlake does no fusion — the client combines these (RRF, weighting,
+/// re-ranking) however it likes.
+#[derive(Clone, Debug)]
+pub struct RawHit {
+    pub id: MemoryId,
+    pub dense: Option<ArmScore>,
+    pub text: Option<ArmScore>,
+    pub graph: Option<ArmScore>,
+}
+
+impl RawHit {
+    fn new(id: MemoryId) -> Self {
+        Self { id, dense: None, text: None, graph: None }
+    }
+}
+
+/// Per-arm candidate depths for a query, plus the IVF probe width. A depth of 0 disables
+/// that arm.
+#[derive(Clone, Copy, Debug)]
+pub struct ArmDepths {
+    pub vector: usize,
+    pub text: usize,
+    pub graph: usize,
+    pub nprobe: usize,
+}
+
 /// Consistency level for a read.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Consistency {
@@ -104,26 +139,47 @@ impl QueryNode {
             let state = match manifest.index(ft) {
                 Some(fti) => {
                     let files = &fti.files;
-                    let centroids_bytes = ns
-                        .store
-                        .get_immutable(&files.centroids, Some((&metrics, 2)))
-                        .await?;
-                    let tag_summary: TagSummary = if files.tag_summary.is_empty() {
+                    // The metadata objects (centroids, tag summary, radj/pk sparse indexes, FTS
+                    // split) are independent immutable reads, so fetch them in one concurrent
+                    // wave instead of five sequential roundtrips. This is the cost the snapshot
+                    // cache re-pays whenever a write invalidates it, so it is worth collapsing.
+                    let centroids_f = async {
+                        ns.store
+                            .get_immutable(&files.centroids, Some((&metrics, 2)))
+                            .await
+                            .map_err(crate::Error::from)
+                    };
+                    let tag_f = async {
+                        if files.tag_summary.is_empty() {
+                            Ok(bytes::Bytes::new())
+                        } else {
+                            ns.store
+                                .get_immutable(&files.tag_summary, Some((&metrics, 2)))
+                                .await
+                                .map_err(crate::Error::from)
+                        }
+                    };
+                    let radj_f = async {
+                        ns.store
+                            .get_immutable(&files.radj_idx, Some((&metrics, 2)))
+                            .await
+                            .map_err(crate::Error::from)
+                    };
+                    let pk_f = async {
+                        ns.store
+                            .get_immutable(&files.pk, Some((&metrics, 2)))
+                            .await
+                            .map_err(crate::Error::from)
+                    };
+                    let fts_f = read_fts_split(&ns.store, files, tokenizer.clone(), Some(&metrics));
+                    let (centroids_bytes, tag_bytes, radj_idx, pk_idx, gen_fts) =
+                        futures::try_join!(centroids_f, tag_f, radj_f, pk_f, fts_f)?;
+
+                    let tag_summary: TagSummary = if tag_bytes.is_empty() {
                         Vec::new()
                     } else {
-                        let b = ns
-                            .store
-                            .get_immutable(&files.tag_summary, Some((&metrics, 2)))
-                            .await?;
-                        serde_json::from_slice(&b).unwrap_or_default()
+                        serde_json::from_slice(&tag_bytes).unwrap_or_default()
                     };
-                    let radj_idx = ns
-                        .store
-                        .get_immutable(&files.radj_idx, Some((&metrics, 2)))
-                        .await?;
-                    let pk_idx = ns.store.get_immutable(&files.pk, Some((&metrics, 2))).await?;
-                    let gen_fts =
-                        read_fts_split(&ns.store, files, tokenizer.clone(), Some(&metrics)).await?;
                     let pk = PkTable::open(&pk_idx, files.pk_data.clone())?;
 
                     // Live doc count for this fact type: its pk record count minus tombstones
@@ -198,8 +254,10 @@ impl QueryNode {
         self.per_type.keys().copied().collect()
     }
 
-    /// Answer a query for a single fact type. Returns an empty list if the bank has no such
-    /// fact type. (Fact types share nothing, so callers query each and keep them grouped.)
+    /// Convenience: run the query and fuse the arms with (weighted) RRF into a single ranked
+    /// list. The gRPC server does NOT use this — it returns the raw per-arm scores and lets
+    /// the client fuse — but it keeps a simple, self-contained retrieval API for Rust callers
+    /// and tests. `config.arm_depth` bounds every arm; `graph_weight == 0` drops the graph arm.
     pub async fn query(
         &self,
         memory_type: u8,
@@ -210,31 +268,72 @@ impl QueryNode {
         config: QueryConfig,
     ) -> Result<Vec<FusedHit>> {
         let metrics = QueryMetrics::new();
-        self.query_metered(memory_type, vector, text, tags, top_k, config, &metrics).await
+        let depths = ArmDepths {
+            vector: config.arm_depth,
+            text: config.arm_depth,
+            graph: if config.graph_weight > 0.0 { config.arm_depth } else { 0 },
+            nprobe: config.nprobe,
+        };
+        let raw = self
+            .query_raw_metered(memory_type, vector, text, tags, depths, &metrics)
+            .await?;
+        Ok(fuse_raw(&raw, top_k, config))
     }
 
-    /// Like [`query`], but records object-storage usage into `metrics`.
-    pub async fn query_metered(
+    /// Answer a query for one memory_type, returning each candidate with its **raw per-arm
+    /// scores** (dense cosine, BM25, graph activation) and per-arm ranks — no fusion. The
+    /// client fuses (RRF or any weighting) with the raw signals. `*_top_k` bound each arm's
+    /// candidate depth; a `*_top_k` of 0 skips that arm. Empty list if the type is unknown.
+    pub async fn query_raw_metered(
         &self,
         memory_type: u8,
         vector: Option<&[f32]>,
         text: Option<&str>,
         tags: &TagFilter,
-        top_k: usize,
-        config: QueryConfig,
+        depths: ArmDepths,
         metrics: &QueryMetrics,
-    ) -> Result<Vec<FusedHit>> {
+    ) -> Result<Vec<RawHit>> {
         let Some(state) = self.per_type.get(&memory_type) else {
             return Ok(Vec::new());
         };
+        let (vector_scored, fts_scored, graph_scored) =
+            self.run_arms(state, vector, text, tags, depths, metrics).await?;
+        metrics.check_budget(&self.ns.name, "query");
 
-        // Probe + fetch the candidate clusters once (RT3); vector and graph arms share them.
-        // The tag filter is applied inline to the materialized memories — they carry their
-        // tags, so filtering is free once fetched (the shared TagFilter primitive).
-        let (probed_items, vector_ranking) = match vector {
-            Some(q) if !state.centroids.is_empty() => {
+        // Merge the three arms' candidates by id, recording each arm's rank + raw score.
+        let mut by_id: HashMap<MemoryId, RawHit> = HashMap::new();
+        let mut fill = |scored: Vec<(MemoryId, f32)>, set: fn(&mut RawHit, ArmScore)| {
+            for (rank, (id, score)) in scored.into_iter().enumerate() {
+                let hit = by_id.entry(id).or_insert_with(|| RawHit::new(id));
+                set(hit, ArmScore { rank: rank as u32, score });
+            }
+        };
+        fill(vector_scored, |h, s| h.dense = Some(s));
+        fill(fts_scored, |h, s| h.text = Some(s));
+        fill(graph_scored, |h, s| h.graph = Some(s));
+        Ok(by_id.into_values().collect())
+    }
+
+    /// Run the three arms for one memory_type, returning each arm's ranked candidates with
+    /// their raw scores: `(dense, fts, graph)`. Shared by every query path. The vector and
+    /// graph arms share the probed clusters (one fetch); the graph arm seeds off the dense
+    /// ranking. An arm with `top_k == 0`, or a missing input, yields an empty list.
+    #[allow(clippy::type_complexity)]
+    async fn run_arms(
+        &self,
+        state: &FactTypeState,
+        vector: Option<&[f32]>,
+        text: Option<&str>,
+        tags: &TagFilter,
+        depths: ArmDepths,
+        metrics: &QueryMetrics,
+    ) -> Result<(Vec<(MemoryId, f32)>, Vec<(MemoryId, f32)>, Vec<(MemoryId, f32)>)> {
+        // Vector arm: probe + fetch the candidate clusters once (RT3); the graph arm reuses
+        // the materialized memories. Tags are applied inline (memories carry their tags).
+        let (probed_items, vector_scored) = match vector {
+            Some(q) if depths.vector > 0 && !state.centroids.is_empty() => {
                 let t = Instant::now();
-                let probed = self.select_clusters(state, q, config.nprobe, tags);
+                let probed = self.select_clusters(state, q, depths.nprobe, tags);
                 metrics.record_phase(Phase::Probe, t.elapsed());
                 let t = Instant::now();
                 let mut items = self.fetch_clusters(state, &probed, metrics, 3).await?;
@@ -242,12 +341,12 @@ impl QueryNode {
                 items.extend(state.tail_items.iter().cloned());
                 items.retain(|m| tags.matches(&m.tags));
                 let t = Instant::now();
-                let ranking: Vec<MemoryId> = exact_search(&items, q, config.arm_depth)
+                let scored: Vec<(MemoryId, f32)> = exact_search(&items, q, depths.vector)
                     .into_iter()
-                    .map(|h| h.id)
+                    .map(|h| (h.id, h.score))
                     .collect();
                 metrics.record_phase(Phase::Rerank, t.elapsed());
-                (items, ranking)
+                (items, scored)
             }
             _ => {
                 let mut items = state.tail_items.clone();
@@ -257,26 +356,23 @@ impl QueryNode {
         };
 
         let tf = Instant::now();
-        let fts_ranking = text
-            .filter(|t| !t.is_empty())
-            .map(|t| self.fts_arm(state, t, config.arm_depth, tags))
+        let fts_scored = text
+            .filter(|t| !t.is_empty() && depths.text > 0)
+            .map(|t| self.fts_arm(state, t, depths.text, tags))
             .unwrap_or_default();
         metrics.record_phase(Phase::Fts, tf.elapsed());
 
-        // The graph arm is skipped when weighted to zero — it does ranged pk/radj reads, so
-        // running an arm that contributes nothing to fusion would be pure waste.
-        let graph_ranking = if config.graph_weight > 0.0 && !vector_ranking.is_empty() {
-            self.graph_arm(state, &vector_ranking, &probed_items, config.arm_depth, tags, metrics)
+        // The graph arm needs dense seeds; it does ranged pk/radj reads, so it is skipped
+        // when disabled (top_k 0) or when there is nothing to seed from.
+        let graph_scored = if depths.graph > 0 && !vector_scored.is_empty() {
+            let seed_ids: Vec<MemoryId> = vector_scored.iter().map(|(id, _)| *id).collect();
+            self.graph_arm(state, &seed_ids, &probed_items, depths.graph, tags, metrics)
                 .await?
         } else {
             Vec::new()
         };
 
-        metrics.check_budget(&self.ns.name, "query");
-        let tfz = Instant::now();
-        let fused = fuse(&vector_ranking, &fts_ranking, &graph_ranking, top_k, config);
-        metrics.record_phase(Phase::Fuse, tfz.elapsed());
-        Ok(fused)
+        Ok((vector_scored, fts_scored, graph_scored))
     }
 
     /// Choose which clusters to fetch for the vector arm.
@@ -358,7 +454,8 @@ impl QueryNode {
         Ok(items)
     }
 
-    fn fts_arm(&self, state: &FactTypeState, text: &str, depth: usize, tags: &TagFilter) -> Vec<MemoryId> {
+    /// The FTS arm's ranked hits with their raw BM25 scores.
+    fn fts_arm(&self, state: &FactTypeState, text: &str, depth: usize, tags: &TagFilter) -> Vec<(MemoryId, f32)> {
         let mut hits = state.gen_fts.search_filtered(text, depth, tags);
         hits.extend(
             state
@@ -375,7 +472,7 @@ impl QueryNode {
         });
         hits.dedup_by_key(|h| h.id);
         hits.truncate(depth);
-        hits.into_iter().map(|h| h.id).collect()
+        hits.into_iter().map(|h| (h.id, h.score)).collect()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -387,7 +484,7 @@ impl QueryNode {
         depth: usize,
         tags: &TagFilter,
         metrics: &QueryMetrics,
-    ) -> Result<Vec<MemoryId>> {
+    ) -> Result<Vec<(MemoryId, f32)>> {
         let mut by_id: HashMap<MemoryId, StoredMemory> =
             probed_items.iter().map(|i| (i.id, i.clone())).collect();
 
@@ -461,34 +558,39 @@ impl QueryNode {
             &seeds,
             GraphParams { budget: depth, ..GraphParams::default() },
         );
-        // Filter graph candidates by the tag filter using their materialized tags.
+        // Filter graph candidates by the tag filter using their materialized tags. Keep the
+        // raw activation score so the client can fuse it however it likes.
         let out = ranked
             .into_iter()
             .filter(|r| by_id.get(&r.id).map(|m| tags.matches(&m.tags)).unwrap_or(false))
-            .map(|r| r.id)
+            .map(|r| (r.id, r.activation))
             .collect();
         metrics.record_phase(Phase::GraphExpand, te.elapsed());
         Ok(out)
     }
 }
 
-/// Combine the arm rankings with (weighted) RRF.
-fn fuse(
-    vector: &[MemoryId],
-    fts: &[MemoryId],
-    graph: &[MemoryId],
-    top_k: usize,
-    config: QueryConfig,
-) -> Vec<FusedHit> {
+/// Reconstruct each arm's ranking from the raw hits and combine with (weighted) RRF. This is
+/// the same fusion the client would do; kept here only for [`QueryNode::query`].
+fn fuse_raw(raw: &[RawHit], top_k: usize, config: QueryConfig) -> Vec<FusedHit> {
+    fn ranking(raw: &[RawHit], arm: impl Fn(&RawHit) -> Option<ArmScore>) -> Vec<MemoryId> {
+        let mut v: Vec<&RawHit> = raw.iter().filter(|h| arm(h).is_some()).collect();
+        v.sort_by_key(|h| arm(h).unwrap().rank);
+        v.into_iter().map(|h| h.id).collect()
+    }
+    let vector = ranking(raw, |h| h.dense);
+    let fts = ranking(raw, |h| h.text);
+    let graph = ranking(raw, |h| h.graph);
+
     let mut arms: Vec<(RankedArm<'_>, f32)> = Vec::new();
     if !vector.is_empty() {
-        arms.push((RankedArm { name: "vector", ranking: vector }, config.vector_weight));
+        arms.push((RankedArm { name: "vector", ranking: &vector }, config.vector_weight));
     }
     if !fts.is_empty() {
-        arms.push((RankedArm { name: "fts", ranking: fts }, config.fts_weight));
+        arms.push((RankedArm { name: "fts", ranking: &fts }, config.fts_weight));
     }
     if !graph.is_empty() {
-        arms.push((RankedArm { name: "graph", ranking: graph }, config.graph_weight));
+        arms.push((RankedArm { name: "graph", ranking: &graph }, config.graph_weight));
     }
     if arms.len() == 1 && (config.vector_weight - config.fts_weight).abs() < f32::EPSILON {
         let only = [RankedArm { name: arms[0].0.name, ranking: arms[0].0.ranking }];

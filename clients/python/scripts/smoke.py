@@ -33,19 +33,21 @@ def main() -> int:
         )
         print(f"wrote batch, WAL seq={seq}")
 
-        # STRONG consistency: visible immediately via the WAL tail, no indexing needed.
-        hits = c.query(NS, memory_type=1, text="cat", top_k=5)
-        print(f"fts 'cat' -> {len(hits)} hits")
+        # STRONG consistency (default): visible immediately via the WAL tail, no indexing.
+        # ONE call, all memory_types, all three arms; each hit carries the raw per-arm signals.
+        hits = c.query(NS, vector=vec(0.1), text="cat")
+        print(f"query -> {len(hits)} hits (roundtrips={c.last_roundtrips})")
         for h in hits:
-            print(f"  {h.id_uuid}  score={h.score:.4f}  {h.contributions}")
+            print(
+                f"  mt={h.memory_type} {h.id_uuid[:8]}  "
+                f"dense={h.dense.score:.4f}@{h.dense.rank if h.dense.present else '-'}  "
+                f"text={h.text.score:.4f}@{h.text.rank if h.text.present else '-'}  "
+                f"graph={'y' if h.graph.present else '-'}"
+            )
 
-        hits = c.query(NS, memory_type=1, vector=vec(0.1), top_k=3)
-        print(f"vector near m1 -> {len(hits)} hits")
-        for h in hits:
-            print(f"  {h.id_uuid}  score={h.score:.4f}")
-
-        hits = c.query(NS, memory_type=1, vector=vec(0.15), tags=["finance"], tags_mode=ANY, top_k=5)
-        print(f"tag=finance -> {len(hits)} hits")
+        # With a tag filter.
+        hits = c.query(NS, vector=vec(0.15), text="prices", tags=["finance"], tags_mode=ANY)
+        print(f"query tag=finance -> {len(hits)} hits")
 
         assert hits is not None
         print("OK")

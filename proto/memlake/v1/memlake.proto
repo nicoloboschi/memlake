@@ -15,8 +15,11 @@ service Memlake {
   // indexing. The write is immediately visible to any STRONG-consistency Query.
   rpc Write(WriteRequest) returns (WriteResponse);
 
-  // Answer a query for a single memory_type. memory_types are independent sub-indexes;
-  // results are never fused across types, so a caller queries each type it cares about.
+  // Answer a query across one or more memory_types in a single call. Always runs all three
+  // arms (dense vector + BM25 full-text + graph expansion) over one shared snapshot, so the
+  // storage reads coalesce into common roundtrip waves. Returns each candidate with its raw
+  // per-arm scores; the client fuses. memory_types are independent — hits are never fused
+  // across types.
   rpc Query(QueryRequest) returns (QueryResponse);
 }
 
@@ -111,41 +114,48 @@ message TagFilter {
   TagsMatch mode = 2;
 }
 
-// Fusion knobs. All-zero means "use server defaults" (equal-weight RRF, default nprobe).
-message QueryConfig {
-  uint32 nprobe = 1;
-  float rrf_k = 2;
-  float vector_weight = 3;
-  float fts_weight = 4;
-  float graph_weight = 5;      // 0 drops the graph arm
-  uint32 arm_depth = 6;
-}
-
 message QueryRequest {
   string namespace = 1;
-  uint32 memory_type = 2;
-  Vector vector = 3;           // omit for no vector arm
-  string text = 4;             // empty for no full-text arm
+  // memory_types to query. Empty means every type present in the snapshot. Each type is an
+  // independent index; hits carry their memory_type and are never fused across types.
+  repeated uint32 memory_types = 2;
+  Vector vector = 3;           // the dense + graph arms (omit to skip both)
+  string text = 4;             // the full-text arm (empty to skip)
   TagFilter tags = 5;          // omit for no tag filter
-  uint32 top_k = 6;
-  Consistency consistency = 7;
-  QueryConfig config = 8;      // omit for defaults
+  // Per-arm candidate depth; 0 uses the server default. Which arms run is decided by the
+  // inputs: `vector` drives dense + graph, `text` drives full-text. (The graph arm always
+  // runs alongside the dense arm — the 3-way query is the normal path.)
+  uint32 vector_top_k = 6;
+  uint32 text_top_k = 7;
+  uint32 graph_top_k = 8;
+  uint32 nprobe = 9;           // IVF clusters probed (0 = server default)
+  Consistency consistency = 10;
 }
 
-message Contribution {
-  string arm = 1;              // "vector" | "fts" | "graph"
-  float score = 2;             // this arm's reciprocal-rank contribution
+// One arm's raw contribution to a hit. `present` says whether the arm surfaced this id;
+// when true, `rank` is its 0-based position within that arm and `score` its native score
+// (dense = cosine similarity, text = BM25, graph = activation).
+message ArmScore {
+  bool present = 1;
+  uint32 rank = 2;
+  float score = 3;
 }
 
+// A retrieved candidate with the raw signal from each arm. memlake does NO fusion: the
+// client combines these (RRF, weighting, re-ranking) itself.
 message Hit {
   bytes id = 1;                // 16-byte MemoryId
-  float score = 2;
-  repeated Contribution contributions = 3;   // per-arm breakdown, for explainability
+  uint32 memory_type = 2;
+  ArmScore dense = 3;          // vector / cosine arm
+  ArmScore text = 4;           // BM25 arm
+  ArmScore graph = 5;          // graph-expansion arm
 }
 
 message QueryResponse {
+  // The union of candidates across arms and memory_types. Unordered — the client ranks by
+  // its own fusion. Group by `memory_type` first (types are independent).
   repeated Hit hits = 1;
-  uint32 load_roundtrips = 2;  // object-storage roundtrips this query consumed
+  uint32 load_roundtrips = 2;  // shared across arms + types (reads coalesce into common waves)
 }
 
 // ---- Namespace -------------------------------------------------------------

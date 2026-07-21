@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import struct
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Iterable, Optional, Sequence
 
 import grpc
@@ -40,6 +40,23 @@ def _unpack(v: pb.Vector) -> list[float]:
     return list(struct.unpack(f"<{len(v.f32le) // 4}f", v.f32le))
 
 
+def _arm(a) -> "Arm":
+    return Arm(present=a.present, rank=a.rank, score=a.score)
+
+
+def _hits(pb_hits) -> list["Hit"]:
+    return [
+        Hit(
+            id=h.id,
+            memory_type=h.memory_type,
+            dense=_arm(h.dense),
+            text=_arm(h.text),
+            graph=_arm(h.graph),
+        )
+        for h in pb_hits
+    ]
+
+
 def memory(
     text: str,
     vector: Optional[Sequence[float]] = None,
@@ -66,10 +83,22 @@ def memory(
 
 
 @dataclass
-class Hit:
-    id: bytes
+class Arm:
+    """One arm's raw signal for a hit. `present` is False if the arm did not surface it."""
+    present: bool
+    rank: int
     score: float
-    contributions: dict[str, float] = field(default_factory=dict)
+
+
+@dataclass
+class Hit:
+    """A retrieved candidate with the RAW per-arm signals. memlake does no fusion — combine
+    these however you like (RRF over ranks, weighted sum of scores, re-ranking...)."""
+    id: bytes
+    memory_type: int
+    dense: Arm   # vector / cosine
+    text: Arm    # BM25
+    graph: Arm   # graph activation
 
     @property
     def id_uuid(self) -> str:
@@ -82,6 +111,7 @@ class MemlakeClient:
     def __init__(self, target: str = "localhost:50051", *, channel: Optional[grpc.Channel] = None):
         self._channel = channel or grpc.insecure_channel(target)
         self._stub = rpc.MemlakeStub(self._channel)
+        self.last_roundtrips: int = 0  # object-storage roundtrips of the last query()
 
     def close(self) -> None:
         self._channel.close()
@@ -121,89 +151,41 @@ class MemlakeClient:
     def query(
         self,
         namespace: str,
-        memory_type: int,
         *,
         vector: Optional[Sequence[float]] = None,
         text: Optional[str] = None,
+        memory_types: Optional[Sequence[int]] = None,
         tags: Optional[Sequence[str]] = None,
         tags_mode: int = ANY,
-        top_k: int = 10,
-        consistency: int = STRONG,
+        vector_top_k: int = 0,
+        text_top_k: int = 0,
+        graph_top_k: int = 0,
         nprobe: int = 0,
-        vector_weight: float = 0.0,
-        fts_weight: float = 0.0,
-        graph_weight: float = 1.0,
-        arm_depth: int = 0,
+        consistency: int = STRONG,
     ) -> list[Hit]:
-        """Query one memory_type. Omit `vector`/`text` to drop that arm. Set `graph_weight=0`
-        to drop the graph arm. Zeroed config fields fall back to server defaults."""
-        req = pb.QueryRequest(
-            namespace=namespace,
-            memory_type=memory_type,
-            vector=_pack(vector),
-            text=text or "",
-            top_k=top_k,
-            consistency=consistency,
-            config=pb.QueryConfig(
-                nprobe=nprobe,
-                vector_weight=vector_weight,
-                fts_weight=fts_weight,
-                graph_weight=graph_weight,
-                arm_depth=arm_depth,
-            ),
-        )
-        hits, _ = self.query_metered(
-            namespace, memory_type,
-            vector=vector, text=text, tags=tags, tags_mode=tags_mode,
-            top_k=top_k, consistency=consistency, nprobe=nprobe,
-            vector_weight=vector_weight, fts_weight=fts_weight,
-            graph_weight=graph_weight, arm_depth=arm_depth,
-        )
-        return hits
+        """Run one query across `memory_types` (or all if None) with all three arms —
+        dense vector, BM25 full-text, and graph — in a single call. `vector` drives the
+        dense + graph arms; `text` drives full-text. `*_top_k` bound each arm's candidate
+        depth (0 = server default).
 
-    def query_metered(
-        self,
-        namespace: str,
-        memory_type: int,
-        *,
-        vector: Optional[Sequence[float]] = None,
-        text: Optional[str] = None,
-        tags: Optional[Sequence[str]] = None,
-        tags_mode: int = ANY,
-        top_k: int = 10,
-        consistency: int = STRONG,
-        nprobe: int = 0,
-        vector_weight: float = 0.0,
-        fts_weight: float = 0.0,
-        graph_weight: float = 1.0,
-        arm_depth: int = 0,
-    ) -> tuple[list[Hit], int]:
-        """Like `query`, but also returns the object-storage roundtrips the query consumed
-        server-side (0 == fully served from the server's cache)."""
+        Returns a flat list of Hit, each carrying the RAW per-arm signals (`hit.dense`,
+        `hit.text`, `hit.graph`, each an `Arm(present, rank, score)`) plus `hit.memory_type`.
+        memlake does NOT fuse — group by `memory_type` and apply your own RRF / weighting.
+        The server-side roundtrips of the last call are available as `client.last_roundtrips`.
+        """
         req = pb.QueryRequest(
             namespace=namespace,
-            memory_type=memory_type,
+            memory_types=list(memory_types or []),
             vector=_pack(vector),
             text=text or "",
-            top_k=top_k,
+            vector_top_k=vector_top_k,
+            text_top_k=text_top_k,
+            graph_top_k=graph_top_k,
+            nprobe=nprobe,
             consistency=consistency,
-            config=pb.QueryConfig(
-                nprobe=nprobe,
-                vector_weight=vector_weight,
-                fts_weight=fts_weight,
-                graph_weight=graph_weight,
-                arm_depth=arm_depth,
-            ),
         )
         if tags:
             req.tags.CopyFrom(pb.TagFilter(tags=list(tags), mode=tags_mode))
         resp = self._stub.Query(req)
-        hits = [
-            Hit(
-                id=h.id,
-                score=h.score,
-                contributions={c.arm: c.score for c in h.contributions},
-            )
-            for h in resp.hits
-        ]
-        return hits, resp.load_roundtrips
+        self.last_roundtrips = resp.load_roundtrips
+        return _hits(resp.hits)

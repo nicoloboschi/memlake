@@ -5,7 +5,10 @@
     with MemlakeClient("localhost:50051") as c:
         c.create_namespace("my-bank")
         c.write("my-bank", [memory("hello world", vector=[...], memory_type=1)])
-        hits = c.query("my-bank", memory_type=1, vector=[...], text="hello", top_k=5)
+        # one call, all memory_types, all 3 arms; each hit carries raw per-arm scores.
+        hits = c.query("my-bank", vector=[...], text="hello")
+        for h in hits:
+            print(h.memory_type, h.dense.score, h.text.score, h.graph.score)
 """
 
 from .client import (
@@ -16,6 +19,7 @@ from .client import (
     EVENTUAL,
     EXACT,
     STRONG,
+    Arm,
     Hit,
     MemlakeClient,
     memory,
@@ -25,6 +29,7 @@ __all__ = [
     "MemlakeClient",
     "memory",
     "Hit",
+    "Arm",
     "ANY",
     "ALL",
     "ANY_STRICT",

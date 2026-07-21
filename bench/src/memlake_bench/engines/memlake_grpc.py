@@ -27,17 +27,35 @@ def _id_bytes(doc_id: str) -> bytes:
     return uuid.uuid5(uuid.NAMESPACE_OID, doc_id).bytes
 
 
+def _rrf(rankings, k=60) -> list:
+    """Reciprocal-rank fusion of several ranked doc-id lists — the client-side fusion memlake
+    deliberately leaves to the caller. This is exactly what Hindsight would do with the raw
+    per-arm ranks memlake returns."""
+    scores: dict = {}
+    for ranking in rankings:
+        for rank, doc in enumerate(ranking):
+            scores[doc] = scores.get(doc, 0.0) + 1.0 / (k + rank + 1)
+    return [doc for doc, _ in sorted(scores.items(), key=lambda x: -x[1])]
+
+
 def _rank(client, query_text, qvec, *, top_k, graph, id_to_doc) -> dict:
-    """Return {arm_name: ranked_doc_ids} for one query."""
-    arms = {
-        "dense": dict(vector=qvec, graph_weight=0.0),
-        "sparse": dict(text=query_text, graph_weight=0.0),
-        "hybrid": dict(vector=qvec, text=query_text, graph_weight=1.0 if graph else 0.0),
-    }
-    out = {}
-    for name, kwargs in arms.items():
-        hits = client.query(NS, MT, top_k=top_k, consistency=EVENTUAL, **kwargs)
-        out[name] = [id_to_doc[h.id] for h in hits if h.id in id_to_doc]
+    """ONE query returns the raw per-arm signals; every arm ranking is derived client-side.
+    Returns {arm_name: ranked_doc_ids}."""
+    hits = client.query(
+        NS, vector=qvec, text=query_text, memory_types=[MT],
+        vector_top_k=top_k, text_top_k=top_k, graph_top_k=top_k, consistency=EVENTUAL,
+    )
+
+    def arm_docs(present, rank_of) -> list:
+        ordered = sorted((h for h in hits if present(h)), key=rank_of)
+        return [id_to_doc[h.id] for h in ordered if h.id in id_to_doc]
+
+    dense = arm_docs(lambda h: h.dense.present, lambda h: h.dense.rank)
+    sparse = arm_docs(lambda h: h.text.present, lambda h: h.text.rank)
+    out = {"dense": dense, "sparse": sparse, "hybrid": _rrf([dense, sparse])}
+    if graph:
+        graph_docs = arm_docs(lambda h: h.graph.present, lambda h: h.graph.rank)
+        out["hybrid"] = _rrf([dense, sparse, graph_docs])
     return out
 
 

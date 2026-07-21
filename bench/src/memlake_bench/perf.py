@@ -14,7 +14,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 
-from memlake_client import ANY, ANY_STRICT, EVENTUAL, MemlakeClient
+from memlake_client import ANY, EVENTUAL, MemlakeClient
 
 from . import server
 from .perf_datagen import GenConfig, Generator
@@ -95,38 +95,24 @@ class PerfReport:
         return "\n".join(lines)
 
 
-# (name, build) where build(query_vec) -> kwargs for client.query_metered.
-def _workloads():
-    return [
-        ("vector", lambda q: dict(vector=q, graph_weight=0.0)),
-        ("fts", lambda q: dict(text="memory vector search", graph_weight=0.0)),
-        ("hybrid", lambda q: dict(vector=q, text="memory vector", graph_weight=0.0)),
-        ("graph", lambda q: dict(vector=q, graph_weight=1.0)),
-        ("tags-any", lambda q: dict(vector=q, tags=["tag-1", "tag-2"], tags_mode=ANY, graph_weight=0.0)),
-        ("tags-strict", lambda q: dict(vector=q, tags=["tag-1"], tags_mode=ANY_STRICT, graph_weight=0.0)),
-    ]
-
-
-def _run_workload(client, ns, mt, qs, build, name) -> WorkloadResult:
+def _run_3way(client, ns, qs, name, *, tags=None, tags_mode=ANY) -> WorkloadResult:
+    """The one query pattern memlake serves: a single call across ALL memory_types with all
+    three arms (dense + full-text + graph). Roundtrips are shared across types and arms, not
+    multiplied. EVENTUAL consistency exercises the warm cached snapshot (0 roundtrips warm)."""
     latencies, total_rt = [], 0
     for q in qs:
-        kwargs = build(q)
         t = time.perf_counter()
-        # Retrieval reads don't need read-your-writes, so EVENTUAL exercises the warm cached
-        # snapshot (0 roundtrips once warm). Switch to STRONG for read-your-writes semantics.
-        _, rt = client.query_metered(ns, mt, top_k=10, consistency=EVENTUAL, **kwargs)
+        client.query(
+            ns, vector=q, text="memory vector",
+            memory_types=None, tags=tags, tags_mode=tags_mode, consistency=EVENTUAL,
+        )
         latencies.append((time.perf_counter() - t) * 1000.0)
-        total_rt += rt
+        total_rt += client.last_roundtrips
     n = max(len(qs), 1)
     mean_rt = total_rt / n
     return WorkloadResult(
-        name=name,
-        p50=_pct(latencies, 50),
-        p90=_pct(latencies, 90),
-        p99=_pct(latencies, 99),
-        mean_rt=mean_rt,
-        # Read cost: each roundtrip is a GET-like request.
-        usd_per_1k=mean_rt * GET_PER_1K,  # (rt/query) / 1000 * price * 1000 queries
+        name=name, p50=_pct(latencies, 50), p90=_pct(latencies, 90),
+        p99=_pct(latencies, 99), mean_rt=mean_rt, usd_per_1k=mean_rt * GET_PER_1K,
     )
 
 
@@ -177,10 +163,14 @@ def run(
     cold, warm = [], []
     with server.Serve(binary, addr=addr, mem_mb=mem_mb, disk_mb=disk_mb) as _srv:
         client = MemlakeClient(addr)
-        mt = 1  # first memory_type
-        for name, build in _workloads():
-            cold.append(_run_workload(client, ns, mt, qs, build, name))
-            warm.append(_run_workload(client, ns, mt, qs, build, name))
+        # Two variants of the 3-way query: plain, and with a tag filter.
+        variants = [
+            ("3way", dict()),
+            ("3way+tags", dict(tags=["tag-1", "tag-2"], tags_mode=ANY)),
+        ]
+        for name, kw in variants:
+            cold.append(_run_3way(client, ns, qs, name, **kw))
+            warm.append(_run_3way(client, ns, qs, name, **kw))
         client.close()
 
     return PerfReport(

@@ -18,8 +18,8 @@ Update this page when a run materially changes a number.
 
 | Phase | Result | Notes |
 |---|---|---|
-| **write** | 9.1s — **10,900 memories/s** | 196 batches via the client; group-committed to the WAL. Acks on durable PUT, not on indexing. |
-| **index (first build)** | **56s** — 1,780 memories/s | k-means train + kNN link derivation + FTS + writes, one generation. Varies ~55–75s run-to-run (MinIO + scheduling). |
+| **write** | ~9–10s — **~10,000 memories/s** | 196 batches via the client; group-committed to the WAL. Acks on durable PUT, not on indexing. |
+| **index (first build)** | **~58s** — ~1,700 memories/s | k-means train + kNN link derivation + FTS + writes, one generation. Varies ~55–75s run-to-run (MinIO + scheduling). |
 | **index (incremental re-index)** | ~30s | folding new WAL entries onto an existing generation reuses trained centroids (train ≈ 0). |
 
 The indexer runs as its own process (`index --once` here; a Deployment in prod), so its cost
@@ -50,24 +50,24 @@ $0.0043/GB-month stored. S3 Standard us-east-1, from counted store ops.
 
 ## Read latency & roundtrips (100k, bounded 64MB/512MB cache)
 
-Measured through the client with `EVENTUAL` consistency (retrieval reads don't need
-read-your-writes). The server caches the open snapshot per namespace, so a warm read is pure
-in-memory fusion over the local cache — **0 object-storage roundtrips**.
+memlake serves exactly one query shape: **a single call across all memory_types running all
+three arms** (dense vector + BM25 + graph). It returns the raw per-arm scores; the client
+fuses. Measured with `EVENTUAL` consistency; the server caches the open snapshot per
+namespace, so a warm read is pure in-memory arm evaluation over the local cache — **0
+object-storage roundtrips**. `3way+tags` adds a tag filter.
 
 | Workload | cold p50 | cold p99 | cold rt | warm p50 | warm p99 | warm rt |
 |---|---:|---:|---:|---:|---:|---:|
-| vector | 1.18ms | 14.4ms | 0.9 | 1.16ms | 1.40ms | 0.0 |
-| fts | 1.05ms | 1.51ms | 0.0 | 1.13ms | 8.59ms | 0.0 |
-| hybrid | 1.79ms | 3.18ms | 0.0 | 1.75ms | 6.49ms | 0.0 |
-| graph | 1.96ms | 8.31ms | 0.0 | 2.05ms | 10.3ms | 0.0 |
-| tags-any | 4.12ms | 5.10ms | 0.0 | 4.14ms | 15.3ms | 0.0 |
-| tags-strict | 3.53ms | 4.58ms | 0.0 | 3.62ms | 22.5ms | 0.0 |
+| **3way** | **10.4ms** | 183ms | **1.3** | **9.5ms** | 146ms | **0.0** |
+| 3way+tags | 27.4ms | 362ms | 0.0 | 27.6ms | 215ms | 0.0 |
 
-p99 tails are first-touch cluster fetches / GC pauses; p50/p90 are the steady state.
-
-Single-digit-ms p50 across every arm, and **roundtrips are bounded** (≤1 cold, 0 warm)
-independent of corpus size — INV-7, now verified through the network path. `tags-*` cost more
-because Zipfian tags admit many clusters under pruning (`fetch_clusters` + `rerank`).
+One `3way` call fans out to 3 memory_types × 3 arms = 9 arm-executions and returns the full
+raw candidate set (~800 hits: up to `top_k` per arm per type) yet consumes only **~1.3 shared
+roundtrips cold / 0 warm** — the reads coalesce into common waves instead of multiplying. The
+p50 reflects evaluating and serializing all candidates so the client has everything it needs
+to fuse; p99 tails are first-touch cluster fetches / GC pauses. `3way+tags` costs more because
+Zipfian tags admit many clusters under pruning. **Roundtrips are bounded** (≤~1.3 cold, 0
+warm) independent of corpus size — INV-7, verified through the network path.
 
 ### 10k, same cache
 
@@ -88,9 +88,10 @@ capped by construction (memory eviction demotes to disk, disk eviction deletes).
 
 ## Accuracy — BEIR vs Qdrant (e2e via the client-server)
 
-The `memlake` engine writes the corpus through the client, runs the indexer, and queries each
-arm over the wire; every engine is scored with identical metric code, so only the ranking
-differs. nDCG@10:
+The `memlake` engine writes the corpus through the client, runs the indexer, and issues **one
+query per BEIR query** — memlake returns the raw per-arm scores and the engine derives the
+dense / sparse / hybrid rankings client-side (RRF over the raw ranks), exactly as Hindsight
+would. Every engine is scored with identical metric code, so only the ranking differs. nDCG@10:
 
 | Dataset  | Arm    | memlake | qdrant | |
 |----------|--------|--------:|-------:|-|

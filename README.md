@@ -110,13 +110,21 @@ with MemlakeClient("memlake:50051") as c:
                memory_type=1, tags=["prod"], key="doc-42"),
     ])
 
-    # Query one memory_type. Omit an arm by leaving vector/text out; graph_weight=0 drops
-    # the graph arm. Under STRONG consistency (default) the write above is already visible.
-    hits = c.query("my-bank", memory_type=1,
-                   vector=query_embedding, text="retrieval",
-                   tags=["prod"], tags_mode=ANY_STRICT, top_k=10)
+    # ONE query across memory_types (all, if omitted), always running the three arms —
+    # dense vector + BM25 full-text + graph. `vector` drives dense + graph, `text` drives
+    # full-text. The server runs them concurrently over one snapshot, so the storage reads
+    # coalesce into shared roundtrips.
+    hits = c.query("my-bank", vector=query_embedding, text="retrieval",
+                   tags=["prod"], tags_mode=ANY_STRICT)
+
+    # memlake does NO fusion. Each hit carries the RAW per-arm signals — dense cosine, BM25,
+    # graph activation, with each arm's rank — so the caller (e.g. Hindsight) runs its own
+    # RRF or weighting. memory_types are independent: group by memory_type first.
     for h in hits:
-        print(h.id_uuid, h.score, h.contributions)   # per-arm RRF breakdown
+        print(h.memory_type, h.id_uuid,
+              h.dense.score, h.dense.rank,     # dense arm (present=False if it didn't retrieve h)
+              h.text.score,  h.text.rank,      # BM25 arm
+              h.graph.score, h.graph.rank)     # graph arm
 ```
 
 The contract is [`proto/memlake/v1/memlake.proto`](proto/memlake/v1/memlake.proto); generate a

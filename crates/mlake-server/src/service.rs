@@ -171,39 +171,56 @@ impl Memlake for MemlakeService {
         if req.namespace.is_empty() {
             return Err(Status::invalid_argument("namespace is required"));
         }
-        let memory_type = convert::memory_type_u8(req.memory_type)?;
         let vector = req.vector.as_ref().map(convert::decode_vector).transpose()?;
         let tags = convert::tag_filter(req.tags);
-        let config = convert::query_config(req.config);
         let consistency = convert::consistency(req.consistency);
-        let top_k = if req.top_k == 0 { 10 } else { req.top_k as usize };
-        // Own every value before the await so no borrow of `req` crosses the await point.
+        let depths = convert::arm_depths(req.vector_top_k, req.text_top_k, req.graph_top_k, req.nprobe);
         let text: Option<String> = if req.text.is_empty() { None } else { Some(req.text) };
+
         let ns = self.namespace(&req.namespace);
-        // Reuse the cached open snapshot when it is still current (see `snapshot`): this turns
-        // the common warm read into a pure in-memory fusion over the shared Store cache, with
-        // 0 (EVENTUAL) or 1 (STRONG head-check) fresh roundtrips instead of a full re-open.
+        // Reuse the cached open snapshot when still current (see `snapshot`): a warm read is
+        // pure in-memory arm evaluation over the shared Store cache, 0 fresh roundtrips.
         let snap = self.snapshot(&ns, consistency).await?;
         let node = &snap.node;
 
-        // Report the roundtrips this *query* consumed (the marginal read cost), not the
-        // snapshot's one-time open cost — a warm cached read is 0.
+        // Which types to answer: the caller's list, or every type in the snapshot.
+        let mut types: Vec<u8> = if req.memory_types.is_empty() {
+            node.memory_types()
+        } else {
+            req.memory_types
+                .iter()
+                .map(|&t| convert::memory_type_u8(t))
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        types.sort_unstable();
+        types.dedup();
+
+        // Run every type's three arms concurrently over the one shared snapshot, sharing a
+        // single metrics sink. Their storage reads are issued together, so they land in the
+        // same roundtrip waves — a 3-type × 3-arm query costs the waves of one, not nine.
         let metrics = QueryMetrics::new();
-        let hits = node
-            .query_metered(
-                memory_type,
-                vector.as_deref(),
-                text.as_deref(),
-                &tags,
-                top_k,
-                config,
-                &metrics,
-            )
-            .await
-            .map_err(internal)?;
+        let vref = vector.as_deref();
+        let tref = text.as_deref();
+        let per_type = futures::future::try_join_all(types.into_iter().map(|mt| {
+            let metrics = &metrics;
+            let tags = &tags;
+            async move {
+                node.query_raw_metered(mt, vref, tref, tags, depths, metrics)
+                    .await
+                    .map(|hits| (mt, hits))
+            }
+        }))
+        .await
+        .map_err(internal)?;
+
+        // Flatten to one hit list; each hit carries its memory_type so the client can group.
+        let mut hits = Vec::new();
+        for (mt, raw) in per_type {
+            hits.extend(raw.into_iter().map(|h| convert::raw_hit(mt, h)));
+        }
 
         Ok(Response::new(pb::QueryResponse {
-            hits: hits.into_iter().map(convert::hit).collect(),
+            hits,
             load_roundtrips: metrics.roundtrips() as u32,
         }))
     }

@@ -4,7 +4,7 @@
 
 use mlake_core::memory::{CausalEdge, LinkType, Timestamps, Weight};
 use mlake_core::{Delta, Memory, MemoryId, Op, TagFilter, TagsMatch};
-use mlake_index::{Consistency, QueryConfig};
+use mlake_index::{ArmDepths, ArmScore, Consistency, RawHit};
 use tonic::Status;
 
 use crate::pb;
@@ -137,40 +137,35 @@ pub fn tag_filter(f: Option<pb::TagFilter>) -> TagFilter {
     TagFilter::new(f.tags, mode)
 }
 
-/// Build a `QueryConfig` from the wire message, treating each zero field as "use the
-/// server default" so a client can send an empty message and get sensible fusion.
-pub fn query_config(c: Option<pb::QueryConfig>) -> QueryConfig {
-    let mut out = QueryConfig::default();
-    let Some(c) = c else { return out };
-    if c.nprobe != 0 {
-        out.nprobe = c.nprobe as usize;
+/// Default per-arm candidate depth when the client sends 0.
+const DEFAULT_ARM_DEPTH: usize = 100;
+/// Default IVF probe width (mirrors `mlake_ivf::DEFAULT_NPROBE`).
+const DEFAULT_NPROBE: usize = 8;
+
+/// Resolve per-arm depths from the wire request, filling server defaults for zero fields.
+pub fn arm_depths(vector_top_k: u32, text_top_k: u32, graph_top_k: u32, nprobe: u32) -> ArmDepths {
+    let depth = |v: u32| if v == 0 { DEFAULT_ARM_DEPTH } else { v as usize };
+    ArmDepths {
+        vector: depth(vector_top_k),
+        text: depth(text_top_k),
+        graph: depth(graph_top_k),
+        nprobe: if nprobe == 0 { DEFAULT_NPROBE } else { nprobe as usize },
     }
-    if c.rrf_k != 0.0 {
-        out.rrf_k = c.rrf_k;
-    }
-    if c.vector_weight != 0.0 {
-        out.vector_weight = c.vector_weight;
-    }
-    if c.fts_weight != 0.0 {
-        out.fts_weight = c.fts_weight;
-    }
-    // graph_weight is special: 0 is a meaningful value (drop the graph arm), so we only
-    // keep the default when the whole config message was omitted (handled above).
-    out.graph_weight = c.graph_weight;
-    if c.arm_depth != 0 {
-        out.arm_depth = c.arm_depth as usize;
-    }
-    out
 }
 
-pub fn hit(h: mlake_index::FusedHit) -> pb::Hit {
+fn arm_score(a: Option<ArmScore>) -> pb::ArmScore {
+    match a {
+        Some(s) => pb::ArmScore { present: true, rank: s.rank, score: s.score },
+        None => pb::ArmScore { present: false, rank: 0, score: 0.0 },
+    }
+}
+
+pub fn raw_hit(memory_type: u8, h: RawHit) -> pb::Hit {
     pb::Hit {
         id: h.id.0.to_vec(),
-        score: h.score,
-        contributions: h
-            .contributions
-            .into_iter()
-            .map(|(arm, score)| pb::Contribution { arm, score })
-            .collect(),
+        memory_type: memory_type as u32,
+        dense: Some(arm_score(h.dense)),
+        text: Some(arm_score(h.text)),
+        graph: Some(arm_score(h.graph)),
     }
 }

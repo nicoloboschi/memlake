@@ -24,19 +24,19 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x18memlake/v1/memlake.proto\x12\nmemlake.v1\"\x17\n\x06Vector\x12\r\n\x05\x66\x33\x32le\x18\x01 \x01(\x0c\"\xbc\x01\n\nTimestamps\x12\x17\n\nevent_date\x18\x01 \x01(\x03H\x00\x88\x01\x01\x12\x1b\n\x0eoccurred_start\x18\x02 \x01(\x03H\x01\x88\x01\x01\x12\x19\n\x0coccurred_end\x18\x03 \x01(\x03H\x02\x88\x01\x01\x12\x19\n\x0cmentioned_at\x18\x04 \x01(\x03H\x03\x88\x01\x01\x42\r\n\x0b_event_dateB\x11\n\x0f_occurred_startB\x0f\n\r_occurred_endB\x0f\n\r_mentioned_at\"U\n\nCausalEdge\x12\x0e\n\x06target\x18\x01 \x01(\x0c\x12\'\n\tlink_type\x18\x02 \x01(\x0e\x32\x14.memlake.v1.LinkType\x12\x0e\n\x06weight\x18\x03 \x01(\x02\"\xf7\x01\n\x06Memory\x12\n\n\x02id\x18\x01 \x01(\x0c\x12\x0b\n\x03key\x18\x02 \x01(\t\x12\"\n\x06vector\x18\x03 \x01(\x0b\x32\x12.memlake.v1.Vector\x12\x0c\n\x04text\x18\x04 \x01(\t\x12\x13\n\x0bmemory_type\x18\x05 \x01(\r\x12\x0c\n\x04tags\x18\x06 \x03(\t\x12\x13\n\x0bproof_count\x18\x07 \x01(\r\x12\x12\n\nentity_ids\x18\x08 \x03(\x04\x12*\n\ntimestamps\x18\t \x01(\x0b\x32\x16.memlake.v1.Timestamps\x12*\n\ncausal_out\x18\n \x03(\x0b\x32\x16.memlake.v1.CausalEdge\".\n\x05Patch\x12\n\n\x02id\x18\x01 \x01(\x0c\x12\x19\n\x11proof_count_delta\x18\x02 \x01(\x05\"\x8a\x01\n\x02Op\x12$\n\x06upsert\x18\x01 \x01(\x0b\x32\x12.memlake.v1.MemoryH\x00\x12\x13\n\ttombstone\x18\x02 \x01(\x0cH\x00\x12\"\n\x05patch\x18\x03 \x01(\x0b\x32\x11.memlake.v1.PatchH\x00\x12\x1d\n\x13guard_expect_seq_lt\x18\x04 \x01(\x04H\x00\x42\x06\n\x04kind\">\n\x0cWriteRequest\x12\x11\n\tnamespace\x18\x01 \x01(\t\x12\x1b\n\x03ops\x18\x02 \x03(\x0b\x32\x0e.memlake.v1.Op\".\n\rWriteResponse\x12\x0b\n\x03seq\x18\x01 \x01(\x04\x12\x10\n\x08\x61ttempts\x18\x02 \x01(\r\">\n\tTagFilter\x12\x0c\n\x04tags\x18\x01 \x03(\t\x12#\n\x04mode\x18\x02 \x01(\x0e\x32\x15.memlake.v1.TagsMatch\"\x80\x01\n\x0bQueryConfig\x12\x0e\n\x06nprobe\x18\x01 \x01(\r\x12\r\n\x05rrf_k\x18\x02 \x01(\x02\x12\x15\n\rvector_weight\x18\x03 \x01(\x02\x12\x12\n\nfts_weight\x18\x04 \x01(\x02\x12\x14\n\x0cgraph_weight\x18\x05 \x01(\x02\x12\x11\n\tarm_depth\x18\x06 \x01(\r\"\xf3\x01\n\x0cQueryRequest\x12\x11\n\tnamespace\x18\x01 \x01(\t\x12\x13\n\x0bmemory_type\x18\x02 \x01(\r\x12\"\n\x06vector\x18\x03 \x01(\x0b\x32\x12.memlake.v1.Vector\x12\x0c\n\x04text\x18\x04 \x01(\t\x12#\n\x04tags\x18\x05 \x01(\x0b\x32\x15.memlake.v1.TagFilter\x12\r\n\x05top_k\x18\x06 \x01(\r\x12,\n\x0b\x63onsistency\x18\x07 \x01(\x0e\x32\x17.memlake.v1.Consistency\x12\'\n\x06\x63onfig\x18\x08 \x01(\x0b\x32\x17.memlake.v1.QueryConfig\"*\n\x0c\x43ontribution\x12\x0b\n\x03\x61rm\x18\x01 \x01(\t\x12\r\n\x05score\x18\x02 \x01(\x02\"Q\n\x03Hit\x12\n\n\x02id\x18\x01 \x01(\x0c\x12\r\n\x05score\x18\x02 \x01(\x02\x12/\n\rcontributions\x18\x03 \x03(\x0b\x32\x18.memlake.v1.Contribution\"G\n\rQueryResponse\x12\x1d\n\x04hits\x18\x01 \x03(\x0b\x32\x0f.memlake.v1.Hit\x12\x17\n\x0fload_roundtrips\x18\x02 \x01(\r\"+\n\x16\x43reateNamespaceRequest\x12\x11\n\tnamespace\x18\x01 \x01(\t\"\x19\n\x17\x43reateNamespaceResponse*@\n\x08LinkType\x12\n\n\x06\x43\x41USES\x10\x00\x12\r\n\tCAUSED_BY\x10\x01\x12\x0b\n\x07\x45NABLES\x10\x02\x12\x0c\n\x08PREVENTS\x10\x03*\'\n\x0b\x43onsistency\x12\n\n\x06STRONG\x10\x00\x12\x0c\n\x08\x45VENTUAL\x10\x01*H\n\tTagsMatch\x12\x07\n\x03\x41NY\x10\x00\x12\x07\n\x03\x41LL\x10\x01\x12\x0e\n\nANY_STRICT\x10\x02\x12\x0e\n\nALL_STRICT\x10\x03\x12\t\n\x05\x45XACT\x10\x04\x32\xe1\x01\n\x07Memlake\x12Z\n\x0f\x43reateNamespace\x12\".memlake.v1.CreateNamespaceRequest\x1a#.memlake.v1.CreateNamespaceResponse\x12<\n\x05Write\x12\x18.memlake.v1.WriteRequest\x1a\x19.memlake.v1.WriteResponse\x12<\n\x05Query\x12\x18.memlake.v1.QueryRequest\x1a\x19.memlake.v1.QueryResponseb\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x18memlake/v1/memlake.proto\x12\nmemlake.v1\"\x17\n\x06Vector\x12\r\n\x05\x66\x33\x32le\x18\x01 \x01(\x0c\"\xbc\x01\n\nTimestamps\x12\x17\n\nevent_date\x18\x01 \x01(\x03H\x00\x88\x01\x01\x12\x1b\n\x0eoccurred_start\x18\x02 \x01(\x03H\x01\x88\x01\x01\x12\x19\n\x0coccurred_end\x18\x03 \x01(\x03H\x02\x88\x01\x01\x12\x19\n\x0cmentioned_at\x18\x04 \x01(\x03H\x03\x88\x01\x01\x42\r\n\x0b_event_dateB\x11\n\x0f_occurred_startB\x0f\n\r_occurred_endB\x0f\n\r_mentioned_at\"U\n\nCausalEdge\x12\x0e\n\x06target\x18\x01 \x01(\x0c\x12\'\n\tlink_type\x18\x02 \x01(\x0e\x32\x14.memlake.v1.LinkType\x12\x0e\n\x06weight\x18\x03 \x01(\x02\"\xf7\x01\n\x06Memory\x12\n\n\x02id\x18\x01 \x01(\x0c\x12\x0b\n\x03key\x18\x02 \x01(\t\x12\"\n\x06vector\x18\x03 \x01(\x0b\x32\x12.memlake.v1.Vector\x12\x0c\n\x04text\x18\x04 \x01(\t\x12\x13\n\x0bmemory_type\x18\x05 \x01(\r\x12\x0c\n\x04tags\x18\x06 \x03(\t\x12\x13\n\x0bproof_count\x18\x07 \x01(\r\x12\x12\n\nentity_ids\x18\x08 \x03(\x04\x12*\n\ntimestamps\x18\t \x01(\x0b\x32\x16.memlake.v1.Timestamps\x12*\n\ncausal_out\x18\n \x03(\x0b\x32\x16.memlake.v1.CausalEdge\".\n\x05Patch\x12\n\n\x02id\x18\x01 \x01(\x0c\x12\x19\n\x11proof_count_delta\x18\x02 \x01(\x05\"\x8a\x01\n\x02Op\x12$\n\x06upsert\x18\x01 \x01(\x0b\x32\x12.memlake.v1.MemoryH\x00\x12\x13\n\ttombstone\x18\x02 \x01(\x0cH\x00\x12\"\n\x05patch\x18\x03 \x01(\x0b\x32\x11.memlake.v1.PatchH\x00\x12\x1d\n\x13guard_expect_seq_lt\x18\x04 \x01(\x04H\x00\x42\x06\n\x04kind\">\n\x0cWriteRequest\x12\x11\n\tnamespace\x18\x01 \x01(\t\x12\x1b\n\x03ops\x18\x02 \x03(\x0b\x32\x0e.memlake.v1.Op\".\n\rWriteResponse\x12\x0b\n\x03seq\x18\x01 \x01(\x04\x12\x10\n\x08\x61ttempts\x18\x02 \x01(\r\">\n\tTagFilter\x12\x0c\n\x04tags\x18\x01 \x03(\t\x12#\n\x04mode\x18\x02 \x01(\x0e\x32\x15.memlake.v1.TagsMatch\"\x8b\x02\n\x0cQueryRequest\x12\x11\n\tnamespace\x18\x01 \x01(\t\x12\x14\n\x0cmemory_types\x18\x02 \x03(\r\x12\"\n\x06vector\x18\x03 \x01(\x0b\x32\x12.memlake.v1.Vector\x12\x0c\n\x04text\x18\x04 \x01(\t\x12#\n\x04tags\x18\x05 \x01(\x0b\x32\x15.memlake.v1.TagFilter\x12\x14\n\x0cvector_top_k\x18\x06 \x01(\r\x12\x12\n\ntext_top_k\x18\x07 \x01(\r\x12\x13\n\x0bgraph_top_k\x18\x08 \x01(\r\x12\x0e\n\x06nprobe\x18\t \x01(\r\x12,\n\x0b\x63onsistency\x18\n \x01(\x0e\x32\x17.memlake.v1.Consistency\"8\n\x08\x41rmScore\x12\x0f\n\x07present\x18\x01 \x01(\x08\x12\x0c\n\x04rank\x18\x02 \x01(\r\x12\r\n\x05score\x18\x03 \x01(\x02\"\x94\x01\n\x03Hit\x12\n\n\x02id\x18\x01 \x01(\x0c\x12\x13\n\x0bmemory_type\x18\x02 \x01(\r\x12#\n\x05\x64\x65nse\x18\x03 \x01(\x0b\x32\x14.memlake.v1.ArmScore\x12\"\n\x04text\x18\x04 \x01(\x0b\x32\x14.memlake.v1.ArmScore\x12#\n\x05graph\x18\x05 \x01(\x0b\x32\x14.memlake.v1.ArmScore\"G\n\rQueryResponse\x12\x1d\n\x04hits\x18\x01 \x03(\x0b\x32\x0f.memlake.v1.Hit\x12\x17\n\x0fload_roundtrips\x18\x02 \x01(\r\"+\n\x16\x43reateNamespaceRequest\x12\x11\n\tnamespace\x18\x01 \x01(\t\"\x19\n\x17\x43reateNamespaceResponse*@\n\x08LinkType\x12\n\n\x06\x43\x41USES\x10\x00\x12\r\n\tCAUSED_BY\x10\x01\x12\x0b\n\x07\x45NABLES\x10\x02\x12\x0c\n\x08PREVENTS\x10\x03*\'\n\x0b\x43onsistency\x12\n\n\x06STRONG\x10\x00\x12\x0c\n\x08\x45VENTUAL\x10\x01*H\n\tTagsMatch\x12\x07\n\x03\x41NY\x10\x00\x12\x07\n\x03\x41LL\x10\x01\x12\x0e\n\nANY_STRICT\x10\x02\x12\x0e\n\nALL_STRICT\x10\x03\x12\t\n\x05\x45XACT\x10\x04\x32\xe1\x01\n\x07Memlake\x12Z\n\x0f\x43reateNamespace\x12\".memlake.v1.CreateNamespaceRequest\x1a#.memlake.v1.CreateNamespaceResponse\x12<\n\x05Write\x12\x18.memlake.v1.WriteRequest\x1a\x19.memlake.v1.WriteResponse\x12<\n\x05Query\x12\x18.memlake.v1.QueryRequest\x1a\x19.memlake.v1.QueryResponseb\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
 _builder.BuildTopDescriptorsAndMessages(DESCRIPTOR, 'memlake.v1.memlake_pb2', _globals)
 if not _descriptor._USE_C_DESCRIPTORS:
   DESCRIPTOR._loaded_options = None
-  _globals['_LINKTYPE']._serialized_start=1607
-  _globals['_LINKTYPE']._serialized_end=1671
-  _globals['_CONSISTENCY']._serialized_start=1673
-  _globals['_CONSISTENCY']._serialized_end=1712
-  _globals['_TAGSMATCH']._serialized_start=1714
-  _globals['_TAGSMATCH']._serialized_end=1786
+  _globals['_LINKTYPE']._serialized_start=1582
+  _globals['_LINKTYPE']._serialized_end=1646
+  _globals['_CONSISTENCY']._serialized_start=1648
+  _globals['_CONSISTENCY']._serialized_end=1687
+  _globals['_TAGSMATCH']._serialized_start=1689
+  _globals['_TAGSMATCH']._serialized_end=1761
   _globals['_VECTOR']._serialized_start=40
   _globals['_VECTOR']._serialized_end=63
   _globals['_TIMESTAMPS']._serialized_start=66
@@ -55,20 +55,18 @@ if not _descriptor._USE_C_DESCRIPTORS:
   _globals['_WRITERESPONSE']._serialized_end=892
   _globals['_TAGFILTER']._serialized_start=894
   _globals['_TAGFILTER']._serialized_end=956
-  _globals['_QUERYCONFIG']._serialized_start=959
-  _globals['_QUERYCONFIG']._serialized_end=1087
-  _globals['_QUERYREQUEST']._serialized_start=1090
-  _globals['_QUERYREQUEST']._serialized_end=1333
-  _globals['_CONTRIBUTION']._serialized_start=1335
-  _globals['_CONTRIBUTION']._serialized_end=1377
-  _globals['_HIT']._serialized_start=1379
-  _globals['_HIT']._serialized_end=1460
-  _globals['_QUERYRESPONSE']._serialized_start=1462
-  _globals['_QUERYRESPONSE']._serialized_end=1533
-  _globals['_CREATENAMESPACEREQUEST']._serialized_start=1535
-  _globals['_CREATENAMESPACEREQUEST']._serialized_end=1578
-  _globals['_CREATENAMESPACERESPONSE']._serialized_start=1580
-  _globals['_CREATENAMESPACERESPONSE']._serialized_end=1605
-  _globals['_MEMLAKE']._serialized_start=1789
-  _globals['_MEMLAKE']._serialized_end=2014
+  _globals['_QUERYREQUEST']._serialized_start=959
+  _globals['_QUERYREQUEST']._serialized_end=1226
+  _globals['_ARMSCORE']._serialized_start=1228
+  _globals['_ARMSCORE']._serialized_end=1284
+  _globals['_HIT']._serialized_start=1287
+  _globals['_HIT']._serialized_end=1435
+  _globals['_QUERYRESPONSE']._serialized_start=1437
+  _globals['_QUERYRESPONSE']._serialized_end=1508
+  _globals['_CREATENAMESPACEREQUEST']._serialized_start=1510
+  _globals['_CREATENAMESPACEREQUEST']._serialized_end=1553
+  _globals['_CREATENAMESPACERESPONSE']._serialized_start=1555
+  _globals['_CREATENAMESPACERESPONSE']._serialized_end=1580
+  _globals['_MEMLAKE']._serialized_start=1764
+  _globals['_MEMLAKE']._serialized_end=1989
 # @@protoc_insertion_point(module_scope)

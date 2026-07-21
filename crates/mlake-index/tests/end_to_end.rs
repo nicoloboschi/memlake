@@ -11,7 +11,7 @@ use std::sync::Arc;
 use mlake_core::memory::Timestamps;
 use mlake_core::{Memory, MemoryId, Op};
 use mlake_fts::Tokenizer;
-use mlake_index::{index, Consistency, IndexOptions, QueryConfig, QueryNode};
+use mlake_index::{index, ArmDepths, Consistency, IndexOptions, QueryConfig, QueryNode};
 use mlake_store::Store;
 use mlake_wal::{Namespace, Writer};
 
@@ -667,18 +667,18 @@ async fn query_fetches_only_probed_clusters_and_warms_the_cache() {
     };
     assert!(cluster_count >= 15, "test needs many clusters, got {cluster_count}");
 
-    let cfg = QueryConfig { nprobe: 4, ..QueryConfig::default() };
+    let nprobe = 4;
+    let depths = ArmDepths { vector: 100, text: 100, graph: 100, nprobe };
     let q = vec![0.5f32, 0.5, 0.5];
 
     // Cold query: fetches only the probed clusters (≤ nprobe requests), far fewer than the
     // total, and stays within the roundtrip budget.
     let cold = QueryMetrics::new();
-    let hits = node.query_metered(1, Some(&q), None, &tf(), 10, cfg, &cold).await.unwrap();
+    let hits = node.query_raw_metered(1, Some(&q), None, &tf(), depths, &cold).await.unwrap();
     assert!(!hits.is_empty());
     assert!(
-        cold.requests() <= cfg.nprobe,
-        "a query must fetch at most nprobe={} clusters, fetched {} (of {cluster_count})",
-        cfg.nprobe,
+        cold.requests() <= nprobe,
+        "a query must fetch at most nprobe={nprobe} clusters, fetched {} (of {cluster_count})",
         cold.requests()
     );
     assert!(cold.requests() < cluster_count, "must not fetch the whole generation");
@@ -687,7 +687,7 @@ async fn query_fetches_only_probed_clusters_and_warms_the_cache() {
 
     // Warm query: same probed clusters, now served from the NVMe cache.
     let warm = QueryMetrics::new();
-    node.query_metered(1, Some(&q), None, &tf(), 10, cfg, &warm).await.unwrap();
+    node.query_raw_metered(1, Some(&q), None, &tf(), depths, &warm).await.unwrap();
     assert!(warm.cache_hits() > 0, "warm query should hit the cache");
     assert_eq!(warm.cache_misses(), 0, "warm query should not miss");
 }
