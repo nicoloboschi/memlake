@@ -223,6 +223,62 @@ impl SsTableIndex {
         }
         Ok(out)
     }
+
+    /// All records with key in `[lo, hi]` (inclusive), in key order, read as one coalesced
+    /// request over the covering blocks. This is the range primitive the time index needs:
+    /// entry-point selection over a time window becomes one bounded ranged scan.
+    pub async fn scan_range(
+        &self,
+        store: &Store,
+        data_path: &str,
+        lo: &[u8; 16],
+        hi: &[u8; 16],
+        ctx: Option<(&QueryMetrics, usize)>,
+    ) -> Result<Vec<([u8; 16], Vec<u8>)>> {
+        if self.blocks.is_empty() || lo > hi {
+            return Ok(Vec::new());
+        }
+        // First block that could hold `lo`: the last block with first_key <= lo (or block 0
+        // if lo precedes the whole table). Last block to read: any with first_key <= hi.
+        let start = self.blocks.partition_point(|b| &b.first_key <= lo).saturating_sub(1);
+        let end = self.blocks.partition_point(|b| &b.first_key <= hi); // exclusive
+        if start >= end {
+            return Ok(Vec::new());
+        }
+        let ranges: Vec<std::ops::Range<usize>> = self.blocks[start..end]
+            .iter()
+            .map(|b| b.offset as usize..b.offset as usize + b.len as usize)
+            .collect();
+        let blocks = store.get_ranges(data_path, &ranges, ctx).await?;
+        let mut out = Vec::new();
+        for block_bytes in &blocks {
+            scan_block_range(block_bytes, lo, hi, &mut out);
+        }
+        Ok(out)
+    }
+}
+
+/// Collect every record in `block` whose key is in `[lo, hi]`. Records are sorted, so the
+/// scan stops once it passes `hi`.
+fn scan_block_range(block: &[u8], lo: &[u8; 16], hi: &[u8; 16], out: &mut Vec<([u8; 16], Vec<u8>)>) {
+    let mut p = 0;
+    while p + 20 <= block.len() {
+        let mut rec_key = [0u8; 16];
+        rec_key.copy_from_slice(&block[p..p + 16]);
+        let vlen = u32::from_le_bytes(block[p + 16..p + 20].try_into().unwrap()) as usize;
+        let vstart = p + 20;
+        let vend = vstart + vlen;
+        if vend > block.len() {
+            break;
+        }
+        if &rec_key > hi {
+            break; // sorted: nothing further is in range
+        }
+        if &rec_key >= lo {
+            out.push((rec_key, block[vstart..vend].to_vec()));
+        }
+        p = vend;
+    }
 }
 
 /// Linear scan of a block for `key`. Records are sorted, so the scan stops once it passes
@@ -452,6 +508,80 @@ fn decode_ids(bytes: &[u8], cap: usize) -> Vec<MemoryId> {
         .collect()
 }
 
+/// The time index: `effective_ts -> [MemoryId]`, sorted by time, so entry-point selection
+/// over a `[from, to]` window is one bounded ranged scan (item i of the temporal arm), and
+/// the memories timeseries is the same scan bucketed. `effective_ts` is
+/// `COALESCE(occurred_start, mentioned_at, occurred_end)`, an `i64` epoch.
+///
+/// The key is an **order-preserving** 16-byte encoding of the `i64`: the sign bit is flipped
+/// and the value stored big-endian, so raw byte order equals numeric order (negatives before
+/// positives). Memories at the same instant are grouped into one key's value.
+pub struct TimeTable {
+    index: SsTableIndex,
+    data_path: String,
+}
+
+/// Encode an `i64` timestamp as an order-preserving 16-byte SSTable key (8-byte flipped
+/// big-endian value + 8 zero bytes; ties within the same instant share the key).
+fn ts_key(ts: i64) -> [u8; 16] {
+    let mut k = [0u8; 16];
+    let flipped = (ts as u64) ^ (1u64 << 63);
+    k[..8].copy_from_slice(&flipped.to_be_bytes());
+    k
+}
+
+impl TimeTable {
+    /// Build from `(effective_ts, memory)` pairs. Memories with no effective timestamp are
+    /// simply not indexed (the caller filters `None`).
+    pub fn build(mut pairs: Vec<(i64, MemoryId)>) -> (Vec<u8>, Vec<u8>) {
+        pairs.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+        let mut b = SsTableBuilder::new();
+        let mut i = 0;
+        while i < pairs.len() {
+            let ts = pairs[i].0;
+            let mut value = Vec::new();
+            while i < pairs.len() && pairs[i].0 == ts {
+                value.extend_from_slice(&pairs[i].1 .0);
+                i += 1;
+            }
+            b.add(ts_key(ts), &value);
+        }
+        b.finish()
+    }
+
+    pub fn open(idx_bytes: &[u8], data_path: impl Into<String>) -> Result<Self> {
+        Ok(Self {
+            index: SsTableIndex::parse(idx_bytes)?,
+            data_path: data_path.into(),
+        })
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.index.is_empty()
+    }
+
+    /// The memories whose effective timestamp falls in `[from, to]` (inclusive), one bounded
+    /// ranged scan over the covering blocks.
+    pub async fn in_window(
+        &self,
+        store: &Store,
+        from: i64,
+        to: i64,
+        ctx: Option<(&QueryMetrics, usize)>,
+    ) -> Result<Vec<MemoryId>> {
+        // The key for ts=`to` is `ts_key(to)` (…+zero padding); widen the high bound to that
+        // instant's whole group so it is included.
+        let mut hi = ts_key(to);
+        hi[8..].copy_from_slice(&[0xFF; 8]);
+        let records = self.index.scan_range(store, &self.data_path, &ts_key(from), &hi, ctx).await?;
+        let mut ids = Vec::new();
+        for (_, value) in records {
+            ids.extend(decode_ids(&value, usize::MAX));
+        }
+        Ok(ids)
+    }
+}
+
 /// Edge wire format: `[source:16][kind:1][linktype:1][weight:f32]` = 22 bytes.
 const EDGE_BYTES: usize = 22;
 
@@ -506,6 +636,40 @@ fn decode_edges(bytes: &[u8]) -> Vec<InEdge> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ts_key_is_order_preserving_across_the_sign_boundary() {
+        // Raw byte order of the key must equal numeric order of the i64, incl. negatives.
+        let mut times = vec![i64::MIN, -1_000_000, -1, 0, 1, 1_700_000_000_000, i64::MAX];
+        let mut shuffled = times.clone();
+        shuffled.reverse();
+        shuffled.sort_by_key(|&t| ts_key(t));
+        times.sort();
+        assert_eq!(shuffled, times, "ts_key byte order must match numeric order");
+    }
+
+    #[tokio::test]
+    async fn time_window_scan_returns_ids_in_range() {
+        let store = Store::in_memory();
+        // Memories at times -100, -50, 0, 10, ..., 200 (mix of negative + positive epochs).
+        let pairs: Vec<(i64, MemoryId)> = (-2..=20)
+            .map(|i| (i * 10, MemoryId::from_key(&format!("m{i}"))))
+            .collect();
+        let (idx, data) = TimeTable::build(pairs);
+        store.put("t/time.data", data).await.unwrap();
+        let tt = TimeTable::open(&idx, "t/time.data").unwrap();
+
+        // Window [-10, 50] should return times -10, 0, 10, 20, 30, 40, 50 -> ids m-1..m5.
+        let got = tt.in_window(&store, -10, 50, None).await.unwrap();
+        let mut got_keys: Vec<MemoryId> = got;
+        got_keys.sort();
+        let mut want: Vec<MemoryId> = (-1..=5).map(|i| MemoryId::from_key(&format!("m{i}"))).collect();
+        want.sort();
+        assert_eq!(got_keys, want);
+
+        // Empty window before everything.
+        assert!(tt.in_window(&store, i64::MIN, -1000, None).await.unwrap().is_empty());
+    }
 
     #[tokio::test]
     async fn point_lookups_hit_the_right_block() {

@@ -170,6 +170,13 @@ class MemlakeClient:
         """Lower-level write for mixed op batches (tombstones, patches, guards)."""
         return self._stub.Write(pb.WriteRequest(namespace=namespace, ops=list(ops)))
 
+    def delete(self, namespace: str, ids: Iterable[bytes]) -> int:
+        """Delete memories by 16-byte id (tombstone). Returns the claimed WAL sequence. The
+        tombstone hides the memory from reads immediately (STRONG) and removes it from the
+        index at the next indexer run. One-way — there is no revert."""
+        ops = [pb.Op(tombstone=i) for i in ids]
+        return self._stub.Write(pb.WriteRequest(namespace=namespace, ops=ops)).seq
+
     def tombstone(self, id16: bytes) -> pb.Op:
         return pb.Op(tombstone=id16)
 

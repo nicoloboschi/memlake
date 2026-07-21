@@ -21,6 +21,31 @@ service Memlake {
   // per-arm scores; the client fuses. memory_types are independent — hits are never fused
   // across types.
   rpc Query(QueryRequest) returns (QueryResponse);
+
+  // ---- Admin / introspection ----
+  //
+  // These serve operators and the admin UI, not the hot path. They are answerable by any
+  // replica for the same reason every other RPC is: the answer lives in object storage.
+  // They are deliberately NOT part of the retrieval contract — a client doing recall
+  // should never need them.
+
+  // Every namespace in the bucket, by listing manifest objects. Cost is one LIST, so this
+  // is an operator call, not something to poll per request.
+  rpc ListNamespaces(ListNamespacesRequest) returns (ListNamespacesResponse);
+
+  // A namespace's index state: generation, WAL position, and per-memory_type doc and
+  // cluster counts. Reads the manifest and each type's metadata — it does NOT fetch
+  // cluster data, so its cost is independent of corpus size.
+  rpc Stats(StatsRequest) returns (StatsResponse);
+
+  // Fetch memories by id, without a query. Resolves each id through the primary-key
+  // SSTable to its cluster, then range-reads only those clusters.
+  rpc Get(GetRequest) returns (GetResponse);
+
+  // Page through a memory_type's stored memories in cluster order. This is a full scan by
+  // construction — the cost DOES grow with the corpus — so it exists for browsing and
+  // debugging, never for retrieval. Use `Query` to find things.
+  rpc Scan(ScanRequest) returns (ScanResponse);
 }
 
 // ---- Value types -----------------------------------------------------------
