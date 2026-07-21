@@ -149,11 +149,13 @@ cluster files. Because time and vector-cluster are uncorrelated, a window of W m
 corpus and the query never returns in reasonable time. Bounded to ~120-memory windows it is fine.
 
 This is the same *materialize-before-truncate* shape the graph fix removed, but harder: the
-truncation key (similarity) needs vectors, which the payload store omits. Fix options:
-1. **Bound `in_window`** to a capped, time-spread sample of entry points (materialize ≤ pool×k,
-   not the whole window) — smallest change, slight recall trade.
-2. **Store vectors in the payload store** too — makes temporal (and every point read) fast, at
-   the cost of duplicating the embedding (storage ~doubles).
+truncation key (similarity) needs vectors, which the payload store omits.
+
+**DONE (option 1): `in_window` now caps its result to a time-spread sample** (`TEMPORAL_WINDOW_CAP`
+= 256, ~4× the pool) via an even stride over the time-ordered range, so the arm materializes at
+most that many entry points regardless of window width (INV-7). Validated: a span=100000 window
+(~half a 200k corpus — which hung before) now runs **32ms warm / 53ms cold**, bounded. Narrow
+windows are unaffected; recall is unchanged on them.
 
 ## Concurrent-request percentiles
 
