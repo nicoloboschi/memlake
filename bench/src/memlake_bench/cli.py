@@ -97,6 +97,13 @@ def cmd_report(args) -> int:
     return 0
 
 
+def cmd_recall(args) -> int:
+    from . import recall_check
+
+    recall_check.run(keep=args.keep)
+    return 0
+
+
 def cmd_perf(args) -> int:
     from . import perf
     from .perf_datagen import GenConfig
@@ -202,6 +209,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("report", help="render bench/results/report.md")
     sp.set_defaults(func=cmd_report)
+
+    sp = sub.add_parser(
+        "recall",
+        help="e2e recall regression: write -> index -> assert every arm recalls (via the client)",
+    )
+    sp.add_argument("--keep", action="store_true", help="use a fixed namespace instead of a fresh one")
+    sp.set_defaults(func=cmd_recall)
 
     sp = sub.add_parser(
         "perf",
