@@ -75,6 +75,7 @@ export interface WireHit {
   dense: WireArmScore | null;
   text: WireArmScore | null;
   graph: WireArmScore | null;
+  temporal: WireArmScore | null;
   memory: WireMemoryPayload | null;
 }
 
@@ -164,6 +165,10 @@ export interface QueryRequest {
   graphTopK: number;
   nprobe: number;
   consistency: Consistency;
+  // proto3 `optional int64`: leave both undefined to skip the temporal arm.
+  // With `longs: String` these go over the wire as decimal strings.
+  temporalFrom?: string;
+  temporalTo?: string;
 }
 export interface QueryResponse {
   hits: WireHit[];

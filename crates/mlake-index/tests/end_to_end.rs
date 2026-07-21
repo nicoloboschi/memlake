@@ -1244,3 +1244,111 @@ async fn scan_respects_the_tag_filter() {
     }
     assert_eq!(seen.len(), 8, "the 8 tagged memories, paged across clusters");
 }
+
+// ---- Dimension safety -------------------------------------------------------
+
+/// A query embedded with a different model than the index was built with is rejected,
+/// rather than scored over the overlapping prefix. Truncating would return a confident,
+/// plausible ranking — a silent wrong answer that looks exactly like a working query.
+#[tokio::test]
+async fn a_query_vector_of_the_wrong_dimension_is_rejected() {
+    let store = Store::in_memory();
+    let ns = namespace(store, "ns").await;
+    let mut writer = Writer::new(ns.clone());
+
+    writer
+        .commit(vec![
+            Op::Upsert(item("a", vec![1.0, 0.0, 0.0], "alpha")),
+            Op::Upsert(item("b", vec![0.0, 1.0, 0.0], "beta")),
+        ])
+        .await
+        .unwrap();
+    index(&ns, &Tokenizer::default(), IndexOptions::default()).await.unwrap();
+
+    let node = QueryNode::open(&ns, Tokenizer::default(), Consistency::Strong).await.unwrap();
+
+    // The index is 3-dim; query with 5.
+    let err = node
+        .query(1, Some(&[1.0, 0.0, 0.0, 0.0, 0.0]), None, &tf(), 10, QueryConfig::default())
+        .await
+        .expect_err("a 5-dim query against a 3-dim index must fail");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("dimension mismatch") && msg.contains('3') && msg.contains('5'),
+        "the error must name both dimensions, got: {msg}"
+    );
+
+    // The matching dimension still works — the check rejects mismatches, nothing else.
+    let hits = node
+        .query(1, Some(&[1.0, 0.0, 0.0]), None, &tf(), 10, QueryConfig::default())
+        .await
+        .unwrap();
+    assert_eq!(hits[0].id, MemoryId::from_key("a"));
+}
+
+/// The same check applies before a fact type has ever been indexed, where the WAL tail —
+/// not the centroids — defines the dimension.
+#[tokio::test]
+async fn wrong_dimension_is_rejected_against_the_un_indexed_tail() {
+    let store = Store::in_memory();
+    let ns = namespace(store, "ns").await;
+    let mut writer = Writer::new(ns.clone());
+    writer.commit(vec![Op::Upsert(item("a", vec![1.0, 0.0], "alpha"))]).await.unwrap();
+
+    // No index() call: this type exists only in the tail.
+    let node = QueryNode::open(&ns, Tokenizer::default(), Consistency::Strong).await.unwrap();
+    let err = node
+        .query(1, Some(&[1.0, 0.0, 0.0]), None, &tf(), 10, QueryConfig::default())
+        .await
+        .expect_err("a 3-dim query against a 2-dim tail must fail");
+    assert!(err.to_string().contains("dimension mismatch"), "got: {err}");
+}
+
+/// A corpus that somehow mixes dimensions fails the fold with a typed error, instead of
+/// panicking deep inside the parallel link derivation.
+#[tokio::test]
+async fn indexing_a_mixed_dimension_corpus_fails_cleanly() {
+    let store = Store::in_memory();
+    let ns = namespace(store, "ns").await;
+    let mut writer = Writer::new(ns.clone());
+
+    writer
+        .commit(vec![
+            Op::Upsert(item("a", vec![1.0, 0.0, 0.0], "three dims")),
+            Op::Upsert(item("b", vec![0.0, 1.0], "two dims")),
+        ])
+        .await
+        .unwrap();
+
+    // `IndexOutcome` is not Debug, so match rather than expect_err.
+    match index(&ns, &Tokenizer::default(), IndexOptions::default()).await {
+        Ok(_) => panic!("a mixed-dimension fact type must not index"),
+        Err(e) => assert!(e.to_string().contains("dimension mismatch"), "got: {e}"),
+    }
+}
+
+/// A memory with no embedding at all is legitimate (text-only), and must not be mistaken
+/// for a dimension violation.
+#[tokio::test]
+async fn text_only_memories_do_not_trip_the_dimension_check() {
+    let store = Store::in_memory();
+    let ns = namespace(store, "ns").await;
+    let mut writer = Writer::new(ns.clone());
+
+    writer
+        .commit(vec![
+            Op::Upsert(item("a", vec![1.0, 0.0], "has an embedding")),
+            Op::Upsert(item("b", vec![], "text only, no embedding")),
+        ])
+        .await
+        .unwrap();
+    index(&ns, &Tokenizer::default(), IndexOptions::default()).await.unwrap();
+
+    let node = QueryNode::open(&ns, Tokenizer::default(), Consistency::Strong).await.unwrap();
+    assert_eq!(node.doc_count(), 2);
+    let hits = node
+        .query(1, Some(&[1.0, 0.0]), Some("text only"), &tf(), 10, QueryConfig::default())
+        .await
+        .unwrap();
+    assert!(!hits.is_empty(), "a text-only memory must still be retrievable");
+}

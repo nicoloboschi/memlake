@@ -46,6 +46,11 @@ service Memlake {
   // construction — the cost DOES grow with the corpus — so it exists for browsing and
   // debugging, never for retrieval. Use `Query` to find things.
   rpc Scan(ScanRequest) returns (ScanResponse);
+
+  // Tombstone every memory matching a predicate. The predicate is metadata AND tags (all
+  // must hold), e.g. `{document_id, chunk_id}` to replace a document's facts on re-ingest.
+  // A full scan by construction (metadata is not indexed) — a maintenance op, not a query.
+  rpc DeleteByPredicate(DeleteByPredicateRequest) returns (DeleteByPredicateResponse);
 }
 
 // ---- Value types -----------------------------------------------------------
@@ -218,6 +223,26 @@ message CreateNamespaceRequest {
 }
 
 message CreateNamespaceResponse {}
+
+// ---- Delete by predicate ---------------------------------------------------
+
+message DeleteByPredicateRequest {
+  string namespace = 1;
+  // memory_types to scan; empty means all. (Only these types are considered for deletion.)
+  repeated uint32 memory_types = 2;
+  // Match memories whose metadata contains ALL these key=value pairs (AND) — e.g.
+  // {"document_id": "d-42", "chunk_id": "3"}. Empty matches on tags / delete_all alone.
+  map<string, string> metadata_equals = 3;
+  TagFilter tags = 4;         // optional additional filter, AND-ed with metadata_equals
+  // Safety: an empty predicate (no metadata, no tags) is rejected unless delete_all is set,
+  // so a stray empty request cannot wipe the namespace by accident.
+  bool delete_all = 5;
+}
+
+message DeleteByPredicateResponse {
+  uint64 deleted = 1;   // number of memories tombstoned
+  uint64 seq = 2;       // WAL sequence of the tombstone batch (0 if nothing matched)
+}
 
 // ---- Admin / introspection -------------------------------------------------
 

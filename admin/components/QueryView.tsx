@@ -15,6 +15,7 @@ import {
 } from "@/lib/fusion";
 import {
   ARMS,
+  ARM_HELP,
   ARM_SCORE_KIND,
   CONSISTENCIES,
   type Arm,
@@ -40,6 +41,7 @@ import {
   Td,
   TableShell,
   TextArea,
+  TextInput,
   Th,
 } from "@/components/ui";
 import {
@@ -63,6 +65,7 @@ const ARM_COLOR: Record<Arm, string> = {
   dense: "text-arm-dense",
   text: "text-arm-text",
   graph: "text-arm-graph",
+  temporal: "text-arm-temporal",
 };
 
 export function QueryView({ namespace }: { namespace: string }) {
@@ -80,6 +83,8 @@ export function QueryView({ namespace }: { namespace: string }) {
   const [consistency, setConsistency] = useState<Consistency>("STRONG");
   const [vectorMode, setVectorMode] = useState<"embed" | "raw" | "none">("embed");
   const [rawVector, setRawVector] = useState("");
+  const [temporalFrom, setTemporalFrom] = useState("");
+  const [temporalTo, setTemporalTo] = useState("");
 
   // ---- results
   const [result, setResult] = useState<QueryJson | null>(null);
@@ -167,6 +172,8 @@ export function QueryView({ namespace }: { namespace: string }) {
       consistency,
       vectorMode,
       vector,
+      temporalFrom: temporalFrom.trim() || null,
+      temporalTo: temporalTo.trim() || null,
     };
 
     const t0 = performance.now();
@@ -204,6 +211,8 @@ export function QueryView({ namespace }: { namespace: string }) {
     consistency,
     vectorMode,
     rawVector,
+    temporalFrom,
+    temporalTo,
     embedStatus?.state,
     refreshEmbedStatus,
   ]);
@@ -350,10 +359,45 @@ export function QueryView({ namespace }: { namespace: string }) {
 
             {vectorMode === "none" && (
               <p className="mt-2 text-[11px] text-ink-faint">
-                No vector is sent, so the dense and graph arms do not run — this
-                is a text-only BM25 query.
+                No vector is sent, so the dense, graph and temporal arms do not
+                run — this is a text-only BM25 query.
               </p>
             )}
+          </div>
+
+          <div className="mt-3 border-t border-line pt-3">
+            <div className="grid grid-cols-2 gap-2 max-w-lg">
+              <Field
+                label="temporal_from"
+                hint="epoch int64; unit only has to match what was written"
+              >
+                <TextInput
+                  value={temporalFrom}
+                  spellCheck={false}
+                  disabled={loading}
+                  placeholder="(empty = arm off)"
+                  onChange={(e) => setTemporalFrom(e.target.value)}
+                  className="text-right"
+                />
+              </Field>
+              <Field label="temporal_to" hint={temporalHint(vectorMode)}>
+                <TextInput
+                  value={temporalTo}
+                  spellCheck={false}
+                  disabled={loading}
+                  placeholder="(empty = arm off)"
+                  onChange={(e) => setTemporalTo(e.target.value)}
+                  className="text-right"
+                />
+              </Field>
+            </div>
+            <p className="mt-1 text-[10px] text-ink-faint">
+              The temporal arm selects entry points whose effective time —
+              COALESCE(occurred_start, mentioned_at, occurred_end) — falls in the
+              window, spreads one hop through links, and scores by proximity to
+              the window centre. Both bounds AND a vector are required; omit
+              either and the arm is skipped.
+            </p>
           </div>
 
           <div className="mt-3 flex items-center gap-3">
@@ -402,11 +446,19 @@ export function QueryView({ namespace }: { namespace: string }) {
                     : `f32[${result.vectorDim ?? "?"}]`
                 }
                 hint={
-                  result.vectorSource === "embedded"
-                    ? `${result.embeddingModel} (prefixed)`
-                    : result.vectorSource === "raw"
-                      ? "pasted verbatim"
-                      : "dense + graph arms skipped"
+                  <>
+                    {result.vectorSource === "embedded"
+                      ? `${result.embeddingModel} (prefixed)`
+                      : result.vectorSource === "raw"
+                        ? "pasted verbatim"
+                        : "dense + graph + temporal arms skipped"}
+                    {result.temporalWindow && (
+                      <span className="block text-arm-temporal">
+                        temporal [{result.temporalWindow.from},{" "}
+                        {result.temporalWindow.to}]
+                      </span>
+                    )}
+                  </>
                 }
               />
             </div>
@@ -454,7 +506,7 @@ export function QueryView({ namespace }: { namespace: string }) {
             </Button>
           </header>
           <div className="p-3">
-            <div className="mb-3 grid grid-cols-3 gap-2">
+            <div className="mb-3 grid grid-cols-2 gap-2">
               {ARMS.map((arm) => (
                 <ArmBadge key={arm} arm={arm} s={selected[arm]} />
               ))}
@@ -602,8 +654,8 @@ function ResultGroup({
             {ARMS.map((arm) => (
               <Th
                 key={arm}
-                className={`w-28 text-right ${ARM_COLOR[arm]}`}
-                title={`${arm} arm — ${ARM_SCORE_KIND[arm]}`}
+                className={`w-24 text-right ${ARM_COLOR[arm]}`}
+                title={`${arm} arm — ${ARM_SCORE_KIND[arm]}. ${ARM_HELP[arm]}`}
               >
                 {arm}
               </Th>
@@ -757,6 +809,12 @@ function EmbedStatusStrip({
       )}
     </span>
   );
+}
+
+function temporalHint(vectorMode: "embed" | "raw" | "none"): string {
+  return vectorMode === "none"
+    ? "the arm cannot run without a vector — its entry points are similarity-ranked"
+    : "set both bounds to run the arm";
 }
 
 function safeNorm(raw: string): { dim: number; norm: number } | null {

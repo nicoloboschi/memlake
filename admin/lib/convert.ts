@@ -136,6 +136,7 @@ export function hitToJson(h: WireHit): HitJson {
     dense: armScoreToJson(h.dense),
     text: armScoreToJson(h.text),
     graph: armScoreToJson(h.graph),
+    temporal: armScoreToJson(h.temporal),
     memory: memoryPayloadToJson(h.memory),
   };
 }

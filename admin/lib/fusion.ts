@@ -14,13 +14,14 @@
 import type { Arm, HitJson } from "./types";
 import { ARMS } from "./types";
 
-export interface ArmWeights {
-  dense: number;
-  text: number;
-  graph: number;
-}
+export type ArmWeights = Record<Arm, number>;
 
-export const DEFAULT_WEIGHTS: ArmWeights = { dense: 1, text: 1, graph: 1 };
+export const DEFAULT_WEIGHTS: ArmWeights = {
+  dense: 1,
+  text: 1,
+  graph: 1,
+  temporal: 1,
+};
 export const DEFAULT_RRF_K = 60;
 
 export interface FusedHit {
@@ -38,7 +39,9 @@ export function rrfScore(
   weights: ArmWeights,
   k: number,
 ): { score: number; contributions: Record<Arm, number> } {
-  const contributions = { dense: 0, text: 0, graph: 0 } as Record<Arm, number>;
+  const contributions = Object.fromEntries(
+    ARMS.map((a) => [a, 0]),
+  ) as Record<Arm, number>;
   let score = 0;
   for (const arm of ARMS) {
     const a = hit[arm];

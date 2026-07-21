@@ -114,6 +114,19 @@ fn internal(e: impl std::fmt::Display) -> Status {
     Status::internal(e.to_string())
 }
 
+/// Map a retrieval error onto a gRPC status. A dimension mismatch is the caller's mistake —
+/// a query embedded with a different model than the index was built with — so it must come
+/// back as INVALID_ARGUMENT with the two dimensions, not as an opaque server fault the
+/// caller would retry forever.
+fn query_error(e: mlake_index::Error) -> Status {
+    match &e {
+        mlake_index::Error::Core(mlake_core::Error::DimMismatch { .. }) => {
+            Status::invalid_argument(e.to_string())
+        }
+        _ => Status::internal(e.to_string()),
+    }
+}
+
 #[tonic::async_trait]
 impl Memlake for MemlakeService {
     async fn create_namespace(
@@ -216,7 +229,7 @@ impl Memlake for MemlakeService {
             }
         }))
         .await
-        .map_err(internal)?;
+        .map_err(query_error)?;
 
         // Flatten to one hit list; each hit carries its memory_type so the client can group.
         let mut hits = Vec::new();
@@ -385,6 +398,54 @@ impl Memlake for MemlakeService {
         }
 
         Ok(Response::new(pb::ScanResponse { memories: out, next_page_token: next_token }))
+    }
+
+    async fn delete_by_predicate(
+        &self,
+        req: Request<pb::DeleteByPredicateRequest>,
+    ) -> Result<Response<pb::DeleteByPredicateResponse>, Status> {
+        let req = req.into_inner();
+        if req.namespace.is_empty() {
+            return Err(Status::invalid_argument("namespace is required"));
+        }
+        let metadata_equals: Vec<(String, String)> = req.metadata_equals.into_iter().collect();
+        let tags = convert::tag_filter(req.tags);
+        // Safety: refuse an empty predicate unless the caller explicitly asked to delete all.
+        if metadata_equals.is_empty() && tags.is_noop() && !req.delete_all {
+            return Err(Status::invalid_argument(
+                "empty predicate: set metadata_equals/tags, or delete_all to remove every memory",
+            ));
+        }
+
+        let ns = self.namespace(&req.namespace);
+        // STRONG snapshot: match against the latest state (incl. un-indexed writes) so a
+        // re-ingest that just wrote the old facts still sees them.
+        let snap = self.snapshot(&ns, Consistency::Strong).await?;
+        let types: Vec<u8> = req
+            .memory_types
+            .iter()
+            .map(|&t| convert::memory_type_u8(t))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let ids = snap.node.ids_matching(&types, &metadata_equals, &tags).await.map_err(internal)?;
+        if ids.is_empty() {
+            return Ok(Response::new(pb::DeleteByPredicateResponse { deleted: 0, seq: 0 }));
+        }
+
+        // Tombstone the matches, chunked so one WAL entry never gets pathologically large.
+        const TOMBSTONE_BATCH: usize = 10_000;
+        let deleted = ids.len() as u64;
+        let writer = self.writer_for(&req.namespace);
+        let mut last_seq = 0u64;
+        {
+            let mut w = writer.lock().await;
+            for chunk in ids.chunks(TOMBSTONE_BATCH) {
+                let ops = chunk.iter().map(|id| mlake_core::Op::Tombstone { id: *id }).collect();
+                last_seq = w.commit(ops).await.map_err(internal)?.seq;
+            }
+        }
+        self.invalidate(&req.namespace);
+        Ok(Response::new(pb::DeleteByPredicateResponse { deleted, seq: last_seq }))
     }
 }
 

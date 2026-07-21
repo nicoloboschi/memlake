@@ -69,6 +69,11 @@ class MemlakeStub:
                 request_serializer=memlake_dot_v1_dot_memlake__pb2.ScanRequest.SerializeToString,
                 response_deserializer=memlake_dot_v1_dot_memlake__pb2.ScanResponse.FromString,
                 _registered_method=True)
+        self.DeleteByPredicate = channel.unary_unary(
+                '/memlake.v1.Memlake/DeleteByPredicate',
+                request_serializer=memlake_dot_v1_dot_memlake__pb2.DeleteByPredicateRequest.SerializeToString,
+                response_deserializer=memlake_dot_v1_dot_memlake__pb2.DeleteByPredicateResponse.FromString,
+                _registered_method=True)
 
 
 class MemlakeServicer:
@@ -142,6 +147,15 @@ class MemlakeServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def DeleteByPredicate(self, request, context):
+        """Tombstone every memory matching a predicate. The predicate is metadata AND tags (all
+        must hold), e.g. `{document_id, chunk_id}` to replace a document's facts on re-ingest.
+        A full scan by construction (metadata is not indexed) — a maintenance op, not a query.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_MemlakeServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -179,6 +193,11 @@ def add_MemlakeServicer_to_server(servicer, server):
                     servicer.Scan,
                     request_deserializer=memlake_dot_v1_dot_memlake__pb2.ScanRequest.FromString,
                     response_serializer=memlake_dot_v1_dot_memlake__pb2.ScanResponse.SerializeToString,
+            ),
+            'DeleteByPredicate': grpc.unary_unary_rpc_method_handler(
+                    servicer.DeleteByPredicate,
+                    request_deserializer=memlake_dot_v1_dot_memlake__pb2.DeleteByPredicateRequest.FromString,
+                    response_serializer=memlake_dot_v1_dot_memlake__pb2.DeleteByPredicateResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -370,6 +389,33 @@ class Memlake:
             '/memlake.v1.Memlake/Scan',
             memlake_dot_v1_dot_memlake__pb2.ScanRequest.SerializeToString,
             memlake_dot_v1_dot_memlake__pb2.ScanResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def DeleteByPredicate(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/memlake.v1.Memlake/DeleteByPredicate',
+            memlake_dot_v1_dot_memlake__pb2.DeleteByPredicateRequest.SerializeToString,
+            memlake_dot_v1_dot_memlake__pb2.DeleteByPredicateResponse.FromString,
             options,
             channel_credentials,
             insecure,

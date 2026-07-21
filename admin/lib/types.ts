@@ -38,19 +38,22 @@ export const TAGS_MATCH_HELP: Record<TagsMatch, string> = {
 export const LINK_TYPES = ["CAUSES", "CAUSED_BY", "ENABLES", "PREVENTS"] as const;
 export type LinkType = (typeof LINK_TYPES)[number];
 
-export const ARMS = ["dense", "text", "graph"] as const;
+export const ARMS = ["dense", "text", "graph", "temporal"] as const;
 export type Arm = (typeof ARMS)[number];
-
-export const ARM_LABEL: Record<Arm, string> = {
-  dense: "dense",
-  text: "text",
-  graph: "graph",
-};
 
 export const ARM_SCORE_KIND: Record<Arm, string> = {
   dense: "cosine similarity",
   text: "BM25",
   graph: "activation",
+  temporal: "proximity to the window centre",
+};
+
+export const ARM_HELP: Record<Arm, string> = {
+  dense: "IVF vector search; runs when a vector is supplied",
+  text: "BM25 full-text; runs when text is supplied",
+  graph: "link expansion; runs alongside the dense arm",
+  temporal:
+    "entry points inside [from, to] by effective time, spread one hop; needs both bounds AND a vector",
 };
 
 // ---- value objects ----------------------------------------------------------
@@ -123,6 +126,7 @@ export interface HitJson {
   dense: ArmScoreJson;
   text: ArmScoreJson;
   graph: ArmScoreJson;
+  temporal: ArmScoreJson;
   /** The stored memory, returned inline by the server (no hydrate roundtrip). */
   memory: MemoryPayloadJson | null;
 }
@@ -205,6 +209,8 @@ export interface QueryJson {
   embeddingModel: string | null;
   /** The exact prefix prepended to the query text before embedding. */
   queryPrefix: string | null;
+  /** Whether the temporal arm was asked for (both bounds set + a vector sent). */
+  temporalWindow: { from: string; to: string } | null;
 }
 
 export type EmbedState = "disabled" | "idle" | "loading" | "ready" | "error";
@@ -260,15 +266,33 @@ export interface QueryRequestBody {
   vectorMode: "embed" | "raw" | "none";
   /** Only read when `vectorMode === "raw"`. */
   vector: number[] | null;
+  /**
+   * The temporal arm's window, as epoch int64 decimal strings. The arm only
+   * runs when BOTH bounds are set AND a vector is supplied; either omitted
+   * skips it. The unit only has to match what was written.
+   */
+  temporalFrom: string | null;
+  temporalTo: string | null;
 }
 
 // ---- helpers ----------------------------------------------------------------
 
+/**
+ * Detect the error envelope. Note the deliberate strictness: several success
+ * shapes carry their own nullable `error` field (EmbedStatusJson does), and
+ * `typeof null === "object"`, so testing only for the key's presence would
+ * classify a perfectly good response as a failure. Require the envelope's own
+ * fields.
+ */
 export function isApiError(body: unknown): body is ApiErrorBody {
+  if (typeof body !== "object" || body === null || !("error" in body)) {
+    return false;
+  }
+  const err = (body as { error: unknown }).error;
   return (
-    typeof body === "object" &&
-    body !== null &&
-    "error" in body &&
-    typeof (body as ApiErrorBody).error === "object"
+    typeof err === "object" &&
+    err !== null &&
+    typeof (err as ApiErrorBody["error"]).codeName === "string" &&
+    typeof (err as ApiErrorBody["error"]).message === "string"
   );
 }

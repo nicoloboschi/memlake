@@ -317,6 +317,19 @@ impl QueryNode {
         self.per_type.get(&memory_type).map(|s| s.cluster_paths.len()).unwrap_or(0)
     }
 
+    /// The embedding dimension a fact type's index was built with, if it has one.
+    ///
+    /// The centroids are authoritative — they are what the query is probed against. A type
+    /// present only in the un-indexed tail has none yet, so its first embedded memory
+    /// stands in. `None` means nothing in this type carries an embedding, so there is no
+    /// dimension to violate.
+    fn expected_dim(state: &FactTypeState) -> Option<usize> {
+        if !state.centroids.is_empty() && state.centroids.dim > 0 {
+            return Some(state.centroids.dim);
+        }
+        state.tail_items.iter().map(|m| m.vector.len()).find(|&n| n > 0)
+    }
+
     /// Fetch memories by id, without ranking anything. Each id is resolved through its fact
     /// type's pk SSTable to a cluster, then the distinct clusters are read in one coalesced
     /// wave — so the cost is bounded by the number of *clusters* touched, not the corpus.
@@ -427,6 +440,53 @@ impl QueryNode {
         Ok((out, next))
     }
 
+    /// Ids of every live memory — across `memory_types` (or all if empty) — whose metadata
+    /// contains all of `metadata_equals` (AND semantics, e.g. `document_id` + `chunk_id`) and
+    /// whose tags pass `tags`. Used by delete-by-predicate.
+    ///
+    /// A full scan by construction: metadata is not indexed, so this reads every cluster of
+    /// every selected type once. Cost grows with the corpus — acceptable for a maintenance
+    /// operation, not a query path.
+    pub async fn ids_matching(
+        &self,
+        memory_types: &[u8],
+        metadata_equals: &[(String, String)],
+        tags: &TagFilter,
+    ) -> Result<Vec<MemoryId>> {
+        let types: Vec<u8> =
+            if memory_types.is_empty() { self.memory_types() } else { memory_types.to_vec() };
+        let metrics = QueryMetrics::new();
+        let mut ids = Vec::new();
+        for mt in types {
+            let Some(state) = self.per_type.get(&mt) else { continue };
+            // Tail overrides the indexed copy of a re-upserted id (newer wins), same as a scan.
+            let superseded: HashSet<MemoryId> = state.tail_items.iter().map(|m| m.id).collect();
+            let tail_cluster = state.cluster_paths.len();
+            for cluster in 0..=tail_cluster {
+                let items: Vec<StoredMemory> = if cluster == tail_cluster {
+                    state
+                        .tail_items
+                        .iter()
+                        .filter(|m| !self.tombstones.contains(&m.id))
+                        .cloned()
+                        .collect()
+                } else {
+                    self.fetch_clusters(state, &[cluster], &metrics, 3)
+                        .await?
+                        .into_iter()
+                        .filter(|m| !superseded.contains(&m.id))
+                        .collect()
+                };
+                for m in &items {
+                    if tags.matches(&m.tags) && metadata_contains_all(&m.metadata, metadata_equals) {
+                        ids.push(m.id);
+                    }
+                }
+            }
+        }
+        Ok(ids)
+    }
+
     /// Convenience: run the query and fuse the arms with (weighted) RRF into a single ranked
     /// list. The gRPC server does NOT use this — it returns the raw per-arm scores and lets
     /// the client fuse — but it keeps a simple, self-contained retrieval API for Rust callers
@@ -471,6 +531,15 @@ impl QueryNode {
         let Some(state) = self.per_type.get(&memory_type) else {
             return Ok(Vec::new());
         };
+        // Reject a query vector that does not match this type's embedding dimension before
+        // any arm runs. Every vector-consuming arm would otherwise compare incomparable
+        // embeddings, and the failure would surface as a plausible ranking rather than an
+        // error — the caller silently gets nonsense for a wrong or stale embedding model.
+        if let (Some(q), Some(dim)) = (vector, Self::expected_dim(state)) {
+            if !q.is_empty() && q.len() != dim {
+                return Err(mlake_core::Error::DimMismatch { expected: dim, got: q.len() }.into());
+            }
+        }
         let (vector_scored, fts_scored, graph_scored, mut materialized) =
             self.run_arms(state, vector, text, tags, depths, metrics).await?;
 
@@ -500,6 +569,11 @@ impl QueryNode {
         fill(fts_scored, |h, s| h.text = Some(s));
         fill(graph_scored, |h, s| h.graph = Some(s));
         fill(temporal_scored, |h, s| h.temporal = Some(s));
+
+        // The generation's FTS index still contains memories tombstoned in the tail (the
+        // tantivy split predates the delete), so an arm can surface a tombstoned id. Drop them
+        // — a deleted memory must never appear in results, regardless of which arm found it.
+        by_id.retain(|id, _| !self.tombstones.contains(id));
 
         // Materialize any hit not already in hand — FTS-only hits that fell outside the
         // probed clusters. One coalesced pk lookup + cluster fetch covers them all; the
@@ -760,7 +834,7 @@ impl QueryNode {
             .filter(|(_, m)| tags.matches(&m.tags))
             .map(|(id, m)| tmp::Candidate {
                 id: *id,
-                similarity: mlake_core::cosine(query, &m.vector),
+                similarity: mlake_core::cosine_opt(query, &m.vector),
                 effective_ts: eff(m),
             })
             .collect();
@@ -944,6 +1018,14 @@ impl QueryNode {
         metrics.record_phase(Phase::GraphExpand, te.elapsed());
         Ok(out)
     }
+}
+
+/// Whether `metadata` contains every `(key, value)` in `required` (AND semantics). An empty
+/// `required` matches everything.
+fn metadata_contains_all(metadata: &[(String, String)], required: &[(String, String)]) -> bool {
+    required
+        .iter()
+        .all(|(k, v)| metadata.iter().any(|(mk, mv)| mk == k && mv == v))
 }
 
 /// Spread multiplier for a causal edge's link type (temporal arm).

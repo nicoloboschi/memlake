@@ -113,6 +113,29 @@ export function coerceTagFilter(input: unknown): TagFilterInput | null {
   return { tags: tags.map((t) => t.trim()), mode };
 }
 
+/**
+ * An optional int64, kept as a decimal string all the way to the wire so a
+ * nanosecond epoch does not lose precision through a JS number. Returns null
+ * for "not supplied".
+ */
+export function coerceInt64(input: unknown, name: string): string | null {
+  if (input === undefined || input === null || input === "") return null;
+  const s = typeof input === "string" ? input.trim() : String(input);
+  if (!/^-?\d+$/.test(s)) {
+    throw new MemlakeError(
+      3,
+      "INVALID_ARGUMENT",
+      `${name} must be an integer epoch value, got ${JSON.stringify(String(input))}`,
+    );
+  }
+  try {
+    BigInt(s);
+  } catch {
+    throw new MemlakeError(3, "INVALID_ARGUMENT", `${name} does not fit an int64`);
+  }
+  return s;
+}
+
 export function coerceUint32(input: unknown, name: string): number {
   if (input === undefined || input === null || input === "") return 0;
   const n = typeof input === "number" ? input : Number(input);

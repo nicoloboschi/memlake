@@ -194,6 +194,30 @@ class MemlakeClient:
         ops = [pb.Op(tombstone=i) for i in ids]
         return self._stub.Write(pb.WriteRequest(namespace=namespace, ops=ops)).seq
 
+    def delete_by_predicate(
+        self,
+        namespace: str,
+        *,
+        metadata_equals: Optional[dict[str, str]] = None,
+        tags: Optional[Sequence[str]] = None,
+        tags_mode: int = ANY,
+        memory_types: Optional[Sequence[int]] = None,
+        delete_all: bool = False,
+    ) -> int:
+        """Tombstone every memory matching the predicate and return how many were deleted.
+        `metadata_equals` is AND-matched — e.g. `{"document_id": "d-42", "chunk_id": "3"}` to
+        replace a document's facts on re-ingest. A full scan (metadata is not indexed), so this
+        is a maintenance op, not a query. An empty predicate is rejected unless `delete_all`."""
+        req = pb.DeleteByPredicateRequest(
+            namespace=namespace,
+            memory_types=list(memory_types or []),
+            metadata_equals=dict(metadata_equals or {}),
+            delete_all=delete_all,
+        )
+        if tags:
+            req.tags.CopyFrom(pb.TagFilter(tags=list(tags), mode=tags_mode))
+        return self._stub.DeleteByPredicate(req).deleted
+
     def tombstone(self, id16: bytes) -> pb.Op:
         return pb.Op(tombstone=id16)
 

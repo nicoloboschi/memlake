@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 
-use mlake_core::{cosine, MemoryId, StoredMemory};
+use mlake_core::{MemoryId, StoredMemory};
 use rkyv::{Archive, Deserialize, Serialize};
 
 use crate::kmeans::{self, nearest};
@@ -196,7 +196,9 @@ pub fn exact_search(items: &[StoredMemory], query: &[f32], k: usize) -> Vec<Hit>
         .iter()
         .map(|item| Hit {
             id: item.id,
-            score: cosine(query, &item.vector),
+            // `_opt`: a text-only memory carries no embedding and scores 0 rather than
+            // being an error. A genuine dimension mismatch still panics.
+            score: mlake_core::cosine_opt(query, &item.vector),
         })
         .collect();
     sort_hits(&mut hits);

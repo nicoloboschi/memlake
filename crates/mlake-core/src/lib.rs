@@ -29,18 +29,30 @@ pub enum Error {
     FormatVersion { found: u32, expected: u32 },
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("vector dimension mismatch: expected {expected}, got {got}")]
+    DimMismatch { expected: usize, got: usize },
 }
 
 /// Cosine similarity between two equal-length vectors.
 ///
 /// Returns 0.0 for a zero-magnitude vector rather than NaN, so a degenerate embedding
 /// sorts to the bottom of a result list instead of poisoning comparisons.
+///
+/// # Panics
+///
+/// If the two vectors have different lengths. That is a broken invariant, not bad input:
+/// callers validate dimensions at their boundary ([`uniform_dim`]) and return a typed
+/// [`Error::DimMismatch`], so a mismatch reaching here means a check was skipped.
+///
+/// It deliberately does not fall back to comparing the overlapping prefix. Truncating to
+/// the shorter side turns "you queried with the wrong embedding model" into a confident,
+/// plausible-looking ranking — a silent wrong answer, which is worse than a loud failure.
 pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
-    debug_assert_eq!(a.len(), b.len(), "cosine over mismatched dimensions");
+    assert_eq!(a.len(), b.len(), "cosine over mismatched dimensions");
     let mut dot = 0.0f32;
     let mut na = 0.0f32;
     let mut nb = 0.0f32;
-    for i in 0..a.len().min(b.len()) {
+    for i in 0..a.len() {
         dot += a[i] * b[i];
         na += a[i] * a[i];
         nb += b[i] * b[i];
@@ -51,6 +63,43 @@ pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
     } else {
         dot / denom
     }
+}
+
+/// Cosine similarity where either side may be an *absent* embedding, represented by an
+/// empty slice — a memory may legitimately be text-only. An absent embedding scores 0.0:
+/// it is simply not retrievable by a vector arm.
+///
+/// This is the variant to use anywhere an operand comes from stored memories. Absent and
+/// wrong-dimension are different failures and must not be conflated: the first is normal
+/// and scores zero, the second is a bug and panics in [`cosine`].
+pub fn cosine_opt(a: &[f32], b: &[f32]) -> f32 {
+    if a.is_empty() || b.is_empty() {
+        return 0.0;
+    }
+    cosine(a, b)
+}
+
+/// The single embedding dimension shared by `vectors`, or `None` if none carry one.
+/// Absent (empty) embeddings are skipped — a memory may legitimately be text-only.
+///
+/// Mixed dimensions within one index are an error rather than something to reconcile:
+/// there is no correct way to compare a 384-dim query against an 8-dim memory, and every
+/// way of faking it produces a confident wrong answer.
+pub fn uniform_dim<'a>(
+    vectors: impl IntoIterator<Item = &'a [f32]>,
+) -> Result<Option<usize>, Error> {
+    let mut dim: Option<usize> = None;
+    for v in vectors {
+        if v.is_empty() {
+            continue;
+        }
+        match dim {
+            None => dim = Some(v.len()),
+            Some(d) if d == v.len() => {}
+            Some(d) => return Err(Error::DimMismatch { expected: d, got: v.len() }),
+        }
+    }
+    Ok(dim)
 }
 
 /// Dot product, for callers that maintain pre-normalized vectors and want to skip the

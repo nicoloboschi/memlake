@@ -16,8 +16,10 @@ query, and the graph arm comes from memlake's persisted entity index instead of
 `LinkExpansionRetriever`. Postgres keeps documents, chunks, banks, operations and
 the `entities` registry.
 
-What is left is everything *other than* retain + recall: the non-search access
-paths, and the write paths (consolidation, curation, import) that still assume a
+With the temporal arm and the admin RPCs (`Get` / `Scan` / `Stats`), all four
+recall arms and the main read surfaces — the curation list, single-unit reads,
+bank fact counts — are served by the provider too. What is left is the
+**mutation** side: consolidation, curation, delete and import all still assume a
 SQL table. Ordered by what blocks what.
 
 ---
@@ -46,9 +48,17 @@ directly is gone; the provider calls `client.query()` / `client.delete()`.
 
 Smaller client gaps (non-blocking, still open):
 
-- [ ] `memory()` accepts no `timestamps` and no `causal_out`, so callers mutate
-      the protobuf message after construction — which the provider does, in
-      `memlake.py:index_facts`. Add both as kwargs.
+- [x] `memory()` takes the timestamps as kwargs (`event_date`, `occurred_start`,
+      `occurred_end`, `mentioned_at`, epoch ints). The provider passes them
+      directly now.
+- [ ] `memory()` still takes no `causal_out`, so the provider appends causal
+      edges to the protobuf message after construction
+      (`memlake.py:index_facts`). Add it as a kwarg.
+- [ ] **The wrapper does not expose the admin RPCs.** `ListNamespaces`, `Stats`,
+      `Get` and `Scan` are in the proto and the generated stubs, but
+      `MemlakeClient` has no methods for them, so the provider builds its own
+      stub off `client._channel` (`memlake.py:_stub`). Same stopgap shape as the
+      pre-migration query path — worth closing the same way.
 - [ ] `proof_count` defaults to `0` in `memory()`; Hindsight's column defaults to
       `1`. Pick one, or make the parameter required, so the discrepancy is not
       silent.
@@ -66,11 +76,13 @@ Smaller client gaps (non-blocking, still open):
 
 ---
 
-## 1. Protocol gaps — memlake cannot yet return a memory
+## 1. Protocol gaps
 
-A `Hit` is now `{id, memory_type, dense, text, graph, memory}` — the **memory is
-returned inline** with every search hit (see below). Remaining gaps are the
-non-search access paths (scan, counts, delete-by-predicate, partial update).
+A `Hit` is now `{id, memory_type, dense, text, graph, temporal, memory}` — the
+**memory is returned inline** with every search hit — and the admin RPCs
+(`ListNamespaces`, `Stats`, `Get`, `Scan`) cover the non-search reads. What is
+left here is the *write* side: delete-by-predicate, partial update, and dropping
+a namespace.
 
 - [x] **Return the memory inline on `Hit`.** Each hit now carries a
       `MemoryPayload` (`text, tags, proof_count, entity_ids, timestamps,
@@ -80,17 +92,31 @@ non-search access paths (scan, counts, delete-by-predicate, partial update).
       `context / document_id / chunk_id / arbitrary JSON-as-string` ride along too,
       and `fact_type` maps from `memory_type`. The embedding vector is the only
       stored field not returned (large; the client has it).
-- [ ] **`Get(namespace, ids) -> [Memory]`** — still worth adding for *non-search*
-      hydration (curation opening a specific unit, export). The machinery is ready
-      (pk lookup → cluster fetch → the same `MemoryPayload` conversion); it just
-      needs an RPC. Lower priority now that recall hydrates inline.
-- [ ] **Scan / list with pagination and ordering.** Hindsight's curation UI
-      (`list_memory_units`), export, and `get_graph_data` all page through
-      memory units filtered by `fact_type` / `document_id` / text ILIKE /
-      `consolidated_at IS NULL`, ordered by `mentioned_at DESC, created_at DESC`.
-- [ ] **Counts / aggregates.** Bank stats (`GROUP BY fact_type`), consolidation
-      backlog gauges, per-document unit counts, and the memories timeseries
-      (`date_trunc` buckets) are all `COUNT(*)` queries today.
+- [x] **`Get(namespace, ids)`** — wired to `get_memory_unit` (curation opening a
+      single unit) via `provider.get_memories`.
+- [x] **`Scan`** — wired to `list_memory_units` via `provider.scan_memories`. Two
+      gaps remain on the Hindsight side, both from Scan being a cursor walk rather
+      than a query:
+  - [ ] **No push-down for `document_id`, text search, or consolidation state.**
+        Hindsight filters each page in Python (`memories/reads.py:_matches`), so a
+        page can come back short and `total` reports what the walk saw rather than
+        a true count. `document_id` in particular is only in the un-indexed
+        metadata bag — an indexed field would fix this *and* the delete-by-document
+        problem below.
+  - [ ] **No ordering.** The SQL path returns `ORDER BY mentioned_at DESC NULLS
+        LAST, created_at DESC`; Scan walks in cluster order, so the curation list
+        comes back in storage order.
+  - [ ] **Offset paging costs pages.** The API takes offset/limit, Scan takes a
+        cursor, so reaching an offset means walking to it. Hindsight caps the walk
+        at 50 pages and logs when it truncates. Either the API moves to cursor
+        paging end to end, or Scan grows a skip.
+- [x] **Counts** — `Stats` wired to `_compute_bank_stats`. `TypeStats.doc_count`
+      is already live (indexed generation − tombstones + WAL tail), so per-
+      fact_type counts cost index metadata rather than a scan.
+  - [ ] Link counts in bank stats are reported as zero: memlake derives its edges
+        and does not expose them as a countable relation.
+  - [ ] The memories timeseries (`date_trunc` buckets over `created_at`) has no
+        equivalent and still returns empty.
 - [ ] **Delete by predicate — now a correctness bug, not just a convenience.**
       Only tombstone-by-id exists. Hindsight deletes "all units for this
       document", "all units for this bank", "all observations in this bank". With
@@ -154,12 +180,17 @@ of it participates in retrieval:
 
 ## 3. Retrieval gaps — arms Hindsight has that memlake does not
 
-- [ ] **Temporal arm.** Hindsight has a whole second retrieval path
-      (`retrieve_temporal_combined`): select entry points whose
-      `COALESCE(occurred_start, mentioned_at, occurred_end)` falls in a window,
-      spread over links with BFS, and score by temporal proximity with coverage
-      buckets across the window. memlake stores `Timestamps` but exposes no
-      time-window query at all. This arm still runs against Postgres.
+- [x] **Temporal arm — DONE.** `temporal_from` / `temporal_to` on `QueryRequest`
+      plus `Hit.temporal`: entry points whose effective time
+      `COALESCE(occurred_start, mentioned_at, occurred_end)` falls in the window,
+      one-hop spread, scored by proximity to the window centre — the same
+      semantics as Hindsight's SQL path. `retrieve_temporal_combined` routes to it
+      when the provider owns the store.
+  - [ ] Hindsight's version also spreads with a multi-hop BFS and selects entry
+        points across N coverage buckets so a wide window is sampled evenly rather
+        than clustered at the most-similar end. memlake spreads one hop and does
+        no bucketing, so results on wide windows will skew toward the query
+        vector. Worth a differential before treating the two as equivalent.
 - [ ] **Entity-expansion arm — the central graph gap.** Hindsight fans out over
       `unit_entities` (a persisted entity→unit posting, LATERAL-capped) *and*
       `memory_links`, then expands observations via `source_memory_ids`. memlake
@@ -252,30 +283,39 @@ of it participates in retrieval:
       inline payload, no hydration query.
 - [x] Graph arm — `ProviderGraphRetriever` replaces `LinkExpansionRetriever` when
       the provider owns the links.
+- [x] Temporal arm — `retrieve_temporal_combined` routes to
+      `provider.temporal_search`, which sends the window as `temporal_from` /
+      `temporal_to` and reads `Hit.temporal`.
+- [x] `list_memory_units` — paged through `Scan` (`memories/reads.py`), with
+      entity names resolved from the Postgres `entities` registry.
+- [x] `get_memory_unit` — served by `Get`.
+- [x] Bank fact counts (`_compute_bank_stats`) — served by `Stats`.
 - [x] Consolidation — refuses to run and says so, rather than reading an empty
       table and reporting a clean pass (see below).
 
 **Still Postgres-only, so unsupported in memlake mode:**
 
 - [ ] **Consolidation** (`engine/consolidation/consolidator.py`) — selects
-      unconsolidated rows and writes observations back with raw INSERTs. Needs
-      scan + partial update + the observation↔fact relation before it can be
-      ported. Currently guarded off with a warning.
+      unconsolidated rows and writes observations back with raw INSERTs. `Scan`
+      covers the read half now; still needs partial update (to stamp
+      `consolidated_at`) and the observation↔fact relation. Currently guarded off
+      with a warning, so `consolidated_at` / `consolidation_failed_at` are always
+      reported as null and every unit reads as pending.
 - [ ] **Curation** — `update_memory_unit` edit / invalidate / revert. Needs
-      partial update and a non-tombstone archive state.
+      partial update and a non-tombstone archive state. `list_memory_units`
+      therefore always reports `state: "valid"`, and the invalidated archive is
+      always empty.
 - [ ] **`delete_memory_unit` / `delete_bank` / `delete_document` /
       `clear_observations`** — need delete-by-predicate and `DeleteNamespace`.
 - [ ] **The document importer** (`engine/transfer/importer.py`) — writes facts
       and then patches them with follow-up UPDATEs.
-- [ ] **Read-only surfaces that now return empty**: `list_memory_units` (the
-      curation UI), bank stats and the memories timeseries, `get_graph_data`,
-      document unit counts, and document/bank export. All are `SELECT`s against
-      `memory_units`; they need the scan and count RPCs in §1.
-- [ ] **Temporal arm** — `retrieve_temporal_combined` still queries Postgres and
-      therefore finds nothing. Blocked on a time-window query (§3).
+- [ ] **Still-empty read surfaces**: `get_graph_data` (needs the edges as a
+      readable relation), the memories timeseries, per-document unit counts, and
+      document/bank export.
 
-The broader shape of the remaining problem is unchanged: `DataAccessOps` covers
-only a fraction of `memory_units` access, and roughly 60 raw statements across
-`memory_engine.py`, `consolidator.py`, `importer.py` and `export.py` still hit the
-table directly. Retain and recall are now behind the provider interface; those
-paths are what is left.
+The shape of what remains has narrowed: retain, all four recall arms, and the
+main read surfaces are behind the provider interface. What is left is
+concentrated in the **mutation** paths — consolidation, curation, delete, import
+— and every one of them is waiting on the same two primitives: **partial update**
+and **delete by predicate**. Those two are the highest-leverage things left in
+this document.

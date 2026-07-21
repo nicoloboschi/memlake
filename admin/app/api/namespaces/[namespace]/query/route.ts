@@ -4,6 +4,7 @@ import { hitToJson } from "@/lib/convert";
 import { EMBED_DIM, embedQuery, embeddingsEnabled } from "@/lib/embed";
 import {
   coerceConsistency,
+  coerceInt64,
   coerceMemoryTypes,
   coerceTagFilter,
   coerceUint32,
@@ -95,6 +96,31 @@ export async function POST(
       }
     }
 
+    // The temporal arm needs BOTH bounds and a vector; omit either and the
+    // server skips the arm. Bounds are opaque epoch int64s — memlake only
+    // requires that the unit match what was written.
+    const temporalFrom = coerceInt64(body.temporalFrom, "temporal_from");
+    const temporalTo = coerceInt64(body.temporalTo, "temporal_to");
+    const temporalWindow =
+      temporalFrom !== null && temporalTo !== null
+        ? { from: temporalFrom, to: temporalTo }
+        : null;
+    if (temporalWindow && !f32le) {
+      throw new MemlakeError(
+        3,
+        "INVALID_ARGUMENT",
+        "the temporal arm requires a query vector — its entry points are similarity-ranked",
+        "switch the vector mode away from 'no vector', or clear the temporal window",
+      );
+    }
+    if (!temporalWindow && (temporalFrom !== null || temporalTo !== null)) {
+      throw new MemlakeError(
+        3,
+        "INVALID_ARGUMENT",
+        "the temporal arm needs both bounds; set temporal_from and temporal_to, or neither",
+      );
+    }
+
     if (!f32le && !text.trim()) {
       throw new MemlakeError(
         3,
@@ -117,6 +143,9 @@ export async function POST(
         graphTopK: coerceUint32(body.graphTopK, "graph_top_k"),
         nprobe: coerceUint32(body.nprobe, "nprobe"),
         consistency: coerceConsistency(body.consistency),
+        ...(temporalWindow
+          ? { temporalFrom: temporalWindow.from, temporalTo: temporalWindow.to }
+          : {}),
       },
       QUERY_DEADLINE_MS,
     );
@@ -131,6 +160,7 @@ export async function POST(
       vectorDim,
       embeddingModel,
       queryPrefix,
+      temporalWindow,
     };
     return NextResponse.json(out);
   } catch (e) {

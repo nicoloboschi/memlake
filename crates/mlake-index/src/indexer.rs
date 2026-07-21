@@ -201,6 +201,11 @@ async fn build_memory_type_index(
     let retrain =
         prev_gen.is_none() || opts.force_retrain || doc_count as u64 > 2 * prev_train_count.max(1);
     let vectors: Vec<Vec<f32>> = items.iter().map(|i| i.vector.clone()).collect();
+    // One dimension per fact type, checked once here rather than deep inside the parallel
+    // link derivation: everything downstream (centroid training, probing, semantic-edge
+    // cosine) assumes it. Failing the fold with a typed error keeps a corpus that somehow
+    // mixed dimensions from becoming an unexplained panic in a rayon worker.
+    mlake_core::uniform_dim(vectors.iter().map(|v| v.as_slice()))?;
     let tt = std::time::Instant::now();
     let (mut centroids, train_count) = match (prev_gen, retrain) {
         (Some(p), false) => (p.centroids.clone(), prev_train_count),
@@ -490,7 +495,7 @@ fn derive_links_ivf(
                     if m == j {
                         continue;
                     }
-                    let sim = mlake_core::cosine(&vectors[j], &vectors[m]);
+                    let sim = mlake_core::cosine_opt(&vectors[j], &vectors[m]);
                     if sim >= SEMANTIC_LINK_THRESHOLD {
                         scored.insert(ids[m].0, sim);
                     }
@@ -534,7 +539,7 @@ fn derive_semantic_links(items: &mut [StoredMemory], new_ids: &std::collections:
                 if i == j {
                     continue;
                 }
-                let sim = mlake_core::cosine(&vectors[i], v);
+                let sim = mlake_core::cosine_opt(&vectors[i], v);
                 if sim >= SEMANTIC_LINK_THRESHOLD {
                     scored.insert(ids[j].0, sim);
                 }
