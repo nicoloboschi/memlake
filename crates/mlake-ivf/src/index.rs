@@ -145,13 +145,39 @@ pub fn build_clusters(items: Vec<StoredMemory>, centroids: &Centroids) -> Vec<Cl
         .collect()
 }
 
-/// Train centroids over a corpus.
+/// Cap on the number of vectors used to *train* centroids. Beyond this, training runs on a
+/// deterministic random sample (mini-batch k-means, SPEC §5.1): a few tens of thousands of
+/// points fix the centroid geometry as well as millions, and it keeps a 1M+ build feasible.
+/// Every vector is still *assigned* against the trained centroids.
+const TRAIN_SAMPLE_CAP: usize = 50_000;
+
+/// Train centroids over a corpus. For large corpora the training set is a deterministic
+/// sample; assignment covers everything.
 pub fn train_centroids(vectors: &[Vec<f32>], seed: u64) -> Centroids {
     if vectors.is_empty() {
         return Centroids::default();
     }
     let k = kmeans::centroid_count(vectors.len());
-    let trained = kmeans::train(vectors, k, 25, seed);
+
+    let sampled: Vec<Vec<f32>>;
+    let train_set: &[Vec<f32>] = if vectors.len() > TRAIN_SAMPLE_CAP {
+        let mut rng = kmeans::Rng::seeded(seed ^ 0xA5A5_A5A5);
+        // Reservoir-free stride+jitter sample: deterministic and evenly spread.
+        let mut idxs: Vec<usize> = Vec::with_capacity(TRAIN_SAMPLE_CAP);
+        let stride = vectors.len() / TRAIN_SAMPLE_CAP;
+        let mut i = rng.below(stride.max(1));
+        while i < vectors.len() && idxs.len() < TRAIN_SAMPLE_CAP {
+            idxs.push(i);
+            i += stride.max(1);
+        }
+        sampled = idxs.into_iter().map(|j| vectors[j].clone()).collect();
+        &sampled
+    } else {
+        vectors
+    };
+
+    let iters = if vectors.len() > TRAIN_SAMPLE_CAP { 15 } else { 25 };
+    let trained = kmeans::train(train_set, k, iters, seed);
     let mut sizes = vec![0usize; trained.len()];
     for v in vectors {
         sizes[nearest(&trained, v)] += 1;

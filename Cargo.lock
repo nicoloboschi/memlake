@@ -1448,6 +1448,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "mlake-perf"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "mlake-core",
+ "mlake-fts",
+ "mlake-index",
+ "mlake-ivf",
+ "mlake-store",
+ "mlake-wal",
+ "rand 0.8.7",
+ "rand_chacha",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "mlake-store"
 version = "0.1.0"
 dependencies = [

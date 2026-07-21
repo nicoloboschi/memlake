@@ -37,11 +37,27 @@ pub struct Store {
     /// materializes generation files here once and serves subsequent reads from local disk
     /// (INV-4 — the cache only ever changes latency, never results).
     cache: Option<Arc<crate::cache::DiskCache>>,
+    /// Optional lifetime op accounting, for the cost model in the performance suite.
+    store_metrics: Option<Arc<crate::metrics::StoreMetrics>>,
 }
 
 impl Store {
     pub fn new(inner: Arc<dyn ObjectStore>) -> Self {
-        Self { inner, cache: None }
+        Self {
+            inner,
+            cache: None,
+            store_metrics: None,
+        }
+    }
+
+    /// Attach lifetime op accounting; every GET/PUT/LIST/DELETE is then counted.
+    pub fn with_store_metrics(mut self, m: Arc<crate::metrics::StoreMetrics>) -> Self {
+        self.store_metrics = Some(m);
+        self
+    }
+
+    pub fn store_metrics(&self) -> Option<&Arc<crate::metrics::StoreMetrics>> {
+        self.store_metrics.as_ref()
     }
 
     /// Attach an NVMe read cache. Immutable reads ([`Store::get_immutable`]) are served
@@ -107,6 +123,9 @@ impl Store {
         if let Some((metrics, rt)) = ctx {
             metrics.record_request(rt, bytes.len() as u64, start.elapsed());
         }
+        if let Some(m) = &self.store_metrics {
+            m.record_get(bytes.len() as u64);
+        }
         Ok(Versioned { bytes, etag })
     }
 
@@ -160,6 +179,9 @@ impl Store {
         if let Some((metrics, rt)) = ctx {
             metrics.record_request(rt, bytes.len() as u64, start.elapsed());
         }
+        if let Some(m) = &self.store_metrics {
+            m.record_get(bytes.len() as u64);
+        }
         Ok(bytes)
     }
 
@@ -183,9 +205,12 @@ impl Store {
                 object_store::Error::NotFound { .. } => Error::NotFound(path.to_string()),
                 other => other.into(),
             })?;
+        let total: u64 = parts.iter().map(|b| b.len() as u64).sum();
         if let Some((metrics, rt)) = ctx {
-            let total: u64 = parts.iter().map(|b| b.len() as u64).sum();
             metrics.record_request(rt, total, start.elapsed());
+        }
+        if let Some(m) = &self.store_metrics {
+            m.record_get(total);
         }
         Ok(parts)
     }
@@ -193,10 +218,14 @@ impl Store {
     /// Unconditional write. Only legal for immutable objects, whose paths are unique by
     /// construction (INV-2) — never for the manifest or a WAL slot.
     pub async fn put(&self, path: &str, bytes: Vec<u8>) -> Result<Option<Etag>> {
+        let len = bytes.len() as u64;
         let result = self
             .inner
             .put(&Path::from(path), PutPayload::from_bytes(Bytes::from(bytes)))
             .await?;
+        if let Some(m) = &self.store_metrics {
+            m.record_put(len);
+        }
         Ok(result.e_tag.map(Etag))
     }
 
@@ -220,7 +249,12 @@ impl Store {
             )
             .await
         {
-            Ok(r) => Ok(r.e_tag.map(Etag)),
+            Ok(r) => {
+                if let Some(m) = &self.store_metrics {
+                    m.record_put(0);
+                }
+                Ok(r.e_tag.map(Etag))
+            }
             Err(object_store::Error::AlreadyExists { .. }) => {
                 Err(Error::AlreadyExists(path.to_string()))
             }
@@ -255,7 +289,12 @@ impl Store {
             )
             .await
         {
-            Ok(r) => Ok(r.e_tag.map(Etag)),
+            Ok(r) => {
+                if let Some(m) = &self.store_metrics {
+                    m.record_put(0);
+                }
+                Ok(r.e_tag.map(Etag))
+            }
             Err(object_store::Error::Precondition { .. }) => {
                 Err(Error::CasConflict(path.to_string()))
             }
@@ -267,6 +306,9 @@ impl Store {
     }
 
     pub async fn delete(&self, path: &str) -> Result<()> {
+        if let Some(m) = &self.store_metrics {
+            m.record_delete();
+        }
         match self.inner.delete(&Path::from(path)).await {
             Ok(()) => Ok(()),
             // Deletion is idempotent: GC may race another node doing the same work.
@@ -277,6 +319,9 @@ impl Store {
 
     /// List object paths under a prefix, sorted ascending.
     pub async fn list(&self, prefix: &str) -> Result<Vec<String>> {
+        if let Some(m) = &self.store_metrics {
+            m.record_list();
+        }
         let mut paths: Vec<String> = self
             .inner
             .list(Some(&Path::from(prefix)))
@@ -293,6 +338,9 @@ impl Store {
         &self,
         prefix: &str,
     ) -> Result<Vec<(String, chrono::DateTime<chrono::Utc>)>> {
+        if let Some(m) = &self.store_metrics {
+            m.record_list();
+        }
         let mut out: Vec<(String, chrono::DateTime<chrono::Utc>)> = self
             .inner
             .list(Some(&Path::from(prefix)))

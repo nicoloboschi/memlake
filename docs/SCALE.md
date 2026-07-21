@@ -140,5 +140,20 @@ Sub-sequence:
     `centroids.bin` (zero extra roundtrip) and/or a range-readable tag→cluster SSTable —
     same discipline as pk/radj. The pruning interface (`select_clusters`) does not change.
 
-- **Phase 5** — cost metrics in the bench harness, gated.
+### Performance suite (`crates/mlake-perf`)
+
+Drives the real write→index→query path over MinIO at scale (10k/100k/1M sweep; 10M opt-in),
+with a seeded data generator exercising every arm (clustered vectors, text, Zipfian tags,
+entities + causal edges, multiple memory types). Reports write throughput + build time, read
+latency + roundtrips per workload (cold/warm), and S3 cost (`$/1M ingested`, `$/GB-month`,
+`$/1k queries`) — this delivers the **cost half of Phase 5** from real counted store ops.
+
+Findings so far (10k): every arm caches to ~0 GET/query warm **except the graph arm**, whose
+per-seed `radj` block reads go through `get_range` (uncached), costing ~21 GET/query and
+~8.5 ms regardless of warm. Concrete next optimization: cache ranged SSTable blocks and/or
+coalesce a query's seed `radj` reads into one coalesced GET. (Also added: the graph arm is
+now skipped when weighted to zero — no point paying for an arm that can't affect fusion.)
+
+- **Phase 5** — cost metrics DONE in `mlake-perf`; CI gating of read/write/cost thresholds
+  still to wire.
 - **Phase 6** — scheduled compaction + purge SLA.

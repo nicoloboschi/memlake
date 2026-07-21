@@ -1,0 +1,23 @@
+[package]
+name = "mlake-perf"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "mlake-perf"
+path = "src/main.rs"
+
+[dependencies]
+mlake-core.workspace = true
+mlake-store.workspace = true
+mlake-wal.workspace = true
+mlake-ivf.workspace = true
+mlake-fts.workspace = true
+mlake-index.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rand = "0.8"
+rand_chacha = "0.3"

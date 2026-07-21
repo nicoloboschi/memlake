@@ -120,3 +120,91 @@ mod tests {
         assert_eq!(m.roundtrips(), 4);
     }
 }
+
+/// Lifetime object-storage accounting for a `Store` handle, across every operation — the
+/// basis for the cost model in the performance suite. Unlike [`QueryMetrics`] (per-query,
+/// critical-path only), this counts *all* GET/PUT/LIST/DELETE calls and their bytes.
+#[derive(Debug, Default)]
+pub struct StoreMetrics {
+    gets: AtomicU64,
+    puts: AtomicU64,
+    lists: AtomicU64,
+    deletes: AtomicU64,
+    get_bytes: AtomicU64,
+    put_bytes: AtomicU64,
+}
+
+impl StoreMetrics {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    pub fn record_get(&self, bytes: u64) {
+        self.gets.fetch_add(1, Ordering::Relaxed);
+        self.get_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+    pub fn record_put(&self, bytes: u64) {
+        self.puts.fetch_add(1, Ordering::Relaxed);
+        self.put_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+    pub fn record_list(&self) {
+        self.lists.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn record_delete(&self) {
+        self.deletes.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn gets(&self) -> u64 {
+        self.gets.load(Ordering::Relaxed)
+    }
+    pub fn puts(&self) -> u64 {
+        self.puts.load(Ordering::Relaxed)
+    }
+    pub fn lists(&self) -> u64 {
+        self.lists.load(Ordering::Relaxed)
+    }
+    pub fn deletes(&self) -> u64 {
+        self.deletes.load(Ordering::Relaxed)
+    }
+    pub fn get_bytes(&self) -> u64 {
+        self.get_bytes.load(Ordering::Relaxed)
+    }
+    pub fn put_bytes(&self) -> u64 {
+        self.put_bytes.load(Ordering::Relaxed)
+    }
+
+    /// A snapshot difference `self - base`, for measuring one phase (write, read) in
+    /// isolation against a starting snapshot.
+    pub fn since(&self, base: &StoreSnapshot) -> StoreSnapshot {
+        StoreSnapshot {
+            gets: self.gets().saturating_sub(base.gets),
+            puts: self.puts().saturating_sub(base.puts),
+            lists: self.lists().saturating_sub(base.lists),
+            deletes: self.deletes().saturating_sub(base.deletes),
+            get_bytes: self.get_bytes().saturating_sub(base.get_bytes),
+            put_bytes: self.put_bytes().saturating_sub(base.put_bytes),
+        }
+    }
+
+    pub fn snapshot(&self) -> StoreSnapshot {
+        StoreSnapshot {
+            gets: self.gets(),
+            puts: self.puts(),
+            lists: self.lists(),
+            deletes: self.deletes(),
+            get_bytes: self.get_bytes(),
+            put_bytes: self.put_bytes(),
+        }
+    }
+}
+
+/// A point-in-time copy of [`StoreMetrics`] counters.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct StoreSnapshot {
+    pub gets: u64,
+    pub puts: u64,
+    pub lists: u64,
+    pub deletes: u64,
+    pub get_bytes: u64,
+    pub put_bytes: u64,
+}

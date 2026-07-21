@@ -254,7 +254,9 @@ impl QueryNode {
             .map(|t| self.fts_arm(state, t, config.arm_depth, tags))
             .unwrap_or_default();
 
-        let graph_ranking = if !vector_ranking.is_empty() {
+        // The graph arm is skipped when weighted to zero — it does ranged pk/radj reads, so
+        // running an arm that contributes nothing to fusion would be pure waste.
+        let graph_ranking = if config.graph_weight > 0.0 && !vector_ranking.is_empty() {
             self.graph_arm(state, &vector_ranking, &probed_items, config.arm_depth, tags, metrics)
                 .await?
         } else {
