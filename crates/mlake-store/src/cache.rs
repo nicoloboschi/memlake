@@ -46,6 +46,47 @@ impl CacheKey {
     }
 }
 
+/// One cached object, as an inspector sees it. Both tier flags can be true at once — see
+/// [`DiskCache::entries`].
+#[derive(Clone, Debug)]
+pub struct CacheEntry {
+    /// Owning namespace, derived from the object key's first segment. `CacheKey` carries a
+    /// namespace field, but the read paths leave it empty (the cache is keyed by path and
+    /// byte range alone), so the key layout is the only reliable source.
+    pub namespace: String,
+    /// The object key. A ranged read appends `#start-end`, because the cache is keyed by
+    /// `(path, byte range)` — the same object can be cached as several distinct blocks.
+    pub path: String,
+    pub etag: String,
+    pub bytes: u64,
+    pub in_memory: bool,
+    pub on_disk: bool,
+    /// The LRU clock value when this entry was last touched. Only meaningful relative to
+    /// other entries — it is a monotonic counter, not a timestamp.
+    pub last_used: u64,
+}
+
+impl CacheEntry {
+    fn new(key: &CacheKey, bytes: u64, in_memory: bool, on_disk: bool, last_used: u64) -> Self {
+        // Object keys are `{namespace}/...`; the key's own namespace field is unset on the
+        // read paths, so take it from the path.
+        let namespace = key
+            .path
+            .split_once('/')
+            .map(|(ns, _)| ns.to_string())
+            .unwrap_or_default();
+        Self {
+            namespace,
+            path: key.path.clone(),
+            etag: key.etag.clone(),
+            bytes,
+            in_memory,
+            on_disk,
+            last_used,
+        }
+    }
+}
+
 struct MemEntry {
     bytes: Bytes,
     last_used: u64,
@@ -243,6 +284,56 @@ impl DiskCache {
         let state = self.state.lock().unwrap();
         let total = state.hits + state.misses;
         (total > 0).then(|| state.hits as f64 / total as f64)
+    }
+
+    /// Lookups served from cache, and lookups that missed, over the cache's lifetime.
+    pub fn hits(&self) -> u64 {
+        self.state.lock().unwrap().hits
+    }
+    pub fn misses(&self) -> u64 {
+        self.state.lock().unwrap().misses
+    }
+
+    /// Objects resident in the disk tier. Note this is not `len()` — an object demoted out
+    /// of memory still occupies disk, so the two tiers overlap rather than partition.
+    pub fn disk_len(&self) -> usize {
+        self.state.lock().unwrap().disk.len()
+    }
+
+    /// What the cache is currently holding, most-recently-used first, optionally filtered
+    /// to one namespace. Returns the (bounded) page and the total number of entries that
+    /// matched *before* `limit` truncated it, so a caller can say how much it is not
+    /// showing rather than presenting a short list as the whole cache.
+    ///
+    /// An entry can be resident in both tiers at once: a memory eviction *demotes* to disk
+    /// without dropping the bytes, and a hit promotes back. So `in_memory` and `on_disk`
+    /// are independent flags, not a single tier field.
+    pub fn entries(&self, namespace: Option<&str>, limit: usize) -> (Vec<CacheEntry>, usize) {
+        let state = self.state.lock().unwrap();
+        let mut by_key: HashMap<&CacheKey, CacheEntry> = HashMap::new();
+        for (key, e) in &state.mem {
+            by_key.insert(key, CacheEntry::new(key, e.bytes.len() as u64, true, false, e.last_used));
+        }
+        for (key, e) in &state.disk {
+            by_key
+                .entry(key)
+                .and_modify(|c| {
+                    c.on_disk = true;
+                    c.last_used = c.last_used.max(e.last_used);
+                })
+                .or_insert_with(|| CacheEntry::new(key, e.size, false, true, e.last_used));
+        }
+
+        let mut out: Vec<CacheEntry> = by_key.into_values().collect();
+        if let Some(ns) = namespace {
+            out.retain(|e| e.namespace == ns);
+        }
+        let total = out.len();
+        // Most recently used first: the hot working set is what an operator looks at.
+        // Ties break on path so repeated calls are stable rather than hash-order noise.
+        out.sort_by(|a, b| b.last_used.cmp(&a.last_used).then(a.path.cmp(&b.path)));
+        out.truncate(limit);
+        (out, total)
     }
 
     /// Drop everything, memory and disk.

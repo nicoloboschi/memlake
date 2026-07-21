@@ -14,7 +14,7 @@ import uuid
 
 import numpy as np
 
-from memlake_client import ANY, EVENTUAL, MemlakeClient, memory
+from memlake_client import ANY, MemlakeClient, memory
 
 from . import server
 
@@ -89,7 +89,7 @@ def run(*, keep: bool = False) -> None:
         results = {}
 
         # 1. DENSE: querying with the anchor's own vector must rank it first by dense score.
-        hits = c.query(ns, vector=_axis(0), consistency=EVENTUAL)
+        hits = c.query(ns, vector=_axis(0))
         dense_ranked = sorted((h for h in hits if h.dense.present), key=lambda h: h.dense.rank)
         _check(dense_ranked and dense_ranked[0].id == _id("dense"),
                "dense arm: self-query did not rank the anchor first")
@@ -99,14 +99,14 @@ def run(*, keep: bool = False) -> None:
         results["dense"] = f"top self-hit score={dense_ranked[0].dense.score:.3f}"
 
         # 2. FTS: a rare word must surface the anchor via the text arm.
-        hits = c.query(ns, vector=_axis(0), text="platypus", consistency=EVENTUAL)
+        hits = c.query(ns, vector=_axis(0), text="platypus")
         fts = [h for h in hits if h.id == _id("dense") and h.text.present]
         _check(bool(fts), "fts arm: rare-word query did not surface the anchor")
         results["fts"] = f"'platypus' -> anchor (text score={fts[0].text.score:.2f})"
 
         # 3. GRAPH: the entity-sharer on a far axis must come back via the graph arm even with
         #    nprobe=1 (its own cluster is not probed by the vector query near the anchor).
-        hits = c.query(ns, vector=_axis(0), nprobe=1, consistency=EVENTUAL)
+        hits = c.query(ns, vector=_axis(0), nprobe=1)
         far = {h.id: h for h in hits}.get(_id("graph"))
         _check(far is not None and far.graph.present,
                "graph arm: entity-sharer in an unprobed cluster was not surfaced")
@@ -115,7 +115,7 @@ def run(*, keep: bool = False) -> None:
 
         # 4. TEMPORAL: a window over the temporal cluster returns those memories, scored by
         #    proximity, peaking nearest the window centre.
-        hits = c.query(ns, vector=_axis(2), temporal_from=20000, temporal_to=22000, consistency=EVENTUAL)
+        hits = c.query(ns, vector=_axis(2), temporal_from=20000, temporal_to=22000)
         temporal = sorted((h for h in hits if h.temporal.present), key=lambda h: -h.temporal.score)
         _check(bool(temporal), "temporal arm: window query returned no temporal hits")
         top_ts = int(temporal[0].memory.metadata.get("occurred_start", "0")) if temporal[0].memory.metadata else 0

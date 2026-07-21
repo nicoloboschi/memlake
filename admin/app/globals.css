@@ -52,6 +52,13 @@
   /* Recessive chrome: solid hairlines one step off the surface, never dashed. */
   --color-viz-grid: #1c222c;
   --color-viz-axis: #2a3341;
+  /*
+   * Meter track: a step of the FILL's own hue moved toward the surface
+   * (blue-on-blue), so a bar's state reads across its whole length instead of
+   * fading into the panel. 1.58:1 against #0e1116 — deliberately recessive,
+   * because the track is chrome and only the fill is data.
+   */
+  --color-viz-track: #0d366b;
 
   --font-mono: ui-monospace, "SFMono-Regular", "SF Mono", "Menlo", "Consolas",
     "Liberation Mono", monospace;

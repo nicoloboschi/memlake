@@ -217,8 +217,15 @@ pub async fn read_generation(
     // Cluster files fetched with bounded concurrency: at 1M there are ~1000 multi-MB
     // clusters, and firing them all at once would push GBs of streamed bodies through the
     // HTTP client simultaneously (enough to truncate responses under load).
-    let cluster_objects: Vec<_> = futures::stream::iter(files.clusters.iter())
-        .map(|path| store.get(path, metrics.map(|m| (m, 3))))
+    //
+    // Iterate owned paths and fetch inside a `move` async block, rather than
+    // `.map(|path| store.get(path, ..))` over borrowed `&String`. The borrowed form builds a
+    // higher-ranked `Fn(&String) -> Future` closure that rustc fails to prove `Send + 'static`
+    // when this fold runs inline under the server's Send-bounded gRPC trait — a `move` block
+    // over an owned `String` gives a concrete future and sidesteps the inference limitation.
+    let ctx = metrics.map(|m| (m, 3));
+    let cluster_objects: Vec<_> = futures::stream::iter(files.clusters.clone())
+        .map(|path| async move { store.get(&path, ctx).await })
         .buffered(FETCH_CONCURRENCY)
         .try_collect()
         .await?;

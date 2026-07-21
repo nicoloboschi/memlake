@@ -16,9 +16,7 @@ from .client import (
     ALL_STRICT,
     ANY,
     ANY_STRICT,
-    EVENTUAL,
     EXACT,
-    STRONG,
     Arm,
     Hit,
     MemlakeClient,
@@ -37,6 +35,4 @@ __all__ = [
     "ANY_STRICT",
     "ALL_STRICT",
     "EXACT",
-    "STRONG",
-    "EVENTUAL",
 ]

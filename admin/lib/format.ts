@@ -69,6 +69,39 @@ export function sharePct(size: string, total: string): string {
   }
 }
 
+/**
+ * Byte sizes arrive as u64 decimal strings (WAL objects, cache entries), so the
+ * magnitude test runs on BigInt before anything touches Number.
+ */
+export function fmtBytes(s: string): string {
+  let n: bigint;
+  try {
+    n = BigInt(s);
+  } catch {
+    return s;
+  }
+  if (n < 1024n) return `${n} B`;
+  const units = ["KiB", "MiB", "GiB", "TiB", "PiB"];
+  let v = Number(n);
+  let u = -1;
+  while (v >= 1024 && u < units.length - 1) {
+    v /= 1024;
+    u++;
+  }
+  return `${v.toFixed(v < 10 ? 1 : 0)} ${units[u]}`;
+}
+
+/** `used / budget` as a 0..1 fraction, or null when the budget is 0/unknown. */
+export function fraction(used: string, budget: string): number | null {
+  try {
+    const b = BigInt(budget);
+    if (b <= 0n) return null;
+    return Number((BigInt(used) * 1000000n) / b) / 1000000;
+  } catch {
+    return null;
+  }
+}
+
 export function truncate(s: string, max: number): string {
   if (s.length <= max) return s;
   return `${s.slice(0, max - 1)}…`;

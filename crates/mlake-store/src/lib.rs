@@ -15,7 +15,7 @@ pub mod latency;
 pub mod metrics;
 pub mod store;
 
-pub use cache::{CacheKey, DiskCache};
+pub use cache::{CacheEntry, CacheKey, DiskCache};
 pub use metrics::{Phase, QueryMetrics, StoreMetrics, StoreSnapshot, COLD_ROUNDTRIP_BUDGET};
 pub use store::{Etag, Store, Versioned};
 

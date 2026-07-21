@@ -25,10 +25,6 @@ ANY_STRICT = pb.ANY_STRICT
 ALL_STRICT = pb.ALL_STRICT
 EXACT = pb.EXACT
 
-# Consistency levels.
-STRONG = pb.STRONG
-EVENTUAL = pb.EVENTUAL
-
 
 def _pack(values: Optional[Sequence[float]]) -> Optional[pb.Vector]:
     if not values:
@@ -184,21 +180,35 @@ class MemlakeClient:
 
     # -- write ---------------------------------------------------------------
 
-    def write(self, namespace: str, memories: Iterable[pb.Memory]) -> int:
+    def write(
+        self, namespace: str, memories: Iterable[pb.Memory], *, wait_for_index: bool = False
+    ) -> int:
         """Upsert a batch of memories atomically. Returns the claimed WAL sequence; the call
-        returns only once the batch is durably persisted to object storage."""
+        returns only once the batch is durably persisted to object storage.
+
+        The write is immediately queryable without indexing (reads merge the WAL tail). Pass
+        `wait_for_index=True` to also fold the tail into the indexed generation before
+        returning — a heavier, synchronous call; use it after a bulk load or when you need the
+        write in the generation before proceeding (e.g. tests, benchmarks)."""
         ops = [pb.Op(upsert=m) for m in memories]
-        resp = self._stub.Write(pb.WriteRequest(namespace=namespace, ops=ops))
+        resp = self._stub.Write(
+            pb.WriteRequest(namespace=namespace, ops=ops, wait_for_index=wait_for_index)
+        )
         return resp.seq
 
-    def write_ops(self, namespace: str, ops: Iterable[pb.Op]) -> pb.WriteResponse:
-        """Lower-level write for mixed op batches (tombstones, patches, guards)."""
-        return self._stub.Write(pb.WriteRequest(namespace=namespace, ops=list(ops)))
+    def write_ops(
+        self, namespace: str, ops: Iterable[pb.Op], *, wait_for_index: bool = False
+    ) -> pb.WriteResponse:
+        """Lower-level write for mixed op batches (tombstones, patches, guards). See `write`
+        for `wait_for_index`."""
+        return self._stub.Write(
+            pb.WriteRequest(namespace=namespace, ops=list(ops), wait_for_index=wait_for_index)
+        )
 
     def delete(self, namespace: str, ids: Iterable[bytes]) -> int:
         """Delete memories by 16-byte id (tombstone). Returns the claimed WAL sequence. The
-        tombstone hides the memory from reads immediately (STRONG) and removes it from the
-        index at the next indexer run. One-way — there is no revert."""
+        tombstone hides the memory from reads immediately and removes it from the index at the
+        next indexer run. One-way — there is no revert."""
         ops = [pb.Op(tombstone=i) for i in ids]
         return self._stub.Write(pb.WriteRequest(namespace=namespace, ops=ops)).seq
 
@@ -326,7 +336,6 @@ class MemlakeClient:
         text_top_k: int = 0,
         graph_top_k: int = 0,
         nprobe: int = 0,
-        consistency: int = STRONG,
         temporal_from: Optional[int] = None,
         temporal_to: Optional[int] = None,
     ) -> list[Hit]:
@@ -351,7 +360,6 @@ class MemlakeClient:
             text_top_k=text_top_k,
             graph_top_k=graph_top_k,
             nprobe=nprobe,
-            consistency=consistency,
         )
         if tags:
             req.tags.CopyFrom(pb.TagFilter(tags=list(tags), mode=tags_mode))

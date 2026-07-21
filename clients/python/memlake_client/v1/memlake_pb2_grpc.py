@@ -89,6 +89,11 @@ class MemlakeStub:
                 request_serializer=memlake_dot_v1_dot_memlake__pb2.IndexLayoutRequest.SerializeToString,
                 response_deserializer=memlake_dot_v1_dot_memlake__pb2.IndexLayoutResponse.FromString,
                 _registered_method=True)
+        self.CacheStats = channel.unary_unary(
+                '/memlake.v1.Memlake/CacheStats',
+                request_serializer=memlake_dot_v1_dot_memlake__pb2.CacheStatsRequest.SerializeToString,
+                response_deserializer=memlake_dot_v1_dot_memlake__pb2.CacheStatsResponse.FromString,
+                _registered_method=True)
 
 
 class MemlakeServicer:
@@ -103,9 +108,11 @@ class MemlakeServicer:
 
     def DeleteNamespace(self, request, context):
         """Drop a whole namespace: delete every object under its prefix (manifest, WAL, all
-        generations). Irreversible and unconditional — there is no snapshot atomicity across the
-        deletes, so do not run it concurrently with writes to the same namespace. Returns the
-        number of objects removed.
+        generations). Irreversible. The manifest is deleted first, which fences a concurrent
+        indexer — an in-flight fold loses its CAS publish and cannot leave a dangling manifest
+        that points at swept files. The drop is still not transactional, though: a query racing
+        the delete may fault on a since-deleted file, so dropping under active writes is
+        discouraged. Returns the number of objects removed.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -113,19 +120,22 @@ class MemlakeServicer:
 
     def Write(self, request, context):
         """Write a batch of ops as one atomic WAL entry. Returns once the entry is durably
-        persisted to object storage under a uniquely-claimed sequence number — NOT after
-        indexing. The write is immediately visible to any STRONG-consistency Query.
+        persisted to object storage under a uniquely-claimed sequence number. The write is
+        immediately visible to any Query without waiting for the indexer: a read always merges
+        the un-indexed WAL tail over the indexed generation. Set `wait_for_index` to also fold
+        the tail into the generation before returning (a heavier, synchronous call).
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
     def Query(self, request, context):
-        """Answer a query across one or more memory_types in a single call. Always runs all three
-        arms (dense vector + BM25 full-text + graph expansion) over one shared snapshot, so the
-        storage reads coalesce into common roundtrip waves. Returns each candidate with its raw
-        per-arm scores; the client fuses. memory_types are independent — hits are never fused
-        across types.
+        """Answer a query across one or more memory_types in a single call. Reads reflect every
+        acked write: the snapshot checks the WAL head and scans the un-indexed tail over the
+        indexed generation. Always runs all three arms (dense vector + BM25 full-text + graph
+        expansion) over one shared snapshot, so the storage reads coalesce into common roundtrip
+        waves. Returns each candidate with its raw per-arm scores; the client fuses. memory_types
+        are independent — hits are never fused across types.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -201,6 +211,19 @@ class MemlakeServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def CacheStats(self, request, context):
+        """What this replica is holding in its two-tier read cache, and how well it is working.
+
+        UNLIKE EVERY OTHER RPC HERE, this one is NOT answerable by any replica: the cache is
+        process-local, so the answer describes whichever pod the call happened to land on and
+        two calls behind a load balancer will disagree. It is a node inspection tool, not a
+        cluster-wide view. Nothing it reports affects correctness — a cold cache changes
+        latency only (INV-4).
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_MemlakeServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -258,6 +281,11 @@ def add_MemlakeServicer_to_server(servicer, server):
                     servicer.IndexLayout,
                     request_deserializer=memlake_dot_v1_dot_memlake__pb2.IndexLayoutRequest.FromString,
                     response_serializer=memlake_dot_v1_dot_memlake__pb2.IndexLayoutResponse.SerializeToString,
+            ),
+            'CacheStats': grpc.unary_unary_rpc_method_handler(
+                    servicer.CacheStats,
+                    request_deserializer=memlake_dot_v1_dot_memlake__pb2.CacheStatsRequest.FromString,
+                    response_serializer=memlake_dot_v1_dot_memlake__pb2.CacheStatsResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -557,6 +585,33 @@ class Memlake:
             '/memlake.v1.Memlake/IndexLayout',
             memlake_dot_v1_dot_memlake__pb2.IndexLayoutRequest.SerializeToString,
             memlake_dot_v1_dot_memlake__pb2.IndexLayoutResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def CacheStats(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/memlake.v1.Memlake/CacheStats',
+            memlake_dot_v1_dot_memlake__pb2.CacheStatsRequest.SerializeToString,
+            memlake_dot_v1_dot_memlake__pb2.CacheStatsResponse.FromString,
             options,
             channel_credentials,
             insecure,

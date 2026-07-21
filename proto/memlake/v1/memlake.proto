@@ -19,15 +19,18 @@ service Memlake {
   rpc DeleteNamespace(DeleteNamespaceRequest) returns (DeleteNamespaceResponse);
 
   // Write a batch of ops as one atomic WAL entry. Returns once the entry is durably
-  // persisted to object storage under a uniquely-claimed sequence number — NOT after
-  // indexing. The write is immediately visible to any STRONG-consistency Query.
+  // persisted to object storage under a uniquely-claimed sequence number. The write is
+  // immediately visible to any Query without waiting for the indexer: a read always merges
+  // the un-indexed WAL tail over the indexed generation. Set `wait_for_index` to also fold
+  // the tail into the generation before returning (a heavier, synchronous call).
   rpc Write(WriteRequest) returns (WriteResponse);
 
-  // Answer a query across one or more memory_types in a single call. Always runs all three
-  // arms (dense vector + BM25 full-text + graph expansion) over one shared snapshot, so the
-  // storage reads coalesce into common roundtrip waves. Returns each candidate with its raw
-  // per-arm scores; the client fuses. memory_types are independent — hits are never fused
-  // across types.
+  // Answer a query across one or more memory_types in a single call. Reads reflect every
+  // acked write: the snapshot checks the WAL head and scans the un-indexed tail over the
+  // indexed generation. Always runs all three arms (dense vector + BM25 full-text + graph
+  // expansion) over one shared snapshot, so the storage reads coalesce into common roundtrip
+  // waves. Returns each candidate with its raw per-arm scores; the client fuses. memory_types
+  // are independent — hits are never fused across types.
   rpc Query(QueryRequest) returns (QueryResponse);
 
   // ---- Admin / introspection ----
@@ -71,6 +74,15 @@ service Memlake {
   // resident on every query node, so returning them alone costs no object-storage read;
   // sampling members does read cluster files, and is bounded by `member_sample`.
   rpc IndexLayout(IndexLayoutRequest) returns (IndexLayoutResponse);
+
+  // What this replica is holding in its two-tier read cache, and how well it is working.
+  //
+  // UNLIKE EVERY OTHER RPC HERE, this one is NOT answerable by any replica: the cache is
+  // process-local, so the answer describes whichever pod the call happened to land on and
+  // two calls behind a load balancer will disagree. It is a node inspection tool, not a
+  // cluster-wide view. Nothing it reports affects correctness — a cold cache changes
+  // latency only (INV-4).
+  rpc CacheStats(CacheStatsRequest) returns (CacheStatsResponse);
 }
 
 // ---- Value types -----------------------------------------------------------
@@ -167,19 +179,24 @@ message Op {
 message WriteRequest {
   string namespace = 1;
   repeated Op ops = 2;          // applied atomically as one WAL entry
+  // Fold this namespace's WAL tail into the indexed generation before returning, and only
+  // return once this write's sequence is covered by the manifest cursor. The fold runs
+  // inline on the serve replica (any replica can fold — the manifest CAS serializes them),
+  // so it needs no separate indexer process. Off by default; a normal write is durable and
+  // immediately queryable via the tail without it. Use it to bound the un-indexed tail after
+  // a bulk load, or when a caller wants the write in the generation before it proceeds.
+  bool wait_for_index = 3;
 }
 
 message WriteResponse {
   uint64 seq = 1;               // the claimed WAL sequence (the write's order point)
   uint32 attempts = 2;          // conditional-PUT attempts it took to claim the slot
+  // The generation this write is folded into, set only when `wait_for_index` was requested
+  // (0 otherwise). Lets a caller confirm the fold advanced and observe the new generation.
+  uint64 generation = 3;
 }
 
 // ---- Query -----------------------------------------------------------------
-
-enum Consistency {
-  STRONG = 0;     // reflect every acked write (checks WAL head, scans the tail)
-  EVENTUAL = 1;   // serve from the cached manifest; staleness bounded by index interval
-}
 
 enum TagsMatch {
   ANY = 0;         // memory has at least one of the tags (untagged allowed)
@@ -209,7 +226,7 @@ message QueryRequest {
   uint32 text_top_k = 7;
   uint32 graph_top_k = 8;
   uint32 nprobe = 9;           // IVF clusters probed (0 = server default)
-  Consistency consistency = 10;
+  reserved 10;                 // was `Consistency consistency` (reads are always strong now)
   // The temporal arm: when both are set, select entry points whose effective time
   // (COALESCE(occurred_start, mentioned_at, occurred_end)) falls in [temporal_from,
   // temporal_to], spread one hop through links, and score by proximity to the window centre.
@@ -316,7 +333,7 @@ message ListNamespacesResponse {
 
 message StatsRequest {
   string namespace = 1;
-  Consistency consistency = 2;
+  reserved 2;                  // was `Consistency consistency`
 }
 
 // One memory_type's index state. Each type is an independent index, so every number here
@@ -355,7 +372,7 @@ message GetRequest {
   // Include the embedding. Off by default: vectors dominate the response size and a
   // caller browsing memories rarely wants them.
   bool include_vector = 3;
-  Consistency consistency = 4;
+  reserved 4;                  // was `Consistency consistency`
 }
 
 message GetResponse {
@@ -387,7 +404,7 @@ message ScanRequest {
   string page_token = 4;
   bool include_vector = 5;
   TagFilter tags = 6;                // omit for no tag filter
-  Consistency consistency = 7;
+  reserved 7;                        // was `Consistency consistency`
 }
 
 message ScanResponse {
@@ -472,7 +489,7 @@ message IndexLayoutRequest {
   // vectors. 0 returns centroids only — which needs no object-storage read at all, since
   // the centroids are already resident. Sampling reads cluster files, so it is bounded.
   uint32 member_sample = 3;
-  Consistency consistency = 4;
+  reserved 4;                  // was `Consistency consistency`
 }
 
 message ClusterInfo {
@@ -500,4 +517,57 @@ message IndexLayoutResponse {
   uint32 dim = 4;                     // 0 when the type has no embeddings
   repeated ClusterInfo clusters = 5;
   repeated ClusterMember members = 6; // empty unless member_sample was set
+}
+
+// ---- Read cache (node-local) -----------------------------------------------
+
+message CacheStatsRequest {
+  // Only entries for this namespace. Empty returns every namespace's.
+  string namespace = 1;
+  // Cap on entries returned; 0 uses the server default. A warm node holds thousands of
+  // blocks, so this is an inspection, not a dump.
+  uint32 limit = 2;
+}
+
+// One cached object. `in_memory` and `on_disk` are INDEPENDENT, not a single tier: a
+// memory eviction demotes an object to disk without dropping its bytes, and a later hit
+// promotes it back, so an object is commonly resident in both at once.
+message CacheEntry {
+  // Derived from the object key's first segment.
+  string namespace = 1;
+  // The object key, e.g. `ns/mt1/gen-3-ab/cluster-7.bin`. A RANGED read appends
+  // `#start-end` (e.g. `pk.data#0-13128`): the cache is keyed by `(path, byte range)`, so
+  // one object can be resident as several independent blocks.
+  string path = 2;
+  string etag = 3;         // part of the cache key: immutability makes a hit safe (INV-2)
+  uint64 bytes = 4;
+  bool in_memory = 5;
+  bool on_disk = 6;
+  // Rank in LRU order, 0 = most recently used. Derived from a monotonic counter, so it
+  // orders entries against each other and says nothing about wall-clock time.
+  uint32 lru_rank = 7;
+}
+
+message CacheStatsResponse {
+  // Whether this replica has a cache configured at all. When false every field below is
+  // zero and the node reads through to object storage every time.
+  bool enabled = 1;
+
+  // Both tiers are bounded independently, so peak RAM and peak disk are each capped by
+  // construction regardless of workload.
+  uint64 mem_bytes = 2;
+  uint64 mem_budget = 3;
+  uint64 disk_bytes = 4;
+  uint64 disk_budget = 5;
+
+  uint64 mem_entries = 6;
+  uint64 disk_entries = 7;   // overlaps mem_entries; the tiers are not a partition
+
+  uint64 hits = 8;
+  uint64 misses = 9;
+
+  // Most-recently-used first, bounded by the request's limit.
+  repeated CacheEntry entries = 10;
+  // Entries the cache holds in total, before `limit` truncated the list.
+  uint64 total_entries = 11;
 }

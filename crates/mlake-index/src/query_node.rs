@@ -68,16 +68,6 @@ pub struct ArmDepths {
     pub nprobe: usize,
 }
 
-/// Consistency level for a read.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Consistency {
-    /// Reflect every acked write: check the WAL head and scan the tail (default).
-    Strong,
-    /// Serve from the cached manifest without a head check; staleness bounded by the
-    /// indexing interval.
-    Eventual,
-}
-
 /// One fact type's loaded state: the indexed generation metadata plus its tail overlay.
 struct FactTypeState {
     centroids: Centroids,
@@ -136,20 +126,16 @@ pub struct ScanCursor {
 impl QueryNode {
     /// Open a snapshot of a bank: read the manifest, load each fact type's metadata, scan
     /// and partition the tail. Cluster and pk/radj data blocks are not fetched here.
-    pub async fn open(
-        ns: &Namespace,
-        tokenizer: Tokenizer,
-        consistency: Consistency,
-    ) -> Result<Self> {
+    ///
+    /// A read is always strongly consistent: it discovers the live WAL head and scans the
+    /// tail past the manifest cursor, so every acked write is reflected even before the
+    /// indexer folds it.
+    pub async fn open(ns: &Namespace, tokenizer: Tokenizer) -> Result<Self> {
         let metrics = QueryMetrics::new();
 
-        // RT1: manifest (+ WAL head, for strong consistency).
+        // RT1: manifest, then the live WAL head (the read's consistency point).
         let (manifest, _etag) = ns.read_manifest().await?;
-        let head = if consistency == Consistency::Strong {
-            ns.wal_head().await?
-        } else {
-            manifest.wal_head
-        };
+        let head = ns.wal_head().await?;
 
         // RT4: the WAL tail (exhaustive overlay), partitioned by fact type.
         let scan = WalTail::new(ns)

@@ -5,7 +5,7 @@
 use mlake_core::memory::{CausalEdge, LinkType, Timestamps, Weight};
 use mlake_core::predicate::tags_mode_to_u8;
 use mlake_core::{Delta, EntityId, Memory, MemoryId, Op, Predicate, StoredMemory, TagFilter, TagsMatch};
-use mlake_index::{ArmDepths, ArmScore, Consistency, RawHit};
+use mlake_index::{ArmDepths, ArmScore, RawHit};
 use tonic::Status;
 
 use crate::pb;
@@ -314,6 +314,21 @@ pub fn cluster_infos(layout: &mlake_index::ClusterLayout<'_>) -> Vec<pb::Cluster
         .collect()
 }
 
+/// One cached object. `lru_rank` is the entry's position in the returned (MRU-first)
+/// order, not the raw LRU counter — the counter is an internal monotonic tick that would
+/// mean nothing to a caller.
+pub fn cache_entry(rank: usize, e: mlake_store::CacheEntry) -> pb::CacheEntry {
+    pb::CacheEntry {
+        namespace: e.namespace,
+        path: e.path,
+        etag: e.etag,
+        bytes: e.bytes,
+        in_memory: e.in_memory,
+        on_disk: e.on_disk,
+        lru_rank: rank as u32,
+    }
+}
+
 pub fn cluster_member(cluster_id: u32, m: StoredMemory) -> pb::ClusterMember {
     pb::ClusterMember {
         id: m.id.0.to_vec(),
@@ -382,13 +397,6 @@ pub fn predicate(p: pb::Predicate) -> Result<Predicate, Status> {
         tags,
         tags_mode,
     })
-}
-
-pub fn consistency(c: i32) -> Consistency {
-    match pb::Consistency::try_from(c).unwrap_or(pb::Consistency::Strong) {
-        pb::Consistency::Strong => Consistency::Strong,
-        pb::Consistency::Eventual => Consistency::Eventual,
-    }
 }
 
 pub fn tag_filter(f: Option<pb::TagFilter>) -> TagFilter {

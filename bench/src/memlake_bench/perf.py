@@ -14,7 +14,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 
-from memlake_client import ANY, EVENTUAL, MemlakeClient
+from memlake_client import ANY, MemlakeClient
 
 from . import server
 from .perf_datagen import GenConfig, Generator
@@ -98,13 +98,14 @@ class PerfReport:
 def _run_3way(client, ns, qs, name, *, tags=None, tags_mode=ANY) -> WorkloadResult:
     """The one query pattern memlake serves: a single call across ALL memory_types with all
     three arms (dense + full-text + graph). Roundtrips are shared across types and arms, not
-    multiplied. EVENTUAL consistency exercises the warm cached snapshot (0 roundtrips warm)."""
+    multiplied. Reads are strongly consistent; a run of queries between writes reuses the warm
+    cached snapshot after one cheap WAL-head check (0 fetch roundtrips warm)."""
     latencies, total_rt = [], 0
     for q in qs:
         t = time.perf_counter()
         client.query(
             ns, vector=q, text="memory vector",
-            memory_types=None, tags=tags, tags_mode=tags_mode, consistency=EVENTUAL,
+            memory_types=None, tags=tags, tags_mode=tags_mode,
         )
         latencies.append((time.perf_counter() - t) * 1000.0)
         total_rt += client.last_roundtrips

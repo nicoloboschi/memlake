@@ -3,7 +3,14 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { isAbort, postJson } from "@/lib/client";
-import { cmpU64, fmtEpochGuess, fmtMs, groupDigits, truncate } from "@/lib/format";
+import {
+  cmpU64,
+  fmtBytes,
+  fmtEpochGuess,
+  fmtMs,
+  groupDigits,
+  truncate,
+} from "@/lib/format";
 import { shortId } from "@/lib/ids";
 import type {
   ListWalJson,
@@ -657,21 +664,3 @@ function WalOpDetail({ op }: { op: WalOpJson }) {
   );
 }
 
-/** WAL object sizes are u64 decimal strings; format without going through Number. */
-function fmtBytes(s: string): string {
-  let n: bigint;
-  try {
-    n = BigInt(s);
-  } catch {
-    return s;
-  }
-  if (n < 1024n) return `${n} B`;
-  const units = ["KiB", "MiB", "GiB", "TiB"];
-  let v = Number(n);
-  let u = -1;
-  while (v >= 1024 && u < units.length - 1) {
-    v /= 1024;
-    u++;
-  }
-  return `${v.toFixed(v < 10 ? 1 : 0)} ${units[u]}`;
-}

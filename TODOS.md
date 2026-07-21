@@ -263,8 +263,36 @@ of it participates in retrieval:
       produces clusters or fails loudly — silently publishing a vector index with
       no clusters looks healthy from `Stats` while serving nothing.
 - [ ] Confirm dense scores are cosine similarity on the same scale Postgres
-      produces (`1 - (embedding <=> query)`). Blocked on the above — no dense hit
-      has been observed yet to compare. The provider applies Hindsight's
+      produces (`1 - (embedding <=> query)`).
+- [ ] **The default `nprobe` silently costs recall.** With clusters building
+      correctly, memlake's semantic arm returned 258 of 344 candidates where the
+      pgvector path returned all 344 — and LoComo accuracy dropped to 11/15.
+      The cause is cluster coverage, not depth: `vector_top_k` was already 2500,
+      but candidates in unprobed clusters are unreachable at any depth. Measured on
+      a 344-memory bank (15 + 10 clusters):
+
+      | nprobe | dense candidates | coverage | median query |
+      |--------|-----------------|----------|--------------|
+      | 0 (default) | 266 | 77% | 5.9 ms |
+      | 15 | 344 | 100% | 5.2 ms |
+      | 32 | 344 | 100% | 4.9 ms |
+
+      Full coverage was *free* here (0 roundtrips either way — all cached), so the
+      default is trading recall for nothing at this size. Setting
+      `HINDSIGHT_API_MEMLAKE_NPROBE=32` restored both the candidate count (344) and
+      accuracy (14/15, matching postgres exactly).
+      Worth considering: scale the default with cluster count, or return the
+      coverage actually achieved so a caller can tell a partial probe from an
+      exhaustive one. Right now a 77% probe is indistinguishable from a full scan.
+- [ ] **The dense arm does not see un-indexed writes.** `STRONG` is documented as
+      "reflect every acked write", and the text arm does — but a query issued
+      immediately after a write returns nothing from the vector arm until the
+      indexer folds it (observed: benchmark imports 344 memories, queries at once,
+      gets `semantic=0`; the same namespace queried minutes later returns 344).
+      Retain-then-recall in one request is a normal Hindsight pattern, so this is
+      the difference between "BM25-only answer" and "full answer". Either the tail
+      scan should cover the dense arm, or the guarantee should be documented
+      per-arm. The provider applies Hindsight's
       `semantic_min_similarity` / `bm25_min_score` floors to memlake's raw arm
       scores on that assumption; if the scales differ, the floors silently cut
       the wrong things.

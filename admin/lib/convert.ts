@@ -12,6 +12,9 @@ import { bytesToUuid } from "./ids";
 import { f32leToFloats, summarizeF32le } from "./vector";
 import type {
   ArmScoreJson,
+  CacheEntryJson,
+  CacheKindSummary,
+  CacheStatsJson,
   CausalEdgeJson,
   ClusterJson,
   ClusterMemberJson,
@@ -20,6 +23,7 @@ import type {
   LinkType,
   ListWalJson,
   MemoryPayloadJson,
+  ObjectKind,
   StatsJson,
   StoredMemoryJson,
   TimestampsJson,
@@ -30,10 +34,12 @@ import type {
 } from "./types";
 import { LINK_TYPES } from "./types";
 import type {
+  CacheStatsResponse,
   IndexLayoutResponse,
   ListWalResponse,
   StatsResponse,
   WireArmScore,
+  WireCacheEntry,
   WireCausalEdge,
   WireClusterInfo,
   WireClusterMember,
@@ -323,6 +329,149 @@ export function indexLayoutToJson(
     totalSize: total.toString(),
     elapsedMs,
   };
+}
+
+// ---- Read cache -------------------------------------------------------------
+
+/**
+ * Infer the object kind from the cache key. memlake never labels these on the
+ * wire — the path spells it out — so this is display sugar, and anything
+ * unrecognised falls through to "other" rather than being guessed at.
+ */
+export function objectKindOf(path: string): ObjectKind {
+  // Strip the `#start-end` range first: `pk.data#0-13128` is still a pk block.
+  const p = splitRange(path).object.toLowerCase();
+  const base = p.slice(p.lastIndexOf("/") + 1);
+  if (p.includes("/wal/") || p.startsWith("wal/")) return "wal";
+  if (base.startsWith("cluster-")) return "cluster";
+  if (base.startsWith("centroids")) return "centroids";
+  if (base.startsWith("pk.")) return "primary key";
+  if (base.startsWith("radj.")) return "reverse adjacency";
+  if (base.startsWith("entity.")) return "entity index";
+  if (base.startsWith("time.")) return "time index";
+  if (base.startsWith("tags.")) return "tags";
+  if (base.startsWith("fts.")) return "full-text";
+  if (base.startsWith("manifest")) return "manifest";
+  return "other";
+}
+
+/**
+ * A ranged read appends `#start-end` to the key. Split it out so the range is
+ * its own column and blocks of one object can be recognised as such.
+ */
+export function splitRange(path: string): { object: string; range: string | null } {
+  const hash = path.lastIndexOf("#");
+  if (hash < 0) return { object: path, range: null };
+  const range = path.slice(hash + 1);
+  // Only treat it as a range if it actually looks like one.
+  return /^\d+-\d+$/.test(range)
+    ? { object: path.slice(0, hash), range }
+    : { object: path, range: null };
+}
+
+export function cacheEntryToJson(e: WireCacheEntry): CacheEntryJson {
+  const path = e.path ?? "";
+  const { object, range } = splitRange(path);
+  return {
+    namespace: e.namespace ?? "",
+    path,
+    object,
+    range,
+    etag: e.etag ?? "",
+    bytes: u64(e.bytes),
+    // Two independent booleans, never one tier field.
+    inMemory: Boolean(e.inMemory),
+    onDisk: Boolean(e.onDisk),
+    lruRank: e.lruRank ?? 0,
+    kind: objectKindOf(path),
+  };
+}
+
+export function cacheStatsToJson(
+  r: CacheStatsResponse,
+  namespace: string,
+  limit: number,
+  elapsedMs: number,
+): CacheStatsJson {
+  const entries = (r.entries ?? []).map(cacheEntryToJson);
+  const hits = u64(r.hits);
+  const misses = u64(r.misses);
+  const totalEntries = u64(r.totalEntries);
+
+  // "No lookups yet" is a distinct state from a 0% hit ratio, and dividing by
+  // zero would render NaN.
+  let lookups = "0";
+  let hitRatio: number | null = null;
+  try {
+    const h = BigInt(hits);
+    const m = BigInt(misses);
+    const total = h + m;
+    lookups = total.toString();
+    if (total > 0n) {
+      // Scale before dividing: BigInt division truncates.
+      hitRatio = Number((h * 1000000n) / total) / 1000000;
+    }
+  } catch {
+    /* leave hitRatio null: better nothing than a wrong number */
+  }
+
+  // Group the RETURNED entries only. This is not a summary of the whole cache
+  // whenever the list was truncated, and the UI says so.
+  const kinds = new Map<ObjectKind, { count: number; bytes: bigint }>();
+  for (const e of entries) {
+    const cur = kinds.get(e.kind) ?? { count: 0, bytes: 0n };
+    cur.count += 1;
+    try {
+      cur.bytes += BigInt(e.bytes);
+    } catch {
+      /* skip a malformed size rather than losing the whole group */
+    }
+    kinds.set(e.kind, cur);
+  }
+  // Biggest first: which object kind is actually consuming the budget is the
+  // question this table answers.
+  const byKind: CacheKindSummary[] = [...kinds.entries()]
+    .map(([kind, v]) => ({ kind, count: v.count, bytes: v.bytes.toString() }))
+    .sort((a, b) => cmpU64Desc(a.bytes, b.bytes) || a.kind.localeCompare(b.kind));
+
+  let truncated = false;
+  try {
+    truncated = BigInt(totalEntries) > BigInt(entries.length);
+  } catch {
+    truncated = false;
+  }
+
+  return {
+    enabled: Boolean(r.enabled),
+    memBytes: u64(r.memBytes),
+    memBudget: u64(r.memBudget),
+    diskBytes: u64(r.diskBytes),
+    diskBudget: u64(r.diskBudget),
+    memEntries: u64(r.memEntries),
+    diskEntries: u64(r.diskEntries),
+    hits,
+    misses,
+    hitRatio,
+    lookups,
+    entries,
+    totalEntries,
+    truncated,
+    limit,
+    namespace,
+    byKind,
+    elapsedMs,
+  };
+}
+
+/** Descending comparator over u64 decimal strings. */
+function cmpU64Desc(a: string, b: string): number {
+  try {
+    const x = BigInt(a);
+    const y = BigInt(b);
+    return x < y ? 1 : x > y ? -1 : 0;
+  } catch {
+    return 0;
+  }
 }
 
 export function statsToJson(s: StatsResponse, elapsedMs: number): StatsJson {

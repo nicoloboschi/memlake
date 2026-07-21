@@ -336,6 +336,96 @@ export interface IndexLayoutRequestBody {
   consistency: Consistency;
 }
 
+// ---- Read cache (node-local) ------------------------------------------------
+
+/**
+ * Object kinds inferred from the cache path. memlake does not label them on the
+ * wire — the key spells out what it is — so this is a display convenience.
+ */
+export const OBJECT_KINDS = [
+  "cluster",
+  "centroids",
+  "primary key",
+  "reverse adjacency",
+  "entity index",
+  "time index",
+  "tags",
+  "full-text",
+  "wal",
+  "manifest",
+  "other",
+] as const;
+export type ObjectKind = (typeof OBJECT_KINDS)[number];
+
+export interface CacheEntryJson {
+  namespace: string;
+  path: string;
+  etag: string;
+  bytes: string;
+  /**
+   * INDEPENDENT of `onDisk`. A memory eviction demotes an object to disk
+   * without dropping its bytes and a later hit promotes it back, so an object
+   * is commonly resident in both at once. Never collapse these into one "tier".
+   */
+  inMemory: boolean;
+  onDisk: boolean;
+  /** 0 = most recently used. Orders entries against each other, not wall clock. */
+  lruRank: number;
+  /** Derived from `path`, purely for grouping in the UI. */
+  kind: ObjectKind;
+  /**
+   * The object key with any `#start-end` suffix stripped. The cache is keyed by
+   * `(path, byte range)`, so one object can be resident as several independent
+   * blocks and this is what those blocks have in common.
+   */
+  object: string;
+  /** The `start-end` byte range of a ranged read, or null for a whole object. */
+  range: string | null;
+}
+
+export interface CacheKindSummary {
+  kind: ObjectKind;
+  count: number;
+  bytes: string;
+}
+
+export interface CacheStatsJson {
+  /** False = this replica has no cache and reads through to storage every time. */
+  enabled: boolean;
+  memBytes: string;
+  memBudget: string;
+  diskBytes: string;
+  diskBudget: string;
+  /**
+   * These two OVERLAP. Their sum is not the object count — `totalEntries` is.
+   */
+  memEntries: string;
+  diskEntries: string;
+  hits: string;
+  misses: string;
+  /** null when hits + misses == 0: no lookups yet is not a 0% hit ratio. */
+  hitRatio: number | null;
+  lookups: string;
+  /** Most-recently-used first, as the server returned them. */
+  entries: CacheEntryJson[];
+  /** Entries held in total, before `limit` truncated the list. */
+  totalEntries: string;
+  /** True when the list was cut short — must be said out loud. */
+  truncated: boolean;
+  /** The limit actually sent, so the UI can name it. */
+  limit: number;
+  /** Echo of the filter; empty means every namespace. */
+  namespace: string;
+  /** Summary over the RETURNED entries only, not the whole cache. */
+  byKind: CacheKindSummary[];
+  elapsedMs: number;
+}
+
+export interface CacheStatsRequestBody {
+  namespace: string;
+  limit: number;
+}
+
 export type EmbedState = "disabled" | "idle" | "loading" | "ready" | "error";
 
 export interface EmbedStatusJson {

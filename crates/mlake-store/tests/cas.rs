@@ -244,3 +244,69 @@ async fn rewriting_identical_content_has_backend_specific_etag_semantics() {
         assert_eq!(&got.bytes[..], b"same", "{name}: content must survive the rewrite");
     }
 }
+
+// ---- Cache inspection -------------------------------------------------------
+
+/// The two tiers OVERLAP rather than partition: a memory eviction demotes an object to
+/// disk without dropping its bytes, so one object can be resident in both at once. An
+/// inspector must report that as two independent flags, never as a single tier.
+#[tokio::test]
+async fn cache_entries_report_both_tiers_and_overlap() {
+    use mlake_store::{CacheKey, DiskCache};
+
+    let dir = tempfile::tempdir().unwrap();
+    // A memory budget that fits one 100-byte blob, and ample disk.
+    let cache = DiskCache::with_budgets(dir.path(), 150, 10_000).unwrap();
+
+    let a = CacheKey::new("ns", "ns/gen-1/cluster-0.bin", "e1");
+    let b = CacheKey::new("ns", "ns/gen-1/cluster-1.bin", "e2");
+    cache.put(a.clone(), bytes::Bytes::from(vec![0u8; 100]));
+    cache.put(b.clone(), bytes::Bytes::from(vec![1u8; 100]));
+
+    let entries = cache.entries(None, 100).0;
+    assert_eq!(entries.len(), 2, "both objects are cached somewhere");
+
+    // `a` was pushed out of memory by `b`, but its bytes remain on disk.
+    let ea = entries.iter().find(|e| e.path.ends_with("cluster-0.bin")).unwrap();
+    let eb = entries.iter().find(|e| e.path.ends_with("cluster-1.bin")).unwrap();
+    assert!(eb.in_memory, "the most recent object stays in memory");
+    assert!(ea.on_disk, "the evicted object is demoted to disk, not dropped");
+    assert_eq!(ea.bytes, 100);
+
+    // Tier counts overlap, so summing them would double-count.
+    assert!(
+        cache.len() + cache.disk_len() >= entries.len(),
+        "mem_entries + disk_entries is not an object count"
+    );
+
+    // A hit promotes back into memory, and both tiers may then hold it.
+    assert!(cache.get(&a).is_some(), "the demoted object is still readable");
+    let after = cache.entries(None, 100).0;
+    let ea2 = after.iter().find(|e| e.path.ends_with("cluster-0.bin")).unwrap();
+    assert!(ea2.in_memory, "a hit promotes the object back into memory");
+    assert!(ea2.on_disk, "and it stays resident on disk too — the tiers overlap");
+
+    // Most-recently-used first: the entry just touched leads the listing.
+    assert!(after[0].path.ends_with("cluster-0.bin"), "MRU leads the listing");
+}
+
+/// `limit` bounds the listing, and lookups are counted for the hit ratio.
+#[tokio::test]
+async fn cache_listing_is_bounded_and_counts_lookups() {
+    use mlake_store::{CacheKey, DiskCache};
+
+    let dir = tempfile::tempdir().unwrap();
+    let cache = DiskCache::with_budgets(dir.path(), 10_000, 100_000).unwrap();
+    for i in 0..20 {
+        cache.put(
+            CacheKey::new("ns", &format!("ns/gen-1/cluster-{i}.bin"), "e"),
+            bytes::Bytes::from(vec![0u8; 50]),
+        );
+    }
+    assert_eq!(cache.entries(None, 5).0.len(), 5, "the limit bounds the listing");
+    assert_eq!(cache.entries(None, 1000).0.len(), 20, "everything else is still there");
+
+    assert!(cache.get(&CacheKey::new("ns", "ns/gen-1/cluster-0.bin", "e")).is_some());
+    assert!(cache.get(&CacheKey::new("ns", "nope", "e")).is_none());
+    assert!(cache.hits() >= 1 && cache.misses() >= 1, "lookups are counted");
+}

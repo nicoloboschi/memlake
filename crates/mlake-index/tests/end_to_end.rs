@@ -11,7 +11,7 @@ use std::sync::Arc;
 use mlake_core::memory::Timestamps;
 use mlake_core::{Memory, MemoryId, Op};
 use mlake_fts::Tokenizer;
-use mlake_index::{index, ArmDepths, Consistency, IndexOptions, QueryConfig, QueryNode};
+use mlake_index::{index, ArmDepths, IndexOptions, QueryConfig, QueryNode};
 use mlake_store::Store;
 use mlake_wal::{Namespace, Writer};
 
@@ -65,7 +65,7 @@ async fn write_index_then_query_from_a_fresh_node() {
 
     // A brand-new node over the same bucket — no shared memory, cold cache.
     let fresh = Namespace::new("ns", Store::new(backing as _));
-    let node = QueryNode::open(&fresh, Tokenizer::default(), Consistency::Strong)
+    let node = QueryNode::open(&fresh, Tokenizer::default())
         .await
         .unwrap();
     assert_eq!(node.doc_count(), 3);
@@ -96,7 +96,7 @@ async fn writes_after_indexing_are_visible_under_strong_consistency() {
     // This lands in the WAL tail, past the generation's cursor.
     writer.commit(vec![Op::Upsert(item("b", vec![0.0, 1.0], "second"))]).await.unwrap();
 
-    let node = QueryNode::open(&ns, Tokenizer::default(), Consistency::Strong).await.unwrap();
+    let node = QueryNode::open(&ns, Tokenizer::default()).await.unwrap();
     assert_eq!(node.doc_count(), 2, "the un-indexed write must be visible");
     let hits = node.query(1, Some(&[0.0, 1.0]), None, &tf(), 10, QueryConfig::default()).await.unwrap();
     assert_eq!(hits[0].id, MemoryId::from_key("b"), "the tail write must be queryable");
@@ -121,7 +121,7 @@ async fn deletes_after_indexing_take_effect_immediately() {
 
     writer.commit(vec![Op::Tombstone { id: MemoryId::from_key("drop") }]).await.unwrap();
 
-    let node = QueryNode::open(&ns, Tokenizer::default(), Consistency::Strong).await.unwrap();
+    let node = QueryNode::open(&ns, Tokenizer::default()).await.unwrap();
     assert_eq!(node.doc_count(), 1);
     let hits = node.query(1, Some(&[0.0, 1.0]), None, &tf(), 10, QueryConfig::default()).await.unwrap();
     assert!(
@@ -152,7 +152,7 @@ async fn reindexing_is_stable_and_advances_the_cursor() {
     // Everything is now indexed: nothing left in the tail.
     assert_eq!(manifest.index_lag(), 0);
 
-    let node = QueryNode::open(&ns, Tokenizer::default(), Consistency::Strong).await.unwrap();
+    let node = QueryNode::open(&ns, Tokenizer::default()).await.unwrap();
     assert_eq!(node.doc_count(), 2);
 }
 
@@ -210,7 +210,7 @@ async fn graph_arm_works_through_the_full_pipeline() {
     };
     index(&ns, &Tokenizer::default(), opts).await.unwrap();
 
-    let node = QueryNode::open(&ns, Tokenizer::default(), Consistency::Strong).await.unwrap();
+    let node = QueryNode::open(&ns, Tokenizer::default()).await.unwrap();
     // Query near `a`; the graph arm should also pull in its neighbour `a2`.
     let cfg = QueryConfig {
         graph_weight: 1.0,
@@ -263,7 +263,7 @@ async fn full_pipeline_against_minio() {
         &name,
         Store::s3("memlake", Some(&endpoint), "memlake", "memlake123", "us-east-1").unwrap(),
     );
-    let node = QueryNode::open(&other, Tokenizer::default(), Consistency::Strong).await.unwrap();
+    let node = QueryNode::open(&other, Tokenizer::default()).await.unwrap();
     assert_eq!(node.doc_count(), 2);
     let hits = node.query(1, Some(&[1.0, 0.0, 0.0]), Some("fox"), &tf(), 10, QueryConfig::default()).await.unwrap();
     assert_eq!(hits[0].id, MemoryId::from_key("x"));
@@ -291,7 +291,7 @@ async fn gc_reclaims_folded_wal_and_old_generations_without_changing_results() {
     writer.commit(vec![Op::Upsert(item("c", vec![1.0, 1.0], "gamma"))]).await.unwrap();
     index(&ns, &Tokenizer::default(), IndexOptions::default()).await.unwrap();
 
-    let before = QueryNode::open(&ns, Tokenizer::default(), Consistency::Strong).await.unwrap();
+    let before = QueryNode::open(&ns, Tokenizer::default()).await.unwrap();
     assert_eq!(before.doc_count(), 3);
 
     let outcome = gc_with_min_age(&ns, GcDuration::ZERO).await.unwrap();
@@ -299,7 +299,7 @@ async fn gc_reclaims_folded_wal_and_old_generations_without_changing_results() {
     assert!(outcome.generation_files_deleted > 0, "an old generation should be reclaimed");
 
     // Results are unchanged: GC only removed files nothing references.
-    let after = QueryNode::open(&ns, Tokenizer::default(), Consistency::Strong).await.unwrap();
+    let after = QueryNode::open(&ns, Tokenizer::default()).await.unwrap();
     assert_eq!(after.doc_count(), 3);
     let hits = after.query(1, Some(&[0.0, 1.0]), None, &tf(), 10, QueryConfig::default()).await.unwrap();
     assert_eq!(hits[0].id, MemoryId::from_key("b"));
@@ -317,7 +317,7 @@ async fn gc_keeps_the_current_generation_intact() {
 
     gc_with_min_age(&ns, GcDuration::ZERO).await.unwrap();
 
-    let node = QueryNode::open(&ns, Tokenizer::default(), Consistency::Strong).await.unwrap();
+    let node = QueryNode::open(&ns, Tokenizer::default()).await.unwrap();
     assert_eq!(node.doc_count(), 1, "current generation must survive GC");
 }
 
@@ -360,7 +360,7 @@ async fn tombstone_survives_compaction_and_wal_gc() {
     index(&ns, &Tokenizer::default(), IndexOptions::default()).await.unwrap();
     gc_with_min_age(&ns, GcDuration::ZERO).await.unwrap();
 
-    let node = QueryNode::open(&ns, Tokenizer::default(), Consistency::Strong).await.unwrap();
+    let node = QueryNode::open(&ns, Tokenizer::default()).await.unwrap();
     assert_eq!(node.doc_count(), 1, "the deleted item must stay gone after compaction");
     assert!(node.query(1, Some(&[0.0, 1.0]), None, &tf(), 10, QueryConfig::default())
         .await
@@ -411,7 +411,7 @@ async fn crash_before_manifest_swap_leaves_the_old_generation_serving() {
     assert_eq!(manifest.generation, 1, "manifest must still point at the pre-crash generation");
 
     // The namespace still serves generation 1 correctly.
-    let node = QueryNode::open(&ns, Tokenizer::default(), Consistency::Strong).await.unwrap();
+    let node = QueryNode::open(&ns, Tokenizer::default()).await.unwrap();
     // Strong consistency also sees the un-indexed 'b' via the WAL tail.
     assert_eq!(node.doc_count(), 2);
 
@@ -448,7 +448,7 @@ async fn generation_load_roundtrips_are_constant_regardless_of_size() {
         }
         index(&ns, &Tokenizer::default(), IndexOptions::default()).await.unwrap();
 
-        let node = QueryNode::open(&ns, Tokenizer::default(), Consistency::Strong).await.unwrap();
+        let node = QueryNode::open(&ns, Tokenizer::default()).await.unwrap();
         node.load_roundtrips
     }
 
@@ -517,7 +517,7 @@ async fn default_indexing_preserves_the_graph_across_reruns() {
     index(&ns, &Tokenizer::default(), IndexOptions::default()).await.unwrap();
 
     let cfg = QueryConfig { graph_weight: 1.0, ..QueryConfig::default() };
-    let node = QueryNode::open(&ns, Tokenizer::default(), Consistency::Strong).await.unwrap();
+    let node = QueryNode::open(&ns, Tokenizer::default()).await.unwrap();
     let hits = node.query(1, Some(&[1.0, 0.0, 0.0]), None, &tf(), 10, cfg).await.unwrap();
     assert!(
         hits.iter().any(|h| h.id == MemoryId::from_key("a2")),
@@ -528,7 +528,7 @@ async fn default_indexing_preserves_the_graph_across_reruns() {
     writer.commit(vec![Op::Upsert(item("z", vec![0.0, 0.0, 1.0], "unrelated"))]).await.unwrap();
     index(&ns, &Tokenizer::default(), IndexOptions::default()).await.unwrap();
 
-    let node2 = QueryNode::open(&ns, Tokenizer::default(), Consistency::Strong).await.unwrap();
+    let node2 = QueryNode::open(&ns, Tokenizer::default()).await.unwrap();
     let hits2 = node2.query(1, Some(&[1.0, 0.0, 0.0]), None, &tf(), 10, cfg).await.unwrap();
     assert!(
         hits2.iter().any(|h| h.id == MemoryId::from_key("a2")),
@@ -667,7 +667,7 @@ async fn query_fetches_only_probed_clusters_and_warms_the_cache() {
         .await
         .unwrap();
 
-    let node = QueryNode::open(&ns, Tokenizer::default(), Consistency::Strong).await.unwrap();
+    let node = QueryNode::open(&ns, Tokenizer::default()).await.unwrap();
     let cluster_count = {
         let (m, _) = ns.read_manifest().await.unwrap();
         m.index(1).unwrap().files.clusters.len()
@@ -721,7 +721,7 @@ async fn graph_arm_materializes_neighbours_from_unprobed_clusters() {
     writer.commit(ops).await.unwrap();
     index(&ns, &Tokenizer::default(), IndexOptions::default()).await.unwrap();
 
-    let node = QueryNode::open(&ns, Tokenizer::default(), Consistency::Strong).await.unwrap();
+    let node = QueryNode::open(&ns, Tokenizer::default()).await.unwrap();
     // Low nprobe so only a couple of clusters are probed.
     let cfg = QueryConfig { nprobe: 2, graph_weight: 1.0, ..QueryConfig::default() };
     let hits = node.query(1, Some(&[1.0, 0.0, 0.0]), None, &tf(), 20, cfg).await.unwrap();
@@ -784,7 +784,7 @@ async fn incremental_fold_copies_unchanged_clusters_forward() {
         "at least one cluster must have been rewritten for the newcomer");
 
     // Correctness is unaffected: the new item and an old item are both queryable.
-    let node = QueryNode::open(&ns, Tokenizer::default(), Consistency::Strong).await.unwrap();
+    let node = QueryNode::open(&ns, Tokenizer::default()).await.unwrap();
     assert_eq!(node.doc_count(), 401);
     let cfg = QueryConfig { graph_weight: 0.0, ..QueryConfig::default() };
     let hits = node.query(1, Some(&[1.0, 0.0, 0.0]), None, &tf(), 10, cfg).await.unwrap();
@@ -845,7 +845,7 @@ async fn assign_only_recall_stays_close_to_a_retrain() {
     assert_eq!(m1.index(1).unwrap().train_count, train_count_0, "assign-only folds must not retrain under 2x growth");
 
     // Recall of the assign-only generation vs brute force over the same items.
-    let node = QueryNode::open(&ns, Tokenizer::default(), Consistency::Strong).await.unwrap();
+    let node = QueryNode::open(&ns, Tokenizer::default()).await.unwrap();
     let queries = corpus_vecs(50, dim, 99);
     let cfg = QueryConfig { nprobe: 16, ..QueryConfig::default() };
     let mut total_recall = 0.0;
@@ -900,7 +900,7 @@ async fn memory_types_are_independent_indexes_in_one_bank() {
     let paths2: std::collections::HashSet<_> = manifest.index(2).unwrap().files.all_paths().collect();
     assert!(paths1.is_disjoint(&paths2), "fact types must not share any object");
 
-    let node = QueryNode::open(&ns, Tokenizer::default(), Consistency::Strong).await.unwrap();
+    let node = QueryNode::open(&ns, Tokenizer::default()).await.unwrap();
     assert_eq!(node.doc_count(), 4);
     assert_eq!(node.doc_count_of(1), 2);
     assert_eq!(node.doc_count_of(2), 2);
@@ -938,7 +938,7 @@ async fn multi_memory_type_open_reads_one_manifest() {
     }
     index(&ns, &Tokenizer::default(), IndexOptions::default()).await.unwrap();
 
-    let node = QueryNode::open(&ns, Tokenizer::default(), Consistency::Strong).await.unwrap();
+    let node = QueryNode::open(&ns, Tokenizer::default()).await.unwrap();
     assert_eq!(node.memory_types().len(), 3, "three fact types under one bank");
     assert_eq!(node.doc_count(), 60);
 }
@@ -970,7 +970,7 @@ async fn tags_filter_the_query_in_all_five_modes() {
         .await
         .unwrap();
     index(&ns, &Tokenizer::default(), IndexOptions::default()).await.unwrap();
-    let node = QueryNode::open(&ns, Tokenizer::default(), Consistency::Strong).await.unwrap();
+    let node = QueryNode::open(&ns, Tokenizer::default()).await.unwrap();
 
     let q = vec![1.0f32, 0.0, 0.0];
     let cfg = QueryConfig { graph_weight: 0.0, ..QueryConfig::default() };
@@ -1044,7 +1044,7 @@ async fn tags_filter_the_fts_arm() {
         .await
         .unwrap();
     index(&ns, &Tokenizer::default(), IndexOptions::default()).await.unwrap();
-    let node = QueryNode::open(&ns, Tokenizer::default(), Consistency::Strong).await.unwrap();
+    let node = QueryNode::open(&ns, Tokenizer::default()).await.unwrap();
 
     // Pure-text query with a strict tag filter returns only the team-a memory.
     let f = mlake_core::TagFilter::new(vec!["team-a".into()], TagsMatch::AnyStrict);
@@ -1079,7 +1079,7 @@ async fn selective_tag_filter_prunes_to_admissible_clusters() {
     }
     writer.commit(ops).await.unwrap();
     index(&ns, &Tokenizer::default(), IndexOptions::default()).await.unwrap();
-    let node = QueryNode::open(&ns, Tokenizer::default(), Consistency::Strong).await.unwrap();
+    let node = QueryNode::open(&ns, Tokenizer::default()).await.unwrap();
 
     // Query near one rare memory, low nprobe, strict filter on the rare tag.
     let a = 7.0f32 * 0.21;
@@ -1121,7 +1121,7 @@ async fn get_many_resolves_ids_from_the_generation_and_the_tail() {
     // Lands in the tail, past the generation's cursor.
     writer.commit(vec![Op::Upsert(item("c", vec![1.0, 1.0], "gamma"))]).await.unwrap();
 
-    let node = QueryNode::open(&ns, Tokenizer::default(), Consistency::Strong).await.unwrap();
+    let node = QueryNode::open(&ns, Tokenizer::default()).await.unwrap();
     let ids = [MemoryId::from_key("a"), MemoryId::from_key("c")];
     let got = node.get_many(&ids).await.unwrap();
 
@@ -1147,7 +1147,7 @@ async fn get_many_hides_tombstoned_memories() {
     index(&ns, &Tokenizer::default(), IndexOptions::default()).await.unwrap();
     writer.commit(vec![Op::Tombstone { id: MemoryId::from_key("a") }]).await.unwrap();
 
-    let node = QueryNode::open(&ns, Tokenizer::default(), Consistency::Strong).await.unwrap();
+    let node = QueryNode::open(&ns, Tokenizer::default()).await.unwrap();
     let got = node.get_many(&[MemoryId::from_key("a")]).await.unwrap();
     assert!(got.is_empty(), "a deleted memory must not be addressable");
 }
@@ -1180,7 +1180,7 @@ async fn scan_pages_over_every_memory_exactly_once() {
         .await
         .unwrap();
 
-    let node = QueryNode::open(&ns, Tokenizer::default(), Consistency::Strong).await.unwrap();
+    let node = QueryNode::open(&ns, Tokenizer::default()).await.unwrap();
 
     let mut seen = std::collections::HashSet::new();
     let mut texts = std::collections::HashMap::new();
@@ -1229,7 +1229,7 @@ async fn scan_respects_the_tag_filter() {
     writer.commit(ops).await.unwrap();
     index(&ns, &Tokenizer::default(), IndexOptions::default()).await.unwrap();
 
-    let node = QueryNode::open(&ns, Tokenizer::default(), Consistency::Strong).await.unwrap();
+    let node = QueryNode::open(&ns, Tokenizer::default()).await.unwrap();
     let filter = mlake_core::TagFilter::new(vec!["keep".into()], TagsMatch::AnyStrict);
 
     let mut seen = std::collections::HashSet::new();
@@ -1265,7 +1265,7 @@ async fn a_query_vector_of_the_wrong_dimension_is_rejected() {
         .unwrap();
     index(&ns, &Tokenizer::default(), IndexOptions::default()).await.unwrap();
 
-    let node = QueryNode::open(&ns, Tokenizer::default(), Consistency::Strong).await.unwrap();
+    let node = QueryNode::open(&ns, Tokenizer::default()).await.unwrap();
 
     // The index is 3-dim; query with 5.
     let err = node
@@ -1296,7 +1296,7 @@ async fn wrong_dimension_is_rejected_against_the_un_indexed_tail() {
     writer.commit(vec![Op::Upsert(item("a", vec![1.0, 0.0], "alpha"))]).await.unwrap();
 
     // No index() call: this type exists only in the tail.
-    let node = QueryNode::open(&ns, Tokenizer::default(), Consistency::Strong).await.unwrap();
+    let node = QueryNode::open(&ns, Tokenizer::default()).await.unwrap();
     let err = node
         .query(1, Some(&[1.0, 0.0, 0.0]), None, &tf(), 10, QueryConfig::default())
         .await
@@ -1344,7 +1344,7 @@ async fn text_only_memories_do_not_trip_the_dimension_check() {
         .unwrap();
     index(&ns, &Tokenizer::default(), IndexOptions::default()).await.unwrap();
 
-    let node = QueryNode::open(&ns, Tokenizer::default(), Consistency::Strong).await.unwrap();
+    let node = QueryNode::open(&ns, Tokenizer::default()).await.unwrap();
     assert_eq!(node.doc_count(), 2);
     let hits = node
         .query(1, Some(&[1.0, 0.0]), Some("text only"), &tf(), 10, QueryConfig::default())
@@ -1430,7 +1430,7 @@ async fn the_cluster_layout_is_visible_from_a_snapshot() {
     writer.commit(ops).await.unwrap();
     index(&ns, &Tokenizer::default(), IndexOptions::default()).await.unwrap();
 
-    let node = QueryNode::open(&ns, Tokenizer::default(), Consistency::Strong).await.unwrap();
+    let node = QueryNode::open(&ns, Tokenizer::default()).await.unwrap();
     let layout = node.cluster_layout(1).expect("type 1 is in the snapshot");
 
     assert_eq!(layout.dim, 3);

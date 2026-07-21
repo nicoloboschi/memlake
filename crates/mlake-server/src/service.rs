@@ -6,10 +6,9 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
 
 use mlake_fts::Tokenizer;
-use mlake_index::{index, Consistency, IndexOptions, QueryNode, ScanCursor};
+use mlake_index::{index, IndexOptions, QueryNode, ScanCursor};
 use mlake_store::{QueryMetrics, Store};
 use mlake_wal::{Namespace, Writer};
 use tokio::sync::Mutex as AsyncMutex;
@@ -18,18 +17,19 @@ use tonic::{Request, Response, Status};
 use crate::pb::memlake_server::Memlake;
 use crate::{convert, pb};
 
-/// How long an EVENTUAL-consistency snapshot may be reused before re-opening. Bounds staleness
-/// to roughly the indexing interval; STRONG never uses this (it checks the WAL head instead).
-const EVENTUAL_TTL: Duration = Duration::from_secs(2);
+/// Bounded number of inline fold attempts a `wait_for_index` write makes before giving up.
+/// One fold folds the whole tail up to the current head, so a single pass normally covers the
+/// write; extra passes only absorb a lost manifest-CAS race or a head that advanced under a
+/// concurrent write. A ceiling keeps a pathological write-storm from spinning forever.
+const MAX_INDEX_ATTEMPTS: usize = 5;
 
 /// A cached open snapshot of a namespace. Opening a `QueryNode` costs a manifest read plus WAL
 /// head/tail scans (uncached, mutable) — re-doing that per query is what makes a naive server
-/// slow. We keep the last snapshot and reuse it while it is still current: for STRONG, while
-/// the WAL head has not advanced; for EVENTUAL, within a short TTL.
+/// slow. We keep the last snapshot and reuse it while the WAL head has not advanced, so a run
+/// of reads between writes is served from memory with a single cheap head check.
 struct Snapshot {
     node: Arc<QueryNode>,
     through_seq: u64,
-    opened: Instant,
 }
 
 pub struct MemlakeService {
@@ -69,40 +69,53 @@ impl MemlakeService {
         self.snapshots.lock().unwrap().get(name).cloned()
     }
 
-    /// Get a current snapshot for `ns`, reusing the cached one when it is still valid.
-    /// A write invalidates the cache for its namespace, so STRONG readers re-open promptly.
-    async fn snapshot(
-        &self,
-        ns: &Namespace,
-        consistency: Consistency,
-    ) -> Result<Arc<Snapshot>, Status> {
+    /// Get a current snapshot for `ns`, reusing the cached one while no write has landed
+    /// since it was opened — one cheap WAL-head check. A write invalidates the cache for its
+    /// namespace, and reads are always strongly consistent, so a reader re-opens promptly and
+    /// never serves a stale view.
+    async fn snapshot(&self, ns: &Namespace) -> Result<Arc<Snapshot>, Status> {
         if let Some(cached) = self.cached_snapshot(&ns.name) {
-            let reusable = match consistency {
-                // EVENTUAL: reuse within the TTL, no storage check at all (0 roundtrips warm).
-                Consistency::Eventual => cached.opened.elapsed() < EVENTUAL_TTL,
-                // STRONG: reuse only if no write has landed since — one cheap head check.
-                Consistency::Strong => {
-                    let head = ns.wal_head().await.map_err(internal)?;
-                    head == cached.through_seq
-                }
-            };
-            if reusable {
+            let head = ns.wal_head().await.map_err(internal)?;
+            if head == cached.through_seq {
                 return Ok(cached);
             }
         }
 
         let node = Arc::new(
-            QueryNode::open(ns, self.tokenizer.clone(), consistency)
+            QueryNode::open(ns, self.tokenizer.clone())
                 .await
                 .map_err(internal)?,
         );
         let snap = Arc::new(Snapshot {
             through_seq: node.through_seq,
             node,
-            opened: Instant::now(),
         });
         self.snapshots.lock().unwrap().insert(ns.name.clone(), snap.clone());
         Ok(snap)
+    }
+
+    /// Fold `name`'s WAL tail into the indexed generation until the manifest cursor covers
+    /// `seq`, then return the resulting generation. Runs the same fold the background indexer
+    /// runs, inline on this replica — the manifest CAS serializes it against any other folder,
+    /// so a lost race just means someone else already advanced the cursor. Bounded retries
+    /// absorb that race and a head that a concurrent write pushed past our fold.
+    async fn index_until(&self, name: &str, seq: u64) -> Result<u64, Status> {
+        let ns = self.namespace(name);
+        for _ in 0..MAX_INDEX_ATTEMPTS {
+            let (manifest, _etag) = ns.read_manifest().await.map_err(internal)?;
+            if manifest.wal_index_cursor >= seq {
+                // A fold advanced past our write; drop any snapshot opened against the older
+                // generation so the next read sees the freshly-indexed one.
+                self.invalidate(name);
+                return Ok(manifest.generation);
+            }
+            index(&ns, &self.tokenizer, IndexOptions::default())
+                .await
+                .map_err(internal)?;
+        }
+        Err(Status::deadline_exceeded(format!(
+            "write seq {seq} was not indexed after {MAX_INDEX_ATTEMPTS} fold attempts"
+        )))
     }
 
     fn invalidate(&self, name: &str) {
@@ -183,12 +196,22 @@ impl Memlake for MemlakeService {
             let mut w = writer.lock().await;
             w.commit(ops).await.map_err(internal)?
         };
-        // A new write means any cached snapshot is stale; drop it so the next STRONG read
-        // re-opens and sees this write.
+        // A new write means any cached snapshot is stale; drop it so the next read re-opens
+        // and sees this write (via the WAL tail, even before it is indexed).
         self.invalidate(&req.namespace);
+
+        // Optionally fold the write into the indexed generation before returning. Done after
+        // the commit so the ack still reflects durability; the extra latency is only paid by
+        // callers that opt in.
+        let generation = if req.wait_for_index {
+            self.index_until(&req.namespace, result.seq).await?
+        } else {
+            0
+        };
         Ok(Response::new(pb::WriteResponse {
             seq: result.seq,
             attempts: result.attempts as u32,
+            generation,
         }))
     }
 
@@ -202,7 +225,6 @@ impl Memlake for MemlakeService {
         }
         let vector = req.vector.as_ref().map(convert::decode_vector).transpose()?;
         let tags = convert::tag_filter(req.tags);
-        let consistency = convert::consistency(req.consistency);
         let depths = convert::arm_depths(req.vector_top_k, req.text_top_k, req.graph_top_k, req.nprobe);
         let text: Option<String> = if req.text.is_empty() { None } else { Some(req.text) };
         // Temporal arm runs only when both window bounds are set.
@@ -214,7 +236,7 @@ impl Memlake for MemlakeService {
         let ns = self.namespace(&req.namespace);
         // Reuse the cached open snapshot when still current (see `snapshot`): a warm read is
         // pure in-memory arm evaluation over the shared Store cache, 0 fresh roundtrips.
-        let snap = self.snapshot(&ns, consistency).await?;
+        let snap = self.snapshot(&ns).await?;
         let node = &snap.node;
 
         // Which types to answer: the caller's list, or every type in the snapshot.
@@ -278,13 +300,12 @@ impl Memlake for MemlakeService {
             return Err(Status::invalid_argument("namespace is required"));
         }
         let ns = self.namespace(&req.namespace);
-        let consistency = convert::consistency(req.consistency);
 
         // The manifest gives the published index state; the snapshot gives the *live* doc
         // counts, which differ from it by the un-indexed tail and any tombstones.
         let (manifest, _etag) = ns.read_manifest().await.map_err(internal)?;
         let wal_head = ns.wal_head().await.map_err(internal)?;
-        let snap = self.snapshot(&ns, consistency).await?;
+        let snap = self.snapshot(&ns).await?;
         let node = &snap.node;
 
         let types: Vec<pb::TypeStats> = node
@@ -332,7 +353,7 @@ impl Memlake for MemlakeService {
         }
 
         let ns = self.namespace(&req.namespace);
-        let snap = self.snapshot(&ns, convert::consistency(req.consistency)).await?;
+        let snap = self.snapshot(&ns).await?;
         let found = snap.node.get_many(&ids).await.map_err(internal)?;
         Ok(Response::new(pb::GetResponse {
             memories: found
@@ -357,7 +378,7 @@ impl Memlake for MemlakeService {
         let tags = convert::tag_filter(req.tags);
 
         let ns = self.namespace(&req.namespace);
-        let snap = self.snapshot(&ns, convert::consistency(req.consistency)).await?;
+        let snap = self.snapshot(&ns).await?;
         let node = &snap.node;
 
         let mut types: Vec<u8> = if req.memory_types.is_empty() {
@@ -459,7 +480,7 @@ impl Memlake for MemlakeService {
 
         // Eager: scan now, tombstone matches by id (O(corpus)), return the exact count.
         let ns = self.namespace(&req.namespace);
-        let snap = self.snapshot(&ns, Consistency::Strong).await?;
+        let snap = self.snapshot(&ns).await?;
         let metadata_equals: Vec<(String, String)> = req.metadata_equals.into_iter().collect();
         let tags = convert::tag_filter(req.tags);
         let ids = snap.node.ids_matching(&pred.memory_types, &metadata_equals, &tags).await.map_err(internal)?;
@@ -537,7 +558,7 @@ impl Memlake for MemlakeService {
         let sample = (req.member_sample as usize).min(MAX_MEMBER_SAMPLE);
 
         let ns = self.namespace(&req.namespace);
-        let snap = self.snapshot(&ns, convert::consistency(req.consistency)).await?;
+        let snap = self.snapshot(&ns).await?;
         let node = &snap.node;
 
         // Centroids are already resident from opening the snapshot, so this branch costs
@@ -564,7 +585,54 @@ impl Memlake for MemlakeService {
             members,
         }))
     }
+
+    async fn cache_stats(
+        &self,
+        req: Request<pb::CacheStatsRequest>,
+    ) -> Result<Response<pb::CacheStatsResponse>, Status> {
+        let req = req.into_inner();
+        let limit = match req.limit {
+            0 => DEFAULT_CACHE_LIMIT,
+            n => (n as usize).min(MAX_CACHE_LIMIT),
+        };
+
+        // No cache configured: the node reads through to object storage every time. That is
+        // a valid deployment, so report it rather than erroring.
+        let Some(cache) = self.store.cache() else {
+            return Ok(Response::new(pb::CacheStatsResponse {
+                enabled: false,
+                ..Default::default()
+            }));
+        };
+
+        // The cache applies the filter and reports the pre-truncation total, so a short
+        // page can be labelled as a page rather than mistaken for the whole cache.
+        let ns_filter = (!req.namespace.is_empty()).then_some(req.namespace.as_str());
+        let (entries, total_entries) = cache.entries(ns_filter, limit);
+
+        Ok(Response::new(pb::CacheStatsResponse {
+            enabled: true,
+            mem_bytes: cache.bytes(),
+            mem_budget: cache.mem_budget(),
+            disk_bytes: cache.disk_bytes(),
+            disk_budget: cache.disk_budget(),
+            mem_entries: cache.len() as u64,
+            disk_entries: cache.disk_len() as u64,
+            hits: cache.hits(),
+            misses: cache.misses(),
+            entries: entries
+                .into_iter()
+                .enumerate()
+                .map(|(rank, e)| convert::cache_entry(rank, e))
+                .collect(),
+            total_entries: total_entries as u64,
+        }))
+    }
 }
+
+/// Cache listing sizes. A warm node holds thousands of blocks; this is an inspection call.
+const DEFAULT_CACHE_LIMIT: usize = 100;
+const MAX_CACHE_LIMIT: usize = 2000;
 
 /// WAL page sizes, and the ceiling on a member sample. All three bound one response: the
 /// log can be long, and a sample is a picture of the layout, not a bulk export.

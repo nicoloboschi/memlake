@@ -21,7 +21,7 @@ use anyhow::{Context, Result};
 use datagen::{GenConfig, Generator};
 use mlake_core::{Op, TagFilter, TagsMatch};
 use mlake_fts::Tokenizer;
-use mlake_index::{index, ArmDepths, Consistency, IndexOptions, QueryConfig, QueryNode};
+use mlake_index::{index, ArmDepths, IndexOptions, QueryConfig, QueryNode};
 use mlake_store::{DiskCache, QueryMetrics, Store, StoreMetrics};
 use mlake_wal::{Namespace, Writer};
 
@@ -266,7 +266,7 @@ async fn read_bench(
     cache.wipe().ok();
     let store = store.clone().with_cache(cache.clone());
     let ns = Namespace::new(bank, store.clone());
-    let node = QueryNode::open(&ns, Tokenizer::default(), Consistency::Strong).await?;
+    let node = QueryNode::open(&ns, Tokenizer::default()).await?;
     let gen = Generator::new(cfg);
 
     let memory_types = node.memory_types();

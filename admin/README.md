@@ -96,6 +96,7 @@ All server-side only; none of it reaches the browser. See
 | `/ns/[ns]/query`        | `Query`                       | The workbench: all arms, raw scores, client-side fusion. |
 | `/ns/[ns]/wal`          | `ListWal`                     | The write-ahead log, with the folded / un-folded boundary drawn as a region. |
 | `/ns/[ns]/clusters`     | `IndexLayout`                 | How k-means partitioned one memory_type: a browser-side PCA projection plus a sortable per-cluster table. |
+| `/ns/[ns]/cache`, `/cache` | `CacheStats`               | This replica's two-tier read cache, filtered to one namespace or unfiltered. |
 
 ### Things the UI is careful about
 
@@ -132,6 +133,54 @@ single arm instead. The panel says so in its title; do not mistake that column
 for something the server computed.
 
 ---
+
+## The cache page — read the caveat first
+
+Two things about `CacheStats` are easy to get wrong, and both are stated on the
+page itself rather than left to the reader.
+
+**It is node-local, not cluster-wide.** Every other RPC here is answerable
+identically by any replica, because the answer lives in object storage. This one
+is not: the cache is process-local, so the numbers describe whichever pod the
+request landed on, and two calls behind a load balancer will disagree. The page
+leads with that in a banner, not a footnote. Nothing it reports affects
+correctness either — a cold cache costs latency and nothing else (INV-4).
+
+**The tiers overlap; they are not a partition.** A memory eviction *demotes* an
+object to disk without dropping its bytes, and a later hit promotes it back, so
+`in_memory` and `on_disk` are independent booleans and an object is commonly in
+both. Consequences the UI honours:
+
+- `mem_entries + disk_entries` is **not** the object count — `total_entries` is,
+  and the page says so where the two numbers sit side by side.
+- Residency renders as two independent flags per row, never one exclusive
+  "tier" column.
+- `mem_bytes` and `disk_bytes` are separate budgets, each capped independently
+  — that is the design's selling point (predictable peak RAM *and* peak disk
+  whatever the workload), so each gets its own usage-against-budget meter.
+
+**Blocks, not objects.** A ranged read is keyed by `(path, byte range)` and the
+key carries a `#start-end` suffix (`pk.data#0-13128`), so one object can be
+resident as several independent blocks. The range is its own column and the
+counts are labelled "blocks".
+
+**Truncation is explicit.** When `entries.length < total_entries` the page says
+"showing N of M — capped at limit = L. This is not the whole cache", and the
+by-kind summary retitles itself to cover only what was returned. A silently
+short list reads as "that's everything".
+
+**Two states that are not errors.** `enabled = false` is a node configured
+without a cache — it renders as an explanatory empty state, since reading
+through to storage every time is a latency choice, not a fault. And
+`hits + misses == 0` renders as "no lookups yet", never `0%` or `NaN`: a 100%
+ratio over three lookups is not the same claim as over three million, so the
+raw counts sit beside the ratio always.
+
+**The meters are deliberately not severity-coloured.** A bounded LRU cache at
+100% is its normal steady state — it means the budget is being used, which is
+the point of having one. Colouring "full" as a warning would tell an operator to
+act on healthy behaviour, so the meters are a plain magnitude bar in the slot-1
+hue over a recessive track from the same ramp.
 
 ## The clusters page
 
@@ -269,12 +318,13 @@ admin/
     api/
       embed/route.ts               GET status / POST warm up
       namespaces/route.ts          GET ListNamespaces / POST CreateNamespace
+      cache/route.ts               POST CacheStats (namespace "" = all)
       namespaces/[namespace]/
         stats/route.ts  scan/route.ts   get/route.ts
         query/route.ts  wal/route.ts    layout/route.ts
   components/                      all "use client"
     NamespacesView  StatsView  BrowseView  QueryView
-    WalView  ClustersView  ClusterScatter
+    WalView  ClustersView  ClusterScatter  CacheView
     MemoryDetail  NamespaceNav  filters  ui
   lib/
     memlake.ts   the gRPC client: proto load, memoized channel, one promisified

@@ -267,6 +267,38 @@ export interface IndexLayoutResponse {
   members: WireClusterMember[];
 }
 
+// ---- Read cache (node-local) ------------------------------------------------
+
+export interface WireCacheEntry {
+  namespace: string;
+  path: string;
+  etag: string;
+  bytes: string;
+  /** Independent of `onDisk` — the tiers overlap, they are not a partition. */
+  inMemory: boolean;
+  onDisk: boolean;
+  lruRank: number;
+}
+
+export interface CacheStatsRequest {
+  namespace: string;
+  limit: number;
+}
+
+export interface CacheStatsResponse {
+  enabled: boolean;
+  memBytes: string;
+  memBudget: string;
+  diskBytes: string;
+  diskBudget: string;
+  memEntries: string;
+  diskEntries: string;
+  hits: string;
+  misses: string;
+  entries: WireCacheEntry[];
+  totalEntries: string;
+}
+
 // ---- errors -----------------------------------------------------------------
 
 /** A failure worth showing to an operator verbatim, RPC or otherwise. */
@@ -363,6 +395,7 @@ type MemlakeStub = grpc.Client & {
   Query: UnaryCall<QueryRequest, QueryResponse>;
   ListWal: UnaryCall<ListWalRequest, ListWalResponse>;
   IndexLayout: UnaryCall<IndexLayoutRequest, IndexLayoutResponse>;
+  CacheStats: UnaryCall<CacheStatsRequest, CacheStatsResponse>;
 };
 
 interface MemlakeGlobal {
@@ -511,6 +544,13 @@ export const memlake = {
   indexLayout(req: IndexLayoutRequest, deadlineMs?: number) {
     return unary<IndexLayoutRequest, IndexLayoutResponse>(
       "IndexLayout",
+      req,
+      deadlineMs,
+    );
+  },
+  cacheStats(req: CacheStatsRequest, deadlineMs?: number) {
+    return unary<CacheStatsRequest, CacheStatsResponse>(
+      "CacheStats",
       req,
       deadlineMs,
     );
