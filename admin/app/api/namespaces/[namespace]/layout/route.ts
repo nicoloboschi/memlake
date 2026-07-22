@@ -2,7 +2,6 @@ import { NextResponse } from "next/server";
 
 import { indexLayoutToJson } from "@/lib/convert";
 import {
-  coerceConsistency,
   coerceUint32,
   errorResponse,
   readJson,
@@ -50,7 +49,6 @@ export async function POST(
       // 0 returns centroids only, which costs the server no object-storage read
       // at all — the centroids are already resident on every query node.
       memberSample,
-      consistency: coerceConsistency(body.consistency),
     });
 
     return NextResponse.json(indexLayoutToJson(res, Date.now() - started));

@@ -4,7 +4,7 @@ import { useCallback, useEffect, useState } from "react";
 
 import { getJson, isAbort } from "@/lib/client";
 import { fmtMs, groupDigits } from "@/lib/format";
-import { CONSISTENCIES, type Consistency, type StatsJson } from "@/lib/types";
+import { type StatsJson } from "@/lib/types";
 import {
   Button,
   Empty,
@@ -19,28 +19,18 @@ import {
   Th,
 } from "@/components/ui";
 
-const CONSISTENCY_OPTIONS = CONSISTENCIES.map((c) => ({
-  value: c,
-  label: c,
-  title:
-    c === "STRONG"
-      ? "reflect every acked write: check the WAL head and scan the tail"
-      : "serve from the cached manifest; staleness bounded by the index interval",
-}));
-
 export function StatsView({ namespace }: { namespace: string }) {
-  const [consistency, setConsistency] = useState<Consistency>("STRONG");
   const [data, setData] = useState<StatsJson | null>(null);
   const [error, setError] = useState<unknown>(null);
   const [loading, setLoading] = useState(true);
 
   const load = useCallback(
-    async (c: Consistency, signal?: AbortSignal) => {
+    async (signal?: AbortSignal) => {
       setLoading(true);
       setError(null);
       try {
         const res = await getJson<StatsJson>(
-          `/api/namespaces/${encodeURIComponent(namespace)}/stats?consistency=${c}`,
+          `/api/namespaces/${encodeURIComponent(namespace)}/stats`,
           signal,
         );
         setData(res);
@@ -60,9 +50,9 @@ export function StatsView({ namespace }: { namespace: string }) {
     // Fetch on mount / on consistency change: synchronising with the server is
     // exactly what this effect is for; the setState is the loading flag.
     // eslint-disable-next-line react-hooks/set-state-in-effect
-    void load(consistency, ac.signal);
+    void load(ac.signal);
     return () => ac.abort();
-  }, [load, consistency]);
+  }, [load]);
 
   const backlog = data ? BigInt(data.backlog) : 0n;
   const backlogTone = backlog === 0n ? "ok" : backlog > 1000n ? "danger" : "warn";
@@ -74,14 +64,8 @@ export function StatsView({ namespace }: { namespace: string }) {
         subtitle="Reads the manifest and each type's metadata — no cluster data — so this call's cost is independent of corpus size."
         actions={
           <>
-            <SegmentedControl
-              value={consistency}
-              onChange={setConsistency}
-              options={CONSISTENCY_OPTIONS}
-              disabled={loading}
-            />
             <Button
-              onClick={() => void load(consistency)}
+              onClick={() => void load()}
               disabled={loading}
               title="re-run Stats"
             >
@@ -95,8 +79,8 @@ export function StatsView({ namespace }: { namespace: string }) {
         {Boolean(error) && (
           <ErrorBanner
             error={error}
-            what={`Stats(${namespace}, ${consistency})`}
-            onRetry={() => void load(consistency)}
+            what={`Stats(${namespace})`}
+            onRetry={() => void load()}
           />
         )}
 

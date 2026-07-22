@@ -15,9 +15,6 @@
 
 // ---- enums (mirrors of the proto enums, as string names) --------------------
 
-export const CONSISTENCIES = ["STRONG", "EVENTUAL"] as const;
-export type Consistency = (typeof CONSISTENCIES)[number];
-
 export const TAGS_MATCHES = [
   "ANY",
   "ALL",
@@ -333,7 +330,6 @@ export interface IndexLayoutJson {
 export interface IndexLayoutRequestBody {
   memoryType: number;
   memberSample: number;
-  consistency: Consistency;
 }
 
 // ---- Read cache (node-local) ------------------------------------------------
@@ -452,13 +448,11 @@ export interface ScanRequestBody {
   pageToken: string;
   includeVector: boolean;
   tags: TagFilterInput | null;
-  consistency: Consistency;
 }
 
 export interface GetRequestBody {
   ids: string[];
   includeVector: boolean;
-  consistency: Consistency;
 }
 
 export interface QueryRequestBody {
@@ -470,7 +464,6 @@ export interface QueryRequestBody {
   textTopK: number;
   graphTopK: number;
   nprobe: number;
-  consistency: Consistency;
   /**
    * "embed"  – embed `text` server-side (default)
    * "raw"    – use `vector` verbatim

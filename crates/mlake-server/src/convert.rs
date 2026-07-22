@@ -179,7 +179,7 @@ pub fn stored_record(m: StoredMemory, include_vector: bool) -> pb::StoredMemoryR
 
 /// One WAL object as a log row. `folded` is the whole point of the view: an entry at or
 /// below the manifest's cursor is already in a generation, everything above it is backlog
-/// that each STRONG query re-scans.
+/// that every query re-scans.
 pub fn wal_entry(
     o: &mlake_wal::WalObject,
     wal_index_cursor: u64,

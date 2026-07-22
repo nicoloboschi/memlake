@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 
 import { storedMemoryToJson } from "@/lib/convert";
 import { uuidToBytes } from "@/lib/ids";
-import { coerceConsistency, errorResponse, readJson } from "@/lib/http";
+import { errorResponse, readJson } from "@/lib/http";
 import { MemlakeError, memlake } from "@/lib/memlake";
 import type { GetJson, GetRequestBody } from "@/lib/types";
 
@@ -43,7 +43,6 @@ export async function POST(
       namespace: decodeURIComponent(namespace),
       ids,
       includeVector: Boolean(body.includeVector),
-      consistency: coerceConsistency(body.consistency),
     });
 
     const out: GetJson = {

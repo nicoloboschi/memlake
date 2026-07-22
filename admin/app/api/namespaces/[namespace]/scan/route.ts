@@ -2,7 +2,6 @@ import { NextResponse } from "next/server";
 
 import { storedMemoryToJson } from "@/lib/convert";
 import {
-  coerceConsistency,
   coerceMemoryTypes,
   coerceTagFilter,
   coerceUint32,
@@ -41,7 +40,6 @@ export async function POST(
       pageToken: typeof body.pageToken === "string" ? body.pageToken : "",
       includeVector: Boolean(body.includeVector),
       tags: tagFilter(coerceTagFilter(body.tags)),
-      consistency: coerceConsistency(body.consistency),
     });
 
     const out: ScanJson = {

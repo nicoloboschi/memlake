@@ -7,10 +7,8 @@ import { NextResponse } from "next/server";
 
 import { MemlakeError, toMemlakeError } from "./memlake";
 import {
-  CONSISTENCIES,
   TAGS_MATCHES,
   type ApiErrorBody,
-  type Consistency,
   type TagFilterInput,
   type TagsMatch,
 } from "./types";
@@ -90,13 +88,6 @@ export function coerceMemoryTypes(input: unknown): number[] {
   return Array.from(new Set(out)).sort((a, b) => a - b);
 }
 
-export function coerceConsistency(input: unknown): Consistency {
-  if (typeof input === "string") {
-    const upper = input.toUpperCase() as Consistency;
-    if ((CONSISTENCIES as readonly string[]).includes(upper)) return upper;
-  }
-  return "STRONG";
-}
 
 export function coerceTagFilter(input: unknown): TagFilterInput | null {
   if (typeof input !== "object" || input === null) return null;

@@ -3,7 +3,6 @@ import { NextResponse } from "next/server";
 import { hitToJson } from "@/lib/convert";
 import { EMBED_DIM, embedQuery, embeddingsEnabled } from "@/lib/embed";
 import {
-  coerceConsistency,
   coerceInt64,
   coerceMemoryTypes,
   coerceTagFilter,
@@ -142,7 +141,6 @@ export async function POST(
         textTopK: coerceUint32(body.textTopK, "text_top_k"),
         graphTopK: coerceUint32(body.graphTopK, "graph_top_k"),
         nprobe: coerceUint32(body.nprobe, "nprobe"),
-        consistency: coerceConsistency(body.consistency),
         ...(temporalWindow
           ? { temporalFrom: temporalWindow.from, temporalTo: temporalWindow.to }
           : {}),

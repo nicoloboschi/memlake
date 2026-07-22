@@ -356,7 +356,7 @@ message StatsResponse {
   optional uint64 prev_generation = 3;
   uint64 wal_head = 4;
   // Last WAL sequence folded into the generation. `wal_head - wal_index_cursor` is the
-  // un-indexed backlog a STRONG query pays to scan.
+  // un-indexed backlog every query pays to scan.
   uint64 wal_index_cursor = 5;
   string tokenizer_config_hash = 6;
   uint32 format_version = 7;
@@ -465,7 +465,7 @@ message WalEntryInfo {
   uint64 size_bytes = 2;              // the WAL object's size
   WalOpCounts counts = 3;
   // True once the indexer has folded this entry into a generation (seq <= wal_index_cursor).
-  // Un-folded entries are exactly what a STRONG query pays to scan on every read.
+  // Un-folded entries are exactly what every query pays to scan on every read.
   bool folded = 4;
   repeated WalOpDetail ops = 5;       // only when include_ops was set
 }
