@@ -145,6 +145,14 @@ impl StoredMemory {
         merge_count(&self.entity_ids, other)
     }
 
+    /// Serialize the whole memory (embedding included) to rkyv bytes — for a disk spill during
+    /// an external-memory fold, where the full item must round-trip.
+    pub fn to_rkyv_bytes(&self) -> Vec<u8> {
+        rkyv::to_bytes::<_, 1024>(self)
+            .map(|b| b.into_vec())
+            .unwrap_or_default()
+    }
+
     /// Serialize this memory's payload for the payload store — its rkyv bytes with the
     /// embedding stripped (the vector is ~4× the rest of a memory and is never returned from a
     /// point read; the cluster file keeps it for rerank and `get --include_vector`).

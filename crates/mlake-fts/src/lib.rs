@@ -7,5 +7,5 @@
 pub mod tantivy_index;
 pub mod tokenizer;
 
-pub use tantivy_index::{FtsHit, TantivyFts};
+pub use tantivy_index::{FtsHit, TantivyFts, TantivyFtsBuilder};
 pub use tokenizer::{Field, Token, Tokenizer, TokenizerConfig};

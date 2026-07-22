@@ -9,7 +9,9 @@ pub mod gc;
 pub mod generation;
 pub mod indexer;
 pub mod query_node;
+pub mod spill;
 pub mod sstable;
+pub mod streaming;
 pub mod temporal;
 
 pub use engine::{Engine, QueryConfig};
@@ -36,6 +38,8 @@ pub enum Error {
     Json(#[from] serde_json::Error),
     #[error("fts: {0}")]
     Fts(String),
+    #[error("io: {0}")]
+    Io(#[from] std::io::Error),
 }
 
 impl From<tantivy::TantivyError> for Error {

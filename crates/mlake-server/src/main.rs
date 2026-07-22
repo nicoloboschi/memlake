@@ -130,7 +130,7 @@ async fn indexer(args: &[String], node: String) -> Result<()> {
     // benchmark's index phase — the harness reads the summary for build time and cost, so it
     // never needs an in-process Rust engine.
     if args.iter().any(|a| a == "--once") {
-        return index_once(store, namespaces).await;
+        return index_once(store, namespaces, args.iter().any(|a| a == "--streaming")).await;
     }
 
     let interval = flag(args, "--interval-secs")
@@ -153,7 +153,7 @@ async fn indexer(args: &[String], node: String) -> Result<()> {
 
 /// One metered index pass over the given namespaces (or all discovered), printing a single
 /// JSON line the benchmark parses: elapsed, store ops, stored bytes, docs.
-async fn index_once(store: Store, namespaces: Vec<String>) -> Result<()> {
+async fn index_once(store: Store, namespaces: Vec<String>, streaming: bool) -> Result<()> {
     use mlake_index::{index, IndexOptions};
     use mlake_wal::Namespace;
 
@@ -170,7 +170,14 @@ async fn index_once(store: Store, namespaces: Vec<String>) -> Result<()> {
     let mut docs = 0usize;
     for name in &targets {
         let ns = Namespace::new(name, store.clone());
-        let outcome = index(&ns, &Tokenizer::default(), IndexOptions::default()).await?;
+        // `--streaming`: the external-memory fold — bounded RAM (spill + external sort) for a
+        // corpus too large to fold in memory, at the cost of a slower build. The default
+        // in-RAM fold is faster for anything that fits.
+        let outcome = if streaming {
+            mlake_index::streaming::index_streaming(&ns, &Tokenizer::default(), IndexOptions::default()).await?
+        } else {
+            index(&ns, &Tokenizer::default(), IndexOptions::default()).await?
+        };
         docs += outcome.doc_count;
     }
     let elapsed = start.elapsed().as_secs_f64();

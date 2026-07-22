@@ -578,7 +578,10 @@ pub struct TimeTable {
 
 /// Encode an `i64` timestamp as an order-preserving 16-byte SSTable key (8-byte flipped
 /// big-endian value + 8 zero bytes; ties within the same instant share the key).
-fn ts_key(ts: i64) -> [u8; 16] {
+/// The order-preserving SSTable key for an effective timestamp (sign bit flipped, big-endian),
+/// so raw byte order matches numeric i64 order. Exposed for the streaming fold, which emits
+/// time-index pairs to an external sort keyed by this.
+pub(crate) fn ts_key(ts: i64) -> [u8; 16] {
     let mut k = [0u8; 16];
     let flipped = (ts as u64) ^ (1u64 << 63);
     k[..8].copy_from_slice(&flipped.to_be_bytes());

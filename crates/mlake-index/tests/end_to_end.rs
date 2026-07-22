@@ -1584,3 +1584,186 @@ async fn the_manifest_head_cannot_show_a_backlog_but_the_log_can() {
     let unfolded = objects.len() - folded;
     assert_eq!((folded, unfolded), (1, 3));
 }
+
+// ---- Streaming (external-memory) fold ------------------------------------------------------
+
+/// Collect every live id of `memory_type` from a node, paging the scan.
+async fn scan_ids(node: &QueryNode, mt: u8) -> std::collections::BTreeSet<MemoryId> {
+    let mut out = std::collections::BTreeSet::new();
+    let mut cursor = mlake_index::ScanCursor::default();
+    loop {
+        let (items, next) = node.scan(mt, cursor, 64, &tf()).await.unwrap();
+        out.extend(items.iter().map(|m| m.id));
+        match next {
+            Some(c) => cursor = c,
+            None => break,
+        }
+    }
+    out
+}
+
+/// A varied item: clustered vector, tags, an entity, a timestamp, some metadata.
+fn rich_item(i: usize) -> Memory {
+    // Ten vector "families" so k-means forms several clusters.
+    let fam = i % 10;
+    let mut v = vec![0.0f32; 10];
+    v[fam] = 1.0;
+    v[(fam + 1) % 10] = 0.15;
+    Memory {
+        id: MemoryId::from_key(&format!("m{i}")),
+        vector: v,
+        text: format!("memory number {i} family {fam} lorem ipsum"),
+        memory_type: if i % 3 == 0 { 2 } else { 1 },
+        tags: if i % 4 == 0 { vec![] } else { vec![format!("tag-{}", i % 5)] },
+        timestamps: Timestamps { occurred_start: Some(1_000 + i as i64), ..Timestamps::default() },
+        proof_count: (i % 3) as u32,
+        entity_ids: vec![mlake_core::EntityId::from_bytes([(i % 7) as u8; 16])],
+        causal_out: vec![],
+        metadata: vec![("doc".into(), format!("d{}", i % 8))],
+    }
+}
+
+/// The streaming fold must produce a generation functionally equivalent to an in-RAM first
+/// build with `derive_links=false`: same live set, same doc counts, correct recall, identical
+/// stored content, and the same handling of tail deletes/patches.
+#[tokio::test]
+async fn streaming_fold_matches_in_ram_fold() {
+    use mlake_core::{Predicate, TagsMatch};
+
+    let no_links = IndexOptions { derive_links: false, ..IndexOptions::default() };
+
+    // The exact same WAL history is written to two namespaces.
+    let write_corpus = |ns: Namespace| async move {
+        let mut w = Writer::new(ns.clone());
+        // 120 varied items across two memory_types.
+        let ups: Vec<Op> = (0..120).map(|i| Op::Upsert(rich_item(i))).collect();
+        w.commit(ups).await.unwrap();
+        // Tail: delete one by id, patch one, and predicate-delete everything with doc=d3.
+        w.commit(vec![
+            Op::Tombstone { id: MemoryId::from_key("m5") },
+            Op::Patch {
+                id: MemoryId::from_key("m6"),
+                deltas: vec![mlake_core::wal::Delta::SetText("patched text".into())],
+            },
+            Op::TombstoneWhere {
+                predicate: Predicate {
+                    memory_types: vec![],
+                    metadata_equals: vec![("doc".into(), "d3".into())],
+                    tags: vec![],
+                    tags_mode: TagsMatch::Any as u8,
+                },
+            },
+        ])
+        .await
+        .unwrap();
+    };
+
+    let backing_a = Arc::new(object_store::memory::InMemory::new());
+    let ns_a = namespace(Store::new(Arc::clone(&backing_a) as _), "a").await;
+    write_corpus(ns_a.clone()).await;
+    let out_a = index(&ns_a, &Tokenizer::default(), no_links).await.unwrap();
+
+    let backing_b = Arc::new(object_store::memory::InMemory::new());
+    let ns_b = namespace(Store::new(Arc::clone(&backing_b) as _), "b").await;
+    write_corpus(ns_b.clone()).await;
+    let out_b = mlake_index::streaming::index_streaming(&ns_b, &Tokenizer::default(), no_links)
+        .await
+        .unwrap();
+
+    // Same overall doc count.
+    assert_eq!(out_a.doc_count, out_b.doc_count, "streaming and in-RAM doc_count must match");
+    assert!(out_b.published, "streaming fold must publish");
+
+    let node_a = QueryNode::open(&ns_a, Tokenizer::default()).await.unwrap();
+    let node_b = QueryNode::open(&ns_b, Tokenizer::default()).await.unwrap();
+    assert_eq!(node_a.doc_count(), node_b.doc_count());
+
+    // Same live set per memory_type (deletes/predicate applied identically).
+    for mt in [1u8, 2u8] {
+        let a = scan_ids(&node_a, mt).await;
+        let b = scan_ids(&node_b, mt).await;
+        assert_eq!(a, b, "live id set for memory_type {mt} must match");
+    }
+    // The tombstoned + predicate-deleted ids are gone from both.
+    let all_b: std::collections::BTreeSet<MemoryId> =
+        scan_ids(&node_b, 1).await.union(&scan_ids(&node_b, 2).await).copied().collect();
+    assert!(!all_b.contains(&MemoryId::from_key("m5")), "id-tombstoned item gone");
+    assert!(!all_b.contains(&MemoryId::from_key("m3")), "predicate-deleted (doc=d3) item gone");
+
+    // Recall + equivalence: a self-query (item m1's vector) returns an exact match with score
+    // ~1.0, and the streaming and in-RAM indexes agree on the top hit. (Family-1 items share a
+    // vector, so which exact match wins is an id tiebreak — but it is the *same* in both.)
+    let q = rich_item(1).vector;
+    // Every live type-1 item in family 1 (i%10==1 and i%3!=0) — they share m1's exact vector.
+    let fam1: std::collections::BTreeSet<MemoryId> = (0..120)
+        .filter(|i| i % 10 == 1 && i % 3 != 0)
+        .map(|i| MemoryId::from_key(&format!("m{i}")))
+        .collect();
+    // Pure vector recall (graph/fts off, probe every cluster): the exact match tops both, and
+    // the two independently-built indexes return identical rankings.
+    let vec_only = QueryConfig { nprobe: 1000, graph_weight: 0.0, fts_weight: 0.0, ..QueryConfig::default() };
+    let hits_b = node_b.query(1, Some(&q), None, &tf(), 10, vec_only).await.unwrap();
+    let hits_a = node_a.query(1, Some(&q), None, &tf(), 10, vec_only).await.unwrap();
+    assert!(fam1.contains(&hits_b[0].id), "streaming self-query must recall an exact match");
+    assert!(fam1.contains(&hits_a[0].id), "in-RAM self-query recalls an exact match too");
+    let ids_b: Vec<_> = hits_b.iter().map(|h| h.id).collect();
+    let ids_a: Vec<_> = hits_a.iter().map(|h| h.id).collect();
+    assert_eq!(ids_a, ids_b, "streaming and in-RAM vector rankings must match");
+
+    // Content: the patched item reads back its new text from the streaming generation.
+    let got = node_b.get_many(&[MemoryId::from_key("m6")], false).await.unwrap();
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0].text, "patched text", "patch must be applied in the streaming fold");
+
+    // FTS works over the streaming split: "family 1" surfaces the family-1 item m1.
+    let fts = node_b
+        .query(1, None, Some("family 1"), &tf(), 10, QueryConfig::default())
+        .await
+        .unwrap();
+    assert!(
+        fts.iter().any(|h| h.id == MemoryId::from_key("m1")),
+        "streaming FTS split must answer a text query"
+    );
+}
+
+/// The streaming fold's incremental path: fold once, then fold *again* over the previous
+/// generation plus a new tail (a delete + fresh upserts). It must still match the in-RAM fold's
+/// live set — this exercises streaming the prior generation's clusters and overlaying the WAL.
+#[tokio::test]
+async fn streaming_fold_incremental_matches_in_ram() {
+    async fn build(streaming: bool) -> std::collections::BTreeSet<MemoryId> {
+        let no_links = IndexOptions { derive_links: false, ..IndexOptions::default() };
+        let store = Store::in_memory();
+        let ns = namespace(store, "ns").await;
+        let mut w = Writer::new(ns.clone());
+        // First batch, then fold (creates generation 1).
+        w.commit((0..80).map(|i| Op::Upsert(rich_item(i))).collect()).await.unwrap();
+        if streaming {
+            mlake_index::streaming::index_streaming(&ns, &Tokenizer::default(), no_links).await.unwrap();
+        } else {
+            index(&ns, &Tokenizer::default(), no_links).await.unwrap();
+        }
+        // New tail past the cursor: delete an indexed item, add fresh ones.
+        w.commit(
+            std::iter::once(Op::Tombstone { id: MemoryId::from_key("m10") })
+                .chain((80..110).map(|i| Op::Upsert(rich_item(i))))
+                .collect(),
+        )
+        .await
+        .unwrap();
+        // Fold again — reads generation 1 (prev-gen streaming) + the new tail.
+        if streaming {
+            mlake_index::streaming::index_streaming(&ns, &Tokenizer::default(), no_links).await.unwrap();
+        } else {
+            index(&ns, &Tokenizer::default(), no_links).await.unwrap();
+        }
+        let node = QueryNode::open(&ns, Tokenizer::default()).await.unwrap();
+        scan_ids(&node, 1).await.union(&scan_ids(&node, 2).await).copied().collect()
+    }
+
+    let ids_ram = build(false).await;
+    let ids_stream = build(true).await;
+    assert_eq!(ids_ram, ids_stream, "incremental streaming fold must match in-RAM live set");
+    assert!(!ids_stream.contains(&MemoryId::from_key("m10")), "tombstoned item stays deleted across the re-fold");
+    assert!(ids_stream.contains(&MemoryId::from_key("m100")), "a fresh tail item is indexed");
+}

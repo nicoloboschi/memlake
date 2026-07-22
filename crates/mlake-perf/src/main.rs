@@ -38,7 +38,7 @@ async fn main() -> Result<()> {
         "write" => {
             let cfg = parse_gen(&args);
             let store = new_store(store_metrics())?;
-            let r = write_bench(&store, &bank_name(cfg.scale), cfg, index_opts(&args)).await?;
+            let r = write_bench(&store, &bank_name(cfg.scale), cfg, index_opts(&args), args.iter().any(|a| a == "--streaming")).await?;
             println!("\n{}", r.render());
         }
         "read" => {
@@ -56,7 +56,7 @@ async fn main() -> Result<()> {
                 let cfg = GenConfig { scale, ..parse_gen(&args) };
                 let store = new_store(store_metrics())?;
                 eprintln!("=== scale {scale}: write ===");
-                let w = write_bench(&store, &bank_name(scale), cfg, index_opts(&args)).await?;
+                let w = write_bench(&store, &bank_name(scale), cfg, index_opts(&args), args.iter().any(|a| a == "--streaming")).await?;
                 eprintln!("=== scale {scale}: read ===");
                 let (mem_b, disk_b) = budgets(&args);
                 let store = new_store(store_metrics())?;
@@ -142,6 +142,7 @@ async fn write_bench(
     bank: &str,
     cfg: GenConfig,
     opts: IndexOptions,
+    streaming: bool,
 ) -> Result<WriteReport> {
     let metrics = store.store_metrics().unwrap().clone();
     let ns = Namespace::new(bank, store.clone());
@@ -161,9 +162,13 @@ async fn write_bench(
     }
     let commit_secs = t0.elapsed().as_secs_f64();
 
-    // Index phase (full first build).
+    // Index phase (full first build). `--streaming` uses the external-memory fold (bounded RAM).
     let ti = Instant::now();
-    index(&ns, &Tokenizer::default(), opts).await?;
+    if streaming {
+        mlake_index::streaming::index_streaming(&ns, &Tokenizer::default(), opts).await?;
+    } else {
+        index(&ns, &Tokenizer::default(), opts).await?;
+    }
     let index_secs = ti.elapsed().as_secs_f64();
 
     let phase = metrics.since(&base);

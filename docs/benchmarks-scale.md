@@ -77,12 +77,45 @@ Measured on the machine above, one scale at a time (namespace dropped between sc
 All landed as committed, tested changes: graph score-then-hydrate; parallelized fold
 O(N·√N) passes; payload store; temporal pool cap; rerank query-norm hoist; `get` via payload.
 
-Remaining perf items are deeper refactors best done with a validation checkpoint (not
-unsupervised): (a) **zero-copy cluster rerank** — `fetch_clusters` fully rkyv-deserializes each
-cluster to score it; scoring over the archived form and deserializing only the top-k would trim
-every cluster-fetching arm, but it's a hot-path API change with rkyv-lifetime ripple; (b) the
-**streaming/external-memory fold** — the O(N)-RAM first build caps this box at ~5–6M and is the
-true 100M blocker.
+One remaining query-side item is a deeper refactor best done with a validation checkpoint: the
+**zero-copy cluster rerank** — `fetch_clusters` fully rkyv-deserializes each cluster to score it;
+scoring over the archived form and deserializing only the top-k would trim every cluster-fetching
+arm, but it's a hot-path API change with rkyv-lifetime ripple.
+
+## Streaming (external-memory) fold — DONE
+
+The first-build fold was O(N) in RAM (`by_id`/`items` hold every memory; the SSTable builds hold
+every pair), so it capped this 36 GB box at ~5–6M. `index_streaming` (`mlake-index/src/streaming.rs`,
+opt-in via `mlake-perf write --streaming` and `mlake-server index --once --streaming`) makes the
+fold bounded:
+
+- **Resolution** streams the WAL twice — pass 1 builds only id-level state (winner upsert seq,
+  tombstone, accumulated patches; ~50 B/id, no bodies), pass 2 re-reads and spills each winning
+  item to a per-type disk `ItemSpill`. The previous generation is streamed cluster-by-cluster and
+  overlaid. Last-write-wins / tombstone / patch / predicate-delete semantics match `fold_entries`.
+- **Per-type build** trains centroids on a reservoir sample (`train_centroids_k` — never scans all
+  N), then makes ONE pass assigning each item and feeding five `ExternalSort`s (one carries the
+  full item bytes grouped by cluster; the rest carry pk/payload/entity/time fragments) plus a
+  streaming FTS builder. Each external sort spills sorted runs and k-way-merges them, so the
+  cluster files and SSTables are written from bounded memory.
+
+Scope: the **bulk build** path — it does not derive semantic kNN links in-fold (that pass reads a
+16-cluster neighbourhood per new item, incompatible with one-cluster streaming; at scale links are
+incremental / query-time, as `--no-links` models) and skips local-split. The result is a correct,
+queryable generation equivalent to an in-RAM first build with `derive_links=false`.
+
+**Measured @ 800k (--no-links):**
+
+| Fold | peak RSS | index time |
+|------|----------|------------|
+| in-RAM | **4,631 MB** (~5.8 GB/M, caps at ~6M) | 112s |
+| streaming | **936 MB** (bounded: 512 MB sort budget + ~50 B/id) | 256s |
+
+~5× less RAM at 800k, and the gap widens with N — the streaming fold's memory is bounded, so it
+scales to 100M+ on adequate disk, at ~2.3× the build time (two WAL passes + external sort).
+Equivalence + incremental-refold correctness are covered by `streaming_fold_matches_in_ram_fold`
+and `streaming_fold_incremental_matches_in_ram`; the spill/merge primitives by unit tests in
+`spill.rs`.
 
 ## Per-arm query profile @ 1M (warm, rt=0 → pure compute/cache)
 

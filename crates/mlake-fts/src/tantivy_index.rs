@@ -85,6 +85,82 @@ fn pretokenized(tokens: &[String]) -> PreTokenizedString {
     }
 }
 
+/// Add one document to a tantivy writer. Shared by the batch [`TantivyFts::build_with_tags`]
+/// and the streaming [`TantivyFtsBuilder`] so both index a document identically.
+fn add_doc(
+    writer: &mut tantivy::IndexWriter,
+    fields: &Fields,
+    tokenizer: &Tokenizer,
+    id: MemoryId,
+    text: &str,
+    tags: &[String],
+) -> tantivy::Result<()> {
+    let tokens = tokenizer.tokenize(text);
+    let mut words = Vec::new();
+    let mut bigrams = Vec::new();
+    for t in tokens {
+        match t.field {
+            Field::Words => words.push(t.text),
+            Field::Bigrams => bigrams.push(t.text),
+        }
+    }
+    let tags_json = serde_json::to_string(tags).unwrap_or_else(|_| "[]".into());
+    writer.add_document(doc!(
+        fields.words => pretokenized(&words),
+        fields.bigrams => pretokenized(&bigrams),
+        fields.id => id.as_uuid().to_string(),
+        fields.tags => tags_json,
+    ))?;
+    Ok(())
+}
+
+/// A streaming FTS builder: `add` one document at a time, then `finish`. The batch
+/// `build_with_tags` ties every document to one borrow lifetime (fine for an in-memory slice),
+/// which the external-memory fold can't satisfy — it reads owned items off a disk spill — so
+/// that path feeds this builder instead. tantivy itself spills to disk as it indexes.
+pub struct TantivyFtsBuilder {
+    dir: tempfile::TempDir,
+    index: Index,
+    writer: tantivy::IndexWriter,
+    fields: Fields,
+    tokenizer: Tokenizer,
+    doc_count: usize,
+}
+
+impl TantivyFtsBuilder {
+    pub fn new(tokenizer: Tokenizer) -> tantivy::Result<Self> {
+        let (schema, fields) = build_schema();
+        let dir = tempfile::tempdir().expect("create temp dir for tantivy split");
+        let index = Index::create_in_dir(dir.path(), schema)?;
+        let writer = index.writer(50_000_000)?;
+        Ok(Self { dir, index, writer, fields, tokenizer, doc_count: 0 })
+    }
+
+    pub fn add(&mut self, id: MemoryId, text: &str, tags: &[String]) -> tantivy::Result<()> {
+        add_doc(&mut self.writer, &self.fields, &self.tokenizer, id, text, tags)?;
+        self.doc_count += 1;
+        Ok(())
+    }
+
+    pub fn finish(mut self) -> tantivy::Result<TantivyFts> {
+        self.writer.commit()?;
+        let split_bytes = pack_dir(self.dir.path());
+        let reader = self
+            .index
+            .reader_builder()
+            .reload_policy(ReloadPolicy::Manual)
+            .try_into()?;
+        Ok(TantivyFts {
+            _dir: self.dir,
+            reader,
+            schema_fields: self.fields,
+            tokenizer: self.tokenizer,
+            split_bytes,
+            doc_count: self.doc_count,
+        })
+    }
+}
+
 /// A built, queryable tantivy FTS index.
 ///
 /// Holds the open index plus the temp directory it was materialized into (the NVMe/mmap
@@ -122,22 +198,7 @@ impl TantivyFts {
         {
             let mut writer: tantivy::IndexWriter = index.writer(50_000_000)?;
             for (id, text, tags) in docs {
-                let tokens = tokenizer.tokenize(text);
-                let mut words = Vec::new();
-                let mut bigrams = Vec::new();
-                for t in tokens {
-                    match t.field {
-                        Field::Words => words.push(t.text),
-                        Field::Bigrams => bigrams.push(t.text),
-                    }
-                }
-                let tags_json = serde_json::to_string(tags).unwrap_or_else(|_| "[]".into());
-                writer.add_document(doc!(
-                    fields.words => pretokenized(&words),
-                    fields.bigrams => pretokenized(&bigrams),
-                    fields.id => id.as_uuid().to_string(),
-                    fields.tags => tags_json,
-                ))?;
+                add_doc(&mut writer, &fields, &tokenizer, id, text, tags)?;
                 doc_count += 1;
             }
             writer.commit()?;

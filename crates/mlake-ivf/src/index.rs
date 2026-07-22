@@ -196,6 +196,25 @@ pub fn train_centroids(vectors: &[Vec<f32>], seed: u64) -> Centroids {
     }
 }
 
+/// Train centroids on a caller-provided sample with an explicit cluster count `k`.
+///
+/// Unlike [`train_centroids`], this never scans the full corpus: `k` comes from the *total* N
+/// (√N — the caller knows it) while training runs on the bounded `sample`, and `sizes` is only
+/// the sample's histogram. The external-memory fold uses this so centroid training touches at
+/// most `sample.len()` vectors, and it overwrites `sizes` with the true per-cluster counts it
+/// tallies during the streaming assignment pass.
+pub fn train_centroids_k(sample: &[Vec<f32>], k: usize, seed: u64) -> Centroids {
+    if sample.is_empty() {
+        return Centroids::default();
+    }
+    let trained = kmeans::train(sample, k.max(1), 15, seed);
+    let mut sizes = vec![0usize; trained.len()];
+    for v in sample {
+        sizes[nearest(&trained, v)] += 1;
+    }
+    Centroids { dim: sample[0].len(), vectors: trained, sizes }
+}
+
 /// Exact search over a set of items — the re-rank step, and the ground truth the recall
 /// gate measures against.
 pub fn exact_search(items: &[StoredMemory], query: &[f32], k: usize) -> Vec<Hit> {
