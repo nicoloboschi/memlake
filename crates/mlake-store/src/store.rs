@@ -274,6 +274,7 @@ impl Store {
     /// same slot all issue this, exactly one wins, and the losers get
     /// [`Error::AlreadyExists`] and retry at the next sequence.
     pub async fn put_if_absent(&self, path: &str, bytes: Vec<u8>) -> Result<Option<Etag>> {
+        let len = bytes.len() as u64;
         let opts = PutOptions {
             mode: PutMode::Create,
             tags: TagSet::default(),
@@ -290,7 +291,7 @@ impl Store {
         {
             Ok(r) => {
                 if let Some(m) = &self.store_metrics {
-                    m.record_put(0);
+                    m.record_put(len);
                 }
                 Ok(r.e_tag.map(Etag))
             }
@@ -311,6 +312,7 @@ impl Store {
         expected: &Etag,
         bytes: Vec<u8>,
     ) -> Result<Option<Etag>> {
+        let len = bytes.len() as u64;
         let opts = PutOptions {
             mode: PutMode::Update(UpdateVersion {
                 e_tag: Some(expected.0.clone()),
@@ -330,7 +332,7 @@ impl Store {
         {
             Ok(r) => {
                 if let Some(m) = &self.store_metrics {
-                    m.record_put(0);
+                    m.record_put(len);
                 }
                 Ok(r.e_tag.map(Etag))
             }

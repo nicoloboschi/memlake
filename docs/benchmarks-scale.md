@@ -82,6 +82,34 @@ One remaining query-side item is a deeper refactor best done with a validation c
 scoring over the archived form and deserializing only the top-k would trim every cluster-fetching
 arm, but it's a hot-path API change with rkyv-lifetime ripple.
 
+## Write throughput — pipelined commits (vs turbopuffer's 150 MB/s)
+
+The write path is `commit()` = one `put_if_absent(wal/{seq}.bin)`. A single writer's sequences
+are contiguous and each WAL object is an independent conditional create, so the batches don't need
+to be written one blocking round-trip at a time. `Writer::commit_many(batches, concurrency)`
+pre-assigns the sequences and pipelines the object PUTs `concurrency` at a time (`buffer_unordered`),
+so throughput is bounded by S3 parallelism rather than a serial chain of round-trips.
+
+Measured at 1M memories (~1.8 GB of WAL) on the **local MinIO** node above. Synthetic
+embedding/text generation is excluded from the timing (it's a benchmark artifact, timed
+separately as `datagen`); this is pure durable-write cost. `--no-index` (index skipped):
+
+| concurrency | commit time | throughput |
+|-------------|-------------|------------|
+| x1 (serial) | 41.9s | 43 MB/s |
+| x8 | 21.0s | 86 MB/s |
+| **x16** | **14.0s** | **129 MB/s** |
+| x32 | 15.3s | 118 MB/s |
+
+- Pipelining lifts throughput **3× (43 → 129 MB/s)**, peaking at concurrency 16 — **~86% of
+  turbopuffer's 150 MB/s**, on a single local MinIO node.
+- It **saturates** by x16; x32 slightly regresses (local MinIO / single-disk contention). Against
+  real S3 with more front-end parallelism the knee should move right and the ceiling up.
+- Correctness is unchanged: `commit_many` still claims contiguous, hole-free sequences (the log is
+  totally ordered); a lost slot fails the burst and invalidates the cached head. It is the
+  sole-writer bulk-load path — a contended namespace uses `commit()` with its CAS retry loop.
+- Bench flags: `mlake-perf write --scale N --no-index --no-links --commit-concurrency 16`.
+
 ## Streaming (external-memory) fold — DONE
 
 The first-build fold was O(N) in RAM (`by_id`/`items` hold every memory; the SSTable builds hold

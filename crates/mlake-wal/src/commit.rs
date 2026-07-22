@@ -115,6 +115,72 @@ impl Writer {
         Err(Error::CommitRetriesExhausted(MAX_CLAIM_ATTEMPTS))
     }
 
+    /// Commit many batches with pipelined, concurrent WAL PUTs — the bulk-load path.
+    ///
+    /// A single writer's sequences are contiguous (`head+1, head+2, …`) and each WAL object is
+    /// an independent conditional create, so instead of one blocking round-trip per batch this
+    /// pre-assigns the sequences and runs the object PUTs `concurrency` at a time. Throughput is
+    /// then bounded by S3 parallelism, not by a serial chain of round-trips. Returns the
+    /// assigned sequences (ascending), and updates the cached head so a later `commit` continues
+    /// past them.
+    ///
+    /// It assumes it is the *only* writer for the burst (the bulk-ingest case): a pre-assigned
+    /// slot being taken by a racing writer surfaces as a store conflict error. Use [`commit`] on
+    /// a contended namespace. Empty batches are dropped (they consume no sequence). `Guard` ops
+    /// are not supported here — guards need the exact head at claim time, which pipelining gives
+    /// up.
+    pub async fn commit_many(
+        &mut self,
+        batches: Vec<Vec<Op>>,
+        concurrency: usize,
+    ) -> Result<Vec<u64>> {
+        use futures::stream::{StreamExt, TryStreamExt};
+
+        let non_empty: Vec<Vec<Op>> = batches.into_iter().filter(|b| !b.is_empty()).collect();
+        if non_empty.is_empty() {
+            return Ok(Vec::new());
+        }
+        let start = match self.next_seq {
+            Some(s) => s,
+            None => self.namespace.wal_head().await? + 1,
+        };
+        // Serialize each entry against its pre-assigned sequence up front, so the pipelined
+        // stage is pure I/O.
+        let mut entries: Vec<(u64, Vec<u8>)> = Vec::with_capacity(non_empty.len());
+        for (i, ops) in non_empty.into_iter().enumerate() {
+            let seq = start + i as u64;
+            entries.push((seq, WalEntry::new(seq, ops).to_bytes()?));
+        }
+        let count = entries.len() as u64;
+        let store = &self.namespace.store;
+        let name = &self.namespace.name;
+
+        // Pipelined conditional creates. A lost slot (racing writer) fails the whole burst —
+        // this path is for a sole bulk writer, and we cache-invalidate below on any error.
+        let result = futures::stream::iter(entries)
+            .map(|(seq, bytes)| async move {
+                store
+                    .put_if_absent(&seq_path(name, seq), bytes)
+                    .await
+                    .map(|_| ())
+                    .map_err(Error::from)
+            })
+            .buffer_unordered(concurrency.max(1))
+            .try_collect::<Vec<()>>()
+            .await;
+
+        match result {
+            Ok(_) => {
+                self.next_seq = Some(start + count);
+                Ok((start..start + count).collect())
+            }
+            Err(e) => {
+                self.next_seq = None; // effect unknown under concurrency; re-derive next time
+                Err(e)
+            }
+        }
+    }
+
     /// Forget the cached head. Used after an error of unknown effect, so the next commit
     /// re-derives the head from storage.
     pub fn reset(&mut self) {
@@ -204,6 +270,20 @@ mod tests {
         seqs.sort();
         // Every writer got its own slot, and the log has no holes.
         assert_eq!(seqs, (1..=8).collect::<Vec<u64>>());
+    }
+
+    #[tokio::test]
+    async fn commit_many_pipelines_contiguous_sequences() {
+        let mut w = Writer::new(namespace().await);
+        let batches: Vec<Vec<Op>> =
+            (0..10).map(|i| vec![Op::Upsert(item(&format!("k{i}")))]).collect();
+        let seqs = w.commit_many(batches, 4).await.unwrap();
+        assert_eq!(seqs, (1..=10).collect::<Vec<u64>>(), "contiguous sequences from the head");
+        assert_eq!(w.namespace().wal_head().await.unwrap(), 10, "log has no holes");
+        // Empty batches consume no sequence; a following commit continues past the burst.
+        let s = w.commit_many(vec![vec![], vec![]], 4).await.unwrap();
+        assert!(s.is_empty());
+        assert_eq!(w.commit(vec![Op::Upsert(item("next"))]).await.unwrap().seq, 11);
     }
 
     #[tokio::test]

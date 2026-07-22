@@ -38,7 +38,7 @@ async fn main() -> Result<()> {
         "write" => {
             let cfg = parse_gen(&args);
             let store = new_store(store_metrics())?;
-            let r = write_bench(&store, &bank_name(cfg.scale), cfg, index_opts(&args), args.iter().any(|a| a == "--streaming")).await?;
+            let r = write_bench(&store, &bank_name(cfg.scale), cfg, index_opts(&args), args.iter().any(|a| a == "--streaming"), flag_usize(&args, "--commit-concurrency", 16), args.iter().any(|a| a == "--no-index")).await?;
             println!("\n{}", r.render());
         }
         "read" => {
@@ -56,7 +56,7 @@ async fn main() -> Result<()> {
                 let cfg = GenConfig { scale, ..parse_gen(&args) };
                 let store = new_store(store_metrics())?;
                 eprintln!("=== scale {scale}: write ===");
-                let w = write_bench(&store, &bank_name(scale), cfg, index_opts(&args), args.iter().any(|a| a == "--streaming")).await?;
+                let w = write_bench(&store, &bank_name(scale), cfg, index_opts(&args), args.iter().any(|a| a == "--streaming"), flag_usize(&args, "--commit-concurrency", 16), args.iter().any(|a| a == "--no-index")).await?;
                 eprintln!("=== scale {scale}: read ===");
                 let (mem_b, disk_b) = budgets(&args);
                 let store = new_store(store_metrics())?;
@@ -104,7 +104,10 @@ fn new_store(metrics: Arc<StoreMetrics>) -> Result<Store> {
 
 struct WriteReport {
     scale: usize,
+    datagen_secs: f64,
     commit_secs: f64,
+    commit_bytes: u64,
+    commit_concurrency: usize,
     index_secs: f64,
     put_count: u64,
     list_count: u64,
@@ -116,14 +119,18 @@ impl WriteReport {
     fn render(&self) -> String {
         format!(
             "write @ {scale}\n  \
-             commit:  {csec:.1}s  ({wps:.0} memories/s)\n  \
+             datagen: {gsec:.1}s  (synthetic embeddings/text — excluded from write timing)\n  \
+             commit:  {csec:.1}s  ({wps:.0} memories/s, {mbps:.0} MB/s, pipelined x{conc})\n  \
              index:   {isec:.1}s  ({ips:.0} memories/s)\n  \
              S3:      {puts} PUTs, {lists} LISTs, {gb:.2} GB written\n  \
              cost:    ${ingest:.4} ingest requests, ${perM:.3}/1M memories, \
              ${store:.4}/GB-month stored ({sgb:.2} GB)",
             scale = self.scale,
+            gsec = self.datagen_secs,
             csec = self.commit_secs,
             wps = self.scale as f64 / self.commit_secs.max(1e-6),
+            mbps = self.commit_bytes as f64 / 1e6 / self.commit_secs.max(1e-6),
+            conc = self.commit_concurrency,
             isec = self.index_secs,
             ips = self.scale as f64 / self.index_secs.max(1e-6),
             puts = self.put_count,
@@ -143,31 +150,43 @@ async fn write_bench(
     cfg: GenConfig,
     opts: IndexOptions,
     streaming: bool,
+    commit_concurrency: usize,
+    skip_index: bool,
 ) -> Result<WriteReport> {
     let metrics = store.store_metrics().unwrap().clone();
     let ns = Namespace::new(bank, store.clone());
     ns.create_if_absent(&Tokenizer::default().config_hash()).await?;
     let gen = Generator::new(cfg);
 
-    // Commit phase.
-    let base = metrics.snapshot();
-    let t0 = Instant::now();
-    let mut writer = Writer::new(ns.clone());
+    // Data generation (synthetic embeddings + text) is a benchmark artifact, not the write, so
+    // it is generated and timed SEPARATELY — the commit timing below is pure durable-write cost.
+    let tg = Instant::now();
+    let mut batches: Vec<Vec<Op>> = Vec::new();
     let mut start = 0;
     while start < cfg.scale {
         let end = (start + COMMIT_BATCH).min(cfg.scale);
-        let ops: Vec<Op> = gen.batch(start, end).into_iter().map(Op::Upsert).collect();
-        writer.commit(ops).await?;
+        batches.push(gen.batch(start, end).into_iter().map(Op::Upsert).collect());
         start = end;
     }
-    let commit_secs = t0.elapsed().as_secs_f64();
+    let datagen_secs = tg.elapsed().as_secs_f64();
 
-    // Index phase (full first build). `--streaming` uses the external-memory fold (bounded RAM).
+    // Commit phase: pipelined, concurrent WAL PUTs. Time and byte-count this alone.
+    let base = metrics.snapshot();
+    let t0 = Instant::now();
+    let mut writer = Writer::new(ns.clone());
+    writer.commit_many(batches, commit_concurrency).await?;
+    let commit_secs = t0.elapsed().as_secs_f64();
+    let commit_bytes = metrics.since(&base).put_bytes;
+
+    // Index phase (full first build). `--streaming` uses the external-memory fold (bounded RAM);
+    // `--no-index` skips it entirely (pure commit-throughput runs).
     let ti = Instant::now();
-    if streaming {
-        mlake_index::streaming::index_streaming(&ns, &Tokenizer::default(), opts).await?;
-    } else {
-        index(&ns, &Tokenizer::default(), opts).await?;
+    if !skip_index {
+        if streaming {
+            mlake_index::streaming::index_streaming(&ns, &Tokenizer::default(), opts).await?;
+        } else {
+            index(&ns, &Tokenizer::default(), opts).await?;
+        }
     }
     let index_secs = ti.elapsed().as_secs_f64();
 
@@ -178,7 +197,10 @@ async fn write_bench(
 
     Ok(WriteReport {
         scale: cfg.scale,
+        datagen_secs,
         commit_secs,
+        commit_bytes,
+        commit_concurrency,
         index_secs,
         put_count: phase.puts,
         list_count: phase.lists,
