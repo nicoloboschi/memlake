@@ -339,7 +339,8 @@ async fn read_bench(
     // whole window before truncating to its pool, and window members scatter across clusters
     // (time and vector-cluster are uncorrelated), so a wide window makes it read a large slice
     // of the corpus — see docs/benchmarks-scale.md.
-    let span: i64 = std::env::var("MLAKE_TEMPORAL_SPAN").ok().and_then(|s| s.parse().ok()).unwrap_or(120);
+    let span: i64 =
+        std::env::var("MEMLAKE_TEMPORAL_SPAN").ok().and_then(|s| s.parse().ok()).unwrap_or(120);
     let windows: Vec<(i64, i64)> = (0..queries)
         .map(|i| gen.time_window(i * cfg.scale / queries.max(1), span))
         .collect();
