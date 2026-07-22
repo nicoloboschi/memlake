@@ -495,10 +495,6 @@ async fn build_type_streaming(
     let mut fts = TantivyFtsBuilder::new(tokenizer.clone(), FoldBudget::bytes(budget.fts_mb))
         .map_err(|e| crate::Error::Fts(e.to_string()))?;
     let mut sizes = vec![0usize; kk];
-    // Cluster radii for adaptive probing, tallied over *every* vector in the same pass that
-    // tallies `sizes` — `train_centroids_k` deliberately leaves them empty because it only saw
-    // a sample, and a radius derived from a sample is too small, i.e. unsound.
-    let mut radii = vec![0.0f32; kk];
     let mut cluster_tags: Vec<(BTreeSet<String>, bool)> = vec![(BTreeSet::new(), false); kk];
     // Per-cluster write-time span, accumulated in the same pass. Starts as an empty range so
     // a cluster whose members all lack an `updated_at` stays empty and prunes correctly.
@@ -523,31 +519,21 @@ async fn build_type_streaming(
         if batch.is_empty() {
             break;
         }
-        // Parallel: nearest centroid + both serializations per item. The item's contribution
-        // to its cluster's radius rides along — it is one more reduction over the assignment
-        // this pass already computed, and this is the only pass that sees every vector.
-        let prepared: Vec<(usize, f32, Vec<u8>, Vec<u8>, Vec<u8>)> = batch
+        // Parallel: nearest centroid + both serializations per item.
+        let prepared: Vec<(usize, Vec<u8>, Vec<u8>, Vec<u8>)> = batch
             .par_iter()
             .map(|item| {
                 let c = if centroids.is_empty() { 0 } else { centroids.assign(&item.vector) };
-                let r = if centroids.is_empty() {
-                    0.0
-                } else {
-                    mlake_ivf::member_radius(&centroids.vectors[c], &item.vector)
-                };
                 let mut vec_bytes = Vec::with_capacity(item.vector.len() * 4);
                 for x in &item.vector {
                     vec_bytes.extend_from_slice(&x.to_le_bytes());
                 }
-                (c, r, item.to_rkyv_bytes(), item.to_payload_bytes(), vec_bytes)
+                (c, item.to_rkyv_bytes(), item.to_payload_bytes(), vec_bytes)
             })
             .collect();
         // Serial: feed the sorts / FTS / summaries.
-        for (item, (c, radius, full, payload, vec_bytes)) in batch.drain(..).zip(prepared) {
+        for (item, (c, full, payload, vec_bytes)) in batch.drain(..).zip(prepared) {
             sizes[c] += 1;
-            if radius > radii[c] {
-                radii[c] = radius;
-            }
             cluster_sort.add(cluster_key(c), full)?;
             pk_sort.add(item.id.0, (c as u32).to_le_bytes().to_vec())?;
             payload_sort.add(item.id.0, payload)?;
@@ -587,7 +573,6 @@ async fn build_type_streaming(
         }
     }
     centroids.sizes = sizes;
-    centroids.radii = radii;
     phase_log("assign", tas);
 
     // Write cluster files from the cluster-grouped stream.

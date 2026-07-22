@@ -484,23 +484,31 @@ green; what follows is what is left.
       scifact this moved `ann_recall@10` from 0.8590 to **0.9627**. The wire field
       remains as an escape hatch; it should eventually be removed from the client
       API entirely.
-- [x] **Adaptive probing via the error bounds — built, proved sound, and it retires
-      nothing.** Each centroid now carries a radius `R = max ‖v̂ − c‖` (`Centroids::radii`,
-      recomputed every fold on both build paths), which bounds the best score any
-      unprobed cluster could hold at `min(⟨q̂,c⟩ + R, 1 − max(0, ‖q̂−c‖ − R)²/2)`. Bounded
-      at two fetch waves so INV-7 holds, and the probed set is a subset of the
-      fixed-fraction one, so recall cannot fall below baseline. It is checked against
-      brute force in `mlake-ivf/tests/adaptive_probe.rs`.
-      **The measurement is a clean negative.** On BEIR at nprobe=half it retired 0
-      clusters across 623 queries: scifact 36.0 → 36.0 probed, `ann_recall@10` 0.9893
+- [x] ~~**Adaptive probing via the error bounds.**~~ **DONE AND REJECTED — do not
+      re-attempt without re-measuring the two numbers below first.** Built, proved
+      sound against brute force, measured on BEIR, and then **removed from the tree**
+      (not left behind an env flag — unexercised code rots, and the reasoning is the
+      part worth keeping).
+      *What was built:* each centroid carried a radius `R = max ‖v̂ − c‖`, recomputed
+      every fold on both build paths, bounding the best score any unprobed cluster
+      could hold at `min(⟨q̂,c⟩ + R, 1 − max(0, ‖q̂−c‖ − R)²/2)`. Bounded at two fetch
+      waves so INV-7 held, and the probed set was a subset of the fixed-fraction one,
+      so recall could not fall below baseline. The rule is correct; that was never the
+      problem.
+      *The measurement is a clean negative.* On BEIR at nprobe=half it retired **0
+      clusters across 623 queries**: scifact 36.0 → 36.0 probed, `ann_recall@10` 0.9893
       either way; nfcorpus 30.0 → 30.0, 0.9625 either way. Mean `tau` is 0.55–0.65 while
-      the *tightest* bound anywhere in the unprobed tail is 0.96–0.98. Nor is it outliers
-      inflating `R` — mean max radius 0.62 vs mean p95 radius 0.58, and a p90 radius (which
-      would cost soundness) still retires 0.00%. At 384-d the cluster radius (~0.62) is
-      comparable to the query's own k-th nearest-neighbour distance (~0.77), so every ball
-      reaches the query's neighbourhood. Left behind `MEMLAKE_ADAPTIVE_PROBE=1` rather than
-      deleted: the verdict is a property of these corpora, and enabling it today costs a
-      second serial wave for nothing. See docs/arms/vector.md.
+      the *tightest* bound anywhere in the unprobed tail is 0.96–0.98 — a ~0.3 gap, not a
+      near miss. Nor is it outliers inflating `R`: mean max radius 0.62 vs mean p95 radius
+      0.58, so a p90 radius (which would cost soundness) moves the bound ~0.04 and still
+      retires 0.00%.
+      *The cause is dimensional, not statistical.* At 384-d the cluster radius (~0.62) is
+      below the query's own k-th nearest-neighbour distance (~0.77) by less than the bound
+      needs, so every ball reaches into the query's neighbourhood and nothing can be
+      retired. A larger corpus at the same dimensionality fails identically. **The gate for
+      any retry: measure mean cluster radius vs. mean k-th-NN distance first; if the radius
+      is not comfortably smaller, stop.** Full write-up in docs/arms/vector.md; the
+      implementation is in git history (`git log -S adaptive_probe`).
 - [ ] **The binary bound is probabilistic, not absolute.** Measured containment
       is 1.000000 over 120k samples with a 0.999 gate and a worst-miss cap, but
       one rotation serves a whole block, so misses are correlated across members
@@ -537,35 +545,52 @@ green; what follows is what is left.
       page-aligned addresses, so a blob whose archive starts at offset 0 is already
       fine; a *ranged* block cached as `path#start-end` is not. Worth confirming
       which of the two the hot paths actually hit before doing anything.
-- [x] **The disk cache is a FIFO ring, not LRU** (`cache.rs`). Both tiers are
-      admission-ordered rings: a read never reorders them, so a memory hit takes a
-      shared lock and a disk hit takes none, and eviction pops the oldest slot
-      instead of scanning for `min_by_key`. A memory eviction still demotes to disk;
-      a disk hit no longer promotes back into memory (that promotion *was* the
-      per-hit mutation, and with mmap the page cache already backs the bytes).
-      **The hit-rate cost is real and larger than the reasoning implied.** Measured
-      with `crates/mlake-store/tests/cache_skew.rs` (256 clusters, 16 distinct
-      Zipf-skewed probes per query plus three always-hot small objects), FIFO vs the
-      LRU it replaced:
+- [x] **The disk cache is a CLOCK ring, not LRU and no longer plain FIFO**
+      (`cache.rs`). Both tiers stay admission-ordered rings — a read never reorders
+      them, so a memory hit takes the state lock only *shared* and a disk hit takes
+      it shared too — but a hit now sets an atomic **reference bit**, and eviction
+      walks a hand that clears a set bit and skips that entry (second chance) before
+      taking the first entry whose bit is already clear. A memory eviction still
+      demotes to disk; a disk hit still does not promote back into memory (that
+      promotion *was* the per-hit write-lock mutation, and with mmap the page cache
+      already backs the bytes). Measured with
+      `crates/mlake-store/tests/cache_skew.rs`, which now runs all three policies
+      over the byte-identical trace (256 clusters, 16 distinct Zipf-skewed probes per
+      query plus three always-hot small objects; `--ignored --nocapture`, ~5 min):
 
       | cache/corpus | 5% | 10% | 25% | 50% |
       |---|---|---|---|---|
-      | LRU, Zipf s=1.1  | 0.0781 | 0.4491 | 0.6758 | 0.8314 |
-      | FIFO, Zipf s=1.1 | 0.0895 | 0.3327 | 0.5937 | 0.7940 |
-      | LRU, Zipf s=1.5  | — | 0.5944 | 0.8136 | — |
-      | FIFO, Zipf s=1.5 | — | 0.4479 | 0.7344 | — |
-      | LRU, uniform     | — | 0.2153 | 0.3469 | — |
-      | FIFO, uniform    | — | 0.1379 | 0.3193 | — |
+      | LRU, Zipf s=1.1   | 0.0780 | 0.4493 | 0.6769 | 0.8442 |
+      | FIFO, Zipf s=1.1  | 0.0895 | 0.3327 | 0.5937 | 0.7940 |
+      | CLOCK, Zipf s=1.1 | 0.0889 | **0.4708** | **0.6898** | **0.8500** |
+      | LRU, Zipf s=1.5   | 0.0994 | 0.5948 | 0.8137 | 0.9226 |
+      | FIFO, Zipf s=1.5  | 0.1450 | 0.4479 | 0.7344 | 0.8839 |
+      | CLOCK, Zipf s=1.5 | 0.1047 | **0.6172** | **0.8218** | **0.9269** |
+      | LRU, uniform      | 0.0165 | 0.2154 | 0.3465 | 0.5657 |
+      | FIFO, uniform     | 0.0170 | 0.1379 | 0.3193 | 0.5546 |
+      | CLOCK, uniform    | 0.0164 | **0.2157** | **0.3470** | **0.5666** |
 
-      FIFO wins only where the working set exceeds the cache and LRU thrashes (5%);
-      elsewhere it gives up 3–15 points. Note it loses on the *uniform* control too,
-      where policy should not matter — because the always-hot small objects are
-      admitted once and then lapped by cluster traffic, which LRU protected and FIFO
-      cannot. That makes SPEC §6.2's in-RAM ARC layer for centroids/footers/`pk.idx`
-      (still unbuilt) load-bearing rather than an optimisation, and it is the
-      cheapest way to buy most of these points back. The other option is CLOCK: one
-      atomic reference bit per entry, set on hit without reordering or taking the
-      write lock, and a second chance on eviction.
+      CLOCK does not just recover FIFO's 3–15 point loss: outside the 5% column it is
+      0.4–2.2 points *ahead of LRU*, because an admission arrives with its bit clear
+      and a one-shot cluster read dies at its FIFO position, where LRU promotes every
+      cold cluster it touches to most-recently-used and evicts hot entries for it.
+      (Admitting with the bit set was tried and is worse everywhere — 0.4133 vs
+      0.4708 at s=1.1/10% — so the scan resistance is doing the work, not the second
+      chance alone.) The 5% column is the thrash regime: 16 distinct probes per query
+      already exceed the cache, every policy laps itself once per query, and no
+      reference bit survives to the hand's next pass; FIFO's edge there is position,
+      not policy, and everything is under 0.15.
+      **The uniform-control regression is fixed** — 0.1379 → 0.2157 against LRU's
+      0.2154, i.e. within noise, which is what a flat access distribution should
+      show. The always-hot objects' own hit ratio says it directly: 0.999 under CLOCK
+      and LRU, 0.503 under FIFO. So SPEC §6.2's in-RAM tier for
+      centroids/footers/`pk.idx` goes back to being an optimisation rather than
+      load-bearing.
+      Caveat on the baseline: the LRU column is `EvictionPolicy::Lru`, a
+      re-measurement that refreshes both rings on a hit; the LRU actually replaced
+      only refreshed the memory tier on a memory hit and scored 0.8314 in the
+      s=1.1/50% cell. Every other cell reproduces the old table to ±0.001, so CLOCK
+      is being judged against a slightly *stronger* LRU than the one that existed.
 
 - [ ] **Nothing calls `Store::put_admitting` yet.** The mechanism landed
       (`store.rs`): an opt-in write that admits its own bytes under exactly the key

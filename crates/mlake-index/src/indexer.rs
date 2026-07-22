@@ -501,16 +501,6 @@ async fn build_memory_type_index(
         clusters[c].push(item.clone());
     }
 
-    // Cluster radii for adaptive probing — recomputed from *this* generation's membership on
-    // every fold, not carried forward. An assign-only fold reuses the previous centroids
-    // without retraining and then adds members to them, so a copied-forward radius is too
-    // small, and a radius that is too small retires a cluster that could have held a winner.
-    // Cheap: one pass over the vectors already in hand, after the local split has settled
-    // which centroid each item belongs to.
-    if !centroids.is_empty() {
-        centroids.recompute_radii(|i| clusters[i].iter().map(|m| m.vector.as_slice()));
-    }
-
     // Per-fact-type prefix so different types never collide on object keys.
     let prefix = format!("{}/mt{memory_type}", mlake_core::manifest::segment_prefix(&ns.name, seg_id));
 
@@ -831,7 +821,6 @@ pub(crate) fn derive_links_in_cluster(items: &mut [StoredMemory], centroid: &[f3
     }
     let centroids = mlake_ivf::Centroids {
         sizes: vec![items.len()],
-        radii: Vec::new(),
         dim: centroid.len(),
         vectors: vec![centroid.to_vec()],
     };
@@ -1052,7 +1041,7 @@ pub fn bench_prepare(
         let stride = (items.len() / k).max(1);
         let sample: Vec<Vec<f32>> = (0..k).map(|i| vectors[(i * stride) % items.len()].clone()).collect();
         let dim = sample.first().map(|v| v.len()).unwrap_or(0);
-        mlake_ivf::Centroids { sizes: vec![0; sample.len()], radii: Vec::new(), dim, vectors: sample }
+        mlake_ivf::Centroids { sizes: vec![0; sample.len()], dim, vectors: sample }
     } else {
         train_centroids(&vectors, seed)
     };

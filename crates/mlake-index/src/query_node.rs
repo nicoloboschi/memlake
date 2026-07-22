@@ -18,7 +18,7 @@ use mlake_core::{EntityId, MemoryId, Predicate, StoredMemory, TagFilter};
 use mlake_fts::{TantivyFts, Tokenizer};
 use mlake_graph::radj::InEdge;
 use mlake_graph::{GraphParams, GraphSource};
-use mlake_ivf::{exact_search, Centroids};
+use mlake_ivf::Centroids;
 use mlake_store::{Phase, QueryMetrics};
 use mlake_wal::{Namespace, WalTail};
 
@@ -101,84 +101,6 @@ impl UpdatedWindow {
             return false;
         };
         self.from.is_none_or(|f| u > f) && self.to.is_none_or(|t| u < t)
-    }
-}
-
-// ------------------------------------------------------------------ adaptive probing
-
-/// How much of the probe set the first wave reads before the geometry decides the rest.
-/// A quarter, floored at [`ADAPTIVE_SEED_MIN`]: small enough that retiring the tail is worth
-/// something, large enough that `tau` is not garbage (a seed holding fewer than `depth`
-/// candidates yields `tau = -inf` and retires nothing).
-const ADAPTIVE_SEED_DIVISOR: usize = 4;
-const ADAPTIVE_SEED_MIN: usize = 4;
-
-/// Length of the first wave. Equal to `probed` when adaptive probing is off or the probe set is
-/// already small, in which case there is exactly one wave and adaptive probing costs nothing.
-fn adaptive_seed_len(probed: usize) -> usize {
-    if !adaptive_enabled() {
-        return probed;
-    }
-    probed.div_ceil(ADAPTIVE_SEED_DIVISOR).clamp(ADAPTIVE_SEED_MIN.min(probed), probed)
-}
-
-/// **Off by default, on measurement, not on principle.** Set `MEMLAKE_ADAPTIVE_PROBE=1` to
-/// enable.
-///
-/// The stopping rule is implemented and provably sound (`Centroids::max_similarity`, and
-/// `mlake-ivf/tests/adaptive_probe.rs` checks it against brute force). It simply never fires on
-/// the corpora we have. Measured e2e on BEIR with bge-small, probing half the clusters:
-///
-/// | dataset  | mean tau (k=100) | tightest bound over the unprobed tail | clusters retired |
-/// |----------|------------------|---------------------------------------|------------------|
-/// | scifact  | 0.653            | 0.979                                 | 0 of 9,700       |
-/// | nfcorpus | 0.548            | 0.962                                 | 0 of 7,400       |
-///
-/// The bound sits ~0.3 above the threshold it would have to fall below, so nothing retires —
-/// and it is not outliers doing it: the mean *max* radius is 0.62 and the mean *p95* radius is
-/// 0.58, so a quantile radius (which would cost soundness) moves the bound by ~0.04 and still
-/// retires nothing. The cause is dimensional, not statistical: at 384-d these clusters have
-/// radius ~0.62 while the query's own k-th nearest neighbour sits ~0.77 away, so every probed
-/// cluster's ball reaches into the query's neighbourhood and none can be ruled out.
-///
-/// Left on the opt-in switch rather than deleted: the machinery is the expensive part to get
-/// right, and the verdict is a property of *these* corpora. Enabling it today costs a second
-/// serial fetch wave and buys nothing.
-fn adaptive_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| matches!(std::env::var("MEMLAKE_ADAPTIVE_PROBE").as_deref(), Ok("1") | Ok("on")))
-}
-
-/// The k-th best lower bound among candidates — `tau`. `-inf` when there are fewer than `k`,
-/// which is the answer that retires nothing: with fewer than `k` candidates in hand, no
-/// cluster can be ruled out of the top `k`.
-fn kth_lower_bound(cands: &[(MemoryId, f32, f32, f32)], k: usize) -> f32 {
-    if cands.len() < k || k == 0 {
-        return f32::NEG_INFINITY;
-    }
-    let mut los: Vec<f32> = cands.iter().map(|c| c.2).collect();
-    los.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
-    los.get(k - 1).copied().unwrap_or(f32::NEG_INFINITY)
-}
-
-/// Per-query probe accounting, for measuring whether the bound actually retires anything.
-/// Off unless `MEMLAKE_PROBE_STATS` is set; one line per segment on stderr.
-mod probe_stats {
-    pub fn on() -> bool {
-        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| std::env::var("MEMLAKE_PROBE_STATS").is_ok())
-    }
-
-    /// `tau` and `min_bound` say *why* the bound did or did not fire: the gap between the
-    /// tightest bound in the tail and the k-th best score in hand is the whole margin.
-    pub fn record(selected: usize, fetched: usize, tau: f32, min_bound: f32) {
-        if !on() {
-            return;
-        }
-        eprintln!(
-            "probe_stats selected={selected} fetched={fetched} retired={} tau={tau:.4} min_bound={min_bound:.4}",
-            selected.saturating_sub(fetched)
-        );
     }
 }
 
@@ -1085,61 +1007,23 @@ impl QueryNode {
         let t = Instant::now();
         let probed = self.select_clusters(state, q, nprobe, tags, updated);
         metrics.record_phase(Phase::Probe, t.elapsed());
-        let k = depth.max(1);
 
-        // ---- Wave one: the seed. -------------------------------------------------------
-        // `probed` is distance-ordered, so the seed is the nearest slice of it. It exists to
-        // produce a `tau` cheaply; the geometry decides the rest without reading anything.
-        let seed_n = adaptive_seed_len(probed.len());
-        let mut cands: Vec<(MemoryId, f32, f32, f32)> = Vec::new(); // id, est, lo, hi
         let t = Instant::now();
-        let blocks = self.fetch_vector_blocks(state, &probed[..seed_n], metrics, 3).await?;
+        let blocks = self.fetch_vector_blocks(state, &probed, metrics, 3).await?;
         metrics.record_phase(Phase::FetchClusters, t.elapsed());
+
+        // Stage one: scan the 1-bit codes, keeping an error interval (est, lo, hi) per candidate.
         let t = Instant::now();
+        let mut cands: Vec<(MemoryId, f32, f32, f32)> = Vec::new(); // id, est, lo, hi
         self.scan_blocks(&blocks, state, q, tags, updated, &mut cands)?;
         metrics.record_phase(Phase::Rerank, t.elapsed());
 
-        // ---- Wave two: whatever the geometry could not retire. -------------------------
-        // `tau` is the k-th best *lower* bound over what the seed found: there are already k
-        // candidates whose true score is at least `tau`. A cluster whose *upper* bound —
-        // `⟨q̂,c⟩ + R`, needing only the centroid and its radius, both resident — falls below
-        // `tau` therefore cannot contain a top-k member, and is dropped without being read.
-        //
-        // Two waves, never more. A probe→look→decide→probe loop would turn one coalesced wave
-        // into N and break INV-7; this bounds the adaptivity instead of the recall. The set is
-        // a *subset* of the fixed-fraction probe, so recall can only match it, never fall
-        // below it (up to the caveat that Binary's `lo` is probabilistic — see `score_bounds`).
-        let mut fetched = seed_n;
-        let (mut seed_tau, mut min_bound) = (f32::NEG_INFINITY, f32::INFINITY);
-        if seed_n < probed.len() {
-            let tau = kth_lower_bound(&cands, k);
-            let rest: Vec<usize> = probed[seed_n..]
-                .iter()
-                .copied()
-                .filter(|&c| {
-                    let ub = state.centroids.max_similarity(q, c);
-                    if probe_stats::on() && ub < min_bound {
-                        min_bound = ub;
-                    }
-                    ub >= tau
-                })
-                .collect();
-            seed_tau = tau;
-            fetched += rest.len();
-            if !rest.is_empty() {
-                let t = Instant::now();
-                let blocks = self.fetch_vector_blocks(state, &rest, metrics, 4).await?;
-                metrics.record_phase(Phase::FetchClusters, t.elapsed());
-                let t = Instant::now();
-                self.scan_blocks(&blocks, state, q, tags, updated, &mut cands)?;
-                metrics.record_phase(Phase::Rerank, t.elapsed());
-            }
-        }
-        probe_stats::record(probed.len(), fetched, seed_tau, min_bound);
-
         // Stage two: rescore exactly, but only what the bound leaves in contention. `tau` is the
         // k-th best lower bound; anything whose upper bound cannot reach it is outside the top-k.
-        let tau = kth_lower_bound(&cands, k);
+        let k = depth.max(1);
+        let mut los: Vec<f32> = cands.iter().map(|c| c.2).collect();
+        los.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+        let tau = los.get(k - 1).copied().unwrap_or(f32::NEG_INFINITY);
         let contenders: Vec<&(MemoryId, f32, f32, f32)> = cands.iter().filter(|c| c.3 >= tau).collect();
 
         let t = Instant::now();
@@ -1162,7 +1046,7 @@ impl QueryNode {
     }
 
     /// Stage one over a set of fetched blocks: score every admissible member and keep its
-    /// `(est, lo, hi)` interval. Appends, so the two probe waves share one candidate list.
+    /// `(est, lo, hi)` interval, appending to `cands`.
     fn scan_blocks(
         &self,
         blocks: &[mlake_ivf::VectorBlock],
@@ -1263,9 +1147,8 @@ impl QueryNode {
         // filter's admissible set is already small.
         //
         // The result is always distance-ordered, including when the admissible set fits under
-        // the cap. Adaptive probing takes its seed from the front of this list, so an
-        // arbitrary (centroid-index) order would seed the first wave with far clusters and
-        // hand it a useless `tau`.
+        // the cap: the cap truncates this list, so an arbitrary (centroid-index) order would
+        // drop near clusters in favour of far ones.
         let cap = nprobe.saturating_mul(4).max(nprobe);
         state
             .centroids
@@ -1802,36 +1685,5 @@ impl GraphSource for LazyGraphSource<'_> {
 
     fn incoming(&self, target: &MemoryId) -> Vec<InEdge> {
         self.incoming.get(target).cloned().unwrap_or_default()
-    }
-}
-
-#[cfg(test)]
-mod adaptive_probe_tests {
-    use super::*;
-
-    fn cand(lo: f32) -> (MemoryId, f32, f32, f32) {
-        (MemoryId::from_key("x"), lo, lo, lo)
-    }
-
-    #[test]
-    fn adaptive_probing_is_off_by_default_so_the_probe_is_one_wave() {
-        // The default is a single wave over the whole probe set — byte-for-byte the
-        // fixed-fraction behaviour. See `adaptive_enabled` for why the default is off.
-        assert!(!adaptive_enabled(), "MEMLAKE_ADAPTIVE_PROBE must default to off");
-        for probed in [0usize, 1, 8, 36, 64] {
-            assert_eq!(adaptive_seed_len(probed), probed, "one wave at {probed}");
-        }
-    }
-
-    #[test]
-    fn tau_retires_nothing_until_k_candidates_are_in_hand() {
-        // Fewer than k candidates means no cluster can be ruled out of the top k, and the
-        // only answer that expresses that is -inf.
-        assert_eq!(kth_lower_bound(&[], 10), f32::NEG_INFINITY);
-        let three: Vec<_> = [0.9f32, 0.5, 0.1].iter().map(|&l| cand(l)).collect();
-        assert_eq!(kth_lower_bound(&three, 10), f32::NEG_INFINITY);
-        assert_eq!(kth_lower_bound(&three, 3), 0.1);
-        assert_eq!(kth_lower_bound(&three, 2), 0.5);
-        assert_eq!(kth_lower_bound(&three, 0), f32::NEG_INFINITY);
     }
 }

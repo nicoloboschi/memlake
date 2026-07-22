@@ -11,8 +11,8 @@ pub mod kmeans;
 pub mod vectors;
 
 pub use index::{
-    build_clusters, exact_search, member_radius, merge_hits, sort_hits, train_centroids,
-    train_centroids_k, Centroids, ClusterFile, Hit,
+    build_clusters, exact_search, merge_hits, sort_hits, train_centroids, train_centroids_k,
+    Centroids, ClusterFile, Hit,
 };
 pub use kmeans::centroid_count;
 pub use vectors::{PreparedQuery, TagMask, VectorBlock, VectorCodec, UPDATED_UNKNOWN};
