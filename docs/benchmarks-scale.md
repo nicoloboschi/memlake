@@ -109,13 +109,30 @@ queryable generation equivalent to an in-RAM first build with `derive_links=fals
 | Fold | peak RSS | index time |
 |------|----------|------------|
 | in-RAM | **4,631 MB** (~5.8 GB/M, caps at ~6M) | 112s |
-| streaming | **936 MB** (bounded: 512 MB sort budget + ~50 B/id) | 256s |
+| streaming | **~920 MB** (bounded: 512 MB sort budget + ~50 B/id) | **120s** |
 
 ~5× less RAM at 800k, and the gap widens with N — the streaming fold's memory is bounded, so it
-scales to 100M+ on adequate disk, at ~2.3× the build time (two WAL passes + external sort).
-Equivalence + incremental-refold correctness are covered by `streaming_fold_matches_in_ram_fold`
-and `streaming_fold_incremental_matches_in_ram`; the spill/merge primitives by unit tests in
-`spill.rs`.
+scales to 100M+ on adequate disk, at **~parity build time** (was 256s before the assign pass was
+parallelized — see below). Equivalence + incremental-refold correctness are covered by
+`streaming_fold_matches_in_ram_fold` and `streaming_fold_incremental_matches_in_ram`; the
+spill/merge primitives by unit tests in `spill.rs`.
+
+**Phase profile (300k, per memory_type) + the speedups:**
+
+| phase | before | after parallel assign |
+|-------|--------|----------------------|
+| train (k-means) | ~13s | ~13s (dominant; parallel + early-terminating already) |
+| assign | ~10s | **~1.7s** (batched rayon: nearest-centroid + both serializations) |
+| cluster_write | ~3s | ~3s |
+| wal pass 1 + 2 | ~3.5s total | ~3.5s (small — the double WAL read is *not* a bottleneck) |
+
+The parallel assign took a 300k build 85.5s → 57.6s (and 800k 256s → 120s). Remaining lifts, in
+order: (1) **`train`** is now the dominant phase but it's inherent k-means, shared with the in-RAM
+fold, and already parallel + convergence-terminating — cutting it means fewer iterations or a
+smaller sample, a recall trade to validate against BEIR, not a free win; (2) **`cluster_write`** is
+streaming-specific (it deserializes each item off the merge and re-serializes the `ClusterFile`) —
+a concatenated cluster-file format would let it copy spill bytes through without the round-trip, at
+the cost of a format change.
 
 ## Per-arm query profile @ 1M (warm, rt=0 → pure compute/cache)
 
