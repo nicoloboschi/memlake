@@ -37,6 +37,8 @@ pub enum Error {
     Io(#[from] std::io::Error),
     #[error("core: {0}")]
     Core(#[from] mlake_core::Error),
+    #[error("config: {0}")]
+    Config(String),
 }
 
 impl Error {

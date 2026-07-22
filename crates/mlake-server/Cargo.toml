@@ -9,6 +9,7 @@ name = "mlake-server"
 path = "src/main.rs"
 
 [dependencies]
+dotenvy.workspace = true
 mlake-core.workspace = true
 mlake-store.workspace = true
 mlake-wal.workspace = true

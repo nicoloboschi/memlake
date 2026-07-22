@@ -26,9 +26,14 @@ use mlake_store::{DiskCache, QueryMetrics, Store, StoreMetrics};
 use mlake_wal::{Namespace, Writer};
 
 const COMMIT_BATCH: usize = 5_000;
+/// Memories generated + committed per window. Bounds resident RAM to one window's `Op`s
+/// (~2M × ~1.8 KB ≈ 3.6 GB) instead of the whole corpus, so 10M+ scales don't OOM the driver.
+const COMMIT_WINDOW: usize = 2_000_000;
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
+    // Load `.env` (working dir or any ancestor) before reading store config; real env wins.
+    let _ = dotenvy::dotenv();
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
         eprintln!("usage: mlake-perf <write|read|suite> [options]");
@@ -91,13 +96,12 @@ fn store_metrics() -> Arc<StoreMetrics> {
     StoreMetrics::new()
 }
 
-/// A MinIO-backed store with lifetime op accounting attached.
+/// The configured store (MinIO in dev, real S3 in prod) with lifetime op accounting attached.
+/// Config comes from the environment / `.env` — see [`Store::from_env`].
 fn new_store(metrics: Arc<StoreMetrics>) -> Result<Store> {
-    let endpoint =
-        std::env::var("MEMLAKE_S3_ENDPOINT").unwrap_or_else(|_| "http://localhost:9000".into());
-    Store::s3("memlake", Some(&endpoint), "memlake", "memlake123", "us-east-1")
+    Store::from_env()
         .map(|s| s.with_store_metrics(metrics))
-        .context("connecting to MinIO (is `docker compose up -d` running?)")
+        .context("building object store (check MEMLAKE_S3_*/AWS_* env or .env)")
 }
 
 // ---------------------------------------------------------------- write bench
@@ -158,24 +162,34 @@ async fn write_bench(
     ns.create_if_absent(&Tokenizer::default().config_hash()).await?;
     let gen = Generator::new(cfg);
 
-    // Data generation (synthetic embeddings + text) is a benchmark artifact, not the write, so
-    // it is generated and timed SEPARATELY — the commit timing below is pure durable-write cost.
-    let tg = Instant::now();
-    let mut batches: Vec<Vec<Op>> = Vec::new();
-    let mut start = 0;
-    while start < cfg.scale {
-        let end = (start + COMMIT_BATCH).min(cfg.scale);
-        batches.push(gen.batch(start, end).into_iter().map(Op::Upsert).collect());
-        start = end;
-    }
-    let datagen_secs = tg.elapsed().as_secs_f64();
-
-    // Commit phase: pipelined, concurrent WAL PUTs. Time and byte-count this alone.
+    // Generate + commit in windows so RAM stays bounded regardless of scale: a single-shot
+    // `Vec<Op>` for the whole corpus would be O(N) resident (~1.8 KB/memory incl. vector) and OOM
+    // at 10M+. Each window's synthetic data (embeddings + text) is a benchmark artifact, not the
+    // write, so it is generated and timed SEPARATELY from the commit — the commit timing stays
+    // pure durable-write cost. The writer is reused across windows, so its cached head carries and
+    // sequences stay contiguous.
     let base = metrics.snapshot();
-    let t0 = Instant::now();
     let mut writer = Writer::new(ns.clone());
-    writer.commit_many(batches, commit_concurrency).await?;
-    let commit_secs = t0.elapsed().as_secs_f64();
+    let mut datagen_secs = 0f64;
+    let mut commit_secs = 0f64;
+    let mut win = 0;
+    while win < cfg.scale {
+        let win_end = (win + COMMIT_WINDOW).min(cfg.scale);
+        let tg = Instant::now();
+        let mut batches: Vec<Vec<Op>> = Vec::new();
+        let mut start = win;
+        while start < win_end {
+            let end = (start + COMMIT_BATCH).min(win_end);
+            batches.push(gen.batch(start, end).into_iter().map(Op::Upsert).collect());
+            start = end;
+        }
+        datagen_secs += tg.elapsed().as_secs_f64();
+
+        let t0 = Instant::now();
+        writer.commit_many(batches, commit_concurrency).await?;
+        commit_secs += t0.elapsed().as_secs_f64();
+        win = win_end;
+    }
     let commit_bytes = metrics.since(&base).put_bytes;
 
     // Index phase (full first build). `--streaming` uses the external-memory fold (bounded RAM);

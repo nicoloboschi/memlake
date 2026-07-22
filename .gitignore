@@ -3,6 +3,11 @@
 .DS_Store
 target/criterion
 
+# Local config / secrets — never commit. Use .env.example as the template.
+.env
+.env.*
+!.env.example
+
 # Python
 __pycache__/
 *.pyc

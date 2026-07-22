@@ -103,6 +103,42 @@ impl Store {
         Ok(Self::new(Arc::new(builder.build()?)))
     }
 
+    /// Build a store from the process environment (after the binary has loaded any `.env`).
+    ///
+    /// Each field is read memlake-specific-name first, then the standard AWS name, so a plain
+    /// `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_REGION` `.env` works out of the box:
+    ///
+    /// | field    | vars (in precedence order)                    | default        |
+    /// |----------|-----------------------------------------------|----------------|
+    /// | bucket   | `MEMLAKE_S3_BUCKET`                            | *(required)*   |
+    /// | endpoint | `MEMLAKE_S3_ENDPOINT`                          | unset ⇒ real S3|
+    /// | access   | `MEMLAKE_S3_ACCESS_KEY`, `AWS_ACCESS_KEY_ID`   | *(required)*   |
+    /// | secret   | `MEMLAKE_S3_SECRET_KEY`, `AWS_SECRET_ACCESS_KEY`| *(required)*  |
+    /// | region   | `MEMLAKE_S3_REGION`, `AWS_REGION`             | `us-east-1`    |
+    ///
+    /// Leaving the endpoint unset selects real AWS S3; setting it points at MinIO or any other
+    /// S3-compatible endpoint (dev).
+    pub fn from_env() -> Result<Self> {
+        fn var(name: &str) -> Option<String> {
+            std::env::var(name).ok().filter(|v| !v.is_empty())
+        }
+        fn any(names: &[&str]) -> Option<String> {
+            names.iter().find_map(|n| var(n))
+        }
+        let bucket = var("MEMLAKE_S3_BUCKET")
+            .ok_or_else(|| Error::Config("MEMLAKE_S3_BUCKET is required".into()))?;
+        let endpoint = var("MEMLAKE_S3_ENDPOINT");
+        let access = any(&["MEMLAKE_S3_ACCESS_KEY", "AWS_ACCESS_KEY_ID"]).ok_or_else(|| {
+            Error::Config("MEMLAKE_S3_ACCESS_KEY or AWS_ACCESS_KEY_ID is required".into())
+        })?;
+        let secret = any(&["MEMLAKE_S3_SECRET_KEY", "AWS_SECRET_ACCESS_KEY"]).ok_or_else(|| {
+            Error::Config("MEMLAKE_S3_SECRET_KEY or AWS_SECRET_ACCESS_KEY is required".into())
+        })?;
+        let region =
+            any(&["MEMLAKE_S3_REGION", "AWS_REGION"]).unwrap_or_else(|| "us-east-1".into());
+        Self::s3(&bucket, endpoint.as_deref(), &access, &secret, &region)
+    }
+
     /// Read an object whole, recording the request against a query's budget.
     pub async fn get(
         &self,

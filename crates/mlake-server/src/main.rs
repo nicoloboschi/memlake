@@ -24,6 +24,10 @@ use service::{run_indexer, MemlakeService};
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Load `.env` from the working dir (or any ancestor) before anything reads config. Real
+    // process env always wins over the file, so a deploy can override without editing it.
+    let _ = dotenvy::dotenv();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -74,19 +78,10 @@ fn lease_holder(node: &str) -> String {
     format!("{node}#{}", std::process::id())
 }
 
-/// Build the base object store from the environment. Same knobs as the perf harness so a
-/// local MinIO works out of the box.
+/// Build the base object store from the environment (`.env` is loaded in `main`). See
+/// [`Store::from_env`] for the full variable list; standard `AWS_*` credentials work as-is.
 fn build_store() -> Result<Store> {
-    let endpoint = std::env::var("MEMLAKE_S3_ENDPOINT").ok();
-    let bucket = std::env::var("MEMLAKE_S3_BUCKET").unwrap_or_else(|_| "memlake".into());
-    let access = std::env::var("MEMLAKE_S3_ACCESS_KEY").unwrap_or_else(|_| "memlake".into());
-    let secret = std::env::var("MEMLAKE_S3_SECRET_KEY").unwrap_or_else(|_| "memlake123".into());
-    let region = std::env::var("MEMLAKE_S3_REGION").unwrap_or_else(|_| "us-east-1".into());
-    // Default to a local MinIO endpoint only when none is configured; in AWS you leave
-    // MEMLAKE_S3_ENDPOINT unset and object_store talks to real S3.
-    let endpoint = endpoint.or_else(|| Some("http://localhost:9000".into()));
-    Store::s3(&bucket, endpoint.as_deref(), &access, &secret, &region)
-        .context("building object store (check MEMLAKE_S3_* env)")
+    Store::from_env().context("building object store (check MEMLAKE_S3_*/AWS_* env or .env)")
 }
 
 async fn serve(args: &[String], node: String) -> Result<()> {
