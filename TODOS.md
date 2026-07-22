@@ -410,3 +410,21 @@ green; what follows is what is left.
       and FIFO does not — so land it behind the cache-hit-ratio and query-latency
       numbers the store already tracks, and keep `SPEC.md` §Unified NVMe cache in
       step (it currently documents LRU).
+
+- [ ] **The cache is read-through only; consider admitting on the inline fold.**
+      `cache.put` is called from exactly two places, both the miss path of a read
+      (`get_immutable`, `get_ranges`). `Store::put` never admits. Since
+      `wait_for_index` landed, a `serve` replica that folds a generation inline
+      writes every cluster, vector block and SSTable and then misses the cache on
+      all of them when the next query arrives — it had the bytes in hand and threw
+      them away. (The background `index` deployment is a different process from
+      the one serving reads, so this only bites the inline path.)
+      Not obviously worth doing: a fold writes the *whole* generation, most of
+      which no imminent query will probe, so blanket admission evicts a hot
+      working set for data nobody asked for — and on a ring buffer a single fold
+      could lap the entire cache. Sequence it after the FIFO change, scope it to
+      the inline-fold path, and gate it on the cache-hit-ratio and query-latency
+      numbers rather than on the reasoning above.
+      Also fix `SPEC.md` §Unified NVMe cache, which calls this "write-through on
+      first fetch" — "on first fetch" is read-through admission; write-through
+      normally means a write populates the cache, which is not what happens.
