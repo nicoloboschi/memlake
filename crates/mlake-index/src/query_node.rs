@@ -68,8 +68,9 @@ pub struct ArmDepths {
     pub nprobe: usize,
 }
 
-/// One fact type's loaded state: the indexed generation metadata plus its tail overlay.
-struct FactTypeState {
+/// One fact type's loaded state within ONE segment — the indexed metadata for that segment. A
+/// query fans out across a fact type's segments (newest-first) and merges (see [`FactType`]).
+struct SegmentState {
     centroids: Centroids,
     cluster_paths: Vec<String>,
     vector_paths: Vec<String>,
@@ -81,6 +82,14 @@ struct FactTypeState {
     time: TimeTable,
     payload: PayloadTable,
     rerank: RerankTable,
+    doc_count: usize,
+}
+
+/// One fact type across the whole snapshot: its segments (newest-first) plus the shared,
+/// un-indexed WAL-tail overlay. Every arm reads across `segments` + the tail and merges, with a
+/// newer segment (or the tail) shadowing an older copy of the same id.
+struct FactType {
+    segments: Vec<SegmentState>,
     tail_items: Vec<StoredMemory>,
     tail_fts: TantivyFts,
     doc_count: usize,
@@ -89,7 +98,7 @@ struct FactTypeState {
 /// A loaded, queryable snapshot of a bank namespace across its fact types.
 pub struct QueryNode {
     ns: Namespace,
-    per_type: BTreeMap<u8, FactTypeState>,
+    per_type: BTreeMap<u8, FactType>,
     tombstones: HashSet<MemoryId>,
     /// Active predicate deletes from the tail: `(sequence, predicate)`. A generation memory
     /// is hidden if it matches one whose sequence exceeds the memory's `write_seq`. Evaluated
@@ -163,10 +172,12 @@ impl QueryNode {
                 tokenizer.clone(),
             )?;
 
-            // Phase 1: a single live segment, so this fact type's index is that segment's entry.
-            // Phase 3 will fan out across all segments and merge per arm.
-            let state = match manifest.segments.first().and_then(|s| s.index(ft)) {
-                Some(fti) => {
+            // Load every segment that indexes this fact type, newest-first; the query fans each
+            // arm out across them and merges. A fact type present only in the tail has no segments.
+            let mut segments: Vec<SegmentState> = Vec::new();
+            for seg in &manifest.segments {
+                let Some(fti) = seg.index(ft) else { continue };
+                {
                     let files = &fti.files;
                     // The metadata objects (centroids, tag summary, radj/pk sparse indexes, FTS
                     // split) are independent immutable reads, so fetch them in one concurrent
@@ -268,21 +279,8 @@ impl QueryNode {
                         PayloadTable::open(&payload_idx, files.payload_data.clone())?
                     };
 
-                    // Live doc count for this fact type: its pk record count minus tombstones
-                    // that hit it, plus genuinely-new tail items.
-                    let mut doc_count = pk.record_count() as usize;
-                    for t in &tombstones {
-                        if pk.lookup(&ns.store, t, None).await?.is_some() {
-                            doc_count -= 1;
-                        }
-                    }
-                    for it in &tail_items {
-                        if pk.lookup(&ns.store, &it.id, None).await?.is_none() {
-                            doc_count += 1;
-                        }
-                    }
-
-                    FactTypeState {
+                    segments.push(SegmentState {
+                        doc_count: pk.record_count() as usize,
                         centroids: Centroids::from_bytes(&centroids_bytes)?,
                         cluster_paths: files.clusters.clone(),
                         vector_paths: files.vectors.clone(),
@@ -294,36 +292,35 @@ impl QueryNode {
                         time,
                         payload,
                         rerank,
-                        doc_count,
-                        tail_items,
-                        tail_fts,
+                    });
+                }
+            }
+
+            // Live doc count across segments: indexed records + genuinely-new tail items, minus
+            // tombstones that hit an indexed one. Approximate across segments (cross-segment
+            // shadowing is resolved at query time, not counted); exact for a single segment.
+            let mut doc_count: usize = segments.iter().map(|s| s.doc_count).sum();
+            for t in &tombstones {
+                for s in &segments {
+                    if s.pk.lookup(&ns.store, t, None).await?.is_some() {
+                        doc_count -= 1;
+                        break;
                     }
                 }
-                None => {
-                    // Fact type present only in the tail (never indexed yet).
-                    let doc_count = tail_items.len();
-                    FactTypeState {
-                        centroids: Centroids::default(),
-                        cluster_paths: Vec::new(),
-                        vector_paths: Vec::new(),
-                        tag_summary: Vec::new(),
-                        gen_fts: TantivyFts::build(
-                            std::iter::empty::<(MemoryId, &str)>(),
-                            tokenizer.clone(),
-                        )?,
-                        radj: RadjTable::open(&[0u8; 16], String::new())?,
-                        pk: PkTable::open(&[0u8; 16], String::new())?,
-                        entity: EntityTable::open(&[0u8; 16], String::new())?,
-                        time: TimeTable::open(&[0u8; 16], String::new())?,
-                        payload: PayloadTable::open(&[0u8; 16], String::new())?,
-                        rerank: RerankTable::open(&[0u8; 16], String::new())?,
-                        doc_count,
-                        tail_items,
-                        tail_fts,
+            }
+            for it in &tail_items {
+                let mut indexed = false;
+                for s in &segments {
+                    if s.pk.lookup(&ns.store, &it.id, None).await?.is_some() {
+                        indexed = true;
+                        break;
                     }
                 }
-            };
-            per_type.insert(ft, state);
+                if !indexed {
+                    doc_count += 1;
+                }
+            }
+            per_type.insert(ft, FactType { segments, tail_items, tail_fts, doc_count });
         }
 
         Ok(Self {
@@ -945,6 +942,24 @@ impl QueryNode {
     /// starved out of the nprobe-nearest set (SCALE.md Phase 4b). Because a selective filter
     /// leaves few admissible clusters, fetching all of them (capped) stays within budget;
     /// a broad filter admits ~everything, degrading to the plain probe.
+    /// The probe width to use when the caller did not pin one (`nprobe == 0`).
+    ///
+    /// Scales with the index rather than being a constant: a fixed 8 is 11% of a small
+    /// index's clusters and a rounding error on a large one, so recall would silently
+    /// depend on corpus size. A quarter of the clusters, floored so tiny indexes still
+    /// probe broadly and capped so a huge one does not turn a probe into a scan. The
+    /// divisor is calibrated against `ann_recall@10` in the BEIR harness — if that metric
+    /// regresses, this constant is the first thing to look at.
+    fn resolve_nprobe(state: &FactTypeState, nprobe: usize) -> usize {
+        if nprobe > 0 {
+            return nprobe;
+        }
+        const MIN_NPROBE: usize = 8;
+        const MAX_NPROBE: usize = 64;
+        const CLUSTER_FRACTION: usize = 4;
+        state.centroids.len().div_ceil(CLUSTER_FRACTION).clamp(MIN_NPROBE, MAX_NPROBE)
+    }
+
     fn select_clusters(
         &self,
         state: &FactTypeState,
@@ -952,6 +967,7 @@ impl QueryNode {
         nprobe: usize,
         tags: &TagFilter,
     ) -> Vec<usize> {
+        let nprobe = Self::resolve_nprobe(state, nprobe);
         if tags.is_noop() || state.tag_summary.is_empty() {
             return state.centroids.probe(query, nprobe);
         }

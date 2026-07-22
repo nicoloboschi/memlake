@@ -359,8 +359,22 @@ green; what follows is what is left.
       "the codec is per-generation, not per-index" statement in the docs.
 - [ ] **The rerank SSTable spends ~3117 B to hold a 1536 B vector** — roughly 2×
       overhead, unexplained. Worth understanding before this scales.
-- [ ] **Drop `nprobe` from the client API.** See below; the client should not be
-      choosing this.
+- [x] **`nprobe` is resolved by the index, not the client.** `nprobe = 0` now means
+      "the index decides" and the snapshot picks a quarter of its clusters
+      (floor 8, cap 64). A fixed constant made recall depend on corpus size:
+      8 clusters is 11% of a small index and a rounding error on a large one. On
+      scifact this moved `ann_recall@10` from 0.8590 to **0.9627**. The wire field
+      remains as an escape hatch; it should eventually be removed from the client
+      API entirely.
+- [ ] **Adaptive probing via the error bounds (the real answer to `nprobe`).**
+      Rather than a tuned fraction, probe clusters nearest-first and stop when the
+      k-th best *lower* bound already exceeds the best score any unprobed cluster
+      could yield (bounded by its centroid distance). That spends probes only
+      where the ranking is still contested and needs no per-corpus calibration —
+      a stopping rule instead of a constant. We are unusually well placed for it
+      since `score_bounds` already exists, but the centroid-distance bound itself
+      is unvalidated: it needs to be proven sound before anything trusts it to
+      stop early, because stopping too soon silently drops results.
 - [ ] **The binary bound is probabilistic, not absolute.** Measured containment
       is 1.000000 over 120k samples with a 0.999 gate and a worst-miss cap, but
       one rotation serves a whole block, so misses are correlated across members

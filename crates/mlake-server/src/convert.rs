@@ -459,8 +459,13 @@ pub fn tag_filter(f: Option<pb::TagFilter>) -> TagFilter {
 
 /// Default per-arm candidate depth when the client sends 0.
 const DEFAULT_ARM_DEPTH: usize = 100;
-/// Default IVF probe width (mirrors `mlake_ivf::DEFAULT_NPROBE`).
-const DEFAULT_NPROBE: usize = 8;
+/// `nprobe = 0` means "the index decides".
+///
+/// A probe width is not a client's decision: it trades recall against bytes read, and only
+/// the server knows how many clusters exist to probe. A fixed constant is wrong for the
+/// same reason — 8 clusters is most of a small index and a sliver of a large one. The
+/// snapshot resolves it from its own cluster count (see `QueryNode::resolve_nprobe`).
+const NPROBE_FROM_INDEX: usize = 0;
 
 /// Resolve per-arm depths from the wire request, filling server defaults for zero fields.
 pub fn arm_depths(vector_top_k: u32, text_top_k: u32, graph_top_k: u32, nprobe: u32) -> ArmDepths {
@@ -469,7 +474,7 @@ pub fn arm_depths(vector_top_k: u32, text_top_k: u32, graph_top_k: u32, nprobe: 
         vector: depth(vector_top_k),
         text: depth(text_top_k),
         graph: depth(graph_top_k),
-        nprobe: if nprobe == 0 { DEFAULT_NPROBE } else { nprobe as usize },
+        nprobe: if nprobe == 0 { NPROBE_FROM_INDEX } else { nprobe as usize },
     }
 }
 
