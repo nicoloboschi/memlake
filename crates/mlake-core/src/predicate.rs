@@ -22,12 +22,22 @@ pub struct Predicate {
     pub tags: Vec<String>,
     /// `TagsMatch` discriminant: 0 Any, 1 All, 2 AnyStrict, 3 AllStrict, 4 Exact.
     pub tags_mode: u8,
+    /// Inclusive-exclusive window on `timestamps.updated_at` (epoch ms): a memory matches
+    /// when its write time is strictly after `updated_from` and strictly before
+    /// `updated_to`. A memory with no `updated_at` fails a bounded window rather than
+    /// passing it — an unknown write time cannot be shown to fall inside one.
+    pub updated_from: Option<i64>,
+    pub updated_to: Option<i64>,
 }
 
 impl Predicate {
     /// True when the predicate constrains nothing — it then matches every memory.
     pub fn is_empty(&self) -> bool {
-        self.memory_types.is_empty() && self.metadata_equals.is_empty() && self.tags.is_empty()
+        self.memory_types.is_empty()
+            && self.metadata_equals.is_empty()
+            && self.tags.is_empty()
+            && self.updated_from.is_none()
+            && self.updated_to.is_none()
     }
 
     /// Whether `m` satisfies every condition.
@@ -39,6 +49,21 @@ impl Predicate {
             let tf = TagFilter::new(self.tags.clone(), tags_mode_from_u8(self.tags_mode));
             if !tf.matches(&m.tags) {
                 return false;
+            }
+        }
+        if self.updated_from.is_some() || self.updated_to.is_some() {
+            let Some(updated) = m.timestamps.updated_at else {
+                return false;
+            };
+            if let Some(from) = self.updated_from {
+                if updated <= from {
+                    return false;
+                }
+            }
+            if let Some(to) = self.updated_to {
+                if updated >= to {
+                    return false;
+                }
             }
         }
         self.metadata_equals

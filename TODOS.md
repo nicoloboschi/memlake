@@ -6,11 +6,23 @@ not repeated here. Everything below is something memlake has to provide before
 Hindsight can stop falling back or degrading.
 
 Current state: in memlake mode Hindsight writes **nothing** memory-shaped to
-Postgres — no `memory_units`, no `memory_links`, no `unit_entities`. Retain, all
-four recall arms (dense, full-text, graph, temporal), the curation list and
-single-unit reads, bank fact counts, deletes, the curation edit, document export
-and **consolidation** all run through memlake. LoComo scores identically to the
-Postgres path (14/15 on conv-26) with `nprobe=32`.
+Postgres — no `memory_units`, no `memory_links`, no `unit_entities`. Running
+through memlake and verified end to end:
+
+* retain, and all four recall arms (dense, full-text, graph, temporal);
+* consolidation — observations written denormalised and upserted by id, sources
+  stamped, observation history recorded;
+* the curation list, single-unit reads, curation edit, tag listing, bank fact
+  counts, entity listing with live per-entity counts;
+* deletes — bank (namespace drop), document and observation (predicate), unit
+  (tombstone) — and document re-ingest that *replaces* rather than duplicates;
+* document and whole-bank export, including observations;
+* the graph view: entity edges, observation edges, and stored semantic edges;
+* graph maintenance's orphan-entity sweep, via `EntityStats`;
+* mental-model staleness.
+
+LoComo scores identically to the Postgres path (14/15 on conv-26) with
+`nprobe=32`.
 
 Ordered by what blocks the most.
 
@@ -64,8 +76,11 @@ provider already has.
 
 What is still missing is only the *stored* edge types:
 
-- [x] **Semantic edges on the payload — DONE.** `MemoryPayload.semantic_out`
-      (target + weight), behind an `include_edges` flag on `Scan` and `Get`.
+- [x] **Semantic edges on the payload — DONE and verified.**
+      `MemoryPayload.semantic_out` (target + weight), behind an `include_edges`
+      flag on `Scan` and `Get`. Measured on the LoComo bank: 1508 semantic edges
+      across 344 memories, rendering as 924 `semantic` edges alongside 2859
+      `entity` edges in a 200-node graph.
 
       No new RPC and no new storage: the indexer already derives these during the
       fold (`indexer.rs:590-677`), already prunes them to live targets
@@ -118,44 +133,78 @@ Two behaviours worth knowing, neither blocking:
 
 ---
 
-## 4. Retrieval semantics
+## 4. Retrieval semantics — mostly closed
 
-- [ ] **The dense arm does not see un-indexed writes.** Reads are documented as
-      always strong, and the text arm honours that — but a query issued
-      immediately after a write returns nothing from the vector arm until the
-      indexer folds it. Measured: import 344 memories, query at once →
-      `semantic=0`; the same namespace minutes later → `semantic=344`.
-      Retain-then-recall in one request is a normal Hindsight pattern, so this is
-      the difference between a BM25-only answer and a full one. Either the tail
-      scan covers the dense arm, or the guarantee is documented per-arm so callers
-      can decide.
-- [ ] **The default `nprobe` silently costs recall.** On a 344-memory bank
-      (15 + 10 clusters) the default returned 266 of 344 candidates where pgvector
-      returned all 344 — and LoComo accuracy dropped to 11/15. The cause is
-      cluster coverage, not depth: `vector_top_k` was already 2500, and candidates
-      in unprobed clusters are unreachable at any depth.
-
-      | nprobe | candidates | coverage | median query |
-      |--------|-----------|----------|--------------|
-      | 0 (default) | 266 | 77% | 5.9 ms |
-      | 15 | 344 | 100% | 5.2 ms |
-      | 32 | 344 | 100% | 4.9 ms |
-
-      Full coverage was *free* at this size (0 roundtrips either way). Setting
-      `nprobe=32` restored both the candidate count and 14/15 accuracy. Suggested:
-      scale the default with cluster count, and/or report the coverage a query
-      actually achieved — right now a 77% probe is indistinguishable from an
-      exhaustive one, which is exactly how this went unnoticed.
-- [ ] **`text_signals` are not indexed.** Hindsight enriches its BM25 document
-      with entity names and spelled-out dates ("May 8 2023") so keyword search can
-      hit them. memlake indexes `text` only, so its full-text arm is strictly
-      weaker on entity/date queries. Either accept a second indexed-text field, or
-      index `text + signals`.
-- [ ] **No nested tag groups.** memlake has five flat modes; Hindsight also
-      supports AND/OR/NOT trees, applied in Python after the query — so they can
-      trim below the requested limit.
-- [ ] **No `updated_at` range push-down.** Recall's `created_after` /
-      `created_before` window is applied post-query for the same reason.
+- [x] **Read-after-write — solved by `wait_for_index`.** A read always merges the
+      un-indexed WAL tail over the indexed generation, and `WriteRequest.wait_for_index`
+      folds inline before returning for callers that want the write in the generation.
+      The earlier symptom (a query right after a write returning `semantic=0`) was the
+      vector arm having no clusters to probe, not the tail being invisible.
+- [x] **`nprobe` — now chosen automatically.** The default no longer silently
+      probes a fraction of clusters. For the record, what it cost when it did: on a
+      344-memory bank the semantic arm returned 266 of 344 candidates and LoComo
+      accuracy dropped to 11/15; `nprobe=32` restored both. Coverage and depth are
+      different knobs — `vector_top_k` was already 2500 and could not compensate,
+      because candidates in unprobed clusters are unreachable at any depth.
+- [x] **`text_signals` — DONE, as `Memory.index_text`.** Text to index for BM25 when
+      it should differ from `text`; empty means index `text`. `StoredMemory::fts_text()`
+      feeds all three FTS build sites (in-RAM fold, streaming fold, WAL tail).
+      Hindsight sends `text + text_signals`, so entity names and spelled-out dates
+      ("May 8 2023") are matchable without changing what a hit returns.
+      Verified: a term present only in `index_text` matches, and the hit returns the
+      clean original text.
+- [x] **`updated_at` window — DONE.** A fifth field on `Timestamps` — deliberately
+      separate from the other four, which are *content* time where this is *write*
+      time — plus `updated_from` / `updated_to` on Query and Scan. The server defaults
+      it to now when a client omits it, so a window never silently skips memories
+      written by a client that does not set it.
+      Verified round-trip and both window directions.
+  - [x] **Push-down on the dense arm — DONE.** The window used to be a post-arm
+        filter, which for a selective window meant a page of nothing: the dense arm
+        truncates to `vector_top_k` *before* anything is materialized, so filtering
+        afterwards removes rows rather than reaching deeper into the matching set.
+        `updated_at` now rides in the vector block beside the tags (an 8-byte column
+        per member, `FLAG_HAS_UPDATED`), so a non-matching member never takes a
+        top-k slot, and the per-cluster summary carries the write-time span so a
+        selective window is not starved out of the nprobe-nearest probe set either —
+        the same treatment a selective tag filter gets.
+        Verified end to end: with the only in-window memories at ranks 31-35 and a
+        depth of 10, the arm returns exactly those five, at `nprobe=1` as well.
+        The WAL tail is filtered in the arm too (it is scored exhaustively).
+    - [ ] **The FTS and graph arms still post-filter.** Neither index carries a
+          write time — tantivy would need the field, and the graph arm walks edges —
+          so a text- or graph-only query can still be trimmed below `top_k`. The
+          server re-applies the window over all arms and remains the authority.
+    - [ ] **Blocks written before the column admit everyone.** A generation built by
+          an older binary carries no `updated` column, so the arm cannot decide and
+          falls back to admitting; the server's own filter catches it. Reindexing a
+          bank is what turns the push-down on for its existing data.
+  - [x] **A patch now bumps the write time — DONE.** `Patch` used to leave
+        `updated_at` untouched, so a consolidated or edited memory stayed invisible to
+        "changed since X" — the window was only ever true for upserts. The server
+        appends a `Delta::Touch(now)` to every patch, last, so it wins over a client's
+        `SetTimestamps`. It is a separate delta because `SetTimestamps` *replaces* the
+        whole struct: stamping the write time through it would wipe the four content
+        timestamps the caller never mentioned. The value is baked in at commit, so
+        replaying the log stays deterministic.
+  - [x] **A partial timestamp patch no longer wipes the rest — DONE.** Found while
+        adding `Touch`, not caused by it: `Delta::SetTimestamps` replaces the whole
+        struct and the client built that struct from *only* the fields passed, so
+        `patch(id, occurred_start=X)` silently cleared `event_date`, `occurred_end`
+        and `mentioned_at` — and Hindsight's `update_memories` sets whichever of the
+        four it has, so it fired on any consolidation revising one time and not the
+        others.
+        `Delta::MergeTimestamps` now carries the patch: `Some` overwrites, `None`
+        leaves alone, which is what a partial update means. `SetTimestamps` stays as
+        the only way to *null* a field, reached by the new `replace_timestamps` flag
+        on the wire `Patch` (`Timestamps` fields are `optional`, so presence is exact).
+        The default flipped to merge — the safe direction, since the replace discards
+        times the caller never mentioned.
+        Verified over gRPC: a partial patch keeps the other three and still stamps
+        `updated_at`; `replace_timestamps=True` clears them and stamps too.
+- [ ] **No nested tag groups.** memlake has five flat modes; Hindsight also supports
+      AND/OR/NOT trees, applied in Python after the query — so they can trim below
+      the requested limit.
 
 ---
 
@@ -217,6 +266,52 @@ curation UI and export:
       already makes, or the counts silently include deleted memories.
       A vocabulary-only `ListTags` with no counts is still a large win over the
       corpus walk if the multiset change proves awkward.
+
+---
+
+## 5b. Declared indexed metadata keys — the counts primitive
+
+Hindsight has four "count memories grouped by X" surfaces that currently return
+zero, and a scan is the wrong answer for all of them:
+
+| surface | grouped by | cheapest source |
+|---|---|---|
+| `get_memories_timeseries` | time buckets | `TimeTable` — already sorted; bucketing is a range walk |
+| `list_observation_scopes` | tag set | `ClusterTagSummary` multiset (same work as §5's tag histogram) |
+| `get_bank_freshness` pending/failed | `consolidated` metadata value | **this item** |
+| `list_documents` per-document count | `document_id` metadata value | **this item** |
+
+The last two share one primitive, and it is the highest-leverage of the four
+because it also closes `document_id` push-down on `Scan` (§5) and makes
+delete-by-document an index lookup rather than a walk.
+
+**Design — mirror `tag_summary`, not a new concept.** Metadata cannot be indexed
+wholesale: `context`, `created_at` and `updated_at` are effectively unique per
+memory, so a blanket index is one entry per memory per key. The keys worth
+indexing are low-cardinality or bounded (`document_id` ~ documents,
+`chunk_id` ~ chunks, `consolidated` = 2), so the namespace declares them.
+
+Concrete insertion points, all alongside structures that already exist:
+
+- `Manifest.indexed_metadata_keys: Vec<String>` (`manifest.rs:167`, `#[serde(default)]`)
+  — declared once for the namespace, carried across swaps.
+- `FactTypeIndex.meta_counts: String` (`manifest.rs:~45`, beside `tag_summary`)
+  — one small per-segment blob, `key -> [(value, count)]`, for the declared keys only.
+- Built at fold from the segment's items, exactly where `tag_summary` is built.
+- `MetadataStats(namespace, key) -> [(value, count)]` sums across segments and
+  applies the same tail/tombstone adjustment `Stats.doc_count` and `EntityStats`
+  already make.
+
+Cost is bounded by distinct `(declared key, value)` pairs, not corpus size — the
+same shape as the per-cluster tag set.
+
+- [ ] **Implement it.** Blocked on nothing conceptually; the fold-side build lands
+      in `indexer.rs` / `streaming.rs` / `generation.rs`, which is the layer being
+      rewritten for segmented indexes (`write_generation`'s signature has already
+      churned once). Worth landing after that settles rather than against it.
+- [ ] **Decide the declaration surface**: `CreateNamespace` field (simple, fixed at
+      creation) vs a `SetNamespaceConfig` RPC (changeable, needs a re-fold to
+      backfill counts for a newly-declared key).
 
 ---
 
@@ -293,6 +388,29 @@ co-occurrence rows written and a 160-node / 352-edge entity graph rendered with
 
 ---
 
+## 6c. Postgres constraints that provider-held memories cannot satisfy
+
+A pattern worth naming, because it bit twice and both times failed *silently*.
+
+Tables that reference `memory_units` assume every memory is a Postgres row. When
+the provider owns the store that assumption breaks, and the failure mode is never
+an error the caller sees:
+
+* **`observation_history.observation_id → memory_units(id)`.** Every history insert
+  raised a foreign-key violation, which the writer catches and logs as "a race with
+  parallel consolidation". The audit trail was silently empty. Fixed on the
+  Hindsight side by dropping the FK (migration `a1c9e7f3b2d8`) and replacing the
+  cascade with explicit deletes.
+* **`prune_orphan_entities` / `prune_stale_cooccurrences`** both key off
+  `unit_entities`, which is empty by design, so their `NOT EXISTS` matched
+  everything. One measured run deleted 161 of 161 entities. Both now guarded.
+
+No memlake work — recorded so the next such table is checked before it is trusted.
+The general shape: any `NOT EXISTS` or FK against `memory_units` is either
+always-true or always-violated in provider mode, and both read as success.
+
+---
+
 ## 7. Operational
 
 - [ ] **Dropping a namespace is not safe against a running indexer.** The proto
@@ -366,15 +484,23 @@ green; what follows is what is left.
       scifact this moved `ann_recall@10` from 0.8590 to **0.9627**. The wire field
       remains as an escape hatch; it should eventually be removed from the client
       API entirely.
-- [ ] **Adaptive probing via the error bounds (the real answer to `nprobe`).**
-      Rather than a tuned fraction, probe clusters nearest-first and stop when the
-      k-th best *lower* bound already exceeds the best score any unprobed cluster
-      could yield (bounded by its centroid distance). That spends probes only
-      where the ranking is still contested and needs no per-corpus calibration —
-      a stopping rule instead of a constant. We are unusually well placed for it
-      since `score_bounds` already exists, but the centroid-distance bound itself
-      is unvalidated: it needs to be proven sound before anything trusts it to
-      stop early, because stopping too soon silently drops results.
+- [x] **Adaptive probing via the error bounds — built, proved sound, and it retires
+      nothing.** Each centroid now carries a radius `R = max ‖v̂ − c‖` (`Centroids::radii`,
+      recomputed every fold on both build paths), which bounds the best score any
+      unprobed cluster could hold at `min(⟨q̂,c⟩ + R, 1 − max(0, ‖q̂−c‖ − R)²/2)`. Bounded
+      at two fetch waves so INV-7 holds, and the probed set is a subset of the
+      fixed-fraction one, so recall cannot fall below baseline. It is checked against
+      brute force in `mlake-ivf/tests/adaptive_probe.rs`.
+      **The measurement is a clean negative.** On BEIR at nprobe=half it retired 0
+      clusters across 623 queries: scifact 36.0 → 36.0 probed, `ann_recall@10` 0.9893
+      either way; nfcorpus 30.0 → 30.0, 0.9625 either way. Mean `tau` is 0.55–0.65 while
+      the *tightest* bound anywhere in the unprobed tail is 0.96–0.98. Nor is it outliers
+      inflating `R` — mean max radius 0.62 vs mean p95 radius 0.58, and a p90 radius (which
+      would cost soundness) still retires 0.00%. At 384-d the cluster radius (~0.62) is
+      comparable to the query's own k-th nearest-neighbour distance (~0.77), so every ball
+      reaches the query's neighbourhood. Left behind `MEMLAKE_ADAPTIVE_PROBE=1` rather than
+      deleted: the verdict is a property of these corpora, and enabling it today costs a
+      second serial wave for nothing. See docs/arms/vector.md.
 - [ ] **The binary bound is probabilistic, not absolute.** Measured containment
       is 1.000000 over 120k samples with a 0.999 gate and a worst-miss cap, but
       one rotation serves a whole block, so misses are correlated across members
@@ -396,35 +522,59 @@ green; what follows is what is left.
       The fix is to operate on `&Archived<StoredMemory>` at the call sites — the
       accessors already exist. Lower value than it looks: after the vector/payload
       split this cost falls only on hydrated winners, not on every probed member.
-- [ ] **The disk cache reads with `fs::read`, not mmap** (`cache.rs`), so a warm
-      hit copies the whole blob into memory. mmap is the other half of the same
-      claim. Wants blobs written 8-byte aligned so the realignment copy disappears too.
-- [ ] **Move the disk cache to a FIFO ring buffer.** It is LRU today: every hit
-      bumps `last_used` and eviction takes `min_by_key(last_used)`, which means
-      every cache *read* acquires the write lock — the cache becomes a contention
-      point exactly when concurrent queries make it matter most. For
-      content-addressed immutable blocks a ring buffer is the better shape: no
-      per-hit mutation (reads can take a shared lock or none), sequential rather
-      than scattered disk writes, and eviction is a pointer bump instead of a scan
-      for the minimum. The cost is hit rate on skewed access, which LRU protects
-      and FIFO does not — so land it behind the cache-hit-ratio and query-latency
-      numbers the store already tracks, and keep `SPEC.md` §Unified NVMe cache in
-      step (it currently documents LRU).
+- [x] **The disk cache now mmaps instead of `fs::read`** (`cache.rs`). A warm hit
+      maps the blob and hands the mapping to `Bytes::from_owner`, so the blob is
+      never copied onto the heap and a re-read of a resident file does no I/O at
+      all. Sound because blobs are content-addressed and written once, published
+      by rename (so a concurrent re-`put` installs a new inode instead of
+      truncating a mapped one — truncation under a mapping is SIGBUS, not an
+      error), and removed only by unlink, which on Unix leaves an existing mapping
+      valid; a covering test evicts a blob while a reader holds it.
+      **This removes one copy, not all of them** — see the item above: consumers
+      still `Deserialize` into an owned graph, so the read path is not zero-copy.
+- [ ] **Blobs are still not written 8-byte aligned**, so `rkyv_read` may realign
+      before validating and the mmap gives that copy straight back. mmap returns
+      page-aligned addresses, so a blob whose archive starts at offset 0 is already
+      fine; a *ranged* block cached as `path#start-end` is not. Worth confirming
+      which of the two the hot paths actually hit before doing anything.
+- [x] **The disk cache is a FIFO ring, not LRU** (`cache.rs`). Both tiers are
+      admission-ordered rings: a read never reorders them, so a memory hit takes a
+      shared lock and a disk hit takes none, and eviction pops the oldest slot
+      instead of scanning for `min_by_key`. A memory eviction still demotes to disk;
+      a disk hit no longer promotes back into memory (that promotion *was* the
+      per-hit mutation, and with mmap the page cache already backs the bytes).
+      **The hit-rate cost is real and larger than the reasoning implied.** Measured
+      with `crates/mlake-store/tests/cache_skew.rs` (256 clusters, 16 distinct
+      Zipf-skewed probes per query plus three always-hot small objects), FIFO vs the
+      LRU it replaced:
 
-- [ ] **The cache is read-through only; consider admitting on the inline fold.**
-      `cache.put` is called from exactly two places, both the miss path of a read
-      (`get_immutable`, `get_ranges`). `Store::put` never admits. Since
-      `wait_for_index` landed, a `serve` replica that folds a generation inline
-      writes every cluster, vector block and SSTable and then misses the cache on
-      all of them when the next query arrives — it had the bytes in hand and threw
-      them away. (The background `index` deployment is a different process from
-      the one serving reads, so this only bites the inline path.)
-      Not obviously worth doing: a fold writes the *whole* generation, most of
-      which no imminent query will probe, so blanket admission evicts a hot
-      working set for data nobody asked for — and on a ring buffer a single fold
-      could lap the entire cache. Sequence it after the FIFO change, scope it to
-      the inline-fold path, and gate it on the cache-hit-ratio and query-latency
-      numbers rather than on the reasoning above.
-      Also fix `SPEC.md` §Unified NVMe cache, which calls this "write-through on
-      first fetch" — "on first fetch" is read-through admission; write-through
-      normally means a write populates the cache, which is not what happens.
+      | cache/corpus | 5% | 10% | 25% | 50% |
+      |---|---|---|---|---|
+      | LRU, Zipf s=1.1  | 0.0781 | 0.4491 | 0.6758 | 0.8314 |
+      | FIFO, Zipf s=1.1 | 0.0895 | 0.3327 | 0.5937 | 0.7940 |
+      | LRU, Zipf s=1.5  | — | 0.5944 | 0.8136 | — |
+      | FIFO, Zipf s=1.5 | — | 0.4479 | 0.7344 | — |
+      | LRU, uniform     | — | 0.2153 | 0.3469 | — |
+      | FIFO, uniform    | — | 0.1379 | 0.3193 | — |
+
+      FIFO wins only where the working set exceeds the cache and LRU thrashes (5%);
+      elsewhere it gives up 3–15 points. Note it loses on the *uniform* control too,
+      where policy should not matter — because the always-hot small objects are
+      admitted once and then lapped by cluster traffic, which LRU protected and FIFO
+      cannot. That makes SPEC §6.2's in-RAM ARC layer for centroids/footers/`pk.idx`
+      (still unbuilt) load-bearing rather than an optimisation, and it is the
+      cheapest way to buy most of these points back. The other option is CLOCK: one
+      atomic reference bit per entry, set on hit without reordering or taking the
+      write lock, and a second chance on eviction.
+
+- [ ] **Nothing calls `Store::put_admitting` yet.** The mechanism landed
+      (`store.rs`): an opt-in write that admits its own bytes under exactly the key
+      `get_immutable` looks up, so a `serve` replica folding a generation inline no
+      longer has to re-fetch what it just wrote. `Store::put` stays read-through on
+      purpose — a fold writes the whole generation, most of which no imminent query
+      probes, and on a ring that laps the cache and leaves only the fold's own tail.
+      What is left is the decision it was scoped to leave open: **which** inline-fold
+      writes opt in. The plausible answer given the measurement above is the small
+      certain-to-be-read objects (centroids, footers, `pk.idx`) and not the cluster
+      or vector-block bulk, but that is untested — it could not be measured from
+      inside `mlake-store`, which has no fold to run.

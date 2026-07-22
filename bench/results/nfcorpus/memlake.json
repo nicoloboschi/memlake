@@ -6,38 +6,38 @@
   },
   "corpus_size": 3633,
   "n_queries": 323,
-  "index_seconds": 11.84,
+  "index_seconds": 16.184,
   "arms": {
     "dense": {
       "ndcg@10": 0.3429,
-      "recall@100": 0.31088,
+      "recall@100": 0.31071,
       "mrr@10": 0.52696,
       "latency": {},
-      "ann_recall@1": 0.99381,
-      "ann_recall@10": 0.99938,
-      "ann_recall@100": 0.99988
+      "ann_recall@1": 0.99071,
+      "ann_recall@10": 0.99628,
+      "ann_recall@100": 0.99
     },
     "sparse": {
       "ndcg@10": 0.3243,
-      "recall@100": 0.2478,
+      "recall@100": 0.2479,
       "mrr@10": 0.52372,
       "latency": {}
     },
     "hybrid": {
-      "ndcg@10": 0.36198,
-      "recall@100": 0.31437,
-      "mrr@10": 0.56703,
+      "ndcg@10": 0.36109,
+      "recall@100": 0.31473,
+      "mrr@10": 0.56471,
       "latency": {
-        "mean_ms": 524.32,
-        "p50_ms": 147.675,
-        "p90_ms": 170.819,
-        "p99_ms": 13288.135,
-        "max_ms": 39537.24,
+        "mean_ms": 472.488,
+        "p50_ms": 141.069,
+        "p90_ms": 156.325,
+        "p99_ms": 13852.259,
+        "max_ms": 19012.741,
         "n_queries": 323
       }
     }
   },
   "dataset": "nfcorpus",
-  "generated_at": "2026-07-22T13:53:59+00:00",
+  "generated_at": "2026-07-22T15:26:26+00:00",
   "platform": "Darwin arm64 py3.13.2"
 }

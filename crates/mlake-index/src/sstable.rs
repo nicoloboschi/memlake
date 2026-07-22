@@ -883,6 +883,7 @@ mod tests {
             id: MemoryId::from_key("m1"),
             vector: vec![0.1, 0.2, 0.3],
             text: "the platypus lays eggs".into(),
+            index_text: String::new(),
             memory_type: 2,
             tags: vec!["bio".into(), "zoo".into()],
             timestamps: Timestamps { occurred_start: Some(5000), ..Default::default() },

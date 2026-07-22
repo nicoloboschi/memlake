@@ -105,6 +105,7 @@ fn main() -> Result<()> {
             id: item_id,
             vector: corpus_vecs.row(i).to_vec(),
             text,
+            index_text: String::new(),
             memory_type: 1,
             tags: vec![],
             timestamps: Timestamps::default(),

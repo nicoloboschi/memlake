@@ -201,6 +201,7 @@ mod tests {
             id: MemoryId::from_key(key),
             vector: vec![0.1, 0.2],
             text: key.to_string(),
+            index_text: String::new(),
             memory_type: 1,
             tags: vec![],
             timestamps: Timestamps::default(),

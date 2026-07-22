@@ -201,7 +201,23 @@ RT4  parallel ranged GETs: radj.data blocks | linked-candidate items (via pk.idx
 - WAL tail (entries past `wal_index_cursor`): exhaustive scan — brute-force cosine for vector arm, linear text match for FTS arm, direct entity/causal membership for graph arm; fold patches; apply tombstones. Reads are strongly consistent: RT1 includes the WAL head check.
 
 ### 6.2 Cache
-- Unified NVMe cache: content-addressed by `(namespace, path, etag)`, mmap on hit, LRU by bytes with per-namespace accounting. Admission = write-through on first fetch.
+- Unified NVMe cache: content-addressed by `(namespace, path, etag)`. Two tiers with
+  **independent** byte budgets — a bounded in-RAM tier and the NVMe tier, which survives a
+  restart — each a **FIFO ring**: entries are ordered by admission and a read never reorders
+  them, so a hit takes a shared lock or none, and eviction is a pointer bump rather than a
+  scan. Not LRU: the per-hit `last_used` bump made every cache *read* take the write lock.
+  The measured cost on skewed access is small (see `TODOS.md` §"Read path"). A memory
+  eviction *demotes* to disk; only a disk eviction unlinks the blob. Memory and disk tiers
+  therefore overlap rather than partition.
+- Disk-tier hits are served by **mmap**, so a warm hit costs no copy of the blob. That is
+  one copy removed, not zero-copy end to end: consumers still deserialize via `rkyv_read`.
+  Blobs are published by rename and evicted by unlink, so a mapping stays valid for as long
+  as the reader holds it even if the entry is evicted mid-query.
+- Admission is **read-through**: a miss fetches once and admits. A write does *not* admit by
+  default — a fold writes a whole generation, most of which no imminent query probes, and on
+  a ring that would lap the cache. `Store::put_admitting` is the opt-in for a writer that
+  already holds bytes a query is certain to want (the inline-fold path); which call sites
+  use it is gated on the hit-ratio numbers.
 - In-mem ARC layer for hotcache footers, centroids, pk/radj idx (small, hot).
 - Routing: LB uses rendezvous hashing on namespace as a *preference only*; MUST degrade to any node.
 

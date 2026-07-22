@@ -51,12 +51,37 @@ pub fn sq_dist_pub(a: &[f32], b: &[f32]) -> f32 {
 }
 
 fn sq_dist(a: &[f32], b: &[f32]) -> f32 {
-    let mut acc = 0.0f32;
-    for i in 0..a.len().min(b.len()) {
-        let d = a[i] - b[i];
-        acc += d * d;
+    // Squared Euclidean distance — the innermost, hottest primitive of both training and
+    // assignment. A single running accumulator forces a serial f32 add chain: the compiler may
+    // NOT vectorize it, because reassociating f32 sums would change the result, and reproducible
+    // output is a correctness requirement (G-6/INV-6). So sum into a FIXED number of independent
+    // lanes and combine them in a FIXED order: the lane loop autovectorizes (NEON/AVX), yet the
+    // arithmetic order is still fully determined by the code, so every node computes identical
+    // bits. ~4-8× the throughput of the scalar chain.
+    const LANES: usize = 8;
+    let n = a.len().min(b.len());
+    let a = &a[..n];
+    let b = &b[..n];
+    let mut acc = [0.0f32; LANES];
+    // `chunks_exact` hands out fixed-length `[f32; LANES]`-shaped slices, so indexing `ca[l]` for
+    // `l < LANES` needs no bounds check — the lane loop lowers to a single SIMD multiply-add.
+    let mut ca = a.chunks_exact(LANES);
+    let mut cb = b.chunks_exact(LANES);
+    for (xa, xb) in ca.by_ref().zip(cb.by_ref()) {
+        for l in 0..LANES {
+            let d = xa[l] - xb[l];
+            acc[l] += d * d;
+        }
     }
-    acc
+    let mut total = 0.0f32;
+    for l in 0..LANES {
+        total += acc[l];
+    }
+    for (x, y) in ca.remainder().iter().zip(cb.remainder()) {
+        let d = x - y;
+        total += d * d;
+    }
+    total
 }
 
 /// Index of the nearest centroid, ties broken toward the lower index for determinism.

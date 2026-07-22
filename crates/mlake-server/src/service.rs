@@ -294,13 +294,23 @@ impl Memlake for MemlakeService {
         let metrics = QueryMetrics::new();
         let vref = vector.as_deref();
         let tref = text.as_deref();
+        let updated = mlake_index::UpdatedWindow { from: req.updated_from, to: req.updated_to };
         let per_type = futures::future::try_join_all(types.into_iter().map(|mt| {
             let metrics = &metrics;
             let tags = &tags;
             async move {
-                node.query_raw_metered(mt, vref, tref, tags, depths, temporal_window, metrics)
-                    .await
-                    .map(|hits| (mt, hits))
+                node.query_raw_metered(
+                    mt,
+                    vref,
+                    tref,
+                    tags,
+                    depths,
+                    temporal_window,
+                    updated,
+                    metrics,
+                )
+                .await
+                .map(|hits| (mt, hits))
             }
         }))
         .await
@@ -310,6 +320,25 @@ impl Memlake for MemlakeService {
         let mut hits = Vec::new();
         for (mt, raw) in per_type {
             hits.extend(raw.into_iter().map(|h| convert::raw_hit(mt, h)));
+        }
+
+        // The dense arm has already applied the window (it rides in the vector block's
+        // `updated` column, so a non-matching member never takes a top-k slot), but the FTS
+        // and graph arms have not — neither index carries a write time — and a block written
+        // before the column existed admits everyone. So the window is re-applied here as the
+        // authority. For a dense query this now trims nothing; for a text- or graph-only one
+        // it is still a post-filter, and can trim a page below `top_k`.
+        if req.updated_from.is_some() || req.updated_to.is_some() {
+            hits.retain(|h| {
+                let Some(ts) = h.memory.as_ref().and_then(|m| m.timestamps.as_ref()) else {
+                    return false;
+                };
+                let Some(updated) = ts.updated_at else {
+                    return false;
+                };
+                req.updated_from.is_none_or(|from| updated > from)
+                    && req.updated_to.is_none_or(|to| updated < to)
+            });
         }
 
         Ok(Response::new(pb::QueryResponse {
@@ -469,6 +498,8 @@ impl Memlake for MemlakeService {
             metadata_equals: req.metadata_equals.into_iter().collect(),
             tags: tag_filter.tags.clone(),
             tags_mode: tag_filter.mode as u8,
+            updated_from: req.updated_from,
+            updated_to: req.updated_to,
         };
         let mut skip = req.skip as usize;
 

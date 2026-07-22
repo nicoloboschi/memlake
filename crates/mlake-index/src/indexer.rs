@@ -47,7 +47,7 @@ impl Default for IndexOptions {
             derive_links: true,
             seed: 42,
             force_retrain: false,
-            vector_codec: VectorCodec::Int8,
+            vector_codec: VectorCodec::Binary,
         }
     }
 }
@@ -243,7 +243,16 @@ async fn derive_corpus_links(
         }
         let self_id = item.id;
         let raw = node
-            .query_raw_metered(item.memory_type, Some(&item.vector), None, &tags, depths, None, metrics)
+            .query_raw_metered(
+                item.memory_type,
+                Some(&item.vector),
+                None,
+                &tags,
+                depths,
+                None,
+                Default::default(),
+                metrics,
+            )
             .await?;
         let mut neigh: Vec<(MemoryId, f32)> = raw
             .into_iter()
@@ -492,6 +501,16 @@ async fn build_memory_type_index(
         clusters[c].push(item.clone());
     }
 
+    // Cluster radii for adaptive probing — recomputed from *this* generation's membership on
+    // every fold, not carried forward. An assign-only fold reuses the previous centroids
+    // without retraining and then adds members to them, so a copied-forward radius is too
+    // small, and a radius that is too small retires a cluster that could have held a winner.
+    // Cheap: one pass over the vectors already in hand, after the local split has settled
+    // which centroid each item belongs to.
+    if !centroids.is_empty() {
+        centroids.recompute_radii(|i| clusters[i].iter().map(|m| m.vector.as_slice()));
+    }
+
     // Per-fact-type prefix so different types never collide on object keys.
     let prefix = format!("{}/mt{memory_type}", mlake_core::manifest::segment_prefix(&ns.name, seg_id));
 
@@ -534,14 +553,20 @@ async fn build_memory_type_index(
                 m.vector = Vec::new();
             }
             let cf = ClusterFile { centroid_id: i as u32, items };
-            // Tags travel with the codes so the probe can filter without the payload half.
+            // Tags and write times travel with the codes so the probe can filter without the
+            // payload half.
             let member_tags: Vec<Vec<String>> = clusters[i].iter().map(|m| m.tags.clone()).collect();
-            let block = VectorBlock::encode_with_tags(
+            let member_updated: Vec<i64> = clusters[i]
+                .iter()
+                .map(|m| m.timestamps.updated_at.unwrap_or(mlake_ivf::UPDATED_UNKNOWN))
+                .collect();
+            let block = VectorBlock::encode_with_columns(
                 opts.vector_codec,
                 vector_dim,
                 &ids,
                 &vectors,
-                &member_tags,
+                Some(&member_tags),
+                &member_updated,
             )?;
             let block_bytes = block.to_bytes();
             let store = ns.store.clone();
@@ -582,7 +607,7 @@ async fn build_memory_type_index(
 
     let tfts = std::time::Instant::now();
     let fts = mlake_fts::TantivyFts::build_with_tags(
-        items.iter().map(|i| (i.id, i.text.as_str(), i.tags.as_slice())),
+        items.iter().map(|i| (i.id, i.fts_text(), i.tags.as_slice())),
         mlake_fts::Tokenizer::new(mlake_fts::TokenizerConfig::default()),
     )
     .map_err(|e| crate::Error::Core(mlake_core::Error::Encode(e.to_string())))?;
@@ -638,8 +663,9 @@ async fn build_memory_type_index(
     // whose error bound leaves them possibly in the true top-k.
     let rerank_tables = crate::sstable::RerankTable::build(&items);
 
-    // Per-cluster tag summaries: the union of each cluster's tags + an untagged flag, so a
-    // query can prune clusters that cannot contain a matching memory (SCALE.md Phase 4b).
+    // Per-cluster summaries: the union of each cluster's tags + an untagged flag + the span of
+    // its write times, so a query can prune clusters that cannot contain a matching memory
+    // (SCALE.md Phase 4b).
     let tag_summary: crate::generation::TagSummary = clusters
         .iter()
         .map(|cluster| {
@@ -655,6 +681,9 @@ async fn build_memory_type_index(
             crate::generation::ClusterTagSummary {
                 tags: tags.into_iter().collect(),
                 has_untagged,
+                updated_range: crate::generation::ClusterTagSummary::range_of(
+                    cluster.iter().map(|m| &m.timestamps.updated_at),
+                ),
             }
         })
         .collect();
@@ -756,60 +785,202 @@ fn local_split(
     split
 }
 
+/// Quantize a vector to int8 codes of its *unit* direction: `round(v[i]/‖v‖ · 127)`, clamped to
+/// [-127, 127]. Then `idot(qa, qb) / 127²` approximates `cosine(a, b)`. A zero-norm (absent)
+/// vector yields all-zero codes, whose int8 dot is 0 — matching cosine's absent-embedding score.
+fn quantize_unit(v: &[f32], norm: f32) -> Vec<i8> {
+    if norm <= 0.0 {
+        return vec![0i8; v.len()];
+    }
+    let inv = 127.0 / norm;
+    v.iter().map(|&x| (x * inv).round().clamp(-127.0, 127.0) as i8).collect()
+}
+
+/// Integer dot product of two int8 code vectors, accumulated in i32. The widening multiply
+/// autovectorizes to SDOT (aarch64) / VPMADD (x86), doing several lanes per instruction.
+fn idot(a: &[i8], b: &[i8]) -> i32 {
+    a.iter().zip(b).map(|(&x, &y)| x as i32 * y as i32).sum()
+}
+
 /// Incremental link derivation via the IVF (SCALE.md Phase 3): each new item probes the
 /// centroids and scans only the probed clusters for its top-5 neighbours, so the cost is
-/// `O(new · nprobe · cluster_size)` instead of the `O(new · N)` full scan. Deterministic
-/// (ties by id) for G-6.
+/// `O(new · nprobe · cluster_size)` instead of the `O(new · N)` full scan. A two-stage scan keeps
+/// it cheap: an int8 pass ranks candidates (4× less RAM traffic), an exact f32 pass reranks the
+/// finalists. Deterministic (ties by id) for G-6.
 fn derive_links_ivf(
     items: &mut [StoredMemory],
     new_ids: &std::collections::HashSet<[u8; 16]>,
     centroids: &mlake_ivf::Centroids,
     assignments: &[usize],
 ) {
-    const DERIVE_NPROBE: usize = 16;
+    derive_links_ivf_tuned(items, new_ids, centroids, assignments, DERIVE_NPROBE, false);
+}
+
+/// Derive semantic links for the items of a SINGLE cluster, scanning every pair within it and
+/// setting each item's `semantic_out`. This is the streaming (external-memory) fold's link pass:
+/// it holds one cluster at a time, so links are *home-cluster only* — an item whose nearest
+/// neighbour sits just across a cluster boundary may miss it, the bounded-RAM tradeoff against the
+/// in-RAM fold's `nprobe`-cluster neighbourhood. Modelled as a one-centroid IVF (nprobe=1) so it
+/// reuses the same int8-ranked, f32-reranked, deterministic derivation as the in-RAM path.
+pub(crate) fn derive_links_in_cluster(items: &mut [StoredMemory], centroid: &[f32]) {
+    if items.len() < 2 {
+        for it in items.iter_mut() {
+            it.semantic_out.clear();
+        }
+        return;
+    }
+    let centroids = mlake_ivf::Centroids {
+        sizes: vec![items.len()],
+        radii: Vec::new(),
+        dim: centroid.len(),
+        vectors: vec![centroid.to_vec()],
+    };
+    let assignments = vec![0usize; items.len()];
+    let new_ids: std::collections::HashSet<[u8; 16]> = items.iter().map(|i| i.id.0).collect();
+    derive_links_ivf_tuned(items, &new_ids, &centroids, &assignments, 1, false);
+}
+
+/// Clusters probed per item during link derivation. Far below the query arm's probe count: an
+/// item's own nearest neighbours sit overwhelmingly in its home Voronoi cell and the few cells
+/// adjacent to it, so a small probe recovers essentially all of its top-5 links (measured link
+/// recall ≈ 1.0 at nprobe=4) while scanning a fraction of the candidates.
+const DERIVE_NPROBE: usize = 4;
+
+/// Candidates the cheap int8 scan forwards to the exact f32 rerank. Comfortably above
+/// MAX_SEMANTIC_OUT so the true top-5 survive int8 quantization noise.
+const DERIVE_RERANK_K: usize = 32;
+
+/// The tunable core of [`derive_links_ivf`]. `exact=true` scans every probed candidate in f32
+/// (the reference); `exact=false` runs the two-stage int8→f32 scan (production). `nprobe` and the
+/// `exact` flag are parameters only so the microbenchmark can sweep speed vs. link recall — the
+/// fold always calls the wrapper with the tuned constants.
+fn derive_links_ivf_tuned(
+    items: &mut [StoredMemory],
+    new_ids: &std::collections::HashSet<[u8; 16]>,
+    centroids: &mlake_ivf::Centroids,
+    assignments: &[usize],
+    nprobe: usize,
+    exact: bool,
+) {
     // cluster -> member item indices.
     let mut members: Vec<Vec<usize>> = vec![Vec::new(); centroids.len().max(1)];
     for (j, &c) in assignments.iter().enumerate() {
         members[c].push(j);
     }
     // Snapshot vectors/ids so we can read while mutating semantic_out.
+    use rayon::prelude::*;
     let vectors: Vec<Vec<f32>> = items.iter().map(|i| i.vector.clone()).collect();
     let ids: Vec<MemoryId> = items.iter().map(|i| i.id).collect();
+    // Precompute each vector's L2 norm ONCE (a naive cosine recomputes both operands' norms on
+    // every comparison), and — for the two-stage scan — an int8 quantization of each *unit* vector.
+    // The scan is memory-bandwidth-bound (it streams the candidate vectors ~nprobe times over), so
+    // ranking on 1-byte int8 codes instead of 4-byte f32 cuts RAM traffic ~4× and lets NEON/AVX
+    // widen the dot (SDOT) — the difference between saturating ~4 cores and all of them. int8 only
+    // *ranks*; the final top-5 are reranked exactly in f32, so quantization never reaches the
+    // stored weights.
+    let norms: Vec<f32> = vectors.par_iter().map(|v| mlake_core::norm(v)).collect();
+    let codes: Vec<Vec<i8>> = if exact {
+        Vec::new()
+    } else {
+        vectors.par_iter().zip(norms.par_iter()).map(|(v, &n)| quantize_unit(v, n)).collect()
+    };
 
-    // Each new item's neighbour derivation is independent (reads the shared vectors/ids
-    // snapshots, writes only its own semantic_out), so derive them across all cores. This
-    // is the dominant cost of a first-time index build (16 probes × cluster members ×
-    // cosine, per new item), so parallelizing it is what keeps large ingests tractable.
-    use rayon::prelude::*;
-    let derived: Vec<(usize, Vec<SemanticEdge>)> = (0..items.len())
-        .into_par_iter()
-        .filter(|&j| new_ids.contains(&items[j].id.0))
-        .map(|j| {
-            let probed = centroids.probe(&vectors[j], DERIVE_NPROBE);
-            let mut scored: BTreeMap<[u8; 16], f32> = BTreeMap::new();
-            for c in probed {
+    // Best-first ranking of two f32 candidates: higher similarity wins, ties by id (ascending) so
+    // derivation is deterministic (G-6). ids are unique, so this is a total order.
+    let cmp = |a: &([u8; 16], f32), b: &([u8; 16], f32)| {
+        b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal).then(a.0.cmp(&b.0))
+    };
+    // Insert one exact-scored candidate into the running top-MAX_SEMANTIC_OUT (bounded, replace the
+    // worst). Never grows past k=5, so a hub item near thousands of neighbours costs O(cand·k), not
+    // an O(cand·log cand) sort of an unbounded buffer.
+    let push_top = |top: &mut Vec<([u8; 16], f32)>, entry: ([u8; 16], f32)| {
+        if entry.1 < SEMANTIC_LINK_THRESHOLD {
+            return;
+        }
+        if top.len() < MAX_SEMANTIC_OUT {
+            top.push(entry);
+        } else {
+            let (wi, worst) = top.iter().enumerate().max_by(|(_, a), (_, b)| cmp(a, b)).unwrap();
+            if cmp(&entry, worst) == std::cmp::Ordering::Less {
+                top[wi] = entry;
+            }
+        }
+    };
+    let exact_sim = |j: usize, m: usize| mlake_core::dot(&vectors[j], &vectors[m]) / (norms[j] * norms[m]);
+
+    let derive_one = |j: usize| -> (usize, Vec<SemanticEdge>) {
+        let nj = norms[j];
+        if nj <= 0.0 {
+            return (j, Vec::new());
+        }
+        let probed = centroids.probe(&vectors[j], nprobe);
+        // No dedup needed: an item is assigned to exactly one cluster, so probed member lists are
+        // disjoint — each candidate is seen at most once.
+        let mut top: Vec<([u8; 16], f32)> = Vec::with_capacity(MAX_SEMANTIC_OUT);
+        if exact {
+            // Single-stage: score every probed candidate in exact f32.
+            for &c in &probed {
                 for &m in &members[c] {
-                    if m == j {
-                        continue;
-                    }
-                    let sim = mlake_core::cosine_opt(&vectors[j], &vectors[m]);
-                    if sim >= SEMANTIC_LINK_THRESHOLD {
-                        scored.insert(ids[m].0, sim);
+                    if m != j && norms[m] > 0.0 {
+                        push_top(&mut top, (ids[m].0, exact_sim(j, m)));
                     }
                 }
             }
-            let mut neighbours: Vec<([u8; 16], f32)> = scored.into_iter().collect();
-            neighbours.sort_by(|a, b| {
-                b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal).then(a.0.cmp(&b.0))
-            });
-            neighbours.truncate(MAX_SEMANTIC_OUT);
-            let edges = neighbours
-                .into_iter()
-                .map(|(id, sim)| SemanticEdge { target: MemoryId(id), weight: Weight::from_f32(sim) })
-                .collect();
-            (j, edges)
-        })
-        .collect();
+        } else {
+            // Stage 1 — cheap int8 scan; keep the DERIVE_RERANK_K highest int8 dots (ties by id
+            // ascending, so the survivor set is deterministic). Bounded replace-worst.
+            let qj = &codes[j];
+            let mut cand: Vec<(usize, i32)> = Vec::with_capacity(DERIVE_RERANK_K);
+            for &c in &probed {
+                for &m in &members[c] {
+                    if m == j || norms[m] == 0.0 {
+                        continue;
+                    }
+                    let s = idot(qj, &codes[m]);
+                    if cand.len() < DERIVE_RERANK_K {
+                        cand.push((m, s));
+                    } else {
+                        // Worst = lowest score, ties toward the larger id (dropped first).
+                        let (wi, &(wm, ws)) = cand
+                            .iter()
+                            .enumerate()
+                            .min_by(|(_, a), (_, b)| a.1.cmp(&b.1).then(ids[b.0].0.cmp(&ids[a.0].0)))
+                            .unwrap();
+                        if s > ws || (s == ws && ids[m].0 < ids[wm].0) {
+                            cand[wi] = (m, s);
+                        }
+                    }
+                }
+            }
+            // Stage 2 — exact f32 rerank of the survivors.
+            for &(m, _) in &cand {
+                push_top(&mut top, (ids[m].0, exact_sim(j, m)));
+            }
+        }
+        top.sort_by(cmp);
+        let edges = top
+            .into_iter()
+            .map(|(id, sim)| SemanticEdge { target: MemoryId(id), weight: Weight::from_f32(sim) })
+            .collect();
+        (j, edges)
+    };
+
+    // Derive in home-cluster order, but let rayon split the work by ITEM COUNT, not by cluster.
+    // A flat "one task per cluster" starves parallelism when a few clusters are huge (dense
+    // embedding regions, or post-split maxima): those become single-core stragglers while the
+    // rest idle. Instead, flatten the new items into one list ordered by home cluster and hand
+    // rayon that list — it carves equal-size contiguous ranges, so every worker gets a balanced
+    // slice AND, because the slice is contiguous in cluster order, the candidate vectors its items
+    // share stay hot in that core's cache. Best of both: balanced load and locality.
+    let mut order: Vec<usize> = Vec::with_capacity(items.len());
+    for cluster_members in &members {
+        for &j in cluster_members {
+            if new_ids.contains(&items[j].id.0) {
+                order.push(j);
+            }
+        }
+    }
+    let derived: Vec<(usize, Vec<SemanticEdge>)> = order.par_iter().map(|&j| derive_one(j)).collect();
     for (j, edges) in derived {
         items[j].semantic_out = edges;
     }
@@ -861,4 +1032,56 @@ fn derive_semantic_links(items: &mut [StoredMemory], new_ids: &std::collections:
     for (i, edges) in derived {
         items[i].semantic_out = edges;
     }
+}
+
+/// Benchmark prep: build the IVF centroids + assignments a fold would, but with `fast` skipping
+/// the k-means refinement iterations (centroids = a deterministic vector sample) so a large-scale
+/// derivation can be timed without waiting on training — the derive scan's cost barely depends on
+/// centroid quality. Returns everything [`bench_derive_links`] needs.
+#[doc(hidden)]
+pub fn bench_prepare(
+    items: &[StoredMemory],
+    seed: u64,
+    fast: bool,
+) -> (mlake_ivf::Centroids, Vec<usize>) {
+    use rayon::prelude::*;
+    let vectors: Vec<Vec<f32>> = items.iter().map(|i| i.vector.clone()).collect();
+    let mut centroids = if fast {
+        // sqrt(n) evenly-strided sample as centroids — no refinement iterations.
+        let k = ((items.len() as f64).sqrt().round() as usize).max(1);
+        let stride = (items.len() / k).max(1);
+        let sample: Vec<Vec<f32>> = (0..k).map(|i| vectors[(i * stride) % items.len()].clone()).collect();
+        let dim = sample.first().map(|v| v.len()).unwrap_or(0);
+        mlake_ivf::Centroids { sizes: vec![0; sample.len()], radii: Vec::new(), dim, vectors: sample }
+    } else {
+        train_centroids(&vectors, seed)
+    };
+    let mut assignments: Vec<usize> = if centroids.is_empty() {
+        vec![0; items.len()]
+    } else {
+        items.par_iter().map(|i| centroids.assign(&i.vector)).collect()
+    };
+    let _ = local_split(&mut centroids, items, &mut assignments, seed);
+    (centroids, assignments)
+}
+
+/// Benchmark hook: time ONLY the semantic-link derivation over `items` for a given `nprobe` and
+/// `exact` mode, returning `(derive_elapsed, total_links_emitted)`. Prep is done separately via
+/// [`bench_prepare`] so the same centroids can be reused to compare modes fairly.
+#[doc(hidden)]
+pub fn bench_derive_links(
+    items: &mut [StoredMemory],
+    centroids: &mlake_ivf::Centroids,
+    assignments: &[usize],
+    nprobe: usize,
+    exact: bool,
+) -> (std::time::Duration, usize) {
+    let new_ids: std::collections::HashSet<[u8; 16]> = items.iter().map(|i| i.id.0).collect();
+    let t = std::time::Instant::now();
+    if !centroids.is_empty() {
+        derive_links_ivf_tuned(items, &new_ids, centroids, assignments, nprobe, exact);
+    }
+    let elapsed = t.elapsed();
+    let total: usize = items.iter().map(|i| i.semantic_out.len()).sum();
+    (elapsed, total)
 }

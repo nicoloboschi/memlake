@@ -114,6 +114,10 @@ message Timestamps {
   optional int64 occurred_start = 2;
   optional int64 occurred_end = 3;
   optional int64 mentioned_at = 4;
+  // When the memory was last written, as opposed to when the thing it describes happened.
+  // The other four are content time; this is write time, and it is what "changed since X"
+  // ranges over (see `updated_from` / `updated_to` on Query and Scan).
+  optional int64 updated_at = 5;
 }
 
 enum LinkType {
@@ -147,6 +151,10 @@ message Memory {
   Vector vector = 3;
   string text = 4;
   uint32 memory_type = 5;   // fits u8; values > 255 are rejected
+  // Text to index for full-text search when it should differ from `text`. Empty means
+  // "index `text`". Lets a client enrich what BM25 matches on — entity names, spelled-out
+  // dates — without changing the text returned on a hit. Never returned; `text` is.
+  string index_text = 12;
   repeated string tags = 6;
   uint32 proof_count = 7;
   repeated bytes entity_ids = 8;    // 16-byte EntityIds (UUIDs)
@@ -173,7 +181,15 @@ message Patch {
   optional string text = 3;           // set text
   Vector vector = 4;                  // set the embedding (present => set)
   TagList tags = 5;                   // replace tags (present => set, empty list clears)
-  Timestamps timestamps = 6;          // set timestamps (present => set)
+  // Set the timestamps that are present, leaving the rest of the memory's alone. Field
+  // presence is what decides: `Timestamps` fields are `optional`, so "not mentioned" and
+  // "set to 0" are distinct on the wire.
+  Timestamps timestamps = 6;
+  // Replace the whole `Timestamps` instead of merging into it, so a field absent above is
+  // *cleared*. The only way to null a timestamp, and off by default because the merge is
+  // what a partial update means — the replace silently discards the times a caller never
+  // mentioned, which is data loss dressed as a no-op.
+  bool replace_timestamps = 8;
   map<string, string> metadata = 7;   // upsert these metadata keys (merge, not replace)
 }
 
@@ -258,6 +274,11 @@ message QueryRequest {
   // points are similarity-ranked). Omit either to skip the arm.
   optional int64 temporal_from = 11;
   optional int64 temporal_to = 12;
+  // Restrict to memories whose `timestamps.updated_at` falls strictly inside this window
+  // (epoch ms). Applied as a filter over candidates, not an index lookup. A memory with no
+  // `updated_at` is excluded from a bounded window.
+  optional int64 updated_from = 13;
+  optional int64 updated_to = 14;
 }
 
 // One arm's raw contribution to a hit. `present` says whether the arm surfaced this id;
@@ -469,6 +490,9 @@ message ScanRequest {
   // offset without paging to it, at the cost of the server doing the same walk — O(skip),
   // just without the round trips. Prefer `page_token` when you have one.
   uint64 skip = 9;
+  // Same `updated_at` window as Query, AND-ed with the tag and metadata conditions.
+  optional int64 updated_from = 11;
+  optional int64 updated_to = 12;
 }
 
 message ScanResponse {

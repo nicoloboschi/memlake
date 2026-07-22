@@ -96,7 +96,10 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn never_admits_more_than_permits_concurrently() {
         const PERMITS: usize = 3;
-        const TASKS: usize = 20;
+        /// A whole number of cohorts. The barrier below is `PERMITS` wide and only releases
+        /// when that many holders reach it, so a remainder cohort waits for a task that can
+        /// never arrive — at 20 the last two hang forever and the suite never finishes.
+        const TASKS: usize = 21;
         let limiter = Arc::new(QueryLimiter::new(PERMITS));
         // A barrier the size of the permit count: each cohort of `PERMITS` holders must all reach
         // the barrier before any releases, forcing genuine concurrency up to the cap (and proving

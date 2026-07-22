@@ -20,6 +20,7 @@ fn item(key: &str, vector: Vec<f32>, text: &str) -> Memory {
         id: MemoryId::from_key(key),
         vector,
         text: text.to_string(),
+        index_text: String::new(),
         memory_type: 1,
         tags: vec![],
         timestamps: Timestamps::default(),
@@ -704,7 +705,7 @@ async fn query_fetches_only_probed_clusters_and_warms_the_cache() {
     // Cold query: fetches only the probed clusters (≤ nprobe requests), far fewer than the
     // total, and stays within the roundtrip budget.
     let cold = QueryMetrics::new();
-    let hits = node.query_raw_metered(1, Some(&q), None, &tf(), depths, None, &cold).await.unwrap();
+    let hits = node.query_raw_metered(1, Some(&q), None, &tf(), depths, None, Default::default(), &cold).await.unwrap();
     assert!(!hits.is_empty());
     // A cluster is now a *pair* of objects — `cluster-{i}.bin` (payload) and
     // `cluster-{i}.vec` (embeddings) — so probing `nprobe` clusters costs `2 * nprobe`
@@ -724,7 +725,7 @@ async fn query_fetches_only_probed_clusters_and_warms_the_cache() {
 
     // Warm query: same probed clusters, now served from the NVMe cache.
     let warm = QueryMetrics::new();
-    node.query_raw_metered(1, Some(&q), None, &tf(), depths, None, &warm).await.unwrap();
+    node.query_raw_metered(1, Some(&q), None, &tf(), depths, None, Default::default(), &warm).await.unwrap();
     assert!(warm.cache_hits() > 0, "warm query should hit the cache");
     assert_eq!(warm.cache_misses(), 0, "warm query should not miss");
 }
@@ -1176,6 +1177,8 @@ async fn get_and_scan_hide_predicate_deleted_memories() {
         metadata_equals: vec![("document_id".into(), "d1".into())],
         tags: vec![],
         tags_mode: 0,
+        updated_from: None,
+        updated_to: None,
     };
     writer.commit(vec![Op::TombstoneWhere { predicate: doc1_predicate }]).await.unwrap();
 
@@ -1513,6 +1516,7 @@ fn rich_item(i: usize) -> Memory {
         id: MemoryId::from_key(&format!("m{i}")),
         vector: v,
         text: format!("memory number {i} family {fam} lorem ipsum"),
+        index_text: String::new(),
         memory_type: if i % 3 == 0 { 2 } else { 1 },
         tags: if i % 4 == 0 { vec![] } else { vec![format!("tag-{}", i % 5)] },
         timestamps: Timestamps { occurred_start: Some(1_000 + i as i64), ..Timestamps::default() },
@@ -1551,6 +1555,8 @@ async fn streaming_fold_matches_in_ram_fold() {
                     metadata_equals: vec![("doc".into(), "d3".into())],
                     tags: vec![],
                     tags_mode: TagsMatch::Any as u8,
+                    updated_from: None,
+                    updated_to: None,
                 },
             },
         ])
@@ -1659,6 +1665,8 @@ async fn streaming_fold_bounded_budget_matches_in_ram() {
                     metadata_equals: vec![("doc".into(), "d3".into())],
                     tags: vec![],
                     tags_mode: TagsMatch::Any as u8,
+                    updated_from: None,
+                    updated_to: None,
                 },
             },
         ])
@@ -1787,6 +1795,81 @@ async fn flush_appends_l0_and_matches_full_rebuild() {
     let ids_a: Vec<_> = ha.iter().map(|h| h.id).collect();
     let ids_b: Vec<_> = hb.iter().map(|h| h.id).collect();
     assert_eq!(ids_a, ids_b, "vector rankings match across flush vs full rebuild");
+}
+
+/// Two similar items ingested in the SAME slice link to EACH OTHER, bidirectionally — the
+/// within-batch case that matters for concurrent ingest: when many memories land together, links
+/// must connect them, not just connect them to the older corpus. Mirrors Hindsight's bidirectional
+/// within-batch semantic links.
+#[tokio::test]
+async fn flush_links_within_a_slice_are_bidirectional() {
+    use mlake_index::fold;
+    use mlake_index::streaming::FoldBudget;
+    let opts = IndexOptions::default(); // derive_links = true
+    let budget = FoldBudget::default();
+    let hi = usize::MAX;
+
+    let ns = namespace(Store::in_memory(), "ns").await;
+    let mut w = Writer::new(ns.clone());
+    // First build: only families 2..=8, memory_type 1 — deliberately NO family-1 items, so any
+    // family-1 link a later item forms can ONLY have come from within its own slice.
+    let base: Vec<Op> = [2usize, 4, 5, 7, 8, 12, 14, 15, 17, 18]
+        .into_iter()
+        .map(|i| Op::Upsert(rich_item(i)))
+        .collect();
+    w.commit(base).await.unwrap();
+    fold(&ns, &Tokenizer::default(), opts, budget, hi).await.unwrap();
+
+    // Flush a slice containing two fresh family-1 (identical-vector), memory_type-1 items together.
+    let mut a = rich_item(1);
+    a.id = MemoryId::from_key("wa");
+    let mut b = rich_item(1);
+    b.id = MemoryId::from_key("wb");
+    w.commit(vec![Op::Upsert(a), Op::Upsert(b)]).await.unwrap();
+    fold(&ns, &Tokenizer::default(), opts, budget, hi).await.unwrap();
+
+    let node = QueryNode::open(&ns, Tokenizer::default()).await.unwrap();
+    let got = node
+        .get_many(&[MemoryId::from_key("wa"), MemoryId::from_key("wb")], true)
+        .await
+        .unwrap();
+    let a_targets: std::collections::BTreeSet<MemoryId> =
+        got.iter().find(|m| m.id == MemoryId::from_key("wa")).unwrap().semantic_out.iter().map(|e| e.target).collect();
+    let b_targets: std::collections::BTreeSet<MemoryId> =
+        got.iter().find(|m| m.id == MemoryId::from_key("wb")).unwrap().semantic_out.iter().map(|e| e.target).collect();
+    assert!(a_targets.contains(&MemoryId::from_key("wb")), "wa links to its slice-mate wb, got {a_targets:?}");
+    assert!(b_targets.contains(&MemoryId::from_key("wa")), "wb links to its slice-mate wa, got {b_targets:?}");
+}
+
+/// The streaming (external-memory) fold — the >4M-doc path — must NOT drop semantic links: it
+/// derives them home-cluster-at-a-time so identical-vector items in the same cluster link, and
+/// the reverse edges reach radj. Forced here at tiny scale via streaming_threshold_docs = 0.
+#[tokio::test]
+async fn streaming_fold_derives_home_cluster_links() {
+    use mlake_index::fold;
+    use mlake_index::streaming::FoldBudget;
+    let opts = IndexOptions::default(); // derive_links = true
+    let budget = FoldBudget::default();
+
+    let ns = namespace(Store::in_memory(), "ns").await;
+    let mut w = Writer::new(ns.clone());
+    // Four family-1 (identical-vector) memory_type-1 items — m1, m31, m61, m91 — plus other
+    // families, so a family-1 cluster forms and its members should link to one another.
+    let ids = [1usize, 31, 61, 91, 2, 4, 5, 7];
+    w.commit(ids.iter().map(|&i| Op::Upsert(rich_item(i))).collect()).await.unwrap();
+    // threshold_docs = 0 forces the streaming fold even at this tiny scale.
+    fold(&ns, &Tokenizer::default(), opts, budget, 0).await.unwrap();
+
+    let node = QueryNode::open(&ns, Tokenizer::default()).await.unwrap();
+    let got = node.get_many(&[MemoryId::from_key("m1")], true).await.unwrap();
+    assert_eq!(got.len(), 1, "m1 survives the streaming build");
+    let targets: std::collections::BTreeSet<MemoryId> =
+        got[0].semantic_out.iter().map(|e| e.target).collect();
+    let fam1 = [MemoryId::from_key("m31"), MemoryId::from_key("m61"), MemoryId::from_key("m91")];
+    assert!(
+        fam1.iter().any(|id| targets.contains(id)),
+        "streaming fold derived home-cluster links (not dropped), got {targets:?}"
+    );
 }
 
 /// A flush derives semantic links against the WHOLE corpus, not just its own slice: a new item
@@ -1953,7 +2036,7 @@ async fn a_tag_filtered_query_filters_before_reading_any_payload() {
 
     let metrics = QueryMetrics::new();
     let hits = node
-        .query_raw_metered(1, Some(&q), None, &filter, depths, None, &metrics)
+        .query_raw_metered(1, Some(&q), None, &filter, depths, None, Default::default(), &metrics)
         .await
         .unwrap();
 
@@ -1993,7 +2076,7 @@ async fn graph_seeds_are_covered_by_the_hydrated_winners() {
     let q = vec![0.3f32, 0.9, 0.1];
     let metrics = QueryMetrics::new();
     let hits = node
-        .query_raw_metered(1, Some(&q), None, &tf(), depths, None, &metrics)
+        .query_raw_metered(1, Some(&q), None, &tf(), depths, None, Default::default(), &metrics)
         .await
         .unwrap();
 
@@ -2008,4 +2091,214 @@ async fn graph_seeds_are_covered_by_the_hydrated_winners() {
         );
     }
     assert!(metrics.within_budget());
+}
+
+/// The `updated_at` window is a real push-down in the dense arm, not a post-filter.
+///
+/// The distinction only shows when the window is selective and the matching memories rank
+/// *below* the arm's depth: the arm truncates to `depths.vector` before anything is
+/// materialized, so filtering afterwards can only remove rows from a page that already holds
+/// none of them. This lays out the corpus so that is exactly the case — the nearest 30
+/// memories are all outside the window and the only 5 inside it sit at ranks 31-35 — and
+/// asserts the arm reaches them at a depth of 10.
+///
+/// This is the shape the one real caller has: a "what changed since my last refresh" query
+/// against a bank whose recent writes are a thin slice of the whole.
+#[tokio::test]
+async fn the_updated_window_reaches_past_the_arm_depth() {
+    use mlake_index::UpdatedWindow;
+
+    const N: usize = 60;
+    const IN_WINDOW: std::ops::Range<usize> = 30..35;
+
+    let backing = Arc::new(object_store::memory::InMemory::new());
+    let ns = namespace(Store::new(Arc::clone(&backing) as _), "ns").await;
+
+    // Vectors on an arc, so similarity to `q` falls monotonically with `i` and the ranking
+    // the arm produces is known ahead of time.
+    let mut writer = Writer::new(ns.clone());
+    let ops: Vec<Op> = (0..N)
+        .map(|i| {
+            let theta = i as f32 * 0.02;
+            let mut m = item(
+                &format!("m{i:02}"),
+                vec![theta.cos(), theta.sin(), 0.0],
+                &format!("memory {i}"),
+            );
+            // Everything is old except the slice the window selects.
+            m.timestamps.updated_at =
+                Some(if IN_WINDOW.contains(&i) { 5_000 } else { 1_000 });
+            Op::Upsert(m)
+        })
+        .collect();
+    writer.commit(ops).await.unwrap();
+    index(&ns, &Tokenizer::default(), IndexOptions::default()).await.unwrap();
+
+    let node = QueryNode::open(&Namespace::new("ns", Store::new(backing as _)), Tokenizer::default())
+        .await
+        .unwrap();
+    let q = [1.0f32, 0.0, 0.0];
+    let depths = ArmDepths { vector: 10, text: 0, graph: 0, nprobe: 64 };
+    let metrics = mlake_store::QueryMetrics::new();
+
+    // Unfiltered, the page is the nearest 10 — none of which the window admits. This is what
+    // a post-filter would have had to work with.
+    let unfiltered = node
+        .query_raw_metered(1, Some(&q), None, &tf(), depths, None, UpdatedWindow::default(), &metrics)
+        .await
+        .unwrap();
+    assert_eq!(unfiltered.len(), 10);
+    assert!(
+        unfiltered.iter().all(|h| !IN_WINDOW.contains(&key_index(h))),
+        "the fixture is wrong: an in-window memory ranked inside the top 10 on its own"
+    );
+
+    // Pushed down, the same depth reaches the matching slice instead.
+    let window = UpdatedWindow { from: Some(4_000), to: Some(6_000) };
+    let filtered = node
+        .query_raw_metered(1, Some(&q), None, &tf(), depths, None, window, &metrics)
+        .await
+        .unwrap();
+    let mut found: Vec<usize> = filtered.iter().map(key_index).collect();
+    found.sort();
+    assert_eq!(
+        found,
+        IN_WINDOW.collect::<Vec<_>>(),
+        "the arm must return every in-window memory and nothing else"
+    );
+
+    // A narrow probe must not starve the window either: the matching memories sit in clusters
+    // the plain nprobe-nearest probe would never reach, so the per-cluster write-time summary
+    // has to pull them into the probe set — the same treatment a selective tag filter gets.
+    let narrow = ArmDepths { nprobe: 1, ..depths };
+    let mut narrow_found: Vec<usize> = node
+        .query_raw_metered(1, Some(&q), None, &tf(), narrow, None, window, &metrics)
+        .await
+        .unwrap()
+        .iter()
+        .map(key_index)
+        .collect();
+    narrow_found.sort();
+    assert_eq!(
+        narrow_found,
+        IN_WINDOW.collect::<Vec<_>>(),
+        "cluster pruning must reach the in-window memories even at nprobe=1"
+    );
+
+    // And the window's edges are exclusive, exactly as `Predicate` defines them.
+    let touching = UpdatedWindow { from: Some(5_000), to: None };
+    assert!(
+        node.query_raw_metered(1, Some(&q), None, &tf(), depths, None, touching, &metrics)
+            .await
+            .unwrap()
+            .is_empty(),
+        "`from` is exclusive, so a memory written exactly at it must not match"
+    );
+}
+
+/// `i` back out of a hit's `m{i:02}` key, via the memory the hit carries.
+fn key_index(hit: &mlake_index::RawHit) -> usize {
+    let text = &hit.memory.as_ref().expect("a hit always carries its memory").text;
+    text.strip_prefix("memory ").expect("fixture text").parse().expect("fixture index")
+}
+
+// ---------------------------------------------------------------- adaptive probing (cluster radii)
+
+/// A fold that keeps embeddings exactly as written. The default `Binary` codec makes the
+/// fold's carried-forward vectors lossy decodes of the previous generation's block, which
+/// would blur this assertion by the codec's error rather than by the thing under test.
+fn exact_codec() -> IndexOptions {
+    IndexOptions { vector_codec: mlake_ivf::VectorCodec::F32, ..IndexOptions::default() }
+}
+
+/// Assert every member of every cluster lies inside the radius the fold wrote for it.
+///
+/// The vectors come from the caller's own map, not from the generation: the cluster `.bin`
+/// no longer carries embeddings (they live in the `.vec` block), so the only copy a test can
+/// compare against is the one it wrote.
+async fn assert_radii_contain_every_member(
+    ns: &Namespace,
+    truth: &std::collections::HashMap<MemoryId, Vec<f32>>,
+    what: &str,
+) {
+    let (manifest, _) = ns.read_manifest().await.unwrap();
+    let files = &manifest.index(1).unwrap().files;
+    let gen = mlake_index::read_generation(&ns.store, files, manifest.version, None).await.unwrap();
+    let centroids = &gen.centroids;
+    assert_eq!(
+        centroids.radii.len(),
+        centroids.len(),
+        "{what}: one radius per centroid, or every reader must treat them all as unknown"
+    );
+    let mut checked = 0usize;
+    for (c, cluster) in gen.clusters.iter().enumerate() {
+        let r = centroids.radius(c).unwrap_or_else(|| panic!("{what}: cluster {c} has no radius"));
+        for m in cluster {
+            let v = &truth[&m.id];
+            assert!(
+                mlake_ivf::member_radius(&centroids.vectors[c], v) <= r + 1e-5,
+                "{what}: member of cluster {c} lies outside the radius the fold wrote"
+            );
+            checked += 1;
+        }
+    }
+    assert_eq!(checked, truth.len(), "{what}: every member must have been checked");
+}
+
+/// Every fold must write a cluster radius per centroid, and it must actually contain that
+/// cluster's members. A radius that is too small silently retires a cluster that held a
+/// winner, and nothing downstream would report it — so it is checked at the source.
+#[tokio::test]
+async fn the_fold_writes_a_radius_that_contains_every_member() {
+    let store = Store::in_memory();
+    let ns = namespace(store, "radii").await;
+    let mut writer = Writer::new(ns.clone());
+    let mut truth = std::collections::HashMap::new();
+    let mut ops = Vec::new();
+    for i in 0..400 {
+        let a = i as f32 * 0.31;
+        let v = vec![a.cos(), a.sin(), (a * 0.7).cos()];
+        truth.insert(MemoryId::from_key(&format!("m{i}")), v.clone());
+        ops.push(Op::Upsert(item(&format!("m{i}"), v, "doc")));
+    }
+    writer.commit(ops).await.unwrap();
+    index(&ns, &Tokenizer::default(), exact_codec()).await.unwrap();
+
+    assert_radii_contain_every_member(&ns, &truth, "first fold").await;
+}
+
+/// The assign-only path adds members to centroids it did not retrain, and a flush appends a
+/// whole segment without touching the old one. A radius carried forward from the previous
+/// generation would be too small — i.e. unsound — the moment one new member lands outside it,
+/// so every fold must recompute rather than copy it.
+#[tokio::test]
+async fn a_radius_does_not_go_stale_across_folds() {
+    let store = Store::in_memory();
+    let ns = namespace(store, "radii-refold").await;
+    let mut writer = Writer::new(ns.clone());
+    let mut truth = std::collections::HashMap::new();
+
+    // A first fold over a tight cloud, so the radii it writes are small.
+    let mut ops = Vec::new();
+    for i in 0..200 {
+        let a = i as f32 * 0.017;
+        let v = vec![1.0, a.sin() * 0.02, a * 0.001];
+        truth.insert(MemoryId::from_key(&format!("a{i}")), v.clone());
+        ops.push(Op::Upsert(item(&format!("a{i}"), v, "doc")));
+    }
+    writer.commit(ops).await.unwrap();
+    index(&ns, &Tokenizer::default(), exact_codec()).await.unwrap();
+
+    // Then a slice of far-flung members, which land in those same clusters without a retrain.
+    let mut ops = Vec::new();
+    for i in 0..20 {
+        let a = i as f32 * 0.3;
+        let v = vec![a.cos(), a.sin(), 1.0];
+        truth.insert(MemoryId::from_key(&format!("b{i}")), v.clone());
+        ops.push(Op::Upsert(item(&format!("b{i}"), v, "doc")));
+    }
+    writer.commit(ops).await.unwrap();
+    index(&ns, &Tokenizer::default(), exact_codec()).await.unwrap();
+
+    assert_radii_contain_every_member(&ns, &truth, "assign-only re-fold").await;
 }

@@ -270,7 +270,9 @@ async fn cache_entries_report_both_tiers_and_overlap() {
     let ea = entries.iter().find(|e| e.path.ends_with("cluster-0.bin")).unwrap();
     let eb = entries.iter().find(|e| e.path.ends_with("cluster-1.bin")).unwrap();
     assert!(eb.in_memory, "the most recent object stays in memory");
+    assert!(eb.on_disk, "and is resident on disk too — the tiers overlap, not partition");
     assert!(ea.on_disk, "the evicted object is demoted to disk, not dropped");
+    assert!(!ea.in_memory);
     assert_eq!(ea.bytes, 100);
 
     // Tier counts overlap, so summing them would double-count.
@@ -279,15 +281,50 @@ async fn cache_entries_report_both_tiers_and_overlap() {
         "mem_entries + disk_entries is not an object count"
     );
 
-    // A hit promotes back into memory, and both tiers may then hold it.
+    // The demoted object is still readable — the demotion cost latency, not the bytes.
     assert!(cache.get(&a).is_some(), "the demoted object is still readable");
+
+    // But the read does NOT promote it back into memory. The tiers are FIFO rings ordered
+    // by admission; re-admitting on every hit is the per-hit mutation the ring exists to
+    // avoid, and it would force a reader to take the write lock. `a` keeps its place in the
+    // disk ring and keeps being served from there.
     let after = cache.entries(None, 100).0;
     let ea2 = after.iter().find(|e| e.path.ends_with("cluster-0.bin")).unwrap();
-    assert!(ea2.in_memory, "a hit promotes the object back into memory");
-    assert!(ea2.on_disk, "and it stays resident on disk too — the tiers overlap");
+    assert!(!ea2.in_memory, "a hit does not re-admit into memory");
+    assert!(ea2.on_disk);
 
-    // Most-recently-used first: the entry just touched leads the listing.
-    assert!(after[0].path.ends_with("cluster-0.bin"), "MRU leads the listing");
+    // Newest admission first — the listing follows the ring, and a read does not reorder it.
+    assert!(after[0].path.ends_with("cluster-1.bin"), "the newest admission leads");
+}
+
+/// The cache is read-through: `Store::put` writes the object and leaves it out of the
+/// cache, so a replica that folds a generation inline then pays a roundtrip to read back
+/// bytes it had in hand. `put_admitting` is the opt-in that closes that — opt-in rather
+/// than the default, because a fold writes far more than any imminent query probes and on a
+/// FIFO ring it would lap the cache.
+#[tokio::test]
+async fn put_admitting_populates_the_read_cache_and_plain_put_does_not() {
+    use mlake_store::{DiskCache, StoreMetrics};
+
+    let dir = tempfile::tempdir().unwrap();
+    let cache = Arc::new(DiskCache::with_budgets(dir.path(), 1 << 20, 1 << 20).unwrap());
+    let metrics = StoreMetrics::new();
+    let store = Store::in_memory()
+        .with_cache(cache.clone())
+        .with_store_metrics(metrics.clone());
+
+    store.put("ns/gen-1/cluster-0.bin", vec![1u8; 64]).await.unwrap();
+    let before = metrics.gets();
+    let got = store.get_immutable("ns/gen-1/cluster-0.bin", None).await.unwrap();
+    assert_eq!(got, bytes::Bytes::from(vec![1u8; 64]));
+    assert_eq!(metrics.gets(), before + 1, "a plain put leaves the first read to miss");
+
+    store.put_admitting("ns/gen-1/cluster-1.bin", vec![2u8; 64]).await.unwrap();
+    let before = metrics.gets();
+    let got = store.get_immutable("ns/gen-1/cluster-1.bin", None).await.unwrap();
+    assert_eq!(got, bytes::Bytes::from(vec![2u8; 64]));
+    assert_eq!(metrics.gets(), before, "an admitting put serves the read with no roundtrip");
+    assert!(cache.hits() >= 1);
 }
 
 /// `limit` bounds the listing, and lookups are counted for the hit ratio.

@@ -55,6 +55,10 @@ pub struct Timestamps {
     pub occurred_start: Option<i64>,
     pub occurred_end: Option<i64>,
     pub mentioned_at: Option<i64>,
+    /// When the memory was last written, as opposed to when the thing it describes
+    /// happened. Distinct from the other four: those are content time, this is
+    /// write time, and it is what a "changed since X" filter ranges over.
+    pub updated_at: Option<i64>,
 }
 
 /// Maximum inline semantic (kNN) links per item, per SPEC §3.3.
@@ -117,6 +121,10 @@ pub struct StoredMemory {
     pub id: MemoryId,
     pub vector: Vec<f32>,
     pub text: String,
+    /// Text to index for full-text search, when it should differ from `text`. Empty means
+    /// "index `text`". Lets a client enrich what BM25 matches on — entity names, spelled-out
+    /// dates — without changing the text it gets back on a hit. Never returned; `text` is.
+    pub index_text: String,
     pub memory_type: u8,
     pub tags: Vec<String>,
     pub timestamps: Timestamps,
@@ -140,6 +148,16 @@ pub struct StoredMemory {
 }
 
 impl StoredMemory {
+    /// What full-text search should index: `index_text` when the client supplied one,
+    /// otherwise `text`.
+    pub fn fts_text(&self) -> &str {
+        if self.index_text.is_empty() {
+            &self.text
+        } else {
+            &self.index_text
+        }
+    }
+
     /// Count of entity ids shared with another item. Both sides must be sorted.
     pub fn shared_entity_count(&self, other: &[EntityId]) -> usize {
         merge_count(&self.entity_ids, other)
@@ -190,6 +208,10 @@ pub struct Memory {
     pub id: MemoryId,
     pub vector: Vec<f32>,
     pub text: String,
+    /// Text to index for full-text search, when it should differ from `text`. Empty means
+    /// "index `text`". Lets a client enrich what BM25 matches on — entity names, spelled-out
+    /// dates — without changing the text it gets back on a hit. Never returned; `text` is.
+    pub index_text: String,
     pub memory_type: u8,
     pub tags: Vec<String>,
     pub timestamps: Timestamps,
@@ -215,6 +237,7 @@ impl Memory {
             id: self.id,
             vector: self.vector,
             text: self.text,
+            index_text: self.index_text,
             memory_type: self.memory_type,
             tags: self.tags,
             timestamps: self.timestamps,
@@ -244,6 +267,7 @@ mod tests {
             id: MemoryId::from_key("a"),
             vector: vec![],
             text: String::new(),
+            index_text: String::new(),
             memory_type: 0,
             tags: vec![],
             timestamps: Timestamps::default(),
@@ -265,6 +289,7 @@ mod tests {
             id: MemoryId::from_key("a"),
             vector: vec![1.0],
             text: "hi".into(),
+            index_text: String::new(),
             memory_type: 1,
             tags: vec![],
             timestamps: Timestamps::default(),

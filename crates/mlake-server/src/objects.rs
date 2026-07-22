@@ -327,5 +327,7 @@ fn delta_name(d: &mlake_core::Delta) -> &'static str {
         mlake_core::Delta::SetEntityIds(_) => "set_entity_ids",
         mlake_core::Delta::SetTimestamps(_) => "set_timestamps",
         mlake_core::Delta::MergeMetadata(_) => "merge_metadata",
+        mlake_core::Delta::Touch(_) => "touch",
+        mlake_core::Delta::MergeTimestamps(_) => "merge_timestamps",
     }
 }

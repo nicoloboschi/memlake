@@ -68,6 +68,120 @@ pub struct ArmDepths {
     pub nprobe: usize,
 }
 
+/// An `updated_at` window pushed into the dense arm, in epoch ms. Half-open on both ends and
+/// exclusive at each bound, exactly as `Predicate` defines it: strictly after `from`, strictly
+/// before `to`, and a memory with no write time fails a *bounded* window.
+///
+/// It is a push-down and not a post-filter because the dense arm truncates to `depths.vector`
+/// before anything is materialized: filtering afterwards removes rows from the page instead of
+/// reaching deeper into the matching set, which for a selective window means a page of nothing.
+/// Applied inside the arm, a non-matching member never occupies a slot in the first place.
+///
+/// The arm can only ever be *more* permissive than the definition — blocks written before the
+/// `updated` column existed carry no write times and admit everyone — so the server's own
+/// window still runs over the results and remains the authority.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct UpdatedWindow {
+    pub from: Option<i64>,
+    pub to: Option<i64>,
+}
+
+impl UpdatedWindow {
+    /// No bounds: every memory passes, unknown write times included.
+    pub fn is_noop(&self) -> bool {
+        self.from.is_none() && self.to.is_none()
+    }
+
+    /// Whether a known-or-unknown write time falls inside the window.
+    pub fn admits(&self, updated_at: Option<i64>) -> bool {
+        if self.is_noop() {
+            return true;
+        }
+        let Some(u) = updated_at else {
+            return false;
+        };
+        self.from.is_none_or(|f| u > f) && self.to.is_none_or(|t| u < t)
+    }
+}
+
+// ------------------------------------------------------------------ adaptive probing
+
+/// How much of the probe set the first wave reads before the geometry decides the rest.
+/// A quarter, floored at [`ADAPTIVE_SEED_MIN`]: small enough that retiring the tail is worth
+/// something, large enough that `tau` is not garbage (a seed holding fewer than `depth`
+/// candidates yields `tau = -inf` and retires nothing).
+const ADAPTIVE_SEED_DIVISOR: usize = 4;
+const ADAPTIVE_SEED_MIN: usize = 4;
+
+/// Length of the first wave. Equal to `probed` when adaptive probing is off or the probe set is
+/// already small, in which case there is exactly one wave and adaptive probing costs nothing.
+fn adaptive_seed_len(probed: usize) -> usize {
+    if !adaptive_enabled() {
+        return probed;
+    }
+    probed.div_ceil(ADAPTIVE_SEED_DIVISOR).clamp(ADAPTIVE_SEED_MIN.min(probed), probed)
+}
+
+/// **Off by default, on measurement, not on principle.** Set `MEMLAKE_ADAPTIVE_PROBE=1` to
+/// enable.
+///
+/// The stopping rule is implemented and provably sound (`Centroids::max_similarity`, and
+/// `mlake-ivf/tests/adaptive_probe.rs` checks it against brute force). It simply never fires on
+/// the corpora we have. Measured e2e on BEIR with bge-small, probing half the clusters:
+///
+/// | dataset  | mean tau (k=100) | tightest bound over the unprobed tail | clusters retired |
+/// |----------|------------------|---------------------------------------|------------------|
+/// | scifact  | 0.653            | 0.979                                 | 0 of 9,700       |
+/// | nfcorpus | 0.548            | 0.962                                 | 0 of 7,400       |
+///
+/// The bound sits ~0.3 above the threshold it would have to fall below, so nothing retires —
+/// and it is not outliers doing it: the mean *max* radius is 0.62 and the mean *p95* radius is
+/// 0.58, so a quantile radius (which would cost soundness) moves the bound by ~0.04 and still
+/// retires nothing. The cause is dimensional, not statistical: at 384-d these clusters have
+/// radius ~0.62 while the query's own k-th nearest neighbour sits ~0.77 away, so every probed
+/// cluster's ball reaches into the query's neighbourhood and none can be ruled out.
+///
+/// Left on the opt-in switch rather than deleted: the machinery is the expensive part to get
+/// right, and the verdict is a property of *these* corpora. Enabling it today costs a second
+/// serial fetch wave and buys nothing.
+fn adaptive_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| matches!(std::env::var("MEMLAKE_ADAPTIVE_PROBE").as_deref(), Ok("1") | Ok("on")))
+}
+
+/// The k-th best lower bound among candidates — `tau`. `-inf` when there are fewer than `k`,
+/// which is the answer that retires nothing: with fewer than `k` candidates in hand, no
+/// cluster can be ruled out of the top `k`.
+fn kth_lower_bound(cands: &[(MemoryId, f32, f32, f32)], k: usize) -> f32 {
+    if cands.len() < k || k == 0 {
+        return f32::NEG_INFINITY;
+    }
+    let mut los: Vec<f32> = cands.iter().map(|c| c.2).collect();
+    los.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+    los.get(k - 1).copied().unwrap_or(f32::NEG_INFINITY)
+}
+
+/// Per-query probe accounting, for measuring whether the bound actually retires anything.
+/// Off unless `MEMLAKE_PROBE_STATS` is set; one line per segment on stderr.
+mod probe_stats {
+    pub fn on() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("MEMLAKE_PROBE_STATS").is_ok())
+    }
+
+    /// `tau` and `min_bound` say *why* the bound did or did not fire: the gap between the
+    /// tightest bound in the tail and the k-th best score in hand is the whole margin.
+    pub fn record(selected: usize, fetched: usize, tau: f32, min_bound: f32) {
+        if !on() {
+            return;
+        }
+        eprintln!(
+            "probe_stats selected={selected} fetched={fetched} retired={} tau={tau:.4} min_bound={min_bound:.4}",
+            selected.saturating_sub(fetched)
+        );
+    }
+}
+
 /// One fact type's loaded state within ONE segment — the indexed metadata for that segment. A
 /// query fans out across a fact type's segments (newest-first) and merges (see [`FactType`]).
 struct SegmentState {
@@ -734,7 +848,16 @@ impl QueryNode {
             nprobe: config.nprobe,
         };
         let raw = self
-            .query_raw_metered(memory_type, vector, text, tags, depths, None, &metrics)
+            .query_raw_metered(
+                memory_type,
+                vector,
+                text,
+                tags,
+                depths,
+                None,
+                UpdatedWindow::default(),
+                &metrics,
+            )
             .await?;
         Ok(fuse_raw(&raw, top_k, config))
     }
@@ -752,6 +875,7 @@ impl QueryNode {
         tags: &TagFilter,
         depths: ArmDepths,
         temporal_window: Option<(i64, i64)>,
+        updated: UpdatedWindow,
         metrics: &QueryMetrics,
     ) -> Result<Vec<RawHit>> {
         let Some(state) = self.per_type.get(&memory_type) else {
@@ -767,7 +891,7 @@ impl QueryNode {
             }
         }
         let (vector_scored, fts_scored, graph_scored, mut materialized) =
-            self.run_arms(state, vector, text, tags, depths, metrics).await?;
+            self.run_arms(state, vector, text, tags, depths, updated, metrics).await?;
 
         // The temporal arm: entry-point selection over the time window + one-hop spread. Needs
         // the query vector (to rank entry points) and a window; scores by proximity, ranked
@@ -845,6 +969,7 @@ impl QueryNode {
         text: Option<&str>,
         tags: &TagFilter,
         depths: ArmDepths,
+        updated: UpdatedWindow,
         metrics: &QueryMetrics,
     ) -> Result<(
         Vec<(MemoryId, f32)>,
@@ -862,13 +987,25 @@ impl QueryNode {
                 // segment's stale copy of the same id.
                 let t = Instant::now();
                 for m in &state.tail_items {
-                    if tags.matches(&m.tags) && !self.hidden(m) {
+                    if tags.matches(&m.tags)
+                        && updated.admits(m.timestamps.updated_at)
+                        && !self.hidden(m)
+                    {
                         merged.entry(m.id).or_insert(mlake_core::cosine_opt(q, &m.vector));
                     }
                 }
                 for seg in &state.segments {
                     for (id, sc) in
-                        self.vector_arm_segment(seg, q, depths.vector, depths.nprobe, tags, metrics).await?
+                        self.vector_arm_segment(
+                            seg,
+                            q,
+                            depths.vector,
+                            depths.nprobe,
+                            tags,
+                            updated,
+                            metrics,
+                        )
+                        .await?
                     {
                         merged.entry(id).or_insert(sc);
                     }
@@ -931,6 +1068,7 @@ impl QueryNode {
     /// scored by the caller (it is shared across segments), so this reads only the segment's blocks.
     /// The scan / bound / contender / rerank logic is unchanged — this is the per-segment black box
     /// the merge in `run_arms` calls once per segment.
+    #[allow(clippy::too_many_arguments)]
     async fn vector_arm_segment(
         &self,
         state: &SegmentState,
@@ -938,49 +1076,70 @@ impl QueryNode {
         depth: usize,
         nprobe: usize,
         tags: &TagFilter,
+        updated: UpdatedWindow,
         metrics: &QueryMetrics,
     ) -> Result<Vec<(MemoryId, f32)>> {
         if state.centroids.is_empty() {
             return Ok(Vec::new());
         }
         let t = Instant::now();
-        let probed = self.select_clusters(state, q, nprobe, tags);
+        let probed = self.select_clusters(state, q, nprobe, tags, updated);
         metrics.record_phase(Phase::Probe, t.elapsed());
+        let k = depth.max(1);
 
-        let t = Instant::now();
-        let blocks = self.fetch_vector_blocks(state, &probed, metrics, 3).await?;
-        metrics.record_phase(Phase::FetchClusters, t.elapsed());
-
-        // Stage one: scan the 1-bit codes, keeping an error interval (est, lo, hi) per candidate.
-        let t = Instant::now();
+        // ---- Wave one: the seed. -------------------------------------------------------
+        // `probed` is distance-ordered, so the seed is the nearest slice of it. It exists to
+        // produce a `tau` cheaply; the geometry decides the rest without reading anything.
+        let seed_n = adaptive_seed_len(probed.len());
         let mut cands: Vec<(MemoryId, f32, f32, f32)> = Vec::new(); // id, est, lo, hi
-        for block in &blocks {
-            let mask = block.tag_mask(&tags.tags);
-            if !tags.is_noop() && block.has_tags() && !block.any_can_pass(&mask, tags.mode) {
-                continue;
-            }
-            let prepared = block.prepare(q)?;
-            for i in 0..block.len() {
-                let id = block.ids()[i];
-                // Drop tail-deleted ids and ids a newer segment supersedes (deleted / re-upserted).
-                if self.superseded(&id, state.seq_hi) {
-                    continue;
-                }
-                if !tags.is_noop() && block.has_tags() && !block.passes(i, &mask, tags.mode) {
-                    continue;
-                }
-                let (lo, hi) = block.score_bounds(&prepared, i);
-                cands.push((id, block.score(&prepared, i), lo, hi));
+        let t = Instant::now();
+        let blocks = self.fetch_vector_blocks(state, &probed[..seed_n], metrics, 3).await?;
+        metrics.record_phase(Phase::FetchClusters, t.elapsed());
+        let t = Instant::now();
+        self.scan_blocks(&blocks, state, q, tags, updated, &mut cands)?;
+        metrics.record_phase(Phase::Rerank, t.elapsed());
+
+        // ---- Wave two: whatever the geometry could not retire. -------------------------
+        // `tau` is the k-th best *lower* bound over what the seed found: there are already k
+        // candidates whose true score is at least `tau`. A cluster whose *upper* bound —
+        // `⟨q̂,c⟩ + R`, needing only the centroid and its radius, both resident — falls below
+        // `tau` therefore cannot contain a top-k member, and is dropped without being read.
+        //
+        // Two waves, never more. A probe→look→decide→probe loop would turn one coalesced wave
+        // into N and break INV-7; this bounds the adaptivity instead of the recall. The set is
+        // a *subset* of the fixed-fraction probe, so recall can only match it, never fall
+        // below it (up to the caveat that Binary's `lo` is probabilistic — see `score_bounds`).
+        let mut fetched = seed_n;
+        let (mut seed_tau, mut min_bound) = (f32::NEG_INFINITY, f32::INFINITY);
+        if seed_n < probed.len() {
+            let tau = kth_lower_bound(&cands, k);
+            let rest: Vec<usize> = probed[seed_n..]
+                .iter()
+                .copied()
+                .filter(|&c| {
+                    let ub = state.centroids.max_similarity(q, c);
+                    if probe_stats::on() && ub < min_bound {
+                        min_bound = ub;
+                    }
+                    ub >= tau
+                })
+                .collect();
+            seed_tau = tau;
+            fetched += rest.len();
+            if !rest.is_empty() {
+                let t = Instant::now();
+                let blocks = self.fetch_vector_blocks(state, &rest, metrics, 4).await?;
+                metrics.record_phase(Phase::FetchClusters, t.elapsed());
+                let t = Instant::now();
+                self.scan_blocks(&blocks, state, q, tags, updated, &mut cands)?;
+                metrics.record_phase(Phase::Rerank, t.elapsed());
             }
         }
-        metrics.record_phase(Phase::Rerank, t.elapsed());
+        probe_stats::record(probed.len(), fetched, seed_tau, min_bound);
 
         // Stage two: rescore exactly, but only what the bound leaves in contention. `tau` is the
         // k-th best lower bound; anything whose upper bound cannot reach it is outside the top-k.
-        let k = depth.max(1);
-        let mut los: Vec<f32> = cands.iter().map(|c| c.2).collect();
-        los.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
-        let tau = los.get(k - 1).copied().unwrap_or(f32::NEG_INFINITY);
+        let tau = kth_lower_bound(&cands, k);
         let contenders: Vec<&(MemoryId, f32, f32, f32)> = cands.iter().filter(|c| c.3 >= tau).collect();
 
         let t = Instant::now();
@@ -1002,15 +1161,60 @@ impl QueryNode {
         Ok(scored)
     }
 
+    /// Stage one over a set of fetched blocks: score every admissible member and keep its
+    /// `(est, lo, hi)` interval. Appends, so the two probe waves share one candidate list.
+    fn scan_blocks(
+        &self,
+        blocks: &[mlake_ivf::VectorBlock],
+        state: &SegmentState,
+        q: &[f32],
+        tags: &TagFilter,
+        updated: UpdatedWindow,
+        cands: &mut Vec<(MemoryId, f32, f32, f32)>,
+    ) -> Result<()> {
+        for block in blocks {
+            let mask = block.tag_mask(&tags.tags);
+            if !tags.is_noop() && block.has_tags() && !block.any_can_pass(&mask, tags.mode) {
+                continue;
+            }
+            // Two integer compares against the block's write-time range retire a whole
+            // cluster before it is scored. A block with no `updated` column admits itself.
+            if !block.any_can_pass_updated(updated.from, updated.to) {
+                continue;
+            }
+            let prepared = block.prepare(q)?;
+            for i in 0..block.len() {
+                let id = block.ids()[i];
+                // Drop tail-deleted ids and ids a newer segment supersedes (deleted / re-upserted).
+                if self.superseded(&id, state.seq_hi) {
+                    continue;
+                }
+                if !tags.is_noop() && block.has_tags() && !block.passes(i, &mask, tags.mode) {
+                    continue;
+                }
+                if !block.passes_updated(i, updated.from, updated.to) {
+                    continue;
+                }
+                let (lo, hi) = block.score_bounds(&prepared, i);
+                cands.push((id, block.score(&prepared, i), lo, hi));
+            }
+        }
+        Ok(())
+    }
+
     /// Choose which clusters to fetch for the vector arm.
     ///
-    /// Without a tag filter (or without per-cluster tag summaries) this is the plain
-    /// `nprobe`-nearest probe. With a filter, the per-cluster tag summaries prune clusters
-    /// that cannot contain a matching memory, and the query probes among the *admissible*
-    /// clusters — so a selective filter still finds its matches instead of them being
-    /// starved out of the nprobe-nearest set (SCALE.md Phase 4b). Because a selective filter
-    /// leaves few admissible clusters, fetching all of them (capped) stays within budget;
-    /// a broad filter admits ~everything, degrading to the plain probe.
+    /// Without a filter (or without per-cluster summaries) this is the plain `nprobe`-nearest
+    /// probe. With one, the per-cluster summaries prune clusters that cannot contain a
+    /// matching memory, and the query probes among the *admissible* clusters — so a selective
+    /// filter still finds its matches instead of them being starved out of the nprobe-nearest
+    /// set (SCALE.md Phase 4b). Because a selective filter leaves few admissible clusters,
+    /// fetching all of them (capped) stays within budget; a broad filter admits ~everything,
+    /// degrading to the plain probe.
+    ///
+    /// Both the tag filter and the `updated_at` window prune here, and for the same reason:
+    /// the block-level checks in `scan_blocks` only ever narrow what a probed cluster
+    /// contributes, so a matching memory sitting in an unprobed cluster is lost outright.
     /// The probe width to use when the caller did not pin one (`nprobe == 0`).
     ///
     /// Scales with the index rather than being a constant: a fixed 8 is 11% of a small
@@ -1046,38 +1250,35 @@ impl QueryNode {
         query: &[f32],
         nprobe: usize,
         tags: &TagFilter,
+        updated: UpdatedWindow,
     ) -> Vec<usize> {
         let nprobe = Self::resolve_nprobe(state, nprobe);
-        if tags.is_noop() || state.tag_summary.is_empty() {
+        if (tags.is_noop() && updated.is_noop()) || state.tag_summary.is_empty() {
             return state.centroids.probe(query, nprobe);
         }
 
-        // Admissible clusters: those whose tag summary could contain a matching memory.
-        let admissible: Vec<usize> = (0..state.centroids.len())
-            .filter(|&c| {
-                state
-                    .tag_summary
-                    .get(c)
-                    .map(|s| tags.cluster_admits(&s.tags, s.has_untagged))
-                    .unwrap_or(true)
-            })
-            .collect();
-
-        // Rank the admissible clusters by centroid distance and take enough to cover the
-        // matches. Cap at a small multiple of nprobe so a broad filter can't blow the byte
-        // budget; a selective filter's admissible set is already small.
+        // Rank the admissible clusters — those whose tag summary could contain a matching
+        // memory — by centroid distance, and take enough to cover the matches. Cap at a small
+        // multiple of nprobe so a broad filter can't blow the byte budget; a selective
+        // filter's admissible set is already small.
+        //
+        // The result is always distance-ordered, including when the admissible set fits under
+        // the cap. Adaptive probing takes its seed from the front of this list, so an
+        // arbitrary (centroid-index) order would seed the first wave with far clusters and
+        // hand it a useless `tau`.
         let cap = nprobe.saturating_mul(4).max(nprobe);
-        if admissible.len() <= cap {
-            return admissible;
-        }
-        let ranked = state.centroids.probe(query, state.centroids.len());
-        ranked
+        state
+            .centroids
+            .probe(query, state.centroids.len())
             .into_iter()
             .filter(|c| {
                 state
                     .tag_summary
                     .get(*c)
-                    .map(|s| tags.cluster_admits(&s.tags, s.has_untagged))
+                    .map(|s| {
+                        (tags.is_noop() || tags.cluster_admits(&s.tags, s.has_untagged))
+                            && s.admits_window(updated.from, updated.to)
+                    })
                     .unwrap_or(true)
             })
             .take(cap)
@@ -1601,5 +1802,36 @@ impl GraphSource for LazyGraphSource<'_> {
 
     fn incoming(&self, target: &MemoryId) -> Vec<InEdge> {
         self.incoming.get(target).cloned().unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+mod adaptive_probe_tests {
+    use super::*;
+
+    fn cand(lo: f32) -> (MemoryId, f32, f32, f32) {
+        (MemoryId::from_key("x"), lo, lo, lo)
+    }
+
+    #[test]
+    fn adaptive_probing_is_off_by_default_so_the_probe_is_one_wave() {
+        // The default is a single wave over the whole probe set — byte-for-byte the
+        // fixed-fraction behaviour. See `adaptive_enabled` for why the default is off.
+        assert!(!adaptive_enabled(), "MEMLAKE_ADAPTIVE_PROBE must default to off");
+        for probed in [0usize, 1, 8, 36, 64] {
+            assert_eq!(adaptive_seed_len(probed), probed, "one wave at {probed}");
+        }
+    }
+
+    #[test]
+    fn tau_retires_nothing_until_k_candidates_are_in_hand() {
+        // Fewer than k candidates means no cluster can be ruled out of the top k, and the
+        // only answer that expresses that is -inf.
+        assert_eq!(kth_lower_bound(&[], 10), f32::NEG_INFINITY);
+        let three: Vec<_> = [0.9f32, 0.5, 0.1].iter().map(|&l| cand(l)).collect();
+        assert_eq!(kth_lower_bound(&three, 10), f32::NEG_INFINITY);
+        assert_eq!(kth_lower_bound(&three, 3), 0.1);
+        assert_eq!(kth_lower_bound(&three, 2), 0.5);
+        assert_eq!(kth_lower_bound(&three, 0), f32::NEG_INFINITY);
     }
 }

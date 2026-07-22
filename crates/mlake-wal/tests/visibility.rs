@@ -16,6 +16,7 @@ fn item(key: &str, proof: u32) -> Memory {
         id: MemoryId::from_key(key),
         vector: vec![1.0, 0.0, 0.0],
         text: format!("body of {key}"),
+        index_text: String::new(),
         memory_type: 1,
         tags: vec!["tag".into()],
         timestamps: Timestamps::default(),

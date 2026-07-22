@@ -83,6 +83,8 @@ def memory(
     proof_count: int = 0,
     entity_ids: Optional[Sequence[bytes]] = None,
     metadata: Optional[dict[str, str]] = None,
+    index_text: Optional[str] = None,
+    updated_at: Optional[int] = None,
     occurred_start: Optional[int] = None,
     occurred_end: Optional[int] = None,
     mentioned_at: Optional[int] = None,
@@ -92,7 +94,10 @@ def memory(
     16-byte id from the key; or pass a 16-byte `id` directly. `entity_ids` are 16-byte ids
     (e.g. `uuid.UUID(...).bytes`). `metadata` is opaque str->str the server stores and returns
     verbatim (never indexed). The timestamp fields (epoch ints) drive the temporal arm; the
-    effective time is COALESCE(occurred_start, mentioned_at, occurred_end)."""
+    effective time is COALESCE(occurred_start, mentioned_at, occurred_end). `index_text`
+    replaces `text` for full-text indexing only — enrich what BM25 matches without changing
+    what a hit returns. `updated_at` is write time (the server defaults it to now), and is
+    what Query/Scan's `updated_from`/`updated_to` window ranges over."""
     ts = pb.Timestamps()
     if occurred_start is not None:
         ts.occurred_start = occurred_start
@@ -102,6 +107,8 @@ def memory(
         ts.mentioned_at = mentioned_at
     if event_date is not None:
         ts.event_date = event_date
+    if updated_at is not None:
+        ts.updated_at = updated_at
     return pb.Memory(
         id=id,
         key=key,
@@ -113,6 +120,7 @@ def memory(
         entity_ids=list(entity_ids or []),
         metadata=dict(metadata or {}),
         timestamps=ts,
+        index_text=index_text or "",
     )
 
 
@@ -378,10 +386,14 @@ class MemlakeClient:
         mentioned_at: Optional[int] = None,
         event_date: Optional[int] = None,
         metadata: Optional[dict[str, str]] = None,
+        replace_timestamps: bool = False,
     ) -> pb.Op:
         """Build a partial-update op: set only the fields you pass, leave the rest.
         `proof_count_delta` is relative; the rest are absolute sets; `metadata` merges (upserts
-        its keys). Passing any timestamp replaces the whole Timestamps. Pair with `update()`
+        its keys). Timestamps merge too: passing `occurred_start` alone leaves the other three
+        as they were. Pass `replace_timestamps=True` to overwrite the whole Timestamps instead,
+        clearing any you did not pass — the only way to null one. A patch always stamps
+        `updated_at` with the server's write time, whichever mode you use. Pair with `update()`
         or include in a `write_ops` batch."""
         p = pb.Patch(id=id16, proof_count_delta=proof_count_delta)
         if text is not None:
@@ -401,6 +413,7 @@ class MemlakeClient:
             if event_date is not None:
                 ts.event_date = event_date
             p.timestamps.CopyFrom(ts)
+            p.replace_timestamps = replace_timestamps
         if metadata:
             p.metadata.update(metadata)
         return pb.Op(patch=p)
@@ -430,6 +443,8 @@ class MemlakeClient:
         nprobe: int = 0,
         temporal_from: Optional[int] = None,
         temporal_to: Optional[int] = None,
+        updated_from: Optional[int] = None,
+        updated_to: Optional[int] = None,
     ) -> list[Hit]:
         """Run one query across `memory_types` (or all if None) with the retrieval arms in a
         single call. `vector` drives the dense + graph arms; `text` drives full-text. Passing
@@ -459,6 +474,10 @@ class MemlakeClient:
             req.temporal_from = temporal_from
         if temporal_to is not None:
             req.temporal_to = temporal_to
+        if updated_from is not None:
+            req.updated_from = updated_from
+        if updated_to is not None:
+            req.updated_to = updated_to
         resp = self._call("Query", req)
         self.last_roundtrips = resp.load_roundtrips
         return _hits(resp.hits)
@@ -514,6 +533,8 @@ class MemlakeClient:
         tags: Optional[Sequence[str]] = None,
         tags_mode: int = ANY,
         skip: int = 0,
+        updated_from: Optional[int] = None,
+        updated_to: Optional[int] = None,
     ) -> pb.ScanResponse:
         """One page of a full scan in cluster order. Follow `next_page_token` until empty. A
         scan is eventually-complete browsing, not a consistent iterator (writes mid-walk can
@@ -530,6 +551,10 @@ class MemlakeClient:
         )
         if tags:
             req.tags.CopyFrom(pb.TagFilter(tags=list(tags), mode=tags_mode))
+        if updated_from is not None:
+            req.updated_from = updated_from
+        if updated_to is not None:
+            req.updated_to = updated_to
         return self._call("Scan", req)
 
     def scan_all_ids(self, namespace: str, *, memory_types: Optional[Sequence[int]] = None) -> list:

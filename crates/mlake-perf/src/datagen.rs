@@ -150,6 +150,7 @@ impl Generator {
                 id: MemoryId::from_key(&Self::key(i)),
                 vector,
                 text,
+                index_text: String::new(),
                 memory_type: (i % self.cfg.memory_types.max(1) as usize) as u8 + 1,
                 tags,
                 timestamps: Timestamps { occurred_start: Some(occurred_start), ..Timestamps::default() },

@@ -79,6 +79,13 @@ pub fn memory_type_u8(v: u32) -> Result<u8, Status> {
     u8::try_from(v).map_err(|_| Status::invalid_argument("memory_type must be 0..=255"))
 }
 
+fn now_epoch_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 fn timestamps(t: Option<pb::Timestamps>) -> Timestamps {
     let t = t.unwrap_or_default();
     Timestamps {
@@ -86,6 +93,7 @@ fn timestamps(t: Option<pb::Timestamps>) -> Timestamps {
         occurred_start: t.occurred_start,
         occurred_end: t.occurred_end,
         mentioned_at: t.mentioned_at,
+        updated_at: t.updated_at,
     }
 }
 
@@ -115,9 +123,19 @@ pub fn memory(m: pb::Memory) -> Result<Memory, Status> {
         id,
         vector,
         text: m.text,
+        index_text: m.index_text,
         memory_type: memory_type_u8(m.memory_type)?,
         tags: m.tags,
-        timestamps: timestamps(m.timestamps),
+        // Default `updated_at` to now when the client omits it, so the field is
+        // reliably populated and an "updated since" window never silently skips
+        // memories written by a client that does not set it.
+        timestamps: {
+            let mut t = timestamps(m.timestamps);
+            if t.updated_at.is_none() {
+                t.updated_at = Some(now_epoch_ms());
+            }
+            t
+        },
         proof_count: m.proof_count,
         entity_ids: entity_ids_in(&m.entity_ids)?,
         causal_out,
@@ -133,6 +151,7 @@ fn timestamps_out(t: &Timestamps) -> pb::Timestamps {
         occurred_start: t.occurred_start,
         occurred_end: t.occurred_end,
         mentioned_at: t.mentioned_at,
+        updated_at: t.updated_at,
     }
 }
 
@@ -285,8 +304,17 @@ fn patch_detail(id: &MemoryId, deltas: &[Delta]) -> pb::Patch {
             Delta::SetText(t) => p.text = Some(t.clone()),
             Delta::SetVector(v) => p.vector = Some(encode_vector(v)),
             Delta::SetTags(tags) => p.tags = Some(pb::TagList { tags: tags.clone() }),
-            Delta::SetTimestamps(ts) => p.timestamps = Some(timestamps_out(ts)),
+            Delta::SetTimestamps(ts) => {
+                p.timestamps = Some(timestamps_out(ts));
+                p.replace_timestamps = true;
+            }
+            Delta::MergeTimestamps(ts) => p.timestamps = Some(timestamps_out(ts)),
             Delta::MergeMetadata(kv) => p.metadata.extend(kv.iter().cloned()),
+            // The server's own write-time stamp, not something a client set. It rides in
+            // the reported timestamps so the log view shows when the patch landed.
+            Delta::Touch(at) => {
+                p.timestamps.get_or_insert_with(Default::default).updated_at = Some(*at)
+            }
             // Entity ids have no field on the wire `Patch` (clients cannot set them), so
             // there is nothing to report beyond the op being a patch.
             Delta::SetEntityIds(_) => {}
@@ -402,11 +430,24 @@ pub fn op(o: pb::Op) -> Result<Op, Status> {
                 deltas.push(Delta::SetTags(tl.tags));
             }
             if let Some(ts) = p.timestamps {
-                deltas.push(Delta::SetTimestamps(timestamps(Some(ts))));
+                let ts = timestamps(Some(ts));
+                // Merge unless the caller explicitly asked to replace: a patch that mentions
+                // one timestamp has said nothing about the others, and wiping them is data
+                // loss the caller never asked for.
+                deltas.push(if p.replace_timestamps {
+                    Delta::SetTimestamps(ts)
+                } else {
+                    Delta::MergeTimestamps(ts)
+                });
             }
             if !p.metadata.is_empty() {
                 deltas.push(Delta::MergeMetadata(p.metadata.into_iter().collect()));
             }
+            // A patch is a write, so it bumps `updated_at` — the same stamp an upsert gets
+            // when the client omits one. Last, so it wins over a timestamps delta in the same
+            // patch: a client that sets content times has not thereby said when the write
+            // happened, and "changed since X" must not be defeatable by a stale client value.
+            deltas.push(Delta::Touch(now_epoch_ms()));
             Op::Patch { id, deltas }
         }
         pb::op::Kind::TombstoneWhere(p) => Op::TombstoneWhere { predicate: predicate(p)? },
@@ -435,6 +476,9 @@ pub fn predicate(p: pb::Predicate) -> Result<Predicate, Status> {
         _ => (Vec::new(), 0),
     };
     Ok(Predicate {
+        // Delete predicates carry no time window; only reads range over updated_at.
+        updated_from: None,
+        updated_to: None,
         memory_types,
         metadata_equals: p.metadata_equals.into_iter().collect(),
         tags,

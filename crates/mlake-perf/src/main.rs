@@ -453,7 +453,16 @@ async fn run_workload(
                 nprobe: config.nprobe,
             };
             let t = Instant::now();
-            node.query_raw_metered(memory_type, vector.as_deref(), text.as_deref(), &tags, depths, tw, &qm)
+            node.query_raw_metered(
+                memory_type,
+                vector.as_deref(),
+                text.as_deref(),
+                &tags,
+                depths,
+                tw,
+                Default::default(),
+                &qm,
+            )
                 .await?;
             let lat = t.elapsed().as_secs_f64() * 1000.0;
             let phases: Vec<(String, u64)> =

@@ -19,12 +19,12 @@
 //! mostly sequentially (resolution, then one memory_type's build at a time), so the budgets do not
 //! all sum at once.
 //!
-//! Scope: this is the **bulk build** path. It does NOT derive semantic kNN links (that pass reads a
-//! 16-cluster neighbourhood per new item, incompatible with one-cluster-at-a-time streaming; at
-//! scale links are derived incrementally / at query time — the same thing `--no-links` models).
-//! causal edges (client-provided, inline) are preserved. It also skips the local-split rebalance.
-//! The result is a correct, queryable generation equivalent to an in-RAM first build with
-//! `derive_links=false`.
+//! Scope: this is the **bulk build** path. It DOES derive semantic kNN links, but *home-cluster
+//! only*: the fold holds one cluster at a time, so each item's links are found among its own
+//! cluster's members rather than the in-RAM fold's wider `nprobe`-cluster neighbourhood (an item
+//! whose nearest neighbour sits just across a cluster boundary may miss it — the bounded-RAM
+//! tradeoff). Causal edges (client-provided, inline) are preserved. It skips the local-split
+//! rebalance. The result is a correct, queryable generation.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -235,7 +235,7 @@ fn resolve_and_emit(
         if predicate_deleted(&item) {
             return Ok(());
         }
-        item.semantic_out.clear(); // bulk build derives no semantic links
+        item.semantic_out.clear(); // drop stale links; re-derived per cluster in build_type_streaming
         resolver.emit(item)?;
     }
     Ok(())
@@ -414,7 +414,8 @@ pub async fn index_streaming_with_budget(
         let n = spill.len();
         doc_count += n;
         let fti = build_type_streaming(
-            ns, &seg_id, ft, spill, sample, n, tokenizer, opts.seed, opts.vector_codec, budget,
+            ns, &seg_id, ft, spill, sample, n, tokenizer, opts.seed, opts.vector_codec,
+            opts.derive_links, budget,
         )
         .await?;
         indexes.insert(ft, fti);
@@ -464,6 +465,7 @@ async fn build_type_streaming(
     tokenizer: &Tokenizer,
     seed: u64,
     codec: VectorCodec,
+    derive_links: bool,
     budget: FoldBudget,
 ) -> Result<mlake_core::manifest::FactTypeIndex> {
     let prefix = format!("{}/mt{memory_type}", mlake_core::manifest::segment_prefix(&ns.name, seg_id));
@@ -493,7 +495,14 @@ async fn build_type_streaming(
     let mut fts = TantivyFtsBuilder::new(tokenizer.clone(), FoldBudget::bytes(budget.fts_mb))
         .map_err(|e| crate::Error::Fts(e.to_string()))?;
     let mut sizes = vec![0usize; kk];
+    // Cluster radii for adaptive probing, tallied over *every* vector in the same pass that
+    // tallies `sizes` — `train_centroids_k` deliberately leaves them empty because it only saw
+    // a sample, and a radius derived from a sample is too small, i.e. unsound.
+    let mut radii = vec![0.0f32; kk];
     let mut cluster_tags: Vec<(BTreeSet<String>, bool)> = vec![(BTreeSet::new(), false); kk];
+    // Per-cluster write-time span, accumulated in the same pass. Starts as an empty range so
+    // a cluster whose members all lack an `updated_at` stays empty and prunes correctly.
+    let mut cluster_updated: Vec<[i64; 2]> = vec![[i64::MAX, i64::MIN]; kk];
 
     // Single assignment pass over the spill, in batches: the per-item centroid assignment and the
     // two rkyv serializations (full item for the cluster file, payload for the store) are the
@@ -514,21 +523,31 @@ async fn build_type_streaming(
         if batch.is_empty() {
             break;
         }
-        // Parallel: nearest centroid + both serializations per item.
-        let prepared: Vec<(usize, Vec<u8>, Vec<u8>, Vec<u8>)> = batch
+        // Parallel: nearest centroid + both serializations per item. The item's contribution
+        // to its cluster's radius rides along — it is one more reduction over the assignment
+        // this pass already computed, and this is the only pass that sees every vector.
+        let prepared: Vec<(usize, f32, Vec<u8>, Vec<u8>, Vec<u8>)> = batch
             .par_iter()
             .map(|item| {
                 let c = if centroids.is_empty() { 0 } else { centroids.assign(&item.vector) };
+                let r = if centroids.is_empty() {
+                    0.0
+                } else {
+                    mlake_ivf::member_radius(&centroids.vectors[c], &item.vector)
+                };
                 let mut vec_bytes = Vec::with_capacity(item.vector.len() * 4);
                 for x in &item.vector {
                     vec_bytes.extend_from_slice(&x.to_le_bytes());
                 }
-                (c, item.to_rkyv_bytes(), item.to_payload_bytes(), vec_bytes)
+                (c, r, item.to_rkyv_bytes(), item.to_payload_bytes(), vec_bytes)
             })
             .collect();
         // Serial: feed the sorts / FTS / summaries.
-        for (item, (c, full, payload, vec_bytes)) in batch.drain(..).zip(prepared) {
+        for (item, (c, radius, full, payload, vec_bytes)) in batch.drain(..).zip(prepared) {
             sizes[c] += 1;
+            if radius > radii[c] {
+                radii[c] = radius;
+            }
             cluster_sort.add(cluster_key(c), full)?;
             pk_sort.add(item.id.0, (c as u32).to_le_bytes().to_vec())?;
             payload_sort.add(item.id.0, payload)?;
@@ -543,7 +562,7 @@ async fn build_type_streaming(
             if let Some(ts) = t.occurred_start.or(t.mentioned_at).or(t.occurred_end) {
                 time_sort.add(ts_key(ts), item.id.0.to_vec())?;
             }
-            fts.add(item.id, &item.text, &item.tags).map_err(|e| crate::Error::Fts(e.to_string()))?;
+            fts.add(item.id, item.fts_text(), &item.tags).map_err(|e| crate::Error::Fts(e.to_string()))?;
             for edge in &item.causal_out {
                 let ie = InEdge {
                     source: item.id,
@@ -551,6 +570,11 @@ async fn build_type_streaming(
                     weight: edge.weight.to_f32(),
                 };
                 radj_sort.add(edge.target.0, encode_in_edge(&ie))?;
+            }
+            if let Some(u) = item.timestamps.updated_at {
+                let r = &mut cluster_updated[c];
+                r[0] = r[0].min(u);
+                r[1] = r[1].max(u);
             }
             let (tset, unt) = &mut cluster_tags[c];
             if item.tags.is_empty() {
@@ -563,6 +587,7 @@ async fn build_type_streaming(
         }
     }
     centroids.sizes = sizes;
+    centroids.radii = radii;
     phase_log("assign", tas);
 
     // Write cluster files from the cluster-grouped stream.
@@ -582,6 +607,7 @@ async fn build_type_streaming(
                 match cur_c {
                     Some(cc) if cc == c => cur_items.push(item),
                     Some(cc) => {
+                        derive_and_feed_radj(&mut cur_items, cc, &centroids, &mut radj_sort, derive_links)?;
                         let (cp, vp) = flush_cluster(ns, &prefix, cc, std::mem::take(&mut cur_items), codec, vector_dim).await?;
                         cluster_paths[cc] = cp;
                         vector_paths[cc] = vp;
@@ -596,6 +622,7 @@ async fn build_type_streaming(
             }
             None => {
                 if let Some(cc) = cur_c {
+                    derive_and_feed_radj(&mut cur_items, cc, &centroids, &mut radj_sort, derive_links)?;
                     let (cp, vp) = flush_cluster(ns, &prefix, cc, std::mem::take(&mut cur_items), codec, vector_dim).await?;
                     cluster_paths[cc] = cp;
                     vector_paths[cc] = vp;
@@ -629,7 +656,12 @@ async fn build_type_streaming(
     let fts_split = fts.finish().map_err(|e| crate::Error::Fts(e.to_string()))?.split_bytes().to_vec();
     let tag_summary: TagSummary = cluster_tags
         .into_iter()
-        .map(|(tags, has_untagged)| ClusterTagSummary { tags: tags.into_iter().collect(), has_untagged })
+        .zip(cluster_updated)
+        .map(|((tags, has_untagged), updated_range)| ClusterTagSummary {
+            tags: tags.into_iter().collect(),
+            has_untagged,
+            updated_range: Some(updated_range),
+        })
         .collect();
     phase_log("sstable_finalize", tsst);
 
@@ -656,6 +688,33 @@ async fn build_type_streaming(
     Ok(mlake_core::manifest::FactTypeIndex { train_count: n as u64, files })
 }
 
+/// Derive home-cluster semantic links for one cluster's resident items (setting each item's
+/// `semantic_out`) and feed their reverse edges into `radj`, in the same layout the in-RAM fold
+/// uses (`EdgeKind::Semantic`, keyed by the target). A no-op when link derivation is disabled.
+/// See [`crate::indexer::derive_links_in_cluster`] for the home-cluster-only recall tradeoff that
+/// keeps this pass within one cluster of RAM.
+fn derive_and_feed_radj(
+    items: &mut Vec<StoredMemory>,
+    cc: usize,
+    centroids: &mlake_ivf::Centroids,
+    radj_sort: &mut ExternalSort,
+    derive_links: bool,
+) -> Result<()> {
+    if !derive_links {
+        return Ok(());
+    }
+    let centroid: &[f32] = centroids.vectors.get(cc).map(|v| v.as_slice()).unwrap_or(&[]);
+    crate::indexer::derive_links_in_cluster(items, centroid);
+    for item in items.iter() {
+        for edge in &item.semantic_out {
+            let ie =
+                InEdge { source: item.id, kind: EdgeKind::Semantic, weight: edge.weight.to_f32() };
+            radj_sort.add(edge.target.0, encode_in_edge(&ie))?;
+        }
+    }
+    Ok(())
+}
+
 /// Write one cluster's pair: the payload file and its vector block, in the same member
 /// order so index `j` names the same memory in both. Returns `(cluster_path, vector_path)`.
 async fn flush_cluster(
@@ -672,8 +731,13 @@ async fn flush_cluster(
         .iter()
         .map(|m| if m.vector.is_empty() { vec![0.0; dim] } else { m.vector.clone() })
         .collect();
-    // Tags travel with the codes so the probe can filter without the payload half.
+    // Tags and write times travel with the codes so the probe can filter without the payload
+    // half.
     let member_tags: Vec<Vec<String>> = items.iter().map(|m| m.tags.clone()).collect();
+    let member_updated: Vec<i64> = items
+        .iter()
+        .map(|m| m.timestamps.updated_at.unwrap_or(mlake_ivf::UPDATED_UNKNOWN))
+        .collect();
     // The embedding moves to the vector block; leaving a copy inline would give back every
     // byte this split exists to save.
     for m in items.iter_mut() {
@@ -681,7 +745,14 @@ async fn flush_cluster(
     }
     let cf = ClusterFile { centroid_id: c as u32, items };
     let cluster = write_cluster_file(&ns.store, prefix, c, &cf).await?;
-    let block = VectorBlock::encode_with_tags(codec, dim, &ids, &vectors, &member_tags)?;
+    let block = VectorBlock::encode_with_columns(
+        codec,
+        dim,
+        &ids,
+        &vectors,
+        Some(&member_tags),
+        &member_updated,
+    )?;
     let vec_path = crate::generation::write_vector_block(&ns.store, prefix, c, block.to_bytes()).await?;
     Ok((cluster, vec_path))
 }

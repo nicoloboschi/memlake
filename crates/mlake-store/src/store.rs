@@ -267,7 +267,7 @@ impl Store {
             if let Some(m) = &self.store_metrics {
                 m.record_get(total);
             }
-            for (&i, bytes) in miss_idx.iter().zip(fetched.into_iter()) {
+            for (&i, bytes) in miss_idx.iter().zip(fetched) {
                 if let Some(cache) = &self.cache {
                     let key = crate::cache::CacheKey::new("", &range_key(&ranges[i]), "immutable");
                     cache.put(key, bytes.clone());
@@ -281,16 +281,50 @@ impl Store {
 
     /// Unconditional write. Only legal for immutable objects, whose paths are unique by
     /// construction (INV-2) — never for the manifest or a WAL slot.
+    ///
+    /// Deliberately does **not** populate the read cache; see [`Store::put_admitting`].
     pub async fn put(&self, path: &str, bytes: Vec<u8>) -> Result<Option<Etag>> {
+        self.put_bytes(path, Bytes::from(bytes)).await
+    }
+
+    async fn put_bytes(&self, path: &str, bytes: Bytes) -> Result<Option<Etag>> {
         let len = bytes.len() as u64;
         let result = self
             .inner
-            .put(&Path::from(path), PutPayload::from_bytes(Bytes::from(bytes)))
+            .put(&Path::from(path), PutPayload::from_bytes(bytes))
             .await?;
         if let Some(m) = &self.store_metrics {
             m.record_put(len);
         }
         Ok(result.e_tag.map(Etag))
+    }
+
+    /// Unconditional write that also **admits the bytes to the read cache**, so the writer
+    /// does not have to re-fetch what it just wrote.
+    ///
+    /// This exists for the inline-fold path: since `wait_for_index`, a `serve` replica can
+    /// fold a generation itself, writing every cluster, vector block and SSTable — and then
+    /// miss the cache on all of them when the next query arrives, having had the bytes in
+    /// hand and dropped them. (The background `index` deployment is a different process, so
+    /// only the inline path is affected.)
+    ///
+    /// It is opt-in on purpose, and [`Store::put`] stays read-through. A fold writes the
+    /// *whole* generation, and no imminent query probes most of it, so admitting all of it
+    /// trades a warm working set for cold data — and because the cache is a FIFO ring, a
+    /// single fold that writes more than the disk budget laps the ring and leaves nothing
+    /// behind but its own tail. Which call sites should use this — plausibly only the small
+    /// objects every query is certain to read (centroids, footers, `pk.idx`) and not the
+    /// per-cluster bulk — is a follow-up decision to make against the hit-ratio numbers,
+    /// not a default. Nothing in the tree calls it yet.
+    pub async fn put_admitting(&self, path: &str, bytes: Vec<u8>) -> Result<Option<Etag>> {
+        let bytes = Bytes::from(bytes);
+        let etag = self.put_bytes(path, bytes.clone()).await?;
+        if let Some(cache) = &self.cache {
+            // Exactly the key `get_immutable` will look up. Anything else would admit bytes
+            // no read can ever find, which is worse than not admitting at all.
+            cache.put(crate::cache::CacheKey::new("", path, "immutable"), bytes);
+        }
+        Ok(etag)
     }
 
     /// Create an object only if it does not already exist (`If-None-Match: *`).

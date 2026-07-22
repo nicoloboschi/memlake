@@ -92,3 +92,74 @@ score}`, and the client fuses (see [text.md](text.md), [graph.md](graph.md)).
   `STRONG` re-checks the WAL head.
 - **Tuning:** `nprobe` trades recall for cost (more clusters fetched = higher recall, more
   bytes/roundtrip-wave width); `vector_top_k` bounds how many candidates the arm contributes.
+
+---
+
+## Adaptive probing — implemented, measured, and off
+
+`nprobe` is a fixed fraction of the cluster count (half, floor 8, cap 64). The fraction is a
+guess: at a quarter, nfcorpus measured `ann_recall@10` 0.8598 and scifact 0.9517 — the same
+fraction nine points apart, because the right number depends on how a corpus clusters, not on
+how many clusters it has. The principled replacement is a **stopping rule**: probe
+nearest-first, and stop when the k-th best score already in hand beats the best score any
+unprobed cluster could possibly yield.
+
+### The bound
+
+Each centroid carries a **radius** `R = max ‖v̂ − c‖` over its members, where `v̂ = v/‖v‖` is the
+member direction (`Centroids::radii`, one `f32` per cluster, recomputed every fold). With
+`q̂ = q/‖q‖`, no member of cluster `i` can score better than
+
+```
+  cos(q, v) = ⟨q̂, v̂⟩ = ⟨q̂, c⟩ + ⟨q̂, v̂ − c⟩ ≤ ⟨q̂, c⟩ + R        (Cauchy–Schwarz)
+  cos(q, v) = 1 − ‖q̂ − v̂‖²/2               ≤ 1 − max(0, ‖q̂ − c‖ − R)²/2   (triangle)
+```
+
+and `max_similarity` returns the smaller of the two. Neither form assumes a unit-length
+centroid (centroids are means, so they are not) nor a unit-length member (the radius is
+measured against the member *direction*, which is all cosine can see). The bound is absolute,
+unlike the RaBitQ per-member bounds it is compared against.
+
+Adaptivity is bounded at **two waves**, never a probe→look→decide→probe loop, which would turn
+one coalesced wave into N and break INV-7: probe a seed (a quarter of the probe set), compute
+`tau` from it, then use the bound — which needs only resident data — to decide the remainder in
+one more wave. The chosen set is a *subset* of the fixed-fraction probe, so recall cannot fall
+below the baseline.
+
+### The measurement, and why it is off by default
+
+`MEMLAKE_ADAPTIVE_PROBE=1` enables it. Measured e2e on BEIR (bge-small, 384-d, `nprobe` = half,
+arm depth 100):
+
+| dataset  | clusters | probed (fixed) | probed (adaptive) | `ann_recall@10` | mean `tau` | tightest bound in the tail |
+|----------|---------:|---------------:|------------------:|----------------:|-----------:|---------------------------:|
+| scifact  | 72       | 36.0           | **36.0**          | 0.9893 (both)   | 0.653      | 0.979                      |
+| nfcorpus | 60       | 30.0           | **30.0**          | 0.9625 (both)   | 0.548      | 0.962                      |
+
+**It retires nothing.** Not "rarely" — zero clusters across 623 queries. The bound sits ~0.3
+above the threshold it would have to fall below.
+
+And it is not outliers inflating `R`, which was the expected failure mode: the mean *max*
+radius is 0.62 and the mean *p95* radius is 0.58, so a quantile radius — which would cost the
+soundness proof — moves the bound by ~0.04 and still retires nothing (0.00% at p90). The cause
+is dimensional: at 384-d these clusters have radius ~0.62 while the query's own k-th nearest
+neighbour sits ~0.77 away, so every probed cluster's ball reaches into the query's
+neighbourhood and none can be ruled out. Cluster geometry offers no separation at this scale.
+
+Enabling it therefore costs a second serial fetch wave and buys nothing, so it is off. The
+machinery stays: the radii are written, the bound is proved sound against brute force
+(`mlake-ivf/tests/adaptive_probe.rs`), and the verdict is a property of these corpora — a much
+larger or better-separated one could flip it. `MEMLAKE_PROBE_STATS=1` prints per-query
+`selected` / `fetched` / `retired` / `tau` / `min_bound` for re-measuring.
+
+**Caveats worth knowing before trusting it anywhere:**
+
+- `tau` is the k-th best *lower* bound from the scan, and `Binary`'s lower bound is
+  probabilistic, not absolute. A `tau` that is optimistic makes the stopping rule slightly
+  over-eager. `Int8` and `F32` bounds are absolute.
+- `k` is the arm depth (100), not the reported `@10`. A `tau` at k=10 would be ~0.05 higher —
+  still nowhere near the bound.
+- The radius is computed from the vectors the fold holds. From the second generation onward
+  those are decodes of the previous `.vec` block, not the caller's original embeddings — but
+  the rerank tier the query scores against is built from the same values in the same fold, so
+  the bound is sound with respect to what the query actually ranks.

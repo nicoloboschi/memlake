@@ -1634,6 +1634,7 @@ dependencies = [
  "bytes",
  "chrono",
  "futures",
+ "memmap2",
  "mlake-core",
  "object_store",
  "serde",

@@ -26,6 +26,20 @@ pub enum Delta {
     SetTimestamps(Timestamps),
     /// Upsert these metadata keys (merge — other keys are untouched).
     MergeMetadata(Vec<(String, String)>),
+    /// Stamp the write time (epoch ms), leaving the four content timestamps alone.
+    ///
+    /// Distinct from `SetTimestamps`, which replaces the whole struct: a patch is a write
+    /// and must bump `updated_at`, but it must not thereby wipe the event/occurred/mentioned
+    /// times a caller did not mention. The value is baked in at commit rather than read from
+    /// a clock during the fold, so replaying the log is deterministic.
+    ///
+    /// Appended last so a log written before it existed still decodes.
+    Touch(i64),
+    /// Set the timestamps that are `Some`, leaving the rest alone.
+    ///
+    /// What a partial update means, and the default the wire `Patch` maps to. `SetTimestamps`
+    /// remains the way to *clear* a field, since under a merge a `None` says nothing.
+    MergeTimestamps(Timestamps),
 }
 
 /// Apply one delta to a stored memory in place.
@@ -43,6 +57,15 @@ pub fn apply_delta(item: &mut StoredMemory, delta: &Delta) {
             item.entity_ids.dedup();
         }
         Delta::SetTimestamps(ts) => item.timestamps = *ts,
+        Delta::Touch(at) => item.timestamps.updated_at = Some(*at),
+        Delta::MergeTimestamps(ts) => {
+            let cur = &mut item.timestamps;
+            cur.event_date = ts.event_date.or(cur.event_date);
+            cur.occurred_start = ts.occurred_start.or(cur.occurred_start);
+            cur.occurred_end = ts.occurred_end.or(cur.occurred_end);
+            cur.mentioned_at = ts.mentioned_at.or(cur.mentioned_at);
+            cur.updated_at = ts.updated_at.or(cur.updated_at);
+        }
         Delta::MergeMetadata(pairs) => {
             for (k, v) in pairs {
                 match item.metadata.iter_mut().find(|(ek, _)| ek == k) {
@@ -140,11 +163,32 @@ mod tests {
     use crate::id::EntityId;
     use crate::memory::Timestamps;
 
+    /// The same fixture as [`item`], as the fold sees it after an upsert.
+    fn stored(key: &str, timestamps: Timestamps) -> StoredMemory {
+        let m = item(key);
+        StoredMemory {
+            id: m.id,
+            vector: m.vector,
+            text: m.text,
+            index_text: m.index_text,
+            memory_type: m.memory_type,
+            tags: m.tags,
+            timestamps,
+            proof_count: m.proof_count,
+            entity_ids: m.entity_ids,
+            semantic_out: vec![],
+            causal_out: m.causal_out,
+            metadata: m.metadata,
+            write_seq: 0,
+        }
+    }
+
     fn item(key: &str) -> Memory {
         Memory {
             id: MemoryId::from_key(key),
             vector: vec![0.1, 0.2, 0.3],
             text: format!("text for {key}"),
+            index_text: String::new(),
             memory_type: 1,
             tags: vec!["t".into()],
             timestamps: Timestamps::default(),
@@ -215,12 +259,98 @@ mod tests {
     }
 
     #[test]
+    fn touch_stamps_the_write_time_and_leaves_content_time_alone() {
+        // The distinction the whole delta exists for. `SetTimestamps` replaces the struct, so
+        // a patch could not bump `updated_at` without also wiping the event/occurred/mentioned
+        // times a caller never mentioned — and "changed since X" would then be trading one
+        // silent data loss for another.
+        let mut item = stored(
+            "a",
+            Timestamps {
+                event_date: Some(10),
+                occurred_start: Some(20),
+                occurred_end: Some(30),
+                mentioned_at: Some(40),
+                updated_at: Some(50),
+            },
+        );
+        apply_delta(&mut item, &Delta::Touch(9_000));
+        assert_eq!(item.timestamps.updated_at, Some(9_000));
+        assert_eq!(item.timestamps.event_date, Some(10));
+        assert_eq!(item.timestamps.occurred_start, Some(20));
+        assert_eq!(item.timestamps.occurred_end, Some(30));
+        assert_eq!(item.timestamps.mentioned_at, Some(40));
+    }
+
+    #[test]
+    fn merging_timestamps_leaves_the_ones_not_mentioned_alone() {
+        // The bug this delta exists to fix: revising one time must not clear the other three.
+        // `SetTimestamps` replaces wholesale, and the client builds its argument from only the
+        // fields the caller passed, so a patch that corrects `occurred_start` used to silently
+        // null `event_date`, `occurred_end` and `mentioned_at`.
+        let full = Timestamps {
+            event_date: Some(10),
+            occurred_start: Some(20),
+            occurred_end: Some(30),
+            mentioned_at: Some(40),
+            updated_at: Some(50),
+        };
+        let one = Timestamps { occurred_start: Some(99), ..Default::default() };
+
+        let mut merged = stored("a", full);
+        apply_delta(&mut merged, &Delta::MergeTimestamps(one));
+        assert_eq!(
+            merged.timestamps,
+            Timestamps { occurred_start: Some(99), ..full },
+            "a merge overwrites what it mentions and nothing else"
+        );
+
+        // `SetTimestamps` still clears, which is what makes it the way to null a field.
+        let mut replaced = stored("a", full);
+        apply_delta(&mut replaced, &Delta::SetTimestamps(one));
+        assert_eq!(replaced.timestamps, one);
+    }
+
+    #[test]
+    fn merging_an_empty_timestamps_changes_nothing() {
+        // A merge cannot express "clear", so an all-`None` argument is a no-op rather than a
+        // wipe — the property that makes the default safe.
+        let full = Timestamps {
+            event_date: Some(10),
+            occurred_start: Some(20),
+            occurred_end: Some(30),
+            mentioned_at: Some(40),
+            updated_at: Some(50),
+        };
+        let mut item = stored("a", full);
+        apply_delta(&mut item, &Delta::MergeTimestamps(Timestamps::default()));
+        assert_eq!(item.timestamps, full);
+    }
+
+    #[test]
+    fn a_touch_after_set_timestamps_wins() {
+        // The order the server emits them in: a client that sets content times has not
+        // thereby said when the write happened, so the server's stamp must survive.
+        let mut item = stored("a", Timestamps::default());
+        apply_deltas(
+            &mut item,
+            &[
+                Delta::SetTimestamps(Timestamps { updated_at: Some(1), ..Default::default() }),
+                Delta::Touch(9_000),
+            ],
+        );
+        assert_eq!(item.timestamps.updated_at, Some(9_000));
+    }
+
+    #[test]
     fn deltas_codec_round_trips_including_unaligned() {
         let deltas = vec![
             Delta::SetText("hello".into()),
             Delta::ProofCount(3),
             Delta::SetTags(vec!["a".into(), "b".into()]),
             Delta::MergeMetadata(vec![("k".into(), "v".into())]),
+            Delta::Touch(9_000),
+            Delta::MergeTimestamps(Timestamps { updated_at: Some(7), ..Default::default() }),
         ];
         let bytes = deltas_to_rkyv_bytes(&deltas);
         assert_eq!(deltas_from_rkyv_bytes(&bytes).unwrap(), deltas);

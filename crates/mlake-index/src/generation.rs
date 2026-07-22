@@ -130,13 +130,54 @@ pub struct Stats {
     pub edge_count: usize,
 }
 
-/// One cluster's tag summary, for pruning it before fetch (SCALE.md Phase 4b): the union of
-/// all its memories' tags, and whether any memory is untagged.
+/// One cluster's summary, for pruning it before fetch (SCALE.md Phase 4b): the union of all
+/// its memories' tags, whether any memory is untagged, and the span of their write times.
 #[derive(Serialize, Deserialize, Default, Clone)]
 pub struct ClusterTagSummary {
     /// Distinct tags present across the cluster's memories, sorted.
     pub tags: Vec<String>,
     pub has_untagged: bool,
+    /// The `[min, max]` of the cluster's members' `updated_at` (epoch ms) — the time twin of
+    /// the tag union, letting an `updated_at` window prune a cluster before it is fetched.
+    ///
+    /// `None` in a summary written before the field existed, which readers must treat as
+    /// "unknown, admit the cluster". A cluster whose members *all* lack a write time writes
+    /// an empty range (`min > max`) instead, which admits nothing bounded. The two are
+    /// different, and conflating them would silently drop clusters across an upgrade.
+    #[serde(default)]
+    pub updated_range: Option<[i64; 2]>,
+}
+
+impl ClusterTagSummary {
+    /// Whether any member of the cluster could fall inside the window. `false` means the
+    /// cluster can be dropped from the probe set without being read.
+    ///
+    /// Necessary, not sufficient: the range says nothing about which points inside it are
+    /// occupied, so a `true` still leaves the per-member check to decide. But a `false` is
+    /// exact — no member of the cluster can pass — which is what makes it safe to prune on.
+    pub fn admits_window(&self, from: Option<i64>, to: Option<i64>) -> bool {
+        if from.is_none() && to.is_none() {
+            return true;
+        }
+        let Some([lo, hi]) = self.updated_range else {
+            return true;
+        };
+        if lo > hi {
+            return false;
+        }
+        from.is_none_or(|f| hi > f) && to.is_none_or(|t| lo < t)
+    }
+
+    /// The summary of a cluster's write times, from its members' `updated_at`.
+    pub fn range_of<'a>(updated: impl Iterator<Item = &'a Option<i64>>) -> Option<[i64; 2]> {
+        let mut lo = i64::MAX;
+        let mut hi = i64::MIN;
+        for u in updated.flatten() {
+            lo = lo.min(*u);
+            hi = hi.max(*u);
+        }
+        Some([lo, hi])
+    }
 }
 
 /// The per-cluster tag summaries for a generation, indexed by cluster id.

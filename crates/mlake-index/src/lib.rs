@@ -21,7 +21,9 @@ pub use generation::{read_fts_split, read_generation, write_generation, ClusterT
 pub use indexer::{
     flush, fold, index, IndexOptions, IndexOutcome, COMPACT_FANOUT, DEFAULT_STREAMING_THRESHOLD_DOCS,
 };
-pub use query_node::{ArmDepths, ArmScore, ClusterLayout, QueryNode, RawHit, ScanCursor};
+pub use query_node::{
+    ArmDepths, ArmScore, ClusterLayout, QueryNode, RawHit, ScanCursor, UpdatedWindow,
+};
 pub use sstable::{
     EntityTable, PayloadTable, PkTable, RadjTable, RerankTable, SsTableBuilder, SsTableIndex,
     TimeTable,

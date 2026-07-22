@@ -34,6 +34,7 @@ fn corpus(n: usize, dim: usize, seed: u64) -> Vec<StoredMemory> {
                 id: MemoryId::from_key(&format!("item-{i}")),
                 vector: v,
                 text: format!("item {i}"),
+                index_text: String::new(),
                 memory_type: 1,
                 tags: vec![],
                 timestamps: Timestamps::default(),

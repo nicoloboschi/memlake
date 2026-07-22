@@ -101,6 +101,12 @@ const HEADER_LEN: usize = 16;
 /// are *all* untagged has an empty dictionary and still filters (the strict modes must
 /// exclude its members; `Exact` with an empty request must select them).
 const FLAG_HAS_TAGS: u8 = 0b0000_0001;
+/// Set when the block carries a per-member `updated_at` column. See [`VectorBlock::updated`].
+const FLAG_HAS_UPDATED: u8 = 0b0000_0010;
+
+/// A member whose write time is unknown. Distinct from any real timestamp, and it fails
+/// every bounded window: an unknown write time cannot be shown to fall inside one.
+pub const UPDATED_UNKNOWN: i64 = i64::MIN;
 
 /// A [`MemoryId`] is a raw 16-byte UUID.
 const ID_LEN: usize = 16;
@@ -363,6 +369,22 @@ pub struct VectorBlock {
     tag_union: Vec<u8>,
     /// Whether any member is untagged (an all-zero bitmap). Derived, never serialized.
     any_untagged: bool,
+    /// Whether the `updated` column below is meaningful. See [`FLAG_HAS_UPDATED`].
+    has_updated: bool,
+    /// Per-member write time (epoch ms), member order, [`UPDATED_UNKNOWN`] where absent.
+    ///
+    /// Fixed 8-byte stride, unlike the tag bitmap's variable width, so the column is a plain
+    /// `i64` lookup. It costs 8 B/member — about 13% on top of a 60 B binary code — and buys
+    /// the *only* way to apply an `updated_at` window before the top-k truncation: a segment
+    /// candidate is `(id, score)` until it is materialized, which happens after the cut, so
+    /// without this a window can only remove rows from the winners rather than deepen the
+    /// search into the matching set.
+    updated: Vec<i64>,
+    /// The block's `updated` range over members with a known value. Lets a query skip a whole
+    /// block whose every member falls outside the window, the way `tag_union` does for tags.
+    /// Derived, never serialized.
+    updated_min: i64,
+    updated_max: i64,
     /// The basis [`VectorCodec::Binary`]'s signs were taken in. Derived from `dim` and
     /// [`ROTATION_SEED`], never serialized — storing it would cost more than the codes.
     /// `None` for the codecs that do not rotate. Behind an [`Arc`] so cloning a block does not
@@ -454,7 +476,7 @@ impl VectorBlock {
         ids: &[MemoryId],
         vectors: &[Vec<f32>],
     ) -> Result<Self, mlake_core::Error> {
-        Self::encode_inner(codec, dim, ids, vectors, None, None)
+        Self::encode_inner(codec, dim, ids, vectors, None, None, None)
     }
 
     /// Encode with a per-cluster tag dictionary and per-member bitmaps.
@@ -480,7 +502,29 @@ impl VectorBlock {
                 ids.len()
             )));
         }
-        Self::encode_inner(codec, dim, ids, vectors, Some(member_tags), None)
+        Self::encode_inner(codec, dim, ids, vectors, Some(member_tags), None, None)
+    }
+
+    /// Encode with the tag column *and* a per-member `updated_at` column.
+    ///
+    /// `member_updated[i]` is member `i`'s write time in epoch ms, or [`UPDATED_UNKNOWN`].
+    /// Both columns are positional and must align 1:1 with `ids`/`vectors`.
+    pub fn encode_with_columns(
+        codec: VectorCodec,
+        dim: usize,
+        ids: &[MemoryId],
+        vectors: &[Vec<f32>],
+        member_tags: Option<&[Vec<String>]>,
+        member_updated: &[i64],
+    ) -> Result<Self, mlake_core::Error> {
+        if member_updated.len() != ids.len() {
+            return Err(mlake_core::Error::Encode(format!(
+                "{} updated_at values for {} ids: the column is positional",
+                member_updated.len(),
+                ids.len()
+            )));
+        }
+        Self::encode_inner(codec, dim, ids, vectors, member_tags, Some(member_updated), None)
     }
 
     /// The same encoding with the rotation replaced — the only way to build a block whose
@@ -494,7 +538,7 @@ impl VectorBlock {
         vectors: &[Vec<f32>],
         rot: Rotation,
     ) -> Result<Self, mlake_core::Error> {
-        Self::encode_inner(codec, dim, ids, vectors, None, Some(Arc::new(rot)))
+        Self::encode_inner(codec, dim, ids, vectors, None, None, Some(Arc::new(rot)))
     }
 
     fn encode_inner(
@@ -503,6 +547,7 @@ impl VectorBlock {
         ids: &[MemoryId],
         vectors: &[Vec<f32>],
         member_tags: Option<&[Vec<String>]>,
+        member_updated: Option<&[i64]>,
         rot_override: Option<Arc<Rotation>>,
     ) -> Result<Self, mlake_core::Error> {
         if ids.len() != vectors.len() {
@@ -591,6 +636,9 @@ impl VectorBlock {
             }
         };
         let (tag_union, any_untagged) = tag_summary(&tag_bits, tag_dict.len().div_ceil(8), ids.len());
+        let updated = member_updated.map(|u| u.to_vec()).unwrap_or_default();
+        let has_updated = member_updated.is_some();
+        let (updated_min, updated_max) = updated_summary(&updated);
 
         Ok(Self {
             codec: Some(codec),
@@ -603,6 +651,10 @@ impl VectorBlock {
             tag_bits,
             tag_union,
             any_untagged,
+            has_updated,
+            updated,
+            updated_min,
+            updated_max,
             rot,
         })
     }
@@ -612,12 +664,14 @@ impl VectorBlock {
     ///
     /// `[magic 4][version 1][codec 1][flags 1][reserved 1][dim u32][count u32]`, then `count`
     /// ids, then the block mean (quantized codecs only), then the tag column when
-    /// [`FLAG_HAS_TAGS`] is set, then the codes.
+    /// [`FLAG_HAS_TAGS`] is set, then the `updated` column when [`FLAG_HAS_UPDATED`] is, then
+    /// the codes.
     ///
     /// The tag column is `[dict len u32]`, then that many `[len u32][utf8]` entries, then
-    /// `count` bitmaps of `ceil(dict len / 8)` bytes. It sits *before* the codes so the codes
-    /// remain the tail: a reader that has parsed everything else knows the exact number of
-    /// bytes that must remain, which is what makes the length check below an equality.
+    /// `count` bitmaps of `ceil(dict len / 8)` bytes. The `updated` column is `count` little-
+    /// endian `i64`s. Both sit *before* the codes so the codes remain the tail: a reader that
+    /// has parsed everything else knows the exact number of bytes that must remain, which is
+    /// what makes the length check below an equality.
     pub fn to_bytes(&self) -> Vec<u8> {
         let codec = self.codec();
         let stride = Self::bytes_per_vector(codec, self.dim);
@@ -626,12 +680,20 @@ impl VectorBlock {
                 + self.ids.len() * ID_LEN
                 + self.mean.len() * 4
                 + self.tag_bits.len()
+                + self.updated_section_len()
                 + self.codes.len(),
         );
         out.extend_from_slice(&MAGIC);
         out.push(FORMAT_VERSION);
         out.push(codec.tag());
-        out.push(if self.has_tags { FLAG_HAS_TAGS } else { 0 });
+        let mut flags = 0u8;
+        if self.has_tags {
+            flags |= FLAG_HAS_TAGS;
+        }
+        if self.has_updated {
+            flags |= FLAG_HAS_UPDATED;
+        }
+        out.push(flags);
         out.push(0);
         out.extend_from_slice(&(self.dim as u32).to_le_bytes());
         out.extend_from_slice(&(self.ids.len() as u32).to_le_bytes());
@@ -649,6 +711,12 @@ impl VectorBlock {
             }
             out.extend_from_slice(&self.tag_bits);
         }
+        // Fixed 8 bytes per member; sits after the tag column so the codes stay the tail.
+        if self.has_updated {
+            for u in &self.updated {
+                out.extend_from_slice(&u.to_le_bytes());
+            }
+        }
         out.extend_from_slice(&self.codes);
         debug_assert_eq!(
             out.len(),
@@ -656,8 +724,18 @@ impl VectorBlock {
                 + self.ids.len() * (ID_LEN + stride)
                 + self.mean.len() * 4
                 + self.tag_section_len()
+                + self.updated_section_len()
         );
         out
+    }
+
+    /// Bytes the `updated` column occupies in the serialized form.
+    fn updated_section_len(&self) -> usize {
+        if self.has_updated {
+            self.updated.len() * 8
+        } else {
+            0
+        }
     }
 
     /// Bytes the tag column occupies in the serialized form.
@@ -692,10 +770,11 @@ impl VectorBlock {
         let codec = VectorCodec::from_tag(bytes[5])
             .ok_or_else(|| bad(&format!("unknown codec {}", bytes[5])))?;
         let flags = bytes[6];
-        if flags & !FLAG_HAS_TAGS != 0 {
+        if flags & !(FLAG_HAS_TAGS | FLAG_HAS_UPDATED) != 0 {
             return Err(bad(&format!("unknown header flags {flags:#04x}")));
         }
         let has_tags = flags & FLAG_HAS_TAGS != 0;
+        let has_updated = flags & FLAG_HAS_UPDATED != 0;
         let dim = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]) as usize;
         let count = u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]) as usize;
 
@@ -769,6 +848,23 @@ impl VectorBlock {
             cursor = end;
         }
 
+        // Fixed-width, so one bounds check covers the whole column.
+        let mut updated: Vec<i64> = Vec::new();
+        if has_updated {
+            let end = count
+                .checked_mul(8)
+                .and_then(|n| n.checked_add(cursor))
+                .ok_or_else(|| bad("updated column overflows"))?;
+            let raw = bytes
+                .get(cursor..end)
+                .ok_or_else(|| bad("updated column truncated"))?;
+            updated = raw
+                .chunks_exact(8)
+                .map(|c| i64::from_le_bytes(c.try_into().expect("chunks_exact yields 8 bytes")))
+                .collect();
+            cursor = end;
+        }
+
         let total = count
             .checked_mul(Self::bytes_per_vector(codec, dim))
             .and_then(|n| n.checked_add(cursor))
@@ -789,6 +885,7 @@ impl VectorBlock {
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
         let (tag_union, any_untagged) = tag_summary(&tag_bits, tag_dict.len().div_ceil(8), count);
+        let (updated_min, updated_max) = updated_summary(&updated);
 
         Ok(Self {
             codec: Some(codec),
@@ -801,6 +898,10 @@ impl VectorBlock {
             tag_bits,
             tag_union,
             any_untagged,
+            has_updated,
+            updated,
+            updated_min,
+            updated_max,
             // Rederived, not read: `dim` is in the header and the rotation is a pure function
             // of it. `dim` is already bounded by the length checks above, so this cannot be
             // talked into a large allocation by a malformed block.
@@ -971,6 +1072,71 @@ impl VectorBlock {
             TagsMatch::All => self.any_untagged || contains_all(u, mask),
             TagsMatch::AnyStrict => overlaps(u, mask),
             TagsMatch::AllStrict | TagsMatch::Exact => contains_all(u, mask),
+        }
+    }
+
+    /// Whether member `i` falls inside the `updated_at` window. Pure integer compare; no
+    /// payload read.
+    ///
+    /// Exactly the window arm of `Predicate::matches`: strictly after `from`, strictly before
+    /// `to`, and a member whose write time is unknown fails a *bounded* window rather than
+    /// passing it by default. An unbounded window (both `None`) admits everyone, unknowns
+    /// included.
+    ///
+    /// Returns `true` for every member when the block carries no `updated` column — the
+    /// caller must then still filter on the hydrated payload — and `false` for an `i` past
+    /// the end.
+    pub fn passes_updated(&self, i: usize, from: Option<i64>, to: Option<i64>) -> bool {
+        if i >= self.ids.len() {
+            return false;
+        }
+        if from.is_none() && to.is_none() {
+            return true;
+        }
+        let Some(&u) = self.updated.get(i) else {
+            // No column: undecidable here, so admit and let the payload-side check rule.
+            return true;
+        };
+        if u == UPDATED_UNKNOWN {
+            return false;
+        }
+        from.is_none_or(|f| u > f) && to.is_none_or(|t| u < t)
+    }
+
+    /// Whether ANY member could fall inside the window. `false` means the caller can skip the
+    /// whole block without scoring it.
+    ///
+    /// Compares the request against the block's `[min, max]` of *known* write times. A block
+    /// written entirely before `from` or entirely after `to` is a whole cluster's worth of
+    /// scoring skipped for two integer compares — the common shape for a time-sliced query
+    /// against an index whose blocks tend to be built from contiguous writes.
+    ///
+    /// Never optimistic in the direction that matters: `false` implies [`Self::passes_updated`]
+    /// is `false` for every member. It may return `true` where nothing in fact passes, since
+    /// the range says nothing about which points inside it are occupied.
+    pub fn any_can_pass_updated(&self, from: Option<i64>, to: Option<i64>) -> bool {
+        if self.ids.is_empty() {
+            return false;
+        }
+        if from.is_none() && to.is_none() {
+            return true;
+        }
+        if !self.has_updated {
+            return true;
+        }
+        // An empty range means every member is unknown, and unknowns fail a bounded window.
+        if self.updated_min > self.updated_max {
+            return false;
+        }
+        from.is_none_or(|f| self.updated_max > f) && to.is_none_or(|t| self.updated_min < t)
+    }
+
+    /// Member `i`'s write time in epoch ms, or `None` when it is unknown, the block carries
+    /// no `updated` column, or `i` is past the end.
+    pub fn member_updated(&self, i: usize) -> Option<i64> {
+        match self.updated.get(i) {
+            Some(&u) if u != UPDATED_UNKNOWN => Some(u),
+            _ => None,
         }
     }
 
@@ -1215,6 +1381,21 @@ fn block_mean(dim: usize, vectors: &[Vec<f32>]) -> Vec<f32> {
 
 /// The block's tag union and whether any member is untagged, derived once from the bitmaps
 /// so [`VectorBlock::any_can_pass`] is `O(width)` rather than `O(members * width)`.
+/// The min and max of the known values in an `updated` column. `(i64::MAX, i64::MIN)` when
+/// the column is empty or every member is unknown — an empty range, which
+/// [`VectorBlock::any_can_pass_updated`] reads as "nothing here can match a bounded window".
+fn updated_summary(updated: &[i64]) -> (i64, i64) {
+    let mut lo = i64::MAX;
+    let mut hi = i64::MIN;
+    for &u in updated {
+        if u != UPDATED_UNKNOWN {
+            lo = lo.min(u);
+            hi = hi.max(u);
+        }
+    }
+    (lo, hi)
+}
+
 fn tag_summary(bits: &[u8], width: usize, count: usize) -> (Vec<u8>, bool) {
     if width == 0 {
         // No dictionary: every member is untagged, and the union is empty. `count == 0` is
@@ -2108,6 +2289,198 @@ mod tests {
         let b = vec![tags(&["a", "b"]), tags(&["c"]), Vec::new()];
         assert_eq!(tagged_block(&a).to_bytes(), tagged_block(&b).to_bytes());
         assert_eq!(tagged_block(&a).to_bytes(), tagged_block(&a).to_bytes());
+    }
+
+    fn updated_block(member_updated: &[i64]) -> VectorBlock {
+        let n = member_updated.len();
+        VectorBlock::encode_with_columns(
+            VectorCodec::F32,
+            2,
+            &ids(n),
+            &filler(n),
+            None,
+            member_updated,
+        )
+        .unwrap()
+    }
+
+    /// A member as `Predicate` sees it, so the block can be checked against the definition
+    /// rather than against a restatement of itself.
+    fn reference_memory(updated: i64) -> mlake_core::StoredMemory {
+        mlake_core::StoredMemory {
+            id: MemoryId::from_key("m"),
+            vector: vec![1.0, 0.0],
+            text: String::new(),
+            index_text: String::new(),
+            memory_type: 1,
+            tags: vec![],
+            timestamps: mlake_core::memory::Timestamps {
+                updated_at: (updated != UPDATED_UNKNOWN).then_some(updated),
+                ..Default::default()
+            },
+            proof_count: 0,
+            entity_ids: vec![],
+            semantic_out: vec![],
+            causal_out: vec![],
+            metadata: vec![],
+            write_seq: 0,
+        }
+    }
+
+    #[test]
+    fn the_window_filter_agrees_with_predicate_on_every_bound() {
+        // The property the push-down rests on: the block-side window is not *approximately*
+        // `Predicate`'s window, it is the same predicate evaluated earlier. Swept over open,
+        // half-open and closed windows, boundary values included, with unknowns mixed in —
+        // the strictness of `>` / `<` and the treatment of an unknown write time are exactly
+        // the two things that would be silently wrong if they drifted.
+        let members: Vec<i64> = vec![10, 20, 20, 30, UPDATED_UNKNOWN, 40];
+        let block = updated_block(&members);
+        let bounds = [None, Some(9), Some(10), Some(20), Some(30), Some(40), Some(41)];
+        for from in bounds {
+            for to in bounds {
+                for (i, &u) in members.iter().enumerate() {
+                    let reference = mlake_core::Predicate {
+                        updated_from: from,
+                        updated_to: to,
+                        ..Default::default()
+                    }
+                    .matches(&reference_memory(u));
+                    assert_eq!(
+                        block.passes_updated(i, from, to),
+                        reference,
+                        "member {i} ({u}) against ({from:?}, {to:?})"
+                    );
+                }
+                if !block.any_can_pass_updated(from, to) {
+                    assert!(
+                        (0..block.len()).all(|i| !block.passes_updated(i, from, to)),
+                        "any_can_pass_updated said no member could pass ({from:?}, {to:?}), \
+                         but one does"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_block_written_outside_the_window_is_skipped_whole() {
+        // What the column is for: two integer compares retire a cluster before it is scored.
+        let block = updated_block(&[100, 150, 200]);
+        assert!(!block.any_can_pass_updated(Some(200), None), "entirely before `from`");
+        assert!(!block.any_can_pass_updated(None, Some(100)), "entirely after `to`");
+        assert!(!block.any_can_pass_updated(Some(200), Some(300)), "window past the block");
+        assert!(block.any_can_pass_updated(Some(150), None), "one member is inside");
+        assert!(block.any_can_pass_updated(None, None), "unbounded admits everything");
+    }
+
+    #[test]
+    fn a_block_whose_members_are_all_unknown_passes_nothing_bounded() {
+        // An empty known-range must not read as "the whole line": a bounded window excludes
+        // an unknown write time, so the block can be retired outright.
+        let block = updated_block(&[UPDATED_UNKNOWN, UPDATED_UNKNOWN]);
+        assert!(!block.any_can_pass_updated(Some(0), None));
+        assert!(!block.any_can_pass_updated(None, Some(i64::MAX)));
+        assert!(block.any_can_pass_updated(None, None), "unbounded still admits them");
+        assert!(block.passes_updated(0, None, None));
+    }
+
+    #[test]
+    fn a_block_encoded_without_the_column_filters_nothing() {
+        // Blocks written before the column existed are undecidable here, so they must admit
+        // every member and leave the window to the payload-side check. Dropping them instead
+        // would silently lose hits across a format upgrade.
+        let block = VectorBlock::encode(VectorCodec::F32, 2, &ids(3), &filler(3)).unwrap();
+        assert!(block.any_can_pass_updated(Some(0), Some(1)));
+        assert!((0..3).all(|i| block.passes_updated(i, Some(0), Some(1))));
+        assert!(block.member_updated(0).is_none());
+    }
+
+    #[test]
+    fn an_index_past_the_end_is_admitted_by_nothing() {
+        let block = updated_block(&[10]);
+        assert!(!block.passes_updated(1, None, None));
+        assert!(!block.passes_updated(1, Some(0), Some(100)));
+        assert!(block.member_updated(1).is_none());
+    }
+
+    #[test]
+    fn the_updated_column_round_trips_through_bytes() {
+        let members = vec![10, UPDATED_UNKNOWN, 30];
+        let block = updated_block(&members);
+        let back = VectorBlock::from_bytes(&block.to_bytes()).unwrap();
+        assert_eq!(back, block);
+        for (i, &u) in members.iter().enumerate() {
+            assert_eq!(back.member_updated(i), (u != UPDATED_UNKNOWN).then_some(u));
+        }
+        assert!(!back.any_can_pass_updated(Some(30), None));
+    }
+
+    #[test]
+    fn both_columns_round_trip_together() {
+        // The two columns are serialized back to back ahead of the codes; this is the case
+        // that catches a reader walking them in the wrong order or off by a section.
+        let member_tags = vec![tags(&["a"]), Vec::new(), tags(&["a", "b"])];
+        let block = VectorBlock::encode_with_columns(
+            VectorCodec::F32,
+            2,
+            &ids(3),
+            &filler(3),
+            Some(&member_tags),
+            &[10, UPDATED_UNKNOWN, 30],
+        )
+        .unwrap();
+        let back = VectorBlock::from_bytes(&block.to_bytes()).unwrap();
+        assert_eq!(back, block);
+        assert_eq!(back.member_tags(2), tags(&["a", "b"]));
+        assert_eq!(back.member_updated(2), Some(30));
+        assert_eq!(back.codes, block.codes, "the codes must still be the tail");
+    }
+
+    #[test]
+    fn a_truncated_updated_column_is_an_error_not_a_panic() {
+        let bytes = updated_block(&[10, 20, 30]).to_bytes();
+        for cut in 1..=(3 * 8) {
+            let err = VectorBlock::from_bytes(&bytes[..bytes.len() - cut]);
+            assert!(err.is_err(), "truncating {cut} bytes decoded anyway");
+        }
+        // A header that claims the column against a body that does not carry it.
+        let mut lying = updated_block(&[10]).to_bytes();
+        let plain = VectorBlock::encode(VectorCodec::F32, 2, &ids(1), &filler(1))
+            .unwrap()
+            .to_bytes();
+        lying.truncate(plain.len());
+        assert!(VectorBlock::from_bytes(&lying).is_err());
+    }
+
+    #[test]
+    fn the_updated_column_encodes_deterministically() {
+        assert_eq!(updated_block(&[3, 1, 2]).to_bytes(), updated_block(&[3, 1, 2]).to_bytes());
+    }
+
+    #[test]
+    fn encode_with_columns_rejects_a_column_that_disagrees_with_the_member_count() {
+        let err = VectorBlock::encode_with_columns(
+            VectorCodec::F32,
+            2,
+            &ids(2),
+            &filler(2),
+            None,
+            &[1],
+        )
+        .unwrap_err();
+        assert!(matches!(err, mlake_core::Error::Encode(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn the_updated_column_costs_eight_bytes_a_member() {
+        // The number the size decision was made against, measured rather than argued.
+        let with = updated_block(&vec![1i64; N]).to_bytes().len();
+        let without = VectorBlock::encode(VectorCodec::F32, 2, &ids(N), &filler(N))
+            .unwrap()
+            .to_bytes()
+            .len();
+        assert_eq!(with - without, N * 8);
     }
 
     #[test]
