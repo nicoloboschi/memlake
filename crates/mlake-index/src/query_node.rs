@@ -14,7 +14,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Instant;
 
-use mlake_core::{EntityId, MemoryId, StoredMemory, TagFilter};
+use mlake_core::{EntityId, MemoryId, Predicate, StoredMemory, TagFilter};
 use mlake_fts::{TantivyFts, Tokenizer};
 use mlake_graph::radj::InEdge;
 use mlake_graph::{GraphParams, GraphSource};
@@ -72,6 +72,7 @@ pub struct ArmDepths {
 struct FactTypeState {
     centroids: Centroids,
     cluster_paths: Vec<String>,
+    vector_paths: Vec<String>,
     tag_summary: TagSummary,
     gen_fts: TantivyFts,
     radj: RadjTable,
@@ -272,6 +273,7 @@ impl QueryNode {
                     FactTypeState {
                         centroids: Centroids::from_bytes(&centroids_bytes)?,
                         cluster_paths: files.clusters.clone(),
+                        vector_paths: files.vectors.clone(),
                         tag_summary,
                         gen_fts,
                         radj: RadjTable::open(&radj_idx, files.radj_csr.clone())?,
@@ -290,6 +292,7 @@ impl QueryNode {
                     FactTypeState {
                         centroids: Centroids::default(),
                         cluster_paths: Vec::new(),
+                        vector_paths: Vec::new(),
                         tag_summary: Vec::new(),
                         gen_fts: TantivyFts::build(
                             std::iter::empty::<(MemoryId, &str)>(),
@@ -505,7 +508,7 @@ impl QueryNode {
         memory_type: u8,
         cursor: ScanCursor,
         limit: usize,
-        tags: &TagFilter,
+        filter: &Predicate,
     ) -> Result<(Vec<StoredMemory>, Option<ScanCursor>)> {
         let Some(state) = self.per_type.get(&memory_type) else {
             return Ok((Vec::new(), None));
@@ -541,7 +544,7 @@ impl QueryNode {
             // Filtering is deterministic for a fixed generation, so `offset` indexes the
             // filtered list stably across calls — the cursor stays valid between pages.
             let matching: Vec<StoredMemory> =
-                items.into_iter().filter(|m| tags.matches(&m.tags)).collect();
+                items.into_iter().filter(|m| filter.matches(m)).collect();
 
             let take = (limit - out.len()).min(matching.len().saturating_sub(offset));
             out.extend(matching.iter().skip(offset).take(take).cloned());
@@ -852,7 +855,16 @@ impl QueryNode {
                 .any(|(seq, p)| m.write_seq < *seq && p.matches(m))
     }
 
-    /// Fetch the items in the given clusters of a fact type — one coalesced roundtrip.
+    /// Fetch the items in the given clusters of a fact type.
+    ///
+    /// Fan-out is bounded: a wide probe (large `nprobe`, or a broad tag filter that admits many
+    /// clusters) would otherwise issue one GET per cluster all at once and hold every raw cluster
+    /// blob in memory simultaneously — a spike proportional to `nprobe × cluster_size`. Instead at
+    /// most `CLUSTER_FETCH_FANOUT` blobs are in flight; each is decoded and its live items kept as
+    /// it arrives, so the transient buffering is capped by the fan-out, not the probe width. (The
+    /// returned live set is still the whole probe — this bounds the fetch spike, not the rerank
+    /// set; per-query rerank size is governed by `nprobe`.) Cross-cluster order is not preserved,
+    /// which no caller depends on.
     async fn fetch_clusters(
         &self,
         state: &FactTypeState,
@@ -860,24 +872,48 @@ impl QueryNode {
         metrics: &QueryMetrics,
         roundtrip: usize,
     ) -> Result<Vec<StoredMemory>> {
-        let futures = cluster_ids.iter().filter_map(|&c| {
-            state
-                .cluster_paths
-                .get(c)
-                .map(|path| self.ns.store.get_immutable(path, Some((metrics, roundtrip))))
-        });
-        let blobs = futures::future::try_join_all(futures).await?;
-        let mut items = Vec::new();
-        for blob in &blobs {
-            let cf = mlake_ivf::ClusterFile::from_bytes(blob)?;
-            for item in cf.items {
-                // Drop tombstoned + predicate-deleted memories so no arm can surface them.
-                if !self.hidden(&item) {
-                    items.push(item);
+        use futures::stream::{StreamExt, TryStreamExt};
+
+        /// Max cluster blobs fetched + resident at once within one `fetch_clusters` call.
+        const CLUSTER_FETCH_FANOUT: usize = 8;
+
+        // Own the paths so each fetch future captures no borrow with a higher-ranked lifetime
+        // (a `&String` stream item would not satisfy `buffer_unordered`'s Send bound).
+        // Each cluster is a pair: `.bin` holds the payload, `.vec` the embeddings, joined
+        // positionally. Both ride the same roundtrip wave, so splitting them cost no extra
+        // latency — the embedding simply stopped being carried through every byte of text.
+        let paths: Vec<(String, String)> = cluster_ids
+            .iter()
+            .filter_map(|&c| {
+                Some((state.cluster_paths.get(c)?.clone(), state.vector_paths.get(c)?.clone()))
+            })
+            .collect();
+        let store = &self.ns.store;
+        let per_cluster: Vec<Vec<StoredMemory>> = futures::stream::iter(paths)
+            .map(|(path, vec_path)| async move {
+                let (blob, vblob) = futures::try_join!(
+                    store.get_immutable(&path, Some((metrics, roundtrip))),
+                    store.get_immutable(&vec_path, Some((metrics, roundtrip))),
+                )?;
+                let mut items = mlake_ivf::ClusterFile::from_bytes(&blob)?.items;
+                let block = mlake_ivf::VectorBlock::from_bytes(&vblob)?;
+                if block.len() != items.len() {
+                    return Err(crate::Error::Core(mlake_core::Error::Decode(format!(
+                        "cluster {path} holds {} members but its vector block holds {}",
+                        items.len(),
+                        block.len()
+                    ))));
                 }
-            }
-        }
-        Ok(items)
+                for (j, item) in items.iter_mut().enumerate() {
+                    item.vector = block.decode(j);
+                }
+                Ok::<_, crate::Error>(items)
+            })
+            .buffer_unordered(CLUSTER_FETCH_FANOUT)
+            .try_collect()
+            .await?;
+        // Drop tombstoned + predicate-deleted memories so no arm can surface them.
+        Ok(per_cluster.into_iter().flatten().filter(|item| !self.hidden(item)).collect())
     }
 
     /// Materialize `ids` (those not already present) into `into`: one coalesced pk lookup +

@@ -24,6 +24,12 @@ pub struct GenerationFiles {
     pub pk: String,
     pub centroids: String,
     pub clusters: Vec<String>,
+    /// `cluster-{i}.vec`: one cluster's embeddings, split out of the cluster file and
+    /// parallel to `clusters` by index. The vector arm reads only these — the embedding is
+    /// ~84% of a stored memory, so scanning it alongside text and metadata meant every
+    /// probe paid for bytes it scored once and discarded.
+    #[serde(default)]
+    pub vectors: Vec<String>,
     /// `radj.csr`: the reverse-adjacency SSTable data blocks (range-read per lookup).
     pub radj_csr: String,
     /// `radj.idx`: the reverse-adjacency SSTable sparse index (loaded whole, small).
@@ -78,6 +84,7 @@ impl GenerationFiles {
         ]
         .into_iter()
         .chain(self.clusters.iter().map(|s| s.as_str()))
+        .chain(self.vectors.iter().map(|s| s.as_str()))
         .filter(|s| !s.is_empty())
     }
 }

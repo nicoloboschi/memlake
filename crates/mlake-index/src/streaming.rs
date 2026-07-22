@@ -32,7 +32,7 @@ use mlake_core::wal::{apply_deltas, deltas_from_rkyv_bytes, deltas_to_rkyv_bytes
 use mlake_core::{Op, Predicate, StoredMemory};
 use mlake_fts::{TantivyFtsBuilder, Tokenizer};
 use mlake_graph::radj::{EdgeKind, InEdge, LinkTypeTag};
-use mlake_ivf::ClusterFile;
+use mlake_ivf::{ClusterFile, VectorBlock, VectorCodec};
 use mlake_wal::Namespace;
 
 use crate::generation::{write_cluster_file, write_generation, ClusterTagSummary, TagSummary};
@@ -412,7 +412,7 @@ pub async fn index_streaming_with_budget(
         let n = spill.len();
         doc_count += n;
         let fti = build_type_streaming(
-            ns, generation, &nonce, ft, spill, sample, n, tokenizer, opts.seed, budget,
+            ns, generation, &nonce, ft, spill, sample, n, tokenizer, opts.seed, opts.vector_codec, budget,
         )
         .await?;
         indexes.insert(ft, fti);
@@ -453,11 +453,14 @@ async fn build_type_streaming(
     n: usize,
     tokenizer: &Tokenizer,
     seed: u64,
+    codec: VectorCodec,
     budget: FoldBudget,
 ) -> Result<mlake_core::manifest::FactTypeIndex> {
     let prefix = format!("{}/mt{memory_type}/gen-{generation}-{nonce}", ns.name);
     let ttr = std::time::Instant::now();
     let k = mlake_ivf::centroid_count(n);
+    // The dimension the vector blocks encode against; 0 for a type with no embeddings.
+    let vector_dim = sample.first().map(|v| v.len()).unwrap_or(0);
     let mut centroids = mlake_ivf::train_centroids_k(&sample, k, seed);
     drop(sample);
     let kk = centroids.len().max(1);
@@ -544,6 +547,7 @@ async fn build_type_streaming(
     // Write cluster files from the cluster-grouped stream.
     let tcw = std::time::Instant::now();
     let mut cluster_paths: Vec<String> = vec![String::new(); kk];
+    let mut vector_paths: Vec<String> = vec![String::new(); kk];
     let mut merge = cluster_sort.finish()?;
     let mut cur_c: Option<usize> = None;
     let mut cur_items: Vec<StoredMemory> = Vec::new();
@@ -557,7 +561,9 @@ async fn build_type_streaming(
                 match cur_c {
                     Some(cc) if cc == c => cur_items.push(item),
                     Some(cc) => {
-                        cluster_paths[cc] = flush_cluster(ns, &prefix, cc, std::mem::take(&mut cur_items)).await?;
+                        let (cp, vp) = flush_cluster(ns, &prefix, cc, std::mem::take(&mut cur_items), codec, vector_dim).await?;
+                        cluster_paths[cc] = cp;
+                        vector_paths[cc] = vp;
                         cur_c = Some(c);
                         cur_items.push(item);
                     }
@@ -569,16 +575,20 @@ async fn build_type_streaming(
             }
             None => {
                 if let Some(cc) = cur_c {
-                    cluster_paths[cc] = flush_cluster(ns, &prefix, cc, std::mem::take(&mut cur_items)).await?;
+                    let (cp, vp) = flush_cluster(ns, &prefix, cc, std::mem::take(&mut cur_items), codec, vector_dim).await?;
+                    cluster_paths[cc] = cp;
+                    vector_paths[cc] = vp;
                 }
                 break;
             }
         }
     }
     // Empty clusters still need a (empty) file so a query can address them by index.
-    for (c, path) in cluster_paths.iter_mut().enumerate() {
-        if path.is_empty() {
-            *path = flush_cluster(ns, &prefix, c, Vec::new()).await?;
+    for c in 0..kk {
+        if cluster_paths[c].is_empty() {
+            let (cp, vp) = flush_cluster(ns, &prefix, c, Vec::new(), codec, vector_dim).await?;
+            cluster_paths[c] = cp;
+            vector_paths[c] = vp;
         }
     }
 
@@ -607,6 +617,7 @@ async fn build_type_streaming(
         &prefix,
         &centroids,
         cluster_paths,
+        vector_paths,
         &fts_split,
         radj.into(),
         pk.into(),
@@ -622,14 +633,32 @@ async fn build_type_streaming(
     Ok(mlake_core::manifest::FactTypeIndex { prev_files: None, train_count: n as u64, files })
 }
 
+/// Write one cluster's pair: the payload file and its vector block, in the same member
+/// order so index `j` names the same memory in both. Returns `(cluster_path, vector_path)`.
 async fn flush_cluster(
     ns: &Namespace,
     prefix: &str,
     c: usize,
-    items: Vec<StoredMemory>,
-) -> Result<String> {
+    mut items: Vec<StoredMemory>,
+    codec: VectorCodec,
+    dim: usize,
+) -> Result<(String, String)> {
+    let ids: Vec<mlake_core::MemoryId> = items.iter().map(|m| m.id).collect();
+    // Absent embeddings (text-only memories) pad to zeros rather than failing the encode.
+    let vectors: Vec<Vec<f32>> = items
+        .iter()
+        .map(|m| if m.vector.is_empty() { vec![0.0; dim] } else { m.vector.clone() })
+        .collect();
+    // The embedding moves to the vector block; leaving a copy inline would give back every
+    // byte this split exists to save.
+    for m in items.iter_mut() {
+        m.vector = Vec::new();
+    }
     let cf = ClusterFile { centroid_id: c as u32, items };
-    write_cluster_file(&ns.store, prefix, c, &cf).await
+    let cluster = write_cluster_file(&ns.store, prefix, c, &cf).await?;
+    let block = VectorBlock::encode(codec, dim, &ids, &vectors)?;
+    let vec_path = crate::generation::write_vector_block(&ns.store, prefix, c, block.to_bytes()).await?;
+    Ok((cluster, vec_path))
 }
 
 /// Group a sorted `(key, value)` merge into an SSTable: consecutive same-key values are

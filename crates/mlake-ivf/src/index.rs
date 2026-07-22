@@ -105,12 +105,64 @@ impl Centroids {
         self.vectors.len() - 1
     }
 
-    pub fn to_bytes(&self) -> Result<Vec<u8>, serde_json::Error> {
-        serde_json::to_vec(self)
+    /// Encode as raw little-endian f32, not JSON.
+    ///
+    /// `[dim: u32][count: u32][vectors: f32 × dim × count][sizes: u32 × count]`
+    ///
+    /// A f32 costs 4 bytes here and 12–20 as decimal text, and this table is read on every
+    /// snapshot open and held resident — so the encoding is pure open-path cost. Raw also
+    /// parses without a tokenizer, which matters more than the bytes on a cold node.
+    pub fn to_bytes(&self) -> Result<Vec<u8>, mlake_core::Error> {
+        let count = self.vectors.len();
+        let mut out = Vec::with_capacity(8 + count * self.dim * 4 + count * 4);
+        out.extend_from_slice(&(self.dim as u32).to_le_bytes());
+        out.extend_from_slice(&(count as u32).to_le_bytes());
+        for v in &self.vectors {
+            if v.len() != self.dim {
+                return Err(mlake_core::Error::Encode(format!(
+                    "centroid has {} dims, table declares {}",
+                    v.len(),
+                    self.dim
+                )));
+            }
+            for x in v {
+                out.extend_from_slice(&x.to_le_bytes());
+            }
+        }
+        for s in &self.sizes {
+            out.extend_from_slice(&(*s as u32).to_le_bytes());
+        }
+        Ok(out)
     }
 
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self, serde_json::Error> {
-        serde_json::from_slice(bytes)
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, mlake_core::Error> {
+        let decode = |b: &[u8]| -> Option<Self> {
+            let dim = u32::from_le_bytes(b.get(0..4)?.try_into().ok()?) as usize;
+            let count = u32::from_le_bytes(b.get(4..8)?.try_into().ok()?) as usize;
+            let vec_end = 8 + count.checked_mul(dim)?.checked_mul(4)?;
+            let sizes_end = vec_end + count.checked_mul(4)?;
+            if b.len() < sizes_end {
+                return None;
+            }
+            let vectors = b[8..vec_end]
+                .chunks_exact(dim.max(1) * 4)
+                .take(count)
+                .map(|c| {
+                    c.chunks_exact(4)
+                        .map(|f| f32::from_le_bytes([f[0], f[1], f[2], f[3]]))
+                        .collect()
+                })
+                .collect();
+            let sizes = b[vec_end..sizes_end]
+                .chunks_exact(4)
+                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]) as usize)
+                .collect();
+            Some(Self { vectors, sizes, dim })
+        };
+        // An empty table encodes as dim=0,count=0 and decodes to the default.
+        decode(bytes).ok_or_else(|| {
+            mlake_core::Error::Decode(format!("malformed centroid table ({} bytes)", bytes.len()))
+        })
     }
 }
 
@@ -395,5 +447,51 @@ mod tests {
         let centroids = train_centroids(&[], 1);
         assert!(centroids.is_empty());
         assert!(centroids.probe(&[1.0], 8).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod centroid_encoding_tests {
+    use super::*;
+
+    fn table() -> Centroids {
+        Centroids {
+            vectors: vec![vec![1.0, -0.5, 0.25], vec![0.0, 2.5, -3.75]],
+            sizes: vec![7, 11],
+            dim: 3,
+        }
+    }
+
+    #[test]
+    fn centroids_round_trip_exactly() {
+        let c = table();
+        let back = Centroids::from_bytes(&c.to_bytes().unwrap()).unwrap();
+        // Raw f32 is bit-exact, unlike the decimal text it replaced.
+        assert_eq!(back, c);
+    }
+
+    #[test]
+    fn centroids_encode_to_the_raw_size() {
+        let c = table();
+        // 8 header + 2 centroids x 3 dims x 4 B + 2 sizes x 4 B.
+        assert_eq!(c.to_bytes().unwrap().len(), 8 + 24 + 8);
+    }
+
+    #[test]
+    fn an_empty_table_round_trips() {
+        let c = Centroids::default();
+        let back = Centroids::from_bytes(&c.to_bytes().unwrap()).unwrap();
+        assert!(back.is_empty());
+    }
+
+    #[test]
+    fn a_truncated_table_is_an_error_not_a_panic() {
+        let bytes = table().to_bytes().unwrap();
+        for cut in [1, 7, 9, bytes.len() - 1] {
+            assert!(
+                Centroids::from_bytes(&bytes[..cut]).is_err(),
+                "a {cut}-byte prefix must be rejected, never indexed into"
+            );
+        }
     }
 }

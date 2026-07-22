@@ -72,7 +72,7 @@ pub fn classify(namespace: &str, path: &str, size_bytes: u64) -> Classified {
     out.kind = match file.as_slice() {
         ["fts", _] => ObjectKind::FtsSplit,
         [name] => match *name {
-            "centroids.json" => ObjectKind::Centroids,
+            "centroids.bin" => ObjectKind::Centroids,
             "stats.json" => ObjectKind::Stats,
             "tags.json" => ObjectKind::TagSummary,
             "pk.idx" => ObjectKind::PkIndex,

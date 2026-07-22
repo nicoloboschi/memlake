@@ -15,7 +15,7 @@ use mlake_core::memory::{SemanticEdge, Weight, MAX_SEMANTIC_OUT, SEMANTIC_LINK_T
 use mlake_core::{MemoryId, StoredMemory};
 use mlake_fts::Tokenizer;
 use mlake_graph::radj::{EdgeKind, InEdge, LinkTypeTag};
-use mlake_ivf::{train_centroids, ClusterFile};
+use mlake_ivf::{train_centroids, ClusterFile, VectorBlock, VectorCodec};
 use mlake_wal::{Namespace, WalTail};
 
 use crate::generation::write_generation;
@@ -35,6 +35,10 @@ pub struct IndexOptions {
     /// Force a full centroid retrain this fold, regardless of the 2× growth trigger. Used
     /// by the recall-vs-churn study to compare assign-only drift against a fresh retrain.
     pub force_retrain: bool,
+    /// How embeddings are encoded in the vector block. The embedding is ~84% of a stored
+    /// memory, so this is the single biggest lever on both stored bytes and bytes scanned
+    /// per query — and the one place where storage is traded directly against recall.
+    pub vector_codec: VectorCodec,
 }
 
 impl Default for IndexOptions {
@@ -43,6 +47,7 @@ impl Default for IndexOptions {
             derive_links: true,
             seed: 42,
             force_retrain: false,
+            vector_codec: VectorCodec::Int8,
         }
     }
 }
@@ -216,7 +221,8 @@ async fn build_memory_type_index(
     // link derivation: everything downstream (centroid training, probing, semantic-edge
     // cosine) assumes it. Failing the fold with a typed error keeps a corpus that somehow
     // mixed dimensions from becoming an unexplained panic in a rayon worker.
-    mlake_core::uniform_dim(vectors.iter().map(|v| v.as_slice()))?;
+    // Also the dimension the vector block encodes against; 0 when the type is text-only.
+    let vector_dim = mlake_core::uniform_dim(vectors.iter().map(|v| v.as_slice()))?.unwrap_or(0);
     let tt = std::time::Instant::now();
     let (mut centroids, train_count) = match (prev_gen, retrain) {
         (Some(p), false) => (p.centroids.clone(), prev_train_count),
@@ -258,24 +264,48 @@ async fn build_memory_type_index(
     let empty_paths: Vec<String> = Vec::new();
     let old_paths = prev_index.map(|p| &p.files.clusters).unwrap_or(&empty_paths);
     let tw = std::time::Instant::now();
+    let old_vec_paths = prev_index.map(|p| &p.files.vectors).unwrap_or(&empty_paths);
     let mut cluster_paths: Vec<Option<String>> = vec![None; k];
+    let mut vector_paths: Vec<Option<String>> = vec![None; k];
     let mut dirty_writes = Vec::new();
     for i in 0..k {
         let can_copy_forward = !retrain
             && !split_clusters.contains(&i)
             && i < old_clusters.len()
             && i < old_paths.len()
+            // The pair is copied forward together or not at all: `.bin` and `.vec` are
+            // joined positionally, so a mismatched pair would silently misattribute every
+            // embedding in the cluster.
+            && i < old_vec_paths.len()
             && !cluster_changed(&clusters[i], &old_clusters[i], touched);
         if can_copy_forward {
             cluster_paths[i] = Some(old_paths[i].clone());
+            vector_paths[i] = Some(old_vec_paths[i].clone());
         } else {
-            let cf = ClusterFile { centroid_id: i as u32, items: clusters[i].clone() };
+            // The embedding leaves the cluster file and lives in the vector block; the two
+            // stay in member order so index `j` means the same memory in both.
+            let ids: Vec<MemoryId> = clusters[i].iter().map(|m| m.id).collect();
+            // A text-only memory carries no embedding. Absent is not a dimension error —
+            // pad it to zeros, which scores 0 on the vector arm and so never surfaces there,
+            // exactly as an empty vector did through `cosine_opt`.
+            let vectors: Vec<Vec<f32>> = clusters[i]
+                .iter()
+                .map(|m| if m.vector.is_empty() { vec![0.0; vector_dim] } else { m.vector.clone() })
+                .collect();
+            let mut items = clusters[i].clone();
+            for m in items.iter_mut() {
+                m.vector = Vec::new();
+            }
+            let cf = ClusterFile { centroid_id: i as u32, items };
+            let block = VectorBlock::encode(opts.vector_codec, vector_dim, &ids, &vectors)?;
+            let block_bytes = block.to_bytes();
             let store = ns.store.clone();
             let prefix = prefix.clone();
             dirty_writes.push(async move {
-                crate::generation::write_cluster_file(&store, &prefix, i, &cf)
-                    .await
-                    .map(|path| (i, path))
+                let cluster = crate::generation::write_cluster_file(&store, &prefix, i, &cf).await?;
+                let vectors =
+                    crate::generation::write_vector_block(&store, &prefix, i, block_bytes).await?;
+                Ok::<_, crate::Error>((i, cluster, vectors))
             });
         }
     }
@@ -283,15 +313,17 @@ async fn build_memory_type_index(
     // time — the dominant cost of a full build over S3 (SCALE.md Phase 3 perf).
     {
         use futures::stream::{StreamExt, TryStreamExt};
-        let written: Vec<(usize, String)> = futures::stream::iter(dirty_writes)
+        let written: Vec<(usize, String, String)> = futures::stream::iter(dirty_writes)
             .buffer_unordered(32)
             .try_collect()
             .await?;
-        for (i, path) in written {
-            cluster_paths[i] = Some(path);
+        for (i, cluster, vectors) in written {
+            cluster_paths[i] = Some(cluster);
+            vector_paths[i] = Some(vectors);
         }
     }
     let cluster_paths: Vec<String> = cluster_paths.into_iter().map(|p| p.unwrap_or_default()).collect();
+    let vector_paths: Vec<String> = vector_paths.into_iter().map(|p| p.unwrap_or_default()).collect();
     phase_log("cluster_write", tw);
 
     // pk / radj / fts, scoped to this fact type.
@@ -385,6 +417,7 @@ async fn build_memory_type_index(
         &prefix,
         &centroids,
         cluster_paths,
+        vector_paths,
         &fts_split,
         radj_tables.into(),
         pk_tables.into(),

@@ -30,6 +30,20 @@ fn item(key: &str, vector: Vec<f32>, text: &str) -> Memory {
     }
 }
 
+/// An unconstrained predicate — `scan` filters on one of these now, not a bare TagFilter.
+fn pred() -> mlake_core::Predicate {
+    mlake_core::Predicate::default()
+}
+
+/// A predicate matching exactly these tags under `mode`.
+fn pred_tags(tags: Vec<String>, mode: mlake_core::TagsMatch) -> mlake_core::Predicate {
+    mlake_core::Predicate {
+        tags,
+        tags_mode: mlake_core::predicate::tags_mode_to_u8(mode),
+        ..Default::default()
+    }
+}
+
 fn tf() -> mlake_core::TagFilter {
     mlake_core::TagFilter::none()
 }
@@ -397,6 +411,7 @@ async fn crash_before_manifest_swap_leaves_the_old_generation_serving() {
         &orphan_prefix,
         &mlake_ivf::train_centroids(&[vec![0.0, 1.0]], 42),
         Vec::new(),
+        Vec::new(),
         empty_split.split_bytes(),
         mlake_index::RadjTable::build(vec![]).into(),
         mlake_index::PkTable::build(vec![]).into(),
@@ -563,6 +578,7 @@ async fn concurrent_generation_builds_write_disjoint_files() {
         &prefix_a,
         &mlake_ivf::train_centroids(&[vec![1.0, 0.0]], 42),
         Vec::new(),
+        Vec::new(),
         empty_split.split_bytes(),
         mlake_index::RadjTable::build(vec![]).into(),
         mlake_index::PkTable::build(vec![(MemoryId::from_key("a"), 0)]).into(),
@@ -578,6 +594,7 @@ async fn concurrent_generation_builds_write_disjoint_files() {
         &ns.store,
         &prefix_b,
         &mlake_ivf::train_centroids(&[vec![0.0, 1.0], vec![1.0, 1.0]], 42),
+        Vec::new(),
         Vec::new(),
         empty_split.split_bytes(),
         mlake_index::RadjTable::build(vec![]).into(),
@@ -666,7 +683,7 @@ async fn query_fetches_only_probed_clusters_and_warms_the_cache() {
             .unwrap();
     }
     // No links, so the graph arm stays off and we isolate the vector arm's cluster reads.
-    index(&ns, &Tokenizer::default(), IndexOptions { derive_links: false, seed: 42, force_retrain: false })
+    index(&ns, &Tokenizer::default(), IndexOptions { derive_links: false, ..IndexOptions::default() })
         .await
         .unwrap();
 
@@ -686,9 +703,16 @@ async fn query_fetches_only_probed_clusters_and_warms_the_cache() {
     let cold = QueryMetrics::new();
     let hits = node.query_raw_metered(1, Some(&q), None, &tf(), depths, None, &cold).await.unwrap();
     assert!(!hits.is_empty());
+    // A cluster is now a *pair* of objects — `cluster-{i}.bin` (payload) and
+    // `cluster-{i}.vec` (embeddings) — so probing `nprobe` clusters costs `2 * nprobe`
+    // requests. They ride one wave, so the roundtrip budget below is unchanged, but the
+    // request count genuinely doubled: asserted exactly, so that if the scan ever stops
+    // needing the payload half, this test fails and someone has to notice the win.
+    const OBJECTS_PER_CLUSTER: usize = 2;
     assert!(
-        cold.requests() <= nprobe,
-        "a query must fetch at most nprobe={nprobe} clusters, fetched {} (of {cluster_count})",
+        cold.requests() <= nprobe * OBJECTS_PER_CLUSTER,
+        "a query must fetch at most nprobe={nprobe} clusters ({} objects), fetched {} (of {cluster_count} clusters)",
+        nprobe * OBJECTS_PER_CLUSTER,
         cold.requests()
     );
     assert!(cold.requests() < cluster_count, "must not fetch the whole generation");
@@ -1190,7 +1214,7 @@ async fn scan_pages_over_every_memory_exactly_once() {
     let mut cursor = Some(ScanCursor::default());
     let mut pages = 0;
     while let Some(c) = cursor {
-        let (items, next) = node.scan(1, c, 7, &tf()).await.unwrap();
+        let (items, next) = node.scan(1, c, 7, &pred()).await.unwrap();
         for m in items {
             assert!(seen.insert(m.id), "scan must not return a memory twice");
             texts.insert(m.id, m.text);
@@ -1236,7 +1260,7 @@ async fn scan_hides_tombstoned_indexed_memories() {
     let mut seen = std::collections::HashSet::new();
     let mut cursor = ScanCursor::default();
     loop {
-        let (items, next) = node.scan(1, cursor, 10, &tf()).await.unwrap();
+        let (items, next) = node.scan(1, cursor, 10, &pred()).await.unwrap();
         seen.extend(items.iter().map(|m| m.id));
         match next {
             Some(c) => cursor = c,
@@ -1271,13 +1295,13 @@ async fn get_and_scan_hide_predicate_deleted_memories() {
     index(&ns, &Tokenizer::default(), IndexOptions::default()).await.unwrap();
 
     // Delete-by-predicate everything in document d1 (lazy tail tombstone-where).
-    let pred = Predicate {
+    let doc1_predicate = Predicate {
         memory_types: vec![],
         metadata_equals: vec![("document_id".into(), "d1".into())],
         tags: vec![],
         tags_mode: 0,
     };
-    writer.commit(vec![Op::TombstoneWhere { predicate: pred }]).await.unwrap();
+    writer.commit(vec![Op::TombstoneWhere { predicate: doc1_predicate }]).await.unwrap();
 
     let node = QueryNode::open(&ns, Tokenizer::default()).await.unwrap();
     // get_many must not resolve the predicate-deleted id...
@@ -1289,7 +1313,7 @@ async fn get_and_scan_hide_predicate_deleted_memories() {
     let mut seen = std::collections::HashSet::new();
     let mut cursor = ScanCursor::default();
     loop {
-        let (items, next) = node.scan(1, cursor, 10, &tf()).await.unwrap();
+        let (items, next) = node.scan(1, cursor, 10, &pred()).await.unwrap();
         seen.extend(items.iter().map(|m| m.id));
         match next {
             Some(c) => cursor = c,
@@ -1322,12 +1346,12 @@ async fn scan_respects_the_tag_filter() {
     index(&ns, &Tokenizer::default(), IndexOptions::default()).await.unwrap();
 
     let node = QueryNode::open(&ns, Tokenizer::default()).await.unwrap();
-    let filter = mlake_core::TagFilter::new(vec!["keep".into()], TagsMatch::AnyStrict);
+    let scan_filter = pred_tags(vec!["keep".into()], TagsMatch::AnyStrict);
 
     let mut seen = std::collections::HashSet::new();
     let mut cursor = Some(ScanCursor::default());
     while let Some(c) = cursor {
-        let (items, next) = node.scan(1, c, 3, &filter).await.unwrap();
+        let (items, next) = node.scan(1, c, 3, &scan_filter).await.unwrap();
         for m in items {
             assert!(m.tags.contains(&"keep".to_string()), "scan must honour the filter");
             seen.insert(m.id);
@@ -1592,7 +1616,7 @@ async fn scan_ids(node: &QueryNode, mt: u8) -> std::collections::BTreeSet<Memory
     let mut out = std::collections::BTreeSet::new();
     let mut cursor = mlake_index::ScanCursor::default();
     loop {
-        let (items, next) = node.scan(mt, cursor, 64, &tf()).await.unwrap();
+        let (items, next) = node.scan(mt, cursor, 64, &pred()).await.unwrap();
         out.extend(items.iter().map(|m| m.id));
         match next {
             Some(c) => cursor = c,

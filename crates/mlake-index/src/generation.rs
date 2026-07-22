@@ -30,10 +30,13 @@ pub struct Generation {
 /// disjoint keys and can never overwrite each other's files — the winner's manifest points
 /// at its own prefix, the loser's files are orphaned for GC (INV-2).
 fn centroids_key(prefix: &str) -> String {
-    format!("{prefix}/centroids.json")
+    format!("{prefix}/centroids.bin")
 }
 fn cluster_key(prefix: &str, i: usize) -> String {
     format!("{prefix}/cluster-{i}.bin")
+}
+fn vector_key(prefix: &str, i: usize) -> String {
+    format!("{prefix}/cluster-{i}.vec")
 }
 fn fts_key(prefix: &str) -> String {
     format!("{prefix}/fts/split.bin")
@@ -119,6 +122,23 @@ pub async fn write_cluster_file(
     Ok(key)
 }
 
+/// Write one cluster's vector block and return its object path.
+///
+/// Paired with [`write_cluster_file`] by index: `cluster-{i}.vec` holds the embeddings for
+/// exactly the members of `cluster-{i}.bin`, in the same order, so the two are joined
+/// positionally with no id lookup. Split apart because the probe scores every member but
+/// reads the payload of almost none.
+pub async fn write_vector_block(
+    store: &Store,
+    prefix: &str,
+    index: usize,
+    bytes: Vec<u8>,
+) -> Result<String> {
+    let key = vector_key(prefix, index);
+    store.put(&key, bytes).await?;
+    Ok(key)
+}
+
 /// Write a generation's metadata files given the (already written) `cluster_paths` — some
 /// freshly written this fold, some copied forward from a previous generation. Every file
 /// is write-once under the unique attempt `prefix` (INV-2).
@@ -128,6 +148,7 @@ pub async fn write_generation(
     prefix: &str,
     centroids: &Centroids,
     cluster_paths: Vec<String>,
+    vector_paths: Vec<String>,
     fts_split: &[u8],
     radj_tables: SsTablePair,
     pk_tables: SsTablePair,
@@ -185,6 +206,7 @@ pub async fn write_generation(
         pk_data: pk_data_key(prefix),
         centroids: centroids_key(prefix),
         clusters: cluster_paths,
+        vectors: vector_paths,
         radj_csr: radj_csr_key(prefix),
         radj_idx: radj_idx_key(prefix),
         fts_split: fts_key(prefix),
@@ -241,9 +263,34 @@ pub async fn read_generation(
         .buffered(FETCH_CONCURRENCY)
         .try_collect()
         .await?;
+    // The embeddings live in the parallel `.vec` blocks, so the fold has to re-join them:
+    // a generation read that returned vector-less items would silently re-cluster the whole
+    // corpus against empty embeddings.
+    let vector_objects: Vec<_> = futures::stream::iter(files.vectors.clone())
+        .map(|path| async move { store.get(&path, ctx).await })
+        .buffered(FETCH_CONCURRENCY)
+        .try_collect()
+        .await?;
     let mut clusters = Vec::with_capacity(cluster_objects.len());
-    for obj in &cluster_objects {
-        clusters.push(ClusterFile::from_bytes(&obj.bytes)?.items);
+    for (i, obj) in cluster_objects.iter().enumerate() {
+        let mut items = ClusterFile::from_bytes(&obj.bytes)?.items;
+        let Some(vobj) = vector_objects.get(i) else {
+            return Err(crate::Error::Core(mlake_core::Error::Decode(format!(
+                "cluster {i} has no vector block: the generation's .bin and .vec lists disagree"
+            ))));
+        };
+        let block = mlake_ivf::VectorBlock::from_bytes(&vobj.bytes)?;
+        if block.len() != items.len() {
+            return Err(crate::Error::Core(mlake_core::Error::Decode(format!(
+                "cluster {i} holds {} members but its vector block holds {}",
+                items.len(),
+                block.len()
+            ))));
+        }
+        for (j, item) in items.iter_mut().enumerate() {
+            item.vector = block.decode(j);
+        }
+        clusters.push(items);
     }
 
     Ok(Generation {
