@@ -337,3 +337,35 @@ co-occurrence rows written and a 160-node / 352-edge entity graph rendered with
       to `1`.
 - [ ] **No `grpc.aio` client.** Hindsight is fully async and wraps every call in
       `asyncio.to_thread` — a thread hop per retain batch and per recall.
+
+## Vector storage — decided, measured, not yet shipped
+
+Context and numbers in [`docs/vector-storage.md`](docs/vector-storage.md). The
+two-stage search (1-bit scan → error bound → exact f32 rerank) is built and
+green; what follows is what is left.
+
+- [ ] **Make `Binary` the default codec again.** It was set to `Binary` in
+      `8ce2617`, then back to `Int8` in `477b620` (a WIP commit). BEIR now says
+      the choice is free: on scifact, Binary and Int8 give **identical**
+      `ann_recall@10` on a clean rebuild, because the rerank stage makes the
+      scan codec's error irrelevant to the final ranking. Binary is ~6.5× smaller
+      in the scan tier, so there is no reason to pay for Int8 codes.
+- [ ] **A codec change does not re-encode existing clusters.** Copy-forward
+      reuses `.vec` blocks by reference, so flipping the codec silently leaves
+      old generations in the old encoding. Blocks are self-describing so reads
+      stay correct — but a migration never happens, and the first attempt at
+      measuring Binary vs Int8 returned identical numbers for exactly this
+      reason. Needs either a forced re-encode on codec change, or an explicit
+      "the codec is per-generation, not per-index" statement in the docs.
+- [ ] **The rerank SSTable spends ~3117 B to hold a 1536 B vector** — roughly 2×
+      overhead, unexplained. Worth understanding before this scales.
+- [ ] **Drop `nprobe` from the client API.** See below; the client should not be
+      choosing this.
+- [ ] **The binary bound is probabilistic, not absolute.** Measured containment
+      is 1.000000 over 120k samples with a 0.999 gate and a worst-miss cap, but
+      one rotation serves a whole block, so misses are correlated across members
+      of the same block rather than independent. `Int8` and `F32` bounds are
+      absolute. If a caller ever needs a hard guarantee, Binary is not it.
+- [ ] **On isotropic data the bound narrows nothing** (99.95% of the block enters
+      rerank). Correct, and useless — a caller must not assume the rerank set is
+      always small.
