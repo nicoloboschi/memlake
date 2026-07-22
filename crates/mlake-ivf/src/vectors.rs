@@ -11,6 +11,16 @@
 //! top region, not the exact scores — but they do have to preserve it, so every codec here
 //! is measured against the f32 ranking in the tests below rather than assumed to be fine.
 //!
+//! Each estimate comes with an interval. [`VectorBlock::score`] is the point estimate and
+//! [`VectorBlock::score_bounds`] is `[lo, hi]` around the true cosine, which is what lets the
+//! rerank set be *derived* rather than guessed: take the top k by `lo`, rerank everything
+//! whose `hi` clears the k-th best `lo`, and nothing that belongs in the true top k has been
+//! dropped. For [`VectorCodec::Binary`] that interval only exists because the residual's signs
+//! are taken in a random basis — see [`Rotation`], which is the whole reason a 1-bit code can
+//! say anything about its own error. The interval is absolute for [`VectorCodec::F32`] and
+//! [`VectorCodec::Int8`] and probabilistic for [`VectorCodec::Binary`]; the measured
+//! containment rate is in the tests, and a caller narrowing on it should read them.
+//!
 //! Beside the codes sits the *tag column*: a per-cluster dictionary of the distinct tags its
 //! members carry, plus one bitmap per member. Filtering used to be applied over materialized
 //! memories, which meant a scan that avoided reading payload could not filter at all — the
@@ -39,8 +49,10 @@ pub enum VectorCodec {
     /// Per-vector affine scalar quantization of the block-mean-centred residual to 8 bits.
     /// ~3.9x smaller than [`VectorCodec::F32`].
     Int8,
-    /// One sign bit per dimension over the block-mean-centred residual, plus a per-vector
-    /// corrective term. ~25.6x smaller than [`VectorCodec::F32`] at dim 384.
+    /// One sign bit per dimension over the block-mean-centred residual **after a random
+    /// rotation** ([`Rotation`]), plus a per-vector corrective term. ~25.6x smaller than
+    /// [`VectorCodec::F32`] at dim 384. The rotation is what makes RaBitQ's error bound
+    /// applicable, and so what makes [`VectorBlock::score_bounds`] mean anything here.
     Binary,
 }
 
@@ -106,11 +118,16 @@ const ROTATION_SEED: u64 = 0x5241_4249_5451_524F;
 
 /// Rounds of `permute -> sign-flip -> block Hadamard` composed into the rotation.
 ///
-/// One round already decorrelates the coordinates within a Hadamard segment; the rounds past
-/// the first exist to mix *across* segments, which is what makes the construction usable at a
-/// `dim` that is not a power of two. Three is the standard `HD3 HD2 HD1` depth (Ailon–Chazelle,
-/// and every FJLT-derived quantizer since). Measured at dim 384, going 1 -> 3 rounds is worth
-/// a point of recall; going 3 -> 5 is worth nothing and costs build time.
+/// One round decorrelates the coordinates *within* a Hadamard segment and not at all across
+/// them, which at a `dim` that is not a power of two leaves the transform visibly non-random:
+/// measured, a spike confined to the 256-segment comes out of one round at
+/// `c = 0.90` against the isotropic 0.798, and two rounds fix it (this is what
+/// `the_rotation_makes_a_spiky_residual_behave_like_a_random_direction` pins). Rounds past the
+/// second buy nothing measurable here — recall over 1/2/3/5 rounds is 0.527/0.500/0.534/0.532,
+/// which is noise, and the bound's width and containment do not move at all. Three is kept
+/// because it is the standard `HD3 HD2 HD1` depth (Ailon–Chazelle, and every FJLT-derived
+/// quantizer since) and the third round costs ~1% of encode time, not because this corpus can
+/// tell it apart from two.
 const ROTATION_ROUNDS: usize = 3;
 
 /// The `epsilon` of RaBitQ's error bound: how many standard deviations of the estimator's
@@ -2675,7 +2692,10 @@ mod tests {
         let before = c_of(&spiky);
         rot.apply(&mut spiky, &mut scratch);
         let after = c_of(&spiky);
-        // Measured: 0.102 -> 0.797, against the isotropic ideal of sqrt(2/pi) = 0.798.
+        // Measured: 0.102 -> 0.797, against the isotropic ideal of sqrt(2/pi) = 0.798. This
+        // is the measurement that sets ROTATION_ROUNDS: at one round the same spike comes out
+        // at 0.90, because a single block-diagonal Hadamard cannot move energy from the
+        // 256-segment into the 128-segment. Two rounds is where it lands.
         assert!(before < 0.15, "the unrotated spike should be terrible: {before}");
         assert!(
             (after - 0.7979).abs() < 0.03,
@@ -3092,6 +3112,12 @@ mod tests {
             }
             let rate = 1.0 - missed as f64 / n as f64;
             println!("{name}: containment {rate:.6}, mean width {:.4}", width / n as f64);
+            // Measured: isotropic 1.000000 at width 0.0218, spiky 1.000000 at width 0.3859.
+            // The spiky width is the honest cost of the case: `c` stays healthy because the
+            // rotation fixes the *basis*, but those vectors sit far from the block mean, so
+            // `|r|/|v|` — the fraction of the score that is estimated rather than known —
+            // is close to 1 and the interval scales with it. Wide, and still correct, which
+            // is the direction a bound is allowed to fail in.
             assert!(rate >= 0.999, "{name} containment {rate:.6} over {n} samples");
         }
     }
