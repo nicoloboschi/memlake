@@ -43,20 +43,24 @@ Each invariant MUST have at least one automated test (see §10).
 
 ## 3. Storage Layout
 
+> **Direction:** the `gen-{G}/` monolith below is becoming a stack of immutable **segments**
+> (`seg/{seg_id}/`, same file families) — see [segmented-index.md](segmented-index.md) §3. The
+> manifest lists the live segments; a flush adds one, compaction merges several.
+
 ```
 s3://{bucket}/{namespace}/
-  manifest.json                  # CAS-swapped; points at current generation
+  manifest.json                  # CAS-swapped; lists the live segments
   wal/
     00000001.bin ... 000000NN.bin
-  gen-{G}/
-    pk.idx                       # sorted item_id -> (file, offset, len, tombstone?)
-    centroids.bin                # IVF centroid vectors + cluster file map
-    cluster-{i}.bin              # items: vector + payload + outgoing links (rkyv)
-    radj.csr                     # reverse adjacency (incoming links), CSR
-    radj.idx                     # sparse offset index for radj.csr
-    fts/
-      split.bin                  # packed tantivy segment + hotcache footer
-    stats.json                   # doc counts, avg lengths, per-signal cardinalities
+  seg/{seg_id}/                  # one immutable segment (per memory_type subtree)
+    pk.idx  pk.data              # sorted item_id -> cluster (last-writer-wins across segments)
+    centroids.bin                # this segment's IVF centroids
+    cluster-{i}.bin  cluster-{i}.vec   # item records (rkyv) + int8 vector block
+    radj.data                    # reverse adjacency (incoming links) SSTable data
+    radj.idx                     # sparse offset index for radj.data
+    entity.* time.* payload.* rerank.*   # the other range-read SSTables
+    fts/split.bin                # packed tantivy segment + hotcache footer
+    tombstones.bin  stats.json   # this segment's deletes + doc counts / lengths
 ```
 
 ### 3.1 `manifest.json`
@@ -113,8 +117,10 @@ struct StoredItem {
 ```
 Items are small ⇒ full payload lives inline in the cluster file. Fetching seed clusters yields seed adjacency for free (zero extra graph roundtrips for outgoing links). Files MUST be readable via mmap with zero-copy access (rkyv archived access; no serde on the warm path).
 
-### 3.4 Reverse adjacency (`radj.csr` + `radj.idx`)
-CSR over incoming semantic + causal edges, sorted by target id:
+### 3.4 Reverse adjacency (`radj.data` + `radj.idx`)
+An SSTable over incoming semantic + causal edges, sorted by target id (same `.idx`/`.data` format as
+pk/entity/time/payload). In the segmented model an edge is stored in the segment that owns its
+**target** id, and graph expansion unions each segment's `radj` (§ [segmented-index.md](segmented-index.md) §5):
 - `radj.idx`: sparse index, every Kth target id → byte offset (K sized so idx ≤ 256 KB for 1M items).
 - Lookup: binary search idx (cached) → 1 coalesced ranged GET → scan block.
 
@@ -144,11 +150,20 @@ client ──HTTP──▶ any node
 
 ## 5. Indexer (async, any node, idempotent)
 
+> **Direction (see [segmented-index.md](segmented-index.md)):** a generation is moving from one
+> monolithic file set to an **LSM-style stack of immutable segments**. A *flush* turns the WAL tail
+> into a new small L0 segment (O(tail)); a background *tiered compaction* merges segments (the only
+> O(corpus) step). The single-generation `index(namespace)` below is the v1 fold; the sections that
+> follow describe its build steps, which a per-segment flush reuses.
+
 Runs `index(namespace)`: read manifest, read WAL entries `(wal_index_cursor, wal_head]`, produce `gen-{G+1}`, CAS-swap manifest. Determinism requirement: output depends only on (prev generation files, WAL slice) so replays are byte-stable modulo float tie-breaks.
 
 ### 5.1 Vector index build
-- Centroid count: `max(1, round(sqrt(N)))`, retrain (mini-batch k-means, faiss or linfa) when N grows 2× since last training; otherwise assign-only into existing centroids (SPFresh-style).
-- Cluster split when size > 8×avg; merge when < ⅛×avg. Incremental — never full rebuild unless retraining.
+- Centroid count: `max(1, round(sqrt(N)))` per **segment** (`N` = the segment's item count), retrained
+  on the segment's slice at build; a query probes each segment's centroids and merges (§6.1). Segments
+  are never appended to — incrementality comes from new segments + compaction, not from mutating an
+  existing centroid set (immutable object storage rules out SPFresh-style in-place update).
+- Cluster split when size > 8×avg; merge when < ⅛×avg, evaluated per segment / at compaction.
 - Cluster file target size 2–8 MB (coalesces into one ranged GET each).
 
 ### 5.2 Semantic kNN link derivation
@@ -159,8 +174,12 @@ For each new item in the WAL slice: query the *current* index (in-process, warm)
 - Custom `Directory` impl (§6.2) is the only storage interface tantivy sees.
 
 ### 5.4 Compaction & GC
-- Compaction = same pipeline with `fold_tombstones=true` + patch folding + cluster rebalance. Triggered when tombstones > 20% or WAL slice count > 64.
-- GC: delete files not referenced by `generation` or `prev_generation` and older than 15 min (grace for in-flight readers).
+- **Tiered segment compaction** (target model, [segmented-index.md](segmented-index.md) §7): when a
+  level accumulates ≥ `FANOUT` segments, merge them into one segment at the next level — resolving
+  last-writer-wins + tombstones and physically reclaiming deleted/shadowed items. The merge is the
+  only O(corpus) step and runs the **streaming (external-memory) fold as its engine**, off the write
+  path. Small L0 flushes use the fast in-RAM build.
+- GC: delete segment prefixes no longer referenced by the manifest, after a ~15 min reader-grace TTL.
 
 ---
 
@@ -174,7 +193,12 @@ RT3  parallel ranged GETs: selected cluster files | fts posting ranges
 RT4  parallel ranged GETs: radj.csr blocks | linked-candidate items (via pk.idx)
 ```
 - Every S3 request MUST flow through one instrumented client that tags `(namespace, query_id, roundtrip_no, bytes, latency)`. A query exceeding 4 roundtrips cold is a **bug** and must emit a `roundtrip_budget_exceeded` metric + debug log.
-- WAL tail (entries past `wal_index_cursor`): exhaustive scan — brute-force cosine for vector arm, linear text match for FTS arm, direct entity/causal membership for graph arm; fold patches; apply tombstones. Consistency modes: `strong` (default, RT1 includes WAL head check) and `eventual` (skip head check, serve from cached manifest, staleness ≤ compaction interval).
+- **Segment fan-out (target model, [segmented-index.md](segmented-index.md) §5):** each arm reads
+  across *all live segments* + the WAL tail and merges — vector probes each segment's centroids;
+  pk/payload lookups take the newest segment that owns the id (last-writer-wins by seq); tombstones are
+  a cross-segment overlay. The roundtrip budget becomes O(levels), which tiered compaction keeps a
+  small constant.
+- WAL tail (entries past `wal_index_cursor`): exhaustive scan — brute-force cosine for vector arm, linear text match for FTS arm, direct entity/causal membership for graph arm; fold patches; apply tombstones. Reads are strongly consistent: RT1 includes the WAL head check.
 
 ### 6.2 Cache
 - Unified NVMe cache: content-addressed by `(namespace, path, etag)`, mmap on hit, LRU by bytes with per-namespace accounting. Admission = write-through on first fetch.
