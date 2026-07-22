@@ -33,7 +33,7 @@ The graph arm persists **three** range-readable SSTables per generation, each th
    rayon. Carried-forward memories keep the links they were indexed with. **memlake derives its
    own semantic links; it does not ingest external link tables.**
 
-2. **Reverse adjacency — `radj.idx` / `radj.csr`** (`RadjTable::build`). The inverse of the
+2. **Reverse adjacency — `radj.idx` / `radj.data`** (`RadjTable::build`). The inverse of the
    inline forward edges: `target → [incoming edges]`, over both semantic and causal edge kinds
    (each edge tagged with its kind + weight). Lets the read walk edges *backward* (who links to
    this seed) with one ranged read, without scanning.

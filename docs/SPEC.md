@@ -190,7 +190,7 @@ For each new item in the WAL slice: query the *current* index (in-process, warm)
 RT1  GET manifest.json  +  LIST/HEAD wal head            (consistency point)
 RT2  parallel: centroids.bin | fts hotcache | pk.idx | radj.idx | wal tail entries
 RT3  parallel ranged GETs: selected cluster files | fts posting ranges
-RT4  parallel ranged GETs: radj.csr blocks | linked-candidate items (via pk.idx)
+RT4  parallel ranged GETs: radj.data blocks | linked-candidate items (via pk.idx)
 ```
 - Every S3 request MUST flow through one instrumented client that tags `(namespace, query_id, roundtrip_no, bytes, latency)`. A query exceeding 4 roundtrips cold is a **bug** and must emit a `roundtrip_budget_exceeded` metric + debug log.
 - **Segment fan-out (target model, [segmented-index.md](segmented-index.md) §5):** each arm reads
