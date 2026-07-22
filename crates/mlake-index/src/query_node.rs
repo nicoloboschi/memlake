@@ -190,7 +190,7 @@ impl QueryNode {
         for ft in memory_types {
             let tail_items = tail_by_ft.remove(&ft).unwrap_or_default();
             let tail_fts = TantivyFts::build_with_tags(
-                tail_items.iter().map(|i| (i.id, i.text.as_str(), i.tags.as_slice())),
+                tail_items.iter().map(|i| (i.id, i.fts_text(), i.tags.as_slice())),
                 tokenizer.clone(),
             )?;
 
@@ -1015,17 +1015,28 @@ impl QueryNode {
     ///
     /// Scales with the index rather than being a constant: a fixed 8 is 11% of a small
     /// index's clusters and a rounding error on a large one, so recall would silently
-    /// depend on corpus size. A quarter of the clusters, floored so tiny indexes still
-    /// probe broadly and capped so a huge one does not turn a probe into a scan. The
-    /// divisor is calibrated against `ann_recall@10` in the BEIR harness — if that metric
-    /// regresses, this constant is the first thing to look at.
+    /// depend on corpus size. Half the clusters, floored so tiny indexes still probe
+    /// broadly and capped so a huge one does not turn a probe into a scan.
+    ///
+    /// The fraction is calibrated against `ann_recall@10` in the BEIR harness: at a quarter,
+    /// nfcorpus measured 0.8598 and scifact 0.9517 — the *same* fraction nine points apart,
+    /// because the right fraction depends on how a corpus clusters, not on how many clusters
+    /// it has. Half measured 0.9625 on nfcorpus (a direct nprobe=30 run over its ~60
+    /// clusters); scifact at half is inferred to be at or above its 0.9517 quarter-fraction
+    /// figure by the monotonicity `recall_increases_monotonically_with_nprobe` asserts, not
+    /// measured directly. A fraction is a stopgap, not a model of the problem; the principled fix is to stop probing when the k-th best lower
+    /// bound already beats what any unprobed cluster could offer (see TODOS).
+    ///
+    /// NOTE the cap binds long before the fraction does at scale: at 1M docs there are ~1000
+    /// clusters, so this probes 64 of them (6%), not half. That regime is untested — every
+    /// number here comes from corpora of a few thousand documents.
     fn resolve_nprobe(state: &SegmentState, nprobe: usize) -> usize {
         if nprobe > 0 {
             return nprobe;
         }
         const MIN_NPROBE: usize = 8;
         const MAX_NPROBE: usize = 64;
-        const CLUSTER_FRACTION: usize = 4;
+        const CLUSTER_FRACTION: usize = 2;
         state.centroids.len().div_ceil(CLUSTER_FRACTION).clamp(MIN_NPROBE, MAX_NPROBE)
     }
 
