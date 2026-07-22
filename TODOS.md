@@ -48,18 +48,51 @@ a separate gap.
 
 ---
 
-## 2. Edges as a readable relation
+## 2. Edges as a readable relation — mostly unblocked
 
-memlake derives semantic links at index time and expands the graph internally,
-but never returns edges. Hindsight can therefore rank *through* the graph but
-cannot render it.
+`get_graph_data` now renders. It turned out most of the graph was never read from
+`memory_links` in the first place: the edges are **derived**, and from data the
+provider already has.
 
-- [ ] **`get_graph_data` returns 0 nodes and 0 links** — the graph view is blank.
-- [ ] **Link counts in bank stats are `{}`.**
+* **Entity edges** — pair visible memories that share an entity. Built from the
+  memories' own `entity_ids` plus the Postgres name registry. Verified: 200 nodes,
+  2786 entity edges on the LoComo bank.
+* **Observation edges** — pair observations that share a source memory, from
+  `source_memory_ids` carried on each observation.
+* **`get_entity_graph`** — a separate endpoint over `entity_cooccurrences`, which
+  is still written and read normally (see §6b). Verified: 159 nodes, 352 edges.
 
-What is needed: an RPC returning a memory's neighbours (semantic + causal, with
-weights), or edges attached to a `Get`. Display and diagnostics only, so it does
-not have to be on the hot path.
+What is still missing is only the *stored* edge types:
+
+- [x] **Semantic edges on the payload — DONE.** `MemoryPayload.semantic_out`
+      (target + weight), behind an `include_edges` flag on `Scan` and `Get`.
+
+      No new RPC and no new storage: the indexer already derives these during the
+      fold (`indexer.rs:590-677`), already prunes them to live targets
+      (`indexer.rs:183`), and already persists them on `StoredMemory` — the graph
+      arm reads them at `query_node.rs:1174`. The payload conversion was simply
+      dropping them. So the cost is response bytes and nothing else: no extra
+      write-time compute, no extra bytes on disk, no second round trip, because
+      the memory is already materialized when the payload is built.
+
+      Deliberately **opt-in**: `Query` is the hot path and never uses edges, and
+      would otherwise pay ~18 bytes per edge across every candidate (~27 KB on a
+      300-candidate recall). The graph reads through `Scan`/`Get`, where it is free.
+
+- [ ] **The streaming indexer derives no semantic links.**
+      `streaming.rs:238` — `item.semantic_out.clear(); // bulk build derives no
+      semantic links`. Above `MEMLAKE_INDEXER_STREAMING_THRESHOLD` docs a namespace
+      takes that path and has **no semantic edges at all**, so the graph silently
+      shows entity and observation structure only. Since the graph is core UI and
+      this flips at a size threshold, the failure mode is "works in dev, empty in
+      production" with no error. (Noted as being removed.)
+
+- [ ] **Temporal and causal edge types.** Temporal links are not edges — derive
+      adjacency from the timestamps already on the payload. `causal_out` is already
+      on the payload but Hindsight does not yet render it in the graph.
+
+- [ ] **Bank-stats link counts stay `{}`.** Countable only once edges are a
+      queryable relation rather than a per-memory list; low value on its own.
 
 ---
 

@@ -14,8 +14,9 @@ use serde::{Deserialize, Serialize};
 /// read with a clear error instead of failing deep in an rkyv decode ("pointer overran
 /// buffer"). Bumped to 2 for the `write_seq` + opaque `metadata` + 16-byte `EntityId` changes;
 /// to 3 for the payload store (`payload.idx`/`payload.data`), which a reader must find to
-/// hydrate hits.
-pub const FORMAT_VERSION: u32 = 3;
+/// hydrate hits; to 4 for the split vector blocks (`cluster-{i}.vec`) and the rerank tier
+/// (`rerank.idx`/`rerank.data`) the two-stage search reads.
+pub const FORMAT_VERSION: u32 = 4;
 
 /// Paths to the files making up a generation. Stored as an explicit struct rather than a
 /// map so a missing file is a deserialization error rather than a runtime surprise.
@@ -30,8 +31,8 @@ pub struct GenerationFiles {
     /// probe paid for bytes it scored once and discarded.
     #[serde(default)]
     pub vectors: Vec<String>,
-    /// `radj.csr`: the reverse-adjacency SSTable data blocks (range-read per lookup).
-    pub radj_csr: String,
+    /// `radj.data`: the reverse-adjacency SSTable data blocks (range-read per lookup).
+    pub radj_data: String,
     /// `radj.idx`: the reverse-adjacency SSTable sparse index (loaded whole, small).
     pub radj_idx: String,
     pub fts_split: String,
@@ -60,6 +61,16 @@ pub struct GenerationFiles {
     pub payload_idx: String,
     #[serde(default)]
     pub payload_data: String,
+    /// `rerank.idx` / `rerank.data`: full-precision embeddings, keyed by MemoryId.
+    ///
+    /// The second stage of the two-stage search. Never scanned — only point-fetched for the
+    /// candidates whose error bound leaves them possibly in the true top-k, which is a small
+    /// fraction of a probe. Keeping f32 here is what lets the scan tier be 1 bit per
+    /// dimension without losing the exact ranking.
+    #[serde(default)]
+    pub rerank_idx: String,
+    #[serde(default)]
+    pub rerank_data: String,
 }
 
 impl GenerationFiles {
@@ -70,7 +81,7 @@ impl GenerationFiles {
             self.pk.as_str(),
             self.pk_data.as_str(),
             self.centroids.as_str(),
-            self.radj_csr.as_str(),
+            self.radj_data.as_str(),
             self.radj_idx.as_str(),
             self.fts_split.as_str(),
             self.stats.as_str(),
@@ -81,6 +92,8 @@ impl GenerationFiles {
             self.time_data.as_str(),
             self.payload_idx.as_str(),
             self.payload_data.as_str(),
+            self.rerank_idx.as_str(),
+            self.rerank_data.as_str(),
         ]
         .into_iter()
         .chain(self.clusters.iter().map(|s| s.as_str()))

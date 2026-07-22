@@ -44,8 +44,8 @@ fn fts_key(prefix: &str) -> String {
 fn radj_idx_key(prefix: &str) -> String {
     format!("{prefix}/radj.idx")
 }
-fn radj_csr_key(prefix: &str) -> String {
-    format!("{prefix}/radj.csr")
+fn radj_data_key(prefix: &str) -> String {
+    format!("{prefix}/radj.data")
 }
 fn pk_idx_key(prefix: &str) -> String {
     format!("{prefix}/pk.idx")
@@ -76,6 +76,12 @@ fn payload_idx_key(prefix: &str) -> String {
 }
 fn payload_data_key(prefix: &str) -> String {
     format!("{prefix}/payload.data")
+}
+fn rerank_idx_key(prefix: &str) -> String {
+    format!("{prefix}/rerank.idx")
+}
+fn rerank_data_key(prefix: &str) -> String {
+    format!("{prefix}/rerank.data")
 }
 
 /// A unique per-attempt generation prefix. The nonce ensures two nodes building the same
@@ -155,6 +161,7 @@ pub async fn write_generation(
     entity_tables: SsTablePair,
     time_tables: SsTablePair,
     payload_tables: SsTablePair,
+    rerank_tables: SsTablePair,
     tag_summary: &TagSummary,
     doc_count: usize,
 ) -> Result<GenerationFiles> {
@@ -173,7 +180,7 @@ pub async fn write_generation(
         tag_summary_key(prefix),
         fts_key(prefix),
         radj_idx_key(prefix),
-        radj_csr_key(prefix),
+        radj_data_key(prefix),
         pk_idx_key(prefix),
         pk_data_key(prefix),
         stats_key(prefix),
@@ -182,6 +189,7 @@ pub async fn write_generation(
     );
     let (kti, ktd) = (time_idx_key(prefix), time_data_key(prefix));
     let (kpli, kpld) = (payload_idx_key(prefix), payload_data_key(prefix));
+    let (kri2, krd2) = (rerank_idx_key(prefix), rerank_data_key(prefix));
     // All metadata objects are independent, immutable, and unique to this prefix, so write
     // them concurrently rather than one sequential PUT at a time.
     futures::try_join!(
@@ -199,6 +207,8 @@ pub async fn write_generation(
         store.put(&ktd, time_tables.data),
         store.put(&kpli, payload_tables.idx),
         store.put(&kpld, payload_tables.data),
+        store.put(&kri2, rerank_tables.idx),
+        store.put(&krd2, rerank_tables.data),
     )?;
 
     Ok(GenerationFiles {
@@ -207,7 +217,7 @@ pub async fn write_generation(
         centroids: centroids_key(prefix),
         clusters: cluster_paths,
         vectors: vector_paths,
-        radj_csr: radj_csr_key(prefix),
+        radj_data: radj_data_key(prefix),
         radj_idx: radj_idx_key(prefix),
         fts_split: fts_key(prefix),
         stats: stats_key(prefix),
@@ -218,6 +228,8 @@ pub async fn write_generation(
         time_data: time_data_key(prefix),
         payload_idx: payload_idx_key(prefix),
         payload_data: payload_data_key(prefix),
+        rerank_idx: rerank_idx_key(prefix),
+        rerank_data: rerank_data_key(prefix),
     })
 }
 

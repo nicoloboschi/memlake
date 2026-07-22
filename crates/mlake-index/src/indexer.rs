@@ -47,7 +47,7 @@ impl Default for IndexOptions {
             derive_links: true,
             seed: 42,
             force_retrain: false,
-            vector_codec: VectorCodec::Int8,
+            vector_codec: VectorCodec::Binary,
         }
     }
 }
@@ -449,6 +449,9 @@ async fn build_memory_type_index(
     // Payload store: one addressable row per memory (embedding stripped), so a point read
     // (FTS/graph hit, `get`) fetches one memory instead of its whole cluster file.
     let payload_tables = crate::sstable::PayloadTable::build(&items);
+    // Full precision for stage two. Never scanned; point-fetched for the few candidates
+    // whose error bound leaves them possibly in the true top-k.
+    let rerank_tables = crate::sstable::RerankTable::build(&items);
 
     // Per-cluster tag summaries: the union of each cluster's tags + an untagged flag, so a
     // query can prune clusters that cannot contain a matching memory (SCALE.md Phase 4b).
@@ -484,6 +487,7 @@ async fn build_memory_type_index(
         entity_tables.into(),
         time_tables.into(),
         payload_tables.into(),
+        rerank_tables.into(),
         &tag_summary,
         doc_count,
     )

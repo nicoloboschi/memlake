@@ -400,7 +400,7 @@ impl Memlake for MemlakeService {
         Ok(Response::new(pb::GetResponse {
             memories: found
                 .into_iter()
-                .map(|m| convert::stored_record(m, req.include_vector))
+                .map(|m| convert::stored_record_with_edges(m, req.include_vector, req.include_edges))
                 .collect(),
         }))
     }
@@ -515,7 +515,11 @@ impl Memlake for MemlakeService {
                 items.drain(..dropped);
                 skip -= dropped;
             }
-            out.extend(items.into_iter().map(|m| convert::stored_record(m, req.include_vector)));
+            out.extend(
+                items
+                    .into_iter()
+                    .map(|m| convert::stored_record_with_edges(m, req.include_vector, req.include_edges)),
+            );
 
             match next {
                 // This type still has more and the page is full: stop here. Still

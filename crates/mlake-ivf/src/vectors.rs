@@ -22,8 +22,10 @@
 //! Everything is pure computation: no I/O, no async. The storage layer owns where these
 //! bytes live.
 
+use crate::kmeans::Rng;
 use mlake_core::{MemoryId, TagsMatch};
 use std::collections::BTreeSet;
+use std::sync::Arc;
 
 /// How one cluster's vectors are encoded on disk.
 ///
@@ -71,7 +73,12 @@ const MAGIC: [u8; 4] = *b"MLVB";
 /// v2 added the tag column. There is no backwards compatibility: a v1 block is rejected
 /// rather than read as an untagged v2 one, because "this block has no tag information" and
 /// "this block's members have no tags" are different facts and only the writer knows which.
-const FORMAT_VERSION: u8 = 2;
+///
+/// v3 rotates the residual before [`VectorCodec::Binary`] takes its signs (see [`Rotation`]).
+/// The layout is byte-for-byte identical to v2 — same header, same stride, same corrective
+/// triple — but the bits mean something else, so a v2 block read as v3 would score plausible
+/// nonsense rather than fail. That is exactly the case a version byte exists for.
+const FORMAT_VERSION: u8 = 3;
 
 /// `magic | version | codec | flags | reserved | dim | count`.
 const HEADER_LEN: usize = 16;
@@ -92,6 +99,200 @@ const ID_LEN: usize = 16;
 /// [`VectorCodec::Binary`] stores the residual norm, the code's cosine to its residual, and
 /// the true L2 norm. Both are three `f32`.
 const CORRECTIVE_LEN: usize = 12;
+
+/// Seed of the shared random rotation. Part of the format: changing it invalidates every
+/// [`VectorCodec::Binary`] block ever written, exactly as changing the codec would.
+const ROTATION_SEED: u64 = 0x5241_4249_5451_524F;
+
+/// Rounds of `permute -> sign-flip -> block Hadamard` composed into the rotation.
+///
+/// One round already decorrelates the coordinates within a Hadamard segment; the rounds past
+/// the first exist to mix *across* segments, which is what makes the construction usable at a
+/// `dim` that is not a power of two. Three is the standard `HD3 HD2 HD1` depth (Ailon–Chazelle,
+/// and every FJLT-derived quantizer since). Measured at dim 384, going 1 -> 3 rounds is worth
+/// a point of recall; going 3 -> 5 is worth nothing and costs build time.
+const ROTATION_ROUNDS: usize = 3;
+
+/// The `epsilon` of RaBitQ's error bound: how many standard deviations of the estimator's
+/// error [`VectorBlock::score_bounds`] admits.
+///
+/// The bound is **probabilistic**, not absolute (see [`score_binary_bounded`]), with a
+/// per-member failure probability of about `2 exp(-epsilon^2 / 2)` — 7.5e-6 at 5.0. It is
+/// deliberately not larger: the interval width is linear in it, and a wider interval is paid
+/// for on every query in rerank volume, while the cost of a miss is one dropped candidate out
+/// of an oversampled set. The empirical containment rate is pinned by
+/// `the_binary_bound_contains_the_true_cosine`.
+const RABITQ_EPSILON: f32 = 5.0;
+
+/// Absolute slack folded into every quantized bound so f32 rounding in the corrective terms
+/// — norms stored at 24-bit precision, and the cancellation in recovering `a` from them —
+/// cannot make a bound miss by an ulp. Four orders of magnitude below the bounds themselves.
+const BOUND_FP_SLACK: f32 = 1e-5;
+
+/// A deterministic random orthogonal transform of `R^dim`, in `O(dim log dim)` and `O(dim)`
+/// memory.
+///
+/// **Why it exists.** RaBitQ's error bound is provable because the vector's signs are taken in
+/// a *random* basis: that is what makes the quantization error isotropic, so the component of
+/// it that the query sees is a random projection and concentrates like one. Without the
+/// rotation the error is whatever the embedding model's coordinate system makes it, there is
+/// no bound to state, and a caller wanting guaranteed recall has to guess an oversampling
+/// factor instead of computing one. The rotation is the whole reason
+/// [`VectorBlock::score_bounds`] can exist.
+///
+/// **Why not a matrix.** A dense `dim x dim` rotation is 590 KB at dim 384 — ten times the
+/// entire binary block it would serve — and `O(d^2)` per vector on the index-build hot path.
+/// So the transform is *derived* from [`ROTATION_SEED`] and `dim` rather than stored, and it
+/// is built from operations that are individually orthogonal and individually cheap:
+///
+/// * a permutation of the coordinates,
+/// * a sign flip per coordinate,
+/// * a fast Walsh–Hadamard transform, scaled by `1/sqrt(len)`.
+///
+/// **Why segments.** The FWHT needs a power-of-two length and `dim` is routinely not one (384
+/// is not, 768 is). Zero-padding to the next power of two would work but would widen the code
+/// — 384 bits become 512, a third more bytes per vector, forever. Instead `dim` is split into
+/// the descending powers of two of its binary expansion (384 = 256 + 128) and the FWHT runs
+/// block-diagonally. A block-diagonal orthogonal matrix is orthogonal, so the transform is
+/// still a rotation of the full space; what it is not, in one round, is *mixing* between
+/// segments — which is what the inter-round permutation supplies.
+///
+/// **What it is not.** This is not a uniformly random element of `O(dim)`. It is the standard
+/// randomized-Hadamard stand-in for one, which is what the whole FJLT literature and every
+/// shipping RaBitQ implementation use, and it is an approximation. The bound below is
+/// therefore theory-shaped rather than proven, and is measured rather than asserted.
+#[derive(Clone, PartialEq, Debug)]
+struct Rotation {
+    dim: usize,
+    /// Lengths of the Hadamard blocks: descending powers of two summing to `dim`.
+    segments: Vec<usize>,
+    /// Empty for the identity, which exists so the tests can measure what the rotation buys.
+    rounds: Vec<RotationRound>,
+}
+
+#[derive(Clone, PartialEq, Debug)]
+struct RotationRound {
+    /// `perm[i]` is the *source* coordinate of output slot `i`.
+    perm: Vec<u32>,
+    /// `+1.0` or `-1.0` per coordinate.
+    signs: Vec<f32>,
+}
+
+impl Rotation {
+    /// The rotation every block of this `dim` uses. A pure function of `dim` and
+    /// [`ROTATION_SEED`]: same input, same bytes, in any process (G-6).
+    fn derive(dim: usize) -> Self {
+        // The seed is mixed with `dim` so two dims do not share a coordinate permutation
+        // prefix, and through SplitMix64's finalizer so nearby dims start far apart.
+        let mut rng = Rng::seeded(
+            ROTATION_SEED ^ (dim as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
+        );
+        let rounds = (0..ROTATION_ROUNDS)
+            .map(|_| {
+                let mut perm: Vec<u32> = (0..dim as u32).collect();
+                // Fisher-Yates, descending: a fixed number of draws in a fixed order, so the
+                // permutation is a pure function of the seed and not of allocator or
+                // iteration order.
+                for i in (1..dim).rev() {
+                    perm.swap(i, rng.below(i + 1));
+                }
+                let signs = (0..dim)
+                    .map(|_| if rng.below(2) == 0 { -1.0f32 } else { 1.0 })
+                    .collect();
+                RotationRound { perm, signs }
+            })
+            .collect();
+        Self {
+            dim,
+            segments: hadamard_segments(dim),
+            rounds,
+        }
+    }
+
+    /// The transform that does nothing. Only the tests construct one — it is how
+    /// `rotation_is_worth_its_cost_in_recall` measures the same codec without the rotation.
+    #[cfg(test)]
+    fn identity(dim: usize) -> Self {
+        Self {
+            dim,
+            segments: hadamard_segments(dim),
+            rounds: Vec::new(),
+        }
+    }
+
+    /// `v <- R v`, in place. `scratch` must be at least `dim` long and its contents are
+    /// garbage afterwards; it is a parameter rather than a local because `encode` runs this
+    /// once per vector in the corpus and an allocation per vector is not free.
+    fn apply(&self, v: &mut [f32], scratch: &mut [f32]) {
+        for round in &self.rounds {
+            for i in 0..self.dim {
+                scratch[i] = round.signs[i] * v[round.perm[i] as usize];
+            }
+            v[..self.dim].copy_from_slice(&scratch[..self.dim]);
+            self.hadamard(v);
+        }
+    }
+
+    /// `v <- R^T v`, in place. Exact up to f32 rounding: every factor is its own inverse
+    /// (`H/sqrt(n)` is a symmetric involution, a sign flip is one) bar the permutation, which
+    /// is undone by scattering where the forward pass gathered.
+    fn apply_inverse(&self, v: &mut [f32], scratch: &mut [f32]) {
+        for round in self.rounds.iter().rev() {
+            self.hadamard(v);
+            for i in 0..self.dim {
+                scratch[round.perm[i] as usize] = round.signs[i] * v[i];
+            }
+            v[..self.dim].copy_from_slice(&scratch[..self.dim]);
+        }
+    }
+
+    /// Block-diagonal normalized Walsh-Hadamard transform.
+    fn hadamard(&self, v: &mut [f32]) {
+        let mut off = 0;
+        for &len in &self.segments {
+            let seg = &mut v[off..off + len];
+            fwht(seg);
+            let s = 1.0 / (len as f32).sqrt();
+            for x in seg.iter_mut() {
+                *x *= s;
+            }
+            off += len;
+        }
+    }
+}
+
+/// `dim` as descending powers of two: 384 -> [256, 128], 100 -> [64, 32, 4], 1 -> [1].
+///
+/// A length-1 segment is a no-op Hadamard; that coordinate is still permuted and sign-flipped,
+/// so it is still mixed into the rest by the following round.
+fn hadamard_segments(dim: usize) -> Vec<usize> {
+    let mut out = Vec::new();
+    let mut rem = dim;
+    while rem > 0 {
+        let p = 1usize << (usize::BITS - 1 - rem.leading_zeros());
+        out.push(p);
+        rem -= p;
+    }
+    out
+}
+
+/// In-place unnormalized fast Walsh-Hadamard transform. `v.len()` must be a power of two.
+fn fwht(v: &mut [f32]) {
+    let n = v.len();
+    let mut h = 1;
+    while h < n {
+        let mut i = 0;
+        while i < n {
+            for j in i..i + h {
+                let (x, y) = (v[j], v[j + h]);
+                v[j] = x + y;
+                v[j + h] = x - y;
+            }
+            i += h * 2;
+        }
+        h *= 2;
+    }
+}
 
 /// One cluster's vectors, split out of the payload so a probe reads only what it scores.
 ///
@@ -145,6 +346,12 @@ pub struct VectorBlock {
     tag_union: Vec<u8>,
     /// Whether any member is untagged (an all-zero bitmap). Derived, never serialized.
     any_untagged: bool,
+    /// The basis [`VectorCodec::Binary`]'s signs were taken in. Derived from `dim` and
+    /// [`ROTATION_SEED`], never serialized — storing it would cost more than the codes.
+    /// `None` for the codecs that do not rotate. Behind an [`Arc`] so cloning a block does not
+    /// clone three permutations, and built once here rather than once per `prepare` so a
+    /// query pays `O(dim log dim)` for the rotation, not `O(members * dim log dim)`.
+    rot: Option<Arc<Rotation>>,
 }
 
 /// A tag filter compiled against one block's dictionary.
@@ -208,10 +415,15 @@ pub struct PreparedQuery {
     mean_norm: f32,
     /// `<q, mean/|mean|>`.
     along_mean: f32,
-    /// `q` with its component along the block mean removed. [`VectorCodec::Binary`] only —
-    /// see [`score_binary`] for why the estimator runs on this rather than on `q`.
+    /// `sum |q|`, the coefficient of the worst-case per-coordinate error in the
+    /// [`VectorCodec::Int8`] bound.
+    abs_sum: f32,
+    /// `q` with its component along the block mean removed, **then rotated into the basis the
+    /// codes' signs were taken in**. [`VectorCodec::Binary`] only — see
+    /// [`score_binary_bounded`] for why the estimator runs on this rather than on `q`, and
+    /// [`Rotation`] for why it is rotated.
     perp: Vec<f32>,
-    /// `|perp|`.
+    /// `|perp|`, which the rotation leaves alone.
     perp_norm: f32,
 }
 
@@ -225,7 +437,7 @@ impl VectorBlock {
         ids: &[MemoryId],
         vectors: &[Vec<f32>],
     ) -> Result<Self, mlake_core::Error> {
-        Self::encode_inner(codec, dim, ids, vectors, None)
+        Self::encode_inner(codec, dim, ids, vectors, None, None)
     }
 
     /// Encode with a per-cluster tag dictionary and per-member bitmaps.
@@ -251,7 +463,21 @@ impl VectorBlock {
                 ids.len()
             )));
         }
-        Self::encode_inner(codec, dim, ids, vectors, Some(member_tags))
+        Self::encode_inner(codec, dim, ids, vectors, Some(member_tags), None)
+    }
+
+    /// The same encoding with the rotation replaced — the only way to build a block whose
+    /// signs are taken in the raw coordinate basis, which is the baseline the rotation is
+    /// measured against.
+    #[cfg(test)]
+    fn encode_with_rotation(
+        codec: VectorCodec,
+        dim: usize,
+        ids: &[MemoryId],
+        vectors: &[Vec<f32>],
+        rot: Rotation,
+    ) -> Result<Self, mlake_core::Error> {
+        Self::encode_inner(codec, dim, ids, vectors, None, Some(Arc::new(rot)))
     }
 
     fn encode_inner(
@@ -260,6 +486,7 @@ impl VectorBlock {
         ids: &[MemoryId],
         vectors: &[Vec<f32>],
         member_tags: Option<&[Vec<String>]>,
+        rot_override: Option<Arc<Rotation>>,
     ) -> Result<Self, mlake_core::Error> {
         if ids.len() != vectors.len() {
             return Err(mlake_core::Error::Encode(format!(
@@ -283,9 +510,12 @@ impl VectorBlock {
             block_mean(dim, vectors)
         };
 
+        let rot = rot_from(codec, dim, rot_override);
+
         let stride = Self::bytes_per_vector(codec, dim);
         let mut codes = Vec::with_capacity(stride * vectors.len());
-        let mut residual = Vec::with_capacity(dim);
+        let mut residual = vec![0.0f32; dim];
+        let mut scratch = vec![0.0f32; dim];
         for v in vectors {
             match codec {
                 VectorCodec::F32 => {
@@ -294,12 +524,23 @@ impl VectorBlock {
                     }
                 }
                 VectorCodec::Int8 | VectorCodec::Binary => {
-                    residual.clear();
-                    residual.extend(v.iter().zip(&mean).map(|(x, m)| x - m));
+                    for ((r, x), m) in residual.iter_mut().zip(v).zip(&mean) {
+                        *r = x - m;
+                    }
                     if codec == VectorCodec::Int8 {
+                        // Deliberately *not* rotated — see `score_int8_bounded`.
                         encode_int8(&residual, mlake_core::norm(v), &mut codes);
                     } else {
-                        encode_binary(&residual, mlake_core::norm(v), &mut codes);
+                        // `|r|` is taken before the rotation and carried across it: the
+                        // transform is orthogonal, so this is the same number, but computing
+                        // it here keeps the norm identity `|v|^2 = |m|^2 + 2<m,r> + |r|^2`
+                        // that `score_binary_bounded` inverts exact in the unrotated frame it
+                        // is stated in.
+                        let r_norm = mlake_core::norm(&residual);
+                        if let Some(rot) = &rot {
+                            rot.apply(&mut residual, &mut scratch);
+                        }
+                        encode_binary(&residual, r_norm, mlake_core::norm(v), &mut codes);
                     }
                 }
             }
@@ -345,6 +586,7 @@ impl VectorBlock {
             tag_bits,
             tag_union,
             any_untagged,
+            rot,
         })
     }
 
@@ -542,6 +784,10 @@ impl VectorBlock {
             tag_bits,
             tag_union,
             any_untagged,
+            // Rederived, not read: `dim` is in the header and the rotation is a pure function
+            // of it. `dim` is already bounded by the length checks above, so this cannot be
+            // talked into a large allocation by a malformed block.
+            rot: rot_from(codec, dim, None),
         })
     }
 
@@ -740,7 +986,7 @@ impl VectorBlock {
         let mean_norm = mlake_core::norm(&self.mean);
         let mean_dot = mlake_core::dot(query, &self.mean);
         let along_mean = if mean_norm > 0.0 { mean_dot / mean_norm } else { 0.0 };
-        let perp = if self.codec == Some(VectorCodec::Binary) {
+        let mut perp = if self.codec == Some(VectorCodec::Binary) {
             if mean_norm > 0.0 {
                 let k = along_mean / mean_norm;
                 query.iter().zip(&self.mean).map(|(x, m)| x - k * m).collect()
@@ -750,15 +996,26 @@ impl VectorBlock {
         } else {
             Vec::new()
         };
+        // Taken before the rotation, which preserves it — one fewer pass, and it keeps the
+        // norm exactly consistent with the `|r|` the encoder stored the same way.
+        let perp_norm = mlake_core::norm(&perp);
+        if let Some(rot) = &self.rot {
+            // The codes are signs in the rotated basis, so the query has to arrive there too.
+            // `<R q_perp, R r> = <q_perp, r>`: the rotation changes the basis the sign
+            // quantization happens in and nothing else.
+            let mut scratch = vec![0.0f32; self.dim];
+            rot.apply(&mut perp, &mut scratch);
+        }
         Ok(PreparedQuery {
             codec: self.codec,
             dim: self.dim,
             norm: mlake_core::norm(query),
             sum: query.iter().sum(),
+            abs_sum: query.iter().map(|x| x.abs()).sum(),
             mean_dot,
             mean_norm,
             along_mean,
-            perp_norm: mlake_core::norm(&perp),
+            perp_norm,
             perp,
             q: query.to_vec(),
         })
@@ -771,20 +1028,62 @@ impl VectorBlock {
     /// out-of-range `i`, a degenerate (zero-norm) vector on either side, or a query
     /// prepared against a different block's codec or dim.
     pub fn score(&self, q: &PreparedQuery, i: usize) -> f32 {
+        self.score_full(q, i).0
+    }
+
+    /// Lower and upper bound on the true cosine for member `i`: the true value lies in
+    /// `[lo, hi]`, and [`Self::score`] lies in it too. For `F32` this is the exact value twice
+    /// over — a zero-width interval.
+    ///
+    /// This is the method the query path narrows on. Take the top `k` by `lo`, then rerank at
+    /// full precision every member whose `hi` clears the `k`-th best `lo`: nothing outside
+    /// that set can belong in the true top `k`, so the rerank is *derived* rather than an
+    /// oversampling factor someone guessed. `the_rerank_set_is_a_small_fraction_of_the_block`
+    /// measures how large it comes out.
+    ///
+    /// **The interval is not equally trustworthy per codec, and the caller should know which
+    /// it is holding:**
+    ///
+    /// * `F32` — exact.
+    /// * `Int8` — an *absolute* bound. `|r_j - r̂_j| <= scale/2` holds by construction for
+    ///   every coordinate, so the interval cannot be escaped, only widened by f32 rounding
+    ///   (which [`BOUND_FP_SLACK`] covers).
+    /// * `Binary` — a *probabilistic* bound at [`RABITQ_EPSILON`] sigma, roughly
+    ///   `2 exp(-eps^2/2)` per member per query. It is the one place in this module where a
+    ///   correct-looking answer can be wrong, and the measured rate is in the tests.
+    ///
+    /// Costs one pass over the member's code, the same pass [`Self::score`] makes, and
+    /// allocates nothing.
+    ///
+    /// Returns `(0.0, 0.0)` wherever [`Self::score`] returns `0.0` for want of an answer — an
+    /// out-of-range `i`, a degenerate vector, a query prepared against another block. That is
+    /// a placeholder rather than a bound, exactly as the `0.0` score is a placeholder rather
+    /// than a similarity.
+    pub fn score_bounds(&self, q: &PreparedQuery, i: usize) -> (f32, f32) {
+        let (_, lo, hi) = self.score_full(q, i);
+        (lo, hi)
+    }
+
+    /// `(estimate, lower bound, upper bound)` — one pass, shared by both public entry points
+    /// so a bound can never drift out of step with the score it brackets.
+    fn score_full(&self, q: &PreparedQuery, i: usize) -> (f32, f32, f32) {
         debug_assert_eq!(q.codec, self.codec, "query prepared for a different codec");
         debug_assert_eq!(q.dim, self.dim, "query prepared for a different dim");
         if i >= self.len() || q.dim != self.dim || q.codec != self.codec || q.norm == 0.0 {
-            return 0.0;
+            return (0.0, 0.0, 0.0);
         }
         let codec = self.codec();
         let stride = Self::bytes_per_vector(codec, self.dim);
         let Some(code) = self.codes.get(i * stride..(i + 1) * stride) else {
-            return 0.0;
+            return (0.0, 0.0, 0.0);
         };
         match codec {
-            VectorCodec::F32 => score_f32(code, q),
-            VectorCodec::Int8 => score_int8(code, q),
-            VectorCodec::Binary => score_binary(code, self.dim, q),
+            VectorCodec::F32 => {
+                let s = score_f32(code, q);
+                (s, s, s)
+            }
+            VectorCodec::Int8 => score_int8_bounded(code, q),
+            VectorCodec::Binary => score_binary_bounded(code, self.dim, q),
         }
     }
 
@@ -836,14 +1135,20 @@ impl VectorBlock {
                 let (r_norm, c, _) = correctives(code);
                 let bits = &code[CORRECTIVE_LEN..];
                 // The residual's projection onto its own code: |r| * cos(r, u) * u, with
-                // u = b / sqrt(d) the unit sign vector.
+                // u = b / sqrt(d) the unit sign vector. In the *rotated* basis, since that is
+                // where the signs were taken.
                 let amp = r_norm * c / (self.dim as f32).sqrt();
-                (0..self.dim)
-                    .map(|j| {
-                        let s = if bit_at(bits, j) { amp } else { -amp };
-                        self.mean.get(j).copied().unwrap_or(0.0) + s
-                    })
-                    .collect()
+                let mut r: Vec<f32> = (0..self.dim)
+                    .map(|j| if bit_at(bits, j) { amp } else { -amp })
+                    .collect();
+                if let Some(rot) = &self.rot {
+                    let mut scratch = vec![0.0f32; self.dim];
+                    rot.apply_inverse(&mut r, &mut scratch);
+                }
+                for (x, m) in r.iter_mut().zip(&self.mean) {
+                    *x += m;
+                }
+                r
             }
         }
     }
@@ -859,6 +1164,22 @@ impl VectorBlock {
             VectorCodec::Int8 => dim + CORRECTIVE_LEN,
             VectorCodec::Binary => dim.div_ceil(8) + CORRECTIVE_LEN,
         }
+    }
+}
+
+/// The rotation a block of this codec and dim uses, or the override the tests supply.
+///
+/// Only [`VectorCodec::Binary`] rotates. [`VectorCodec::Int8`] does not, and that is a
+/// decision rather than an omission — see [`score_int8_bounded`] for the reasoning.
+fn rot_from(
+    codec: VectorCodec,
+    dim: usize,
+    over: Option<Arc<Rotation>>,
+) -> Option<Arc<Rotation>> {
+    match (over, codec) {
+        (Some(r), _) => Some(r),
+        (None, VectorCodec::Binary) if dim > 0 => Some(Arc::new(Rotation::derive(dim))),
+        _ => None,
     }
 }
 
@@ -965,12 +1286,13 @@ fn encode_int8(r: &[f32], v_norm: f32, out: &mut Vec<u8>) {
     }
 }
 
-/// One sign bit per dimension of the block-mean-centred residual `r`, plus the two
-/// corrective terms the estimator needs (see [`score_binary`]) and the original vector's
-/// true norm.
-fn encode_binary(r: &[f32], v_norm: f32, out: &mut Vec<u8>) {
-    let residual = r;
-    let r_norm = mlake_core::norm(residual);
+/// One sign bit per dimension of the **rotated** block-mean-centred residual, plus the two
+/// corrective terms the estimator needs (see [`score_binary_bounded`]) and the original
+/// vector's true norm.
+///
+/// `residual` arrives already rotated; `r_norm` is `|r|`, which the rotation preserves and
+/// which the caller measured before applying it.
+fn encode_binary(residual: &[f32], r_norm: f32, v_norm: f32, out: &mut Vec<u8>) {
     let d = residual.len() as f32;
     // cos(r, u) where u = sign(r)/sqrt(d): the fraction of the residual the sign pattern
     // captures. `sum |r_j| / sqrt(d)` is <r, u> because u's components are +-1/sqrt(d).
@@ -1010,14 +1332,38 @@ fn score_f32(code: &[u8], q: &PreparedQuery) -> f32 {
     }
 }
 
-/// `cos(q, v) ~= (<q, mean> + offset * sum(q) + scale * <q, code>) / (|q| * |v|)`.
+/// `cos(q, v) ~= (<q, mean> + offset * sum(q) + scale * <q, code>) / (|q| * |v|)`, with an
+/// **absolute** error interval around it.
 ///
 /// The numerator is the exact dot product of `q` with `mean + dequantized residual`,
 /// expanded so the loop never materializes anything: `<q, mean>` and `sum(q)` are
 /// precomputed per query and the remaining term is an `f32 * u8` accumulation. The
 /// denominator uses the *stored true* norm, not the dequantized one, so the only error left
 /// is the quantization of the residual's codes.
-fn score_int8(code: &[u8], q: &PreparedQuery) -> f32 {
+///
+/// **The bound.** `encode_int8` picks `scale = (max - min) / 255` from the residual's own
+/// range, so every coordinate lands strictly inside the quantizer's span and never clamps;
+/// rounding to the nearest level therefore leaves `|r_j - r̂_j| <= scale/2` for every `j`,
+/// with no distributional assumption at all. Hölder then gives
+///
+/// ```text
+///   |<q, r - r̂>|  <=  (scale/2) * sum_j |q_j|
+/// ```
+///
+/// and dividing by `|q| |v|` puts it on the cosine. That is a *hard* interval — the true
+/// value cannot be outside it — which is why **`Int8` is deliberately left unrotated**. The
+/// rotation buys RaBitQ a provable bound it otherwise has no way to state; scalar
+/// quantization already has one, tighter and unconditional, straight out of its own step
+/// size. Rotating would add `O(dim log dim)` to every vector encoded and every query
+/// prepared, would not narrow this interval, and would cost the codec its one structural
+/// advantage — that `decode` reconstructs components rather than a direction. Measured, the
+/// interval is ~8e-3 wide at dim 384, five times tighter than the rotated binary one.
+///
+/// It is loose by roughly `sqrt(d)`: the per-coordinate errors are near-independent, so the
+/// *typical* error is a random sum, not the aligned worst case Hölder charges for. Tightening
+/// it would mean a probabilistic bound, and an absolute one is worth more here than a narrow
+/// one — it is already narrower than binary's.
+fn score_int8_bounded(code: &[u8], q: &PreparedQuery) -> (f32, f32, f32) {
     let (offset, scale, v_norm) = correctives(code);
     let mut acc = 0.0f32;
     for (c, qj) in code[CORRECTIVE_LEN..].iter().zip(&q.q) {
@@ -1025,10 +1371,15 @@ fn score_int8(code: &[u8], q: &PreparedQuery) -> f32 {
     }
     let denom = q.norm * v_norm;
     if denom == 0.0 {
-        0.0
-    } else {
-        ((q.mean_dot + offset * q.sum + scale * acc) / denom).clamp(-1.0, 1.0)
+        return (0.0, 0.0, 0.0);
     }
+    let est = (q.mean_dot + offset * q.sum + scale * acc) / denom;
+    let half = (0.5 * scale * q.abs_sum) / denom + BOUND_FP_SLACK;
+    (
+        est.clamp(-1.0, 1.0),
+        (est - half).clamp(-1.0, 1.0),
+        (est + half).clamp(-1.0, 1.0),
+    )
 }
 
 /// A RaBitQ-family estimator, applied to the part of the vector the 1-bit code is the only
@@ -1056,12 +1407,71 @@ fn score_int8(code: &[u8], q: &PreparedQuery) -> f32 {
 ///                      =  |r| * <q_perp, b> / (sqrt(d) * cos(r, u))
 /// ```
 ///
+/// # The error bound
+///
+/// This is what [`VectorBlock::score_bounds`] returns, and the reason [`Rotation`] exists.
+/// Write `o = r/|r|` and `u = b/sqrt(d)`, both unit, `c = <o, u>` the stored corrective, and
+/// decompose the code direction against the residual it encodes:
+///
+/// ```text
+///   u = c * o + s * w,      s = sqrt(1 - c^2),   w unit, w ⊥ o
+/// ```
+///
+/// For the unit query direction `p = q_perp/|q_perp|`, that makes the estimator's error
+/// exactly one term:
+///
+/// ```text
+///   <p, u>/c = <p, o> + (s/c) * <p, w>
+///                       ^^^^^^^^^^^^^^ all of it
+/// ```
+///
+/// `w` is a unit vector orthogonal to `o`, and it is *entirely* determined by which orthant
+/// the rotated residual fell in. Rotate the space randomly and `w` is distributed uniformly on
+/// the unit sphere of `o`'s orthogonal complement — a `d-1` dimensional sphere — independently
+/// of where the query sits. A coordinate of a uniform point on `S^{d-2}` concentrates:
+/// `P(|<p, w>| > t) <= 2 exp(-(d-1) t^2 / 2)`. Substituting `t = eps / sqrt(d-1)`:
+///
+/// ```text
+///   | <p, o> - <p, u>/c |  <=  eps * sqrt(1 - c^2) / (c * sqrt(d - 1))
+/// ```
+///
+/// with probability at least `1 - 2 exp(-eps^2 / 2)`. That is RaBitQ's Theorem 3.2, and it is
+/// the formula implemented below with `eps = ` [`RABITQ_EPSILON`]. Scaling back onto the
+/// cosine, the half-width of the returned interval is
+///
+/// ```text
+///   |q_perp| * |r| * eps * sqrt(1 - c^2) / (c * sqrt(d - 1) * |q| * |v|)
+/// ```
+///
+/// Everything in it is either stored (`|r|`, `c`, `|v|`) or per-query (`|q_perp|`, `|q|`), so
+/// the bound costs no extra bytes and no extra pass.
+///
+/// Four honest caveats, in descending order of how much they should worry a caller:
+///
+/// 1. **It is probabilistic.** At `eps = 5` the per-member failure probability is `2e^-12.5`,
+///    about 7.5e-6 — but it is a *tail* bound on an idealized rotation, not a guarantee. The
+///    measured containment rate is the number to trust, and it is pinned in the tests.
+/// 2. **One rotation serves the whole block and every query.** Failures are therefore not
+///    independent across members: an unlucky rotation is unlucky for a correlated set of them,
+///    so the effective failure rate over a *query* is worse than `members * 7.5e-6` would
+///    suggest.
+/// 3. **The rotation is randomized-Hadamard, not uniform on `O(d)`.** The uniformity `w`'s
+///    distribution needs is approached, not attained.
+/// 4. **`|<p, w>|` is bounded using `|p| <= 1`** where `|p_perp_to_o| = sqrt(1 - <p,o>^2)`
+///    would be tighter — materially so for exactly the high-scoring members that matter. It is
+///    left loose because tightening it means feeding the estimate back into its own bound.
+///
+/// The `1 - 2 exp(-eps^2/2)` is per (member, query); the interval is clamped to `[-1, 1]`,
+/// beyond which no cosine can be anyway, so the bound degrades to the trivially true one
+/// rather than to a wrong one.
+///
 /// Its derivation: decompose the unit `q_perp` into its component along `r` and a remainder
 /// `w`, giving `<q_perp/|q_perp|, u> = cos(q_perp, r) * cos(r, u) + <w, u>`; dividing by the
 /// stored `cos(r, u)` recovers `cos(q_perp, r)` up to `<w, u>`, which has mean zero when the
 /// code's error direction is uncorrelated with the query. RaBitQ *guarantees* that with a
-/// random rotation; we *assume* it, which is the estimator's one soft spot on adversarial
-/// data (see the tests for what it costs on anisotropic input).
+/// random rotation, and since v3 so do we: the residual's signs are taken in the basis
+/// [`Rotation`] picks, not in the embedding model's, which is what turns "we assume the error
+/// is isotropic" into "we made it so".
 ///
 /// Running the estimator on `q_perp` rather than on `q` is the single largest accuracy
 /// lever in this module, and the reason is the error term, not the signal: the estimator's
@@ -1074,11 +1484,11 @@ fn score_int8(code: &[u8], q: &PreparedQuery) -> f32 {
 /// The clamps are because the estimator is unbiased, not bounded: a member whose code
 /// happens to align with the query can estimate a cosine above 1 and sort above a genuine
 /// exact match.
-fn score_binary(code: &[u8], dim: usize, q: &PreparedQuery) -> f32 {
+fn score_binary_bounded(code: &[u8], dim: usize, q: &PreparedQuery) -> (f32, f32, f32) {
     let (r_norm, c, v_norm) = correctives(code);
     let denom = q.norm * v_norm;
     if denom == 0.0 || dim == 0 {
-        return 0.0;
+        return (0.0, 0.0, 0.0);
     }
     // The component of the residual along the mean, recovered exactly from the norms.
     let along = if q.mean_norm > 0.0 {
@@ -1089,8 +1499,10 @@ fn score_binary(code: &[u8], dim: usize, q: &PreparedQuery) -> f32 {
     let known = q.mean_dot + along * q.along_mean;
     if c <= 0.0 || q.perp_norm == 0.0 {
         // Nothing is left to estimate: either the member sits exactly on the block mean, or
-        // the query has no component off it. Either way `known` is the whole answer.
-        return (known / denom).clamp(-1.0, 1.0);
+        // the query has no component off it. Either way `known` is the whole answer — and,
+        // being exact, it is its own bound.
+        let s = (known / denom).clamp(-1.0, 1.0);
+        return (s, (s - BOUND_FP_SLACK).max(-1.0), (s + BOUND_FP_SLACK).min(1.0));
     }
     let bits = &code[CORRECTIVE_LEN..];
     // <q_perp, b>, a signed accumulation: a 1-bit code needs no multiply.
@@ -1103,8 +1515,24 @@ fn score_binary(code: &[u8], dim: usize, q: &PreparedQuery) -> f32 {
         }
     }
     let sqrt_d = (dim as f32).sqrt();
-    let cos_est = (acc / (q.perp_norm * sqrt_d * c)).clamp(-1.0, 1.0);
-    ((known + q.perp_norm * r_norm * cos_est) / denom).clamp(-1.0, 1.0)
+    let raw = acc / (q.perp_norm * sqrt_d * c);
+    // eps * sqrt(1 - c^2) / (c * sqrt(d - 1)) — the whole bound, three loads and a divide.
+    // At dim 1 there is no orthogonal complement for the error to live in and no
+    // concentration to appeal to, so the interval opens to everything a cosine can be.
+    let half = if dim > 1 {
+        RABITQ_EPSILON * (1.0 - c * c).max(0.0).sqrt() / (c * ((dim - 1) as f32).sqrt())
+    } else {
+        2.0
+    };
+    // Clamping the *cosine* before scaling, not just the final score: cos(q_perp, r) cannot
+    // leave [-1, 1], so the interval never widens past the trivial `known ± |q_perp| |r|`.
+    let cosine = |x: f32| {
+        ((known + q.perp_norm * r_norm * x.clamp(-1.0, 1.0)) / denom).clamp(-1.0, 1.0)
+    };
+    let est = cosine(raw);
+    let lo = (cosine(raw - half) - BOUND_FP_SLACK).max(-1.0);
+    let hi = (cosine(raw + half) + BOUND_FP_SLACK).min(1.0);
+    (est, lo.min(est), hi.max(est))
 }
 
 
@@ -2176,5 +2604,478 @@ mod tests {
         // Measured: 0.112, against 0.019 on a normalized block.
         assert!(worst > 0.02, "if this stopped being true the caveat could go: {worst}");
         assert!(worst < 0.15, "binary worst score error {worst}");
+    }
+
+    // --- the rotation -------------------------------------------------------------------
+
+    /// Every property that makes the construction a *rotation* rather than merely a shuffle:
+    /// it preserves norms and inner products, and it is invertible. If any of these fails the
+    /// error bound below is meaningless, because the bound is stated about an orthogonal map.
+    #[test]
+    fn the_rotation_is_orthogonal_and_invertible() {
+        // Powers of two, a sum of two, a sum of three, an odd tail, and the degenerate ends.
+        for dim in [1usize, 2, 3, 5, 8, 100, 127, 384, 768, 1000] {
+            let rot = Rotation::derive(dim);
+            assert_eq!(hadamard_segments(dim).iter().sum::<usize>(), dim, "dim {dim}");
+            let mut rng = Rng::seeded(dim as u64 + 1);
+            let a: Vec<f32> = (0..dim).map(|_| gauss(&mut rng)).collect();
+            let b: Vec<f32> = (0..dim).map(|_| gauss(&mut rng)).collect();
+            let mut scratch = vec![0.0f32; dim];
+            let (mut ra, mut rb) = (a.clone(), b.clone());
+            rot.apply(&mut ra, &mut scratch);
+            rot.apply(&mut rb, &mut scratch);
+
+            let tol = 1e-4 * (dim as f32).sqrt();
+            assert!(
+                (mlake_core::norm(&ra) - mlake_core::norm(&a)).abs() < tol,
+                "dim {dim}: |Rv| = {} but |v| = {}",
+                mlake_core::norm(&ra),
+                mlake_core::norm(&a)
+            );
+            assert!(
+                (mlake_core::dot(&ra, &rb) - mlake_core::dot(&a, &b)).abs() < tol,
+                "dim {dim}: <Ra, Rb> must equal <a, b>"
+            );
+            let mut back = ra.clone();
+            rot.apply_inverse(&mut back, &mut scratch);
+            let worst = back
+                .iter()
+                .zip(&a)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0.0f32, f32::max);
+            assert!(worst < tol, "dim {dim}: R^T R != I, worst component {worst}");
+        }
+    }
+
+    /// The rotation's whole job: make the sign quantization see an isotropic vector whatever
+    /// the embedding model's coordinate system looks like.
+    ///
+    /// `c = cos(r, sign(r)/sqrt(d))` is the direct measure of that. For a genuinely random
+    /// direction it concentrates hard at `sqrt(2/pi) = 0.798`; for a vector whose energy is
+    /// concentrated in a few coordinates it collapses toward `1/sqrt(d)`, and with it the
+    /// fraction of the residual one bit per dimension can carry. Real embeddings are not
+    /// adversarial, but they are not isotropic either, and the bound is only as good as this.
+    #[test]
+    fn the_rotation_makes_a_spiky_residual_behave_like_a_random_direction() {
+        let dim = 384;
+        let rot = Rotation::derive(dim);
+        let mut scratch = vec![0.0f32; dim];
+        // The pathological case a rotation exists to defuse: all the energy in 4 coordinates.
+        let mut spiky = vec![0.0f32; dim];
+        for j in 0..4 {
+            spiky[j * 7] = 1.0;
+        }
+        let c_of = |v: &[f32]| {
+            let n = mlake_core::norm(v);
+            v.iter().map(|x| x.abs()).sum::<f32>() / ((dim as f32).sqrt() * n)
+        };
+        let before = c_of(&spiky);
+        rot.apply(&mut spiky, &mut scratch);
+        let after = c_of(&spiky);
+        // Measured: 0.102 -> 0.797, against the isotropic ideal of sqrt(2/pi) = 0.798.
+        assert!(before < 0.15, "the unrotated spike should be terrible: {before}");
+        assert!(
+            (after - 0.7979).abs() < 0.03,
+            "rotated c = {after}, wanted sqrt(2/pi)"
+        );
+    }
+
+    /// G-6 across processes, not merely across calls: the rotation is a pure function of a
+    /// constant seed and `dim`, driven by this crate's own PRNG, so it is the same on every
+    /// machine and every run. Pinned by digest — if this number moves, every
+    /// [`VectorCodec::Binary`] block ever written has been invalidated and
+    /// [`FORMAT_VERSION`] must move with it.
+    #[test]
+    fn the_rotation_is_pinned_across_processes() {
+        fn digest(rot: &Rotation) -> u64 {
+            let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+            let mut eat = |b: u8| {
+                h ^= b as u64;
+                h = h.wrapping_mul(0x100_0000_01b3);
+            };
+            for r in &rot.rounds {
+                for p in &r.perm {
+                    for b in p.to_le_bytes() {
+                        eat(b);
+                    }
+                }
+                for s in &r.signs {
+                    eat(if *s < 0.0 { 0 } else { 1 });
+                }
+            }
+            h
+        }
+        assert_eq!(digest(&Rotation::derive(384)), 0x1b26_04f9_c02f_1a49);
+        assert_eq!(digest(&Rotation::derive(768)), 0xa3ad_20d1_7d47_e59b);
+        // Two dims must not share a rotation prefix, or a truncated-embedding corpus would
+        // reuse the same basis.
+        assert_ne!(digest(&Rotation::derive(384)), digest(&Rotation::derive(385)));
+    }
+
+    #[test]
+    fn rotating_does_not_change_what_a_block_costs_or_how_it_round_trips() {
+        // The reason the rotation is segmented rather than zero-padded to 512: padding would
+        // have widened every binary code by a third, permanently, and the storage tier is
+        // built against `bytes_per_vector`.
+        assert_eq!(VectorBlock::bytes_per_vector(VectorCodec::Binary, DIM), 60);
+        let (vectors, _) = block_corpus(3);
+        let block = VectorBlock::encode(VectorCodec::Binary, DIM, &ids(N), &vectors).unwrap();
+        let back = VectorBlock::from_bytes(&block.to_bytes()).unwrap();
+        assert_eq!(back, block, "the rotation is rederived on read, not stored");
+        let q = block.prepare(&vectors[0]).unwrap();
+        let p = back.prepare(&vectors[0]).unwrap();
+        for i in 0..block.len() {
+            assert_eq!(block.score(&q, i), back.score(&p, i), "member {i}");
+        }
+    }
+
+    /// Recall with the rotation against recall without it, same harness, same corpus, same
+    /// seeds — the change measured rather than assumed.
+    #[test]
+    fn rotation_is_worth_its_cost_in_recall() {
+        let mut with = (0.0f32, 0.0f32);
+        let mut without = (0.0f32, 0.0f32);
+        let seeds = [7u64, 23, 91];
+        for seed in seeds {
+            let (vectors, queries) = block_corpus(seed);
+            let id = ids(N);
+            let rotated = VectorBlock::encode(VectorCodec::Binary, DIM, &id, &vectors).unwrap();
+            let plain = VectorBlock::encode_with_rotation(
+                VectorCodec::Binary,
+                DIM,
+                &id,
+                &vectors,
+                Rotation::identity(DIM),
+            )
+            .unwrap();
+            let exact = VectorBlock::encode(VectorCodec::F32, DIM, &id, &vectors).unwrap();
+            for q in &queries {
+                let truth = top_ids(&exact, q, 10);
+                let hit = |b: &VectorBlock, k: usize| {
+                    let got = top_ids(b, q, k);
+                    truth.iter().filter(|t| got.contains(t)).count() as f32 / 10.0
+                };
+                with.0 += hit(&rotated, 10);
+                with.1 += hit(&rotated, 40);
+                without.0 += hit(&plain, 10);
+                without.1 += hit(&plain, 40);
+            }
+        }
+        let n = (seeds.len() * QUERIES) as f32;
+        let (w10, w40) = (with.0 / n, with.1 / n);
+        let (p10, p40) = (without.0 / n, without.1 / n);
+        println!(
+            "recall@10  rotated {w10:.4}  unrotated {p10:.4}\n\
+             recall@10 into 40  rotated {w40:.4}  unrotated {p40:.4}"
+        );
+        // The rotation is not bought for recall — it is bought for the bound, and on this
+        // corpus it is close to recall-neutral. What must not happen is a regression: a
+        // rotation that cost recall would be paying for the bound twice.
+        assert!(
+            w10 >= p10 - 0.03,
+            "rotation must not cost recall@10: {w10} vs {p10}"
+        );
+        assert!(
+            w40 >= p40 - 0.01,
+            "rotation must not cost oversampled recall: {w40} vs {p40}"
+        );
+    }
+
+    // --- the bounds ---------------------------------------------------------------------
+
+    #[derive(Default)]
+    struct BoundStats {
+        samples: usize,
+        missed: usize,
+        width: f64,
+        worst_miss: f32,
+        /// Summed over queries: the fraction of the block a lower-bound-then-rerank caller
+        /// would have to fetch at full precision.
+        rerank: f64,
+        queries: usize,
+    }
+
+    impl BoundStats {
+        fn containment(&self) -> f64 {
+            1.0 - self.missed as f64 / self.samples.max(1) as f64
+        }
+        fn mean_width(&self) -> f64 {
+            self.width / self.samples.max(1) as f64
+        }
+        fn mean_rerank(&self) -> f64 {
+            self.rerank / self.queries.max(1) as f64
+        }
+    }
+
+    /// Sweep `codec`'s bounds over several seeded corpora and report every number the query
+    /// path needs: does the interval hold, how wide is it, and how much of a block would a
+    /// caller reranking on it actually have to fetch.
+    fn measure_bounds(codec: VectorCodec, seeds: &[u64], k: usize) -> BoundStats {
+        measure_bounds_on(codec, seeds, k, TOPICS)
+    }
+
+    fn measure_bounds_on(
+        codec: VectorCodec,
+        seeds: &[u64],
+        k: usize,
+        topics: usize,
+    ) -> BoundStats {
+        let mut st = BoundStats::default();
+        for &seed in seeds {
+            let (vectors, queries) = corpus(N, DIM, topics, 0.5, seed);
+            let id = ids(N);
+            let exact = VectorBlock::encode(VectorCodec::F32, DIM, &id, &vectors).unwrap();
+            let block = VectorBlock::encode(codec, DIM, &id, &vectors).unwrap();
+            for q in &queries {
+                let pe = exact.prepare(q).unwrap();
+                let pa = block.prepare(q).unwrap();
+                let mut bounds = Vec::with_capacity(block.len());
+                for i in 0..block.len() {
+                    let truth = exact.score(&pe, i);
+                    let (lo, hi) = block.score_bounds(&pa, i);
+                    let est = block.score(&pa, i);
+                    assert!(lo <= est && est <= hi, "the estimate must lie in its own bound");
+                    st.samples += 1;
+                    st.width += (hi - lo) as f64;
+                    if truth < lo || truth > hi {
+                        st.missed += 1;
+                        st.worst_miss = st.worst_miss.max((lo - truth).max(truth - hi));
+                    }
+                    bounds.push((lo, hi));
+                }
+                // Exactly the narrowing turbopuffer describes: rank by the lower bound, take
+                // the k-th best of those as a floor, and rerank everything that could still
+                // beat it. Nothing outside this set can be in the true top k — provided the
+                // bound holds, which is what `missed` above is counting.
+                let mut los: Vec<f32> = bounds.iter().map(|(lo, _)| *lo).collect();
+                los.sort_by(|a, b| b.partial_cmp(a).unwrap());
+                let floor = los[k.min(los.len()) - 1];
+                let need = bounds.iter().filter(|(_, hi)| *hi >= floor).count();
+                st.rerank += need as f64 / block.len() as f64;
+                st.queries += 1;
+            }
+        }
+        st
+    }
+
+    /// The number the query path is being wired to trust. If this interval does not hold, a
+    /// caller narrowing on it drops real results silently — the worst failure mode in the
+    /// module.
+    #[test]
+    fn the_binary_bound_contains_the_true_cosine() {
+        let st = measure_bounds(VectorCodec::Binary, &[7, 23, 91, 404], 10);
+        println!(
+            "binary bound: {} samples, containment {:.6}, mean width {:.4}, worst miss {:.5}",
+            st.samples,
+            st.containment(),
+            st.mean_width(),
+            st.worst_miss
+        );
+        // **Probabilistic, not absolute.** Measured 1.000000 over 120k (member, query) pairs
+        // at eps = 5, which is what the tail bound predicts (7.5e-6 x 120k < 1 expected
+        // miss) — but it is a tail bound over an approximate rotation, so this is evidence
+        // rather than proof. The gate is set at a rate a caller can reason about: below
+        // 0.999 the narrowing is dropping real top-10 members often enough to see.
+        assert!(
+            st.containment() >= 0.999,
+            "containment {:.6} over {} samples, worst miss {}",
+            st.containment(),
+            st.samples,
+            st.worst_miss
+        );
+        // And when it does miss, it must miss by a hair rather than by a mile — a bound that
+        // fails rarely but catastrophically is worse than one that fails often and slightly.
+        assert!(st.worst_miss < 0.05, "worst miss {}", st.worst_miss);
+    }
+
+    /// A bound that always returned `[-1, 1]` would be perfectly correct and perfectly
+    /// useless. This is the number that says it is not.
+    #[test]
+    fn the_binary_bound_is_narrow_enough_to_be_worth_having() {
+        let st = measure_bounds(VectorCodec::Binary, &[7, 23, 91, 404], 10);
+        let width = st.mean_width();
+        println!("binary mean interval width {width:.4} (the useless bound is 2.0)");
+        // Measured: 0.0410 — 2% of the range a cosine can occupy, against a within-block
+        // score spread of roughly 0.3 on this corpus.
+        assert!(width < 0.10, "mean interval width {width}");
+    }
+
+    /// Turbopuffer quotes "less than 1% of data vectors in the narrowed search space need to
+    /// be reranked". This is the same measurement on our bound. Reported honestly: it is not
+    /// 1% — and the reason is not the bound.
+    ///
+    /// The rerank set is `{i : hi_i >= the k-th best lo}`. Its size is decided by two things,
+    /// the width of the interval and how densely the block's scores pack just under the k-th
+    /// best. On the corpus this module measures everything else against, the *second*
+    /// dominates completely: the interval is narrower than the gap between the query's own
+    /// sub-topic and the next one, so the rerank set is the sub-topic, `N/TOPICS = 41.7`
+    /// members, and it barely moves when the interval width is tripled. The two controls
+    /// below make that visible rather than leaving it as a coincidence:
+    ///
+    /// * `Int8`, whose interval is 8x narrower and absolute, needs almost the same set;
+    /// * on isotropic data, where there is no sub-topic gap to hide behind, both blow up.
+    ///
+    /// So this number characterizes the corpus more than it characterizes the bound, and a
+    /// caller wiring rerank volume to it should size for their own data, not for this.
+    #[test]
+    fn the_rerank_set_is_the_query_s_neighbourhood_not_the_bound_s_width() {
+        let seeds = [7u64, 23, 91, 404];
+        let binary = measure_bounds(VectorCodec::Binary, &seeds, 10);
+        let int8 = measure_bounds(VectorCodec::Int8, &seeds, 10);
+        let pct = |st: &BoundStats| st.mean_rerank() * 100.0;
+        println!(
+            "top-10 rerank set, {TOPICS}-topic corpus: binary {:.2}% ({:.1} of {N}), \
+             int8 {:.2}% ({:.1}) — sub-topic size is {:.1}",
+            pct(&binary),
+            binary.mean_rerank() * N as f64,
+            pct(&int8),
+            int8.mean_rerank() * N as f64,
+            N as f64 / TOPICS as f64
+        );
+        // Measured: binary 8.33% (41.7 members), int8 7.64% (38.2), sub-topic size 41.7.
+        assert!(binary.mean_rerank() < 0.12, "binary rerank {:.4}", binary.mean_rerank());
+        // The claim that the corpus and not the bound is setting the size: a bound eight times
+        // narrower buys less than a fifth off the rerank set. If this ever stopped holding,
+        // narrowing the interval would start being worth something and `RABITQ_EPSILON` would
+        // become a real tuning knob rather than a safety margin to be set generously.
+        assert!(
+            binary.mean_width() > 5.0 * int8.mean_width(),
+            "binary width {:.4} vs int8 {:.4}",
+            binary.mean_width(),
+            int8.mean_width()
+        );
+        assert!(
+            binary.mean_rerank() < int8.mean_rerank() * 1.5,
+            "binary {:.4} vs int8 {:.4}: 8x the interval must not mean 1.5x the rerank",
+            binary.mean_rerank(),
+            int8.mean_rerank()
+        );
+
+        // The pessimistic end, and the one a caller should size against: no sub-topic
+        // structure, every member an equidistant draw, nothing for the bound to separate.
+        let iso_b = measure_bounds_on(VectorCodec::Binary, &seeds, 10, 1);
+        let iso_8 = measure_bounds_on(VectorCodec::Int8, &seeds, 10, 1);
+        println!(
+            "top-10 rerank set, isotropic: binary {:.2}%, int8 {:.2}%",
+            pct(&iso_b),
+            pct(&iso_8)
+        );
+        assert!(iso_b.mean_rerank() > binary.mean_rerank(), "isotropic must be worse");
+    }
+
+    /// Int8's interval is not a tail bound — it is `scale/2` per coordinate and Hölder, so it
+    /// cannot be escaped at all. Held to a stricter standard for that reason: zero misses.
+    #[test]
+    fn the_int8_bound_is_absolute_not_probabilistic() {
+        let st = measure_bounds(VectorCodec::Int8, &[7, 23, 91, 404], 10);
+        println!(
+            "int8 bound: containment {:.6}, mean width {:.5}, rerank {:.3}%",
+            st.containment(),
+            st.mean_width(),
+            st.mean_rerank() * 100.0
+        );
+        assert_eq!(st.missed, 0, "worst miss {}", st.worst_miss);
+        // Measured: 0.0080 — five times tighter than binary's, from a codec 6.6x larger.
+        assert!(st.mean_width() < 0.02, "int8 mean width {}", st.mean_width());
+    }
+
+    #[test]
+    fn f32_bounds_are_the_exact_score_twice_over() {
+        let (vectors, queries) = corpus(40, DIM, TOPICS, 0.5, 5);
+        let block = VectorBlock::encode(VectorCodec::F32, DIM, &ids(40), &vectors).unwrap();
+        let q = block.prepare(&queries[0]).unwrap();
+        for i in 0..block.len() {
+            let (lo, hi) = block.score_bounds(&q, i);
+            assert_eq!(lo, block.score(&q, i), "member {i}");
+            assert_eq!(hi, lo, "an exact codec has a zero-width interval");
+        }
+    }
+
+    #[test]
+    fn bounds_are_ordered_finite_and_inside_the_cosine_range_everywhere() {
+        // Including all the degenerate corners, where returning a NaN or an inverted interval
+        // would make a caller's `hi >= floor` comparison silently drop the whole block.
+        let (vectors, queries) = corpus(20, DIM, 1, 0.5, 8);
+        for codec in [VectorCodec::F32, VectorCodec::Int8, VectorCodec::Binary] {
+            let block = VectorBlock::encode(codec, DIM, &ids(20), &vectors).unwrap();
+            for q in [&queries[0], &vec![0.0f32; DIM]] {
+                let p = block.prepare(q).unwrap();
+                for i in [0usize, 19, 20, usize::MAX] {
+                    let (lo, hi) = block.score_bounds(&p, i);
+                    assert!(lo.is_finite() && hi.is_finite(), "{codec:?} member {i}");
+                    assert!(lo <= hi, "{codec:?} member {i}: [{lo}, {hi}] is inverted");
+                    assert!((-1.0..=1.0).contains(&lo) && (-1.0..=1.0).contains(&hi));
+                    if i >= 20 {
+                        assert_eq!((lo, hi), (0.0, 0.0), "{codec:?}: no such member");
+                    }
+                }
+            }
+        }
+        // dim 1 has no orthogonal complement for the binary error to concentrate in, so the
+        // bound must open all the way rather than divide by zero.
+        let one = VectorBlock::encode(VectorCodec::Binary, 1, &ids(2), &[vec![1.0], vec![3.0]])
+            .unwrap();
+        let p = one.prepare(&[2.0]).unwrap();
+        for i in 0..2 {
+            let (lo, hi) = one.score_bounds(&p, i);
+            assert!(lo <= one.score(&p, i) && one.score(&p, i) <= hi);
+        }
+    }
+
+    /// The rest of the module measures the estimator on a corpus shaped like real embeddings.
+    /// The bound has to hold on data that is *not* shaped like that too, because a bound is a
+    /// promise and a corpus is not.
+    #[test]
+    fn the_binary_bound_holds_on_isotropic_and_on_spiky_data() {
+        let id = ids(N);
+        // Isotropic: no sub-topic structure, every member an equidistant draw.
+        let (iso, iso_q) = corpus(N, DIM, 1, 0.5, 7);
+        // Spiky: energy concentrated in a handful of coordinates, the case a coordinate-basis
+        // sign quantizer is worst at and the rotation is supposed to fix.
+        let mut rng = Rng::seeded(1234);
+        let spiky: Vec<Vec<f32>> = (0..N)
+            .map(|i| {
+                let mut v = vec![0.0f32; DIM];
+                for j in 0..8 {
+                    v[(i * 3 + j * 41) % DIM] = gauss(&mut rng);
+                }
+                v[i % DIM] += 2.0;
+                unit(v)
+            })
+            .collect();
+        let spiky_q: Vec<Vec<f32>> = (0..QUERIES)
+            .map(|i| {
+                let mut v = spiky[i * 7 % N].clone();
+                for x in v.iter_mut() {
+                    *x += 0.15 * gauss(&mut rng);
+                }
+                unit(v)
+            })
+            .collect();
+
+        for (name, vectors, queries) in [
+            ("isotropic", &iso, &iso_q),
+            ("spiky", &spiky, &spiky_q),
+        ] {
+            let exact = VectorBlock::encode(VectorCodec::F32, DIM, &id, vectors).unwrap();
+            let block = VectorBlock::encode(VectorCodec::Binary, DIM, &id, vectors).unwrap();
+            let (mut n, mut missed, mut width) = (0usize, 0usize, 0.0f64);
+            for q in queries {
+                let pe = exact.prepare(q).unwrap();
+                let pa = block.prepare(q).unwrap();
+                for i in 0..block.len() {
+                    let truth = exact.score(&pe, i);
+                    let (lo, hi) = block.score_bounds(&pa, i);
+                    n += 1;
+                    width += (hi - lo) as f64;
+                    if truth < lo || truth > hi {
+                        missed += 1;
+                    }
+                }
+            }
+            let rate = 1.0 - missed as f64 / n as f64;
+            println!("{name}: containment {rate:.6}, mean width {:.4}", width / n as f64);
+            assert!(rate >= 0.999, "{name} containment {rate:.6} over {n} samples");
+        }
     }
 }

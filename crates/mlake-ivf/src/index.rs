@@ -25,35 +25,30 @@ pub struct ClusterFile {
     pub items: Vec<StoredMemory>,
 }
 
+/// Object header magic + version for a cluster file (`cluster-{i}.bin`).
+const CLUSTER_MAGIC: &[u8; 4] = b"CLUS";
+const CLUSTER_VERSION: u16 = 1;
+
 impl ClusterFile {
     pub fn to_bytes(&self) -> Result<Vec<u8>, mlake_core::Error> {
-        rkyv::to_bytes::<_, 65536>(self)
-            .map(|b| b.into_vec())
-            .map_err(|e| mlake_core::Error::Encode(e.to_string()))
+        let payload = rkyv::to_bytes::<_, 65536>(self)
+            .map_err(|e| mlake_core::Error::Encode(e.to_string()))?;
+        Ok(mlake_core::envelope::wrap(CLUSTER_MAGIC, CLUSTER_VERSION, &payload))
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, mlake_core::Error> {
-        // Same alignment concern as the WAL: bytes off the network are not aligned.
-        if (bytes.as_ptr() as usize).is_multiple_of(8) {
-            Self::from_aligned(bytes)
-        } else {
-            let mut aligned = rkyv::AlignedVec::with_capacity(bytes.len());
-            aligned.extend_from_slice(bytes);
-            Self::from_aligned(&aligned)
-        }
-    }
-
-    fn from_aligned(bytes: &[u8]) -> Result<Self, mlake_core::Error> {
-        let archived = rkyv::check_archived_root::<ClusterFile>(bytes)
-            .map_err(|e| mlake_core::Error::Decode(e.to_string()))?;
-        Deserialize::<ClusterFile, _>::deserialize(archived, &mut rkyv::Infallible)
-            .map_err(|e| mlake_core::Error::Decode(format!("{e:?}")))
+        let (_version, payload) = mlake_core::envelope::unwrap(CLUSTER_MAGIC, bytes)
+            .ok_or_else(|| mlake_core::Error::Decode("cluster file: bad header".into()))?;
+        // Shared validated, alignment-tolerant rkyv read (see mlake_core::rkyv_io).
+        mlake_core::rkyv_read(payload)
+            .ok_or_else(|| mlake_core::Error::Decode("cluster file".into()))
     }
 }
 
 /// The centroid table, held in memory on every query node. Small — `sqrt(N)` vectors —
 /// and hot, so it lives in the in-memory ARC tier rather than being re-fetched.
-#[derive(Clone, PartialEq, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Archive, Deserialize, Serialize, Clone, PartialEq, Debug, Default)]
+#[archive(check_bytes)]
 pub struct Centroids {
     pub vectors: Vec<Vec<f32>>,
     /// Number of items in each cluster, used to decide splits and merges.
@@ -113,58 +108,23 @@ impl Centroids {
     /// snapshot open and held resident — so the encoding is pure open-path cost. Raw also
     /// parses without a tokenizer, which matters more than the bytes on a cold node.
     pub fn to_bytes(&self) -> Result<Vec<u8>, mlake_core::Error> {
-        let count = self.vectors.len();
-        let mut out = Vec::with_capacity(8 + count * self.dim * 4 + count * 4);
-        out.extend_from_slice(&(self.dim as u32).to_le_bytes());
-        out.extend_from_slice(&(count as u32).to_le_bytes());
-        for v in &self.vectors {
-            if v.len() != self.dim {
-                return Err(mlake_core::Error::Encode(format!(
-                    "centroid has {} dims, table declares {}",
-                    v.len(),
-                    self.dim
-                )));
-            }
-            for x in v {
-                out.extend_from_slice(&x.to_le_bytes());
-            }
-        }
-        for s in &self.sizes {
-            out.extend_from_slice(&(*s as u32).to_le_bytes());
-        }
-        Ok(out)
+        Ok(mlake_core::envelope::wrap(CENTROIDS_MAGIC, CENTROIDS_VERSION, &mlake_core::rkyv_write(self)))
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, mlake_core::Error> {
-        let decode = |b: &[u8]| -> Option<Self> {
-            let dim = u32::from_le_bytes(b.get(0..4)?.try_into().ok()?) as usize;
-            let count = u32::from_le_bytes(b.get(4..8)?.try_into().ok()?) as usize;
-            let vec_end = 8 + count.checked_mul(dim)?.checked_mul(4)?;
-            let sizes_end = vec_end + count.checked_mul(4)?;
-            if b.len() < sizes_end {
-                return None;
-            }
-            let vectors = b[8..vec_end]
-                .chunks_exact(dim.max(1) * 4)
-                .take(count)
-                .map(|c| {
-                    c.chunks_exact(4)
-                        .map(|f| f32::from_le_bytes([f[0], f[1], f[2], f[3]]))
-                        .collect()
-                })
-                .collect();
-            let sizes = b[vec_end..sizes_end]
-                .chunks_exact(4)
-                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]) as usize)
-                .collect();
-            Some(Self { vectors, sizes, dim })
-        };
-        // An empty table encodes as dim=0,count=0 and decodes to the default.
-        decode(bytes).ok_or_else(|| {
-            mlake_core::Error::Decode(format!("malformed centroid table ({} bytes)", bytes.len()))
+        let (_version, payload) = mlake_core::envelope::unwrap(CENTROIDS_MAGIC, bytes).ok_or_else(
+            || mlake_core::Error::Decode(format!("centroid table: bad header ({} bytes)", bytes.len())),
+        )?;
+        // An empty table round-trips as the default (empty rkyv archive).
+        mlake_core::rkyv_read(payload).ok_or_else(|| {
+            mlake_core::Error::Decode(format!("malformed centroid table ({} bytes)", payload.len()))
         })
     }
 }
+
+/// Object header magic + version for the centroid table (`centroids.bin`).
+const CENTROIDS_MAGIC: &[u8; 4] = b"CENT";
+const CENTROIDS_VERSION: u16 = 1;
 
 /// A scored search hit.
 #[derive(Clone, PartialEq, Debug)]
@@ -468,13 +428,6 @@ mod centroid_encoding_tests {
         let back = Centroids::from_bytes(&c.to_bytes().unwrap()).unwrap();
         // Raw f32 is bit-exact, unlike the decimal text it replaced.
         assert_eq!(back, c);
-    }
-
-    #[test]
-    fn centroids_encode_to_the_raw_size() {
-        let c = table();
-        // 8 header + 2 centroids x 3 dims x 4 B + 2 sizes x 4 B.
-        assert_eq!(c.to_bytes().unwrap().len(), 8 + 24 + 8);
     }
 
     #[test]

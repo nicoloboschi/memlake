@@ -23,7 +23,8 @@ pub use indexer::{
 };
 pub use query_node::{ArmDepths, ArmScore, ClusterLayout, QueryNode, RawHit, ScanCursor};
 pub use sstable::{
-    EntityTable, PayloadTable, PkTable, RadjTable, SsTableBuilder, SsTableIndex, TimeTable,
+    EntityTable, PayloadTable, PkTable, RadjTable, RerankTable, SsTableBuilder, SsTableIndex,
+    TimeTable,
 };
 
 pub type Result<T> = std::result::Result<T, Error>;

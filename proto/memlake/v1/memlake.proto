@@ -123,6 +123,14 @@ enum LinkType {
   PREVENTS = 3;
 }
 
+// A derived kNN edge. The indexer computes these during the fold and stores them on the
+// memory, so returning them costs no extra read — they are already materialized alongside
+// the payload. Capped per memory by the index (see MAX_SEMANTIC_OUT).
+message SemanticEdge {
+  bytes target = 1;     // 16-byte MemoryId
+  float weight = 2;
+}
+
 // A causal edge is intrinsic to a memory and travels in the WAL (semantic edges, by
 // contrast, are derived by the indexer and never sent by clients).
 message CausalEdge {
@@ -273,6 +281,11 @@ message MemoryPayload {
   Timestamps timestamps = 5;
   repeated CausalEdge causal_out = 6;
   map<string, string> metadata = 7;   // the opaque metadata, verbatim
+  // Derived kNN edges, present only when the read opted in via `include_edges`. Off by
+  // default because the ranking path (Query) never uses them and would pay the bytes on
+  // every candidate; the graph view reads them through Scan/Get, where the memory is
+  // already materialized and the edges cost nothing extra to include.
+  repeated SemanticEdge semantic_out = 8;
 }
 
 // A retrieved candidate with the raw signal from each arm plus the materialized memory.
@@ -385,6 +398,8 @@ message StatsResponse {
 message GetRequest {
   string namespace = 1;
   repeated bytes ids = 2;            // 16-byte MemoryIds
+  // Include each memory's derived semantic edges (see MemoryPayload.semantic_out).
+  bool include_edges = 5;
   // Include the embedding. Off by default: vectors dominate the response size and a
   // caller browsing memories rarely wants them.
   bool include_vector = 3;
@@ -448,6 +463,8 @@ message ScanRequest {
   // touches every cluster. It is the difference between the caller filtering N pages client
   // side and the server filtering them, not an index lookup.
   map<string, string> metadata_equals = 8;
+  // Include each memory's derived semantic edges (see MemoryPayload.semantic_out).
+  bool include_edges = 10;
   // Discard this many matching memories before filling the page. Lets a caller reach an
   // offset without paging to it, at the cost of the server doing the same walk — O(skip),
   // just without the round trips. Prefer `page_token` when you have one.

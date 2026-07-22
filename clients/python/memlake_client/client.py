@@ -11,7 +11,7 @@ from __future__ import annotations
 import hashlib
 import struct
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Iterable, Optional, Sequence
 
 import grpc
@@ -41,6 +41,10 @@ def _arm(a) -> "Arm":
     return Arm(present=a.present, rank=a.rank, score=a.score)
 
 
+def _edge(e):
+    return SemanticEdge(target=e.target, weight=e.weight)
+
+
 def _payload(p) -> "Payload":
     return Payload(
         text=p.text,
@@ -49,6 +53,7 @@ def _payload(p) -> "Payload":
         entity_ids=list(p.entity_ids),
         metadata=dict(p.metadata),
         timestamps=p.timestamps,
+        semantic_out=[_edge(e) for e in p.semantic_out],
     )
 
 
@@ -120,6 +125,18 @@ class Arm:
 
 
 @dataclass
+class SemanticEdge:
+    """A derived kNN edge: the target memory and its similarity weight."""
+
+    target: bytes
+    weight: float
+
+    @property
+    def target_uuid(self) -> str:
+        return str(uuid.UUID(bytes=self.target))
+
+
+@dataclass
 class Payload:
     """The stored memory returned inline with a hit (embedding vector omitted). `metadata` is
     the opaque str->str the caller wrote. `timestamps` is the raw protobuf Timestamps."""
@@ -129,6 +146,8 @@ class Payload:
     entity_ids: list
     metadata: dict
     timestamps: object
+    # Present only when the read asked for `include_edges`; empty otherwise.
+    semantic_out: list = field(default_factory=list)
 
 
 @dataclass
@@ -455,14 +474,26 @@ class MemlakeClient:
         does not fetch cluster data."""
         return self._call("Stats", pb.StatsRequest(namespace=namespace))
 
-    def get(self, namespace: str, ids: Iterable[bytes], *, include_vector: bool = False) -> list:
+    def get(
+        self,
+        namespace: str,
+        ids: Iterable[bytes],
+        *,
+        include_vector: bool = False,
+        include_edges: bool = False,
+    ) -> list:
         """Fetch memories by 16-byte id, bypassing ranking. Returns the resolved
         `StoredMemoryRecord`s in request order; a missing or tombstoned id is simply absent (so
         `len(result) < len(ids)` means some ids are gone). This is the visibility oracle: after
         an acked write, a `get` of its ids must return them."""
         resp = self._call(
             "Get",
-            pb.GetRequest(namespace=namespace, ids=list(ids), include_vector=include_vector),
+            pb.GetRequest(
+                namespace=namespace,
+                ids=list(ids),
+                include_vector=include_vector,
+                include_edges=include_edges,
+            ),
         )
         return list(resp.memories)
 
@@ -478,6 +509,7 @@ class MemlakeClient:
         page_token: str = "",
         limit: int = 0,
         include_vector: bool = False,
+        include_edges: bool = False,
         metadata_equals: Optional[dict[str, str]] = None,
         tags: Optional[Sequence[str]] = None,
         tags_mode: int = ANY,
@@ -492,6 +524,7 @@ class MemlakeClient:
             page_token=page_token,
             limit=limit,
             include_vector=include_vector,
+            include_edges=include_edges,
             metadata_equals=dict(metadata_equals or {}),
             skip=skip,
         )

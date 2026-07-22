@@ -148,9 +148,7 @@ impl StoredMemory {
     /// Serialize the whole memory (embedding included) to rkyv bytes — for a disk spill during
     /// an external-memory fold, where the full item must round-trip.
     pub fn to_rkyv_bytes(&self) -> Vec<u8> {
-        rkyv::to_bytes::<_, 1024>(self)
-            .map(|b| b.into_vec())
-            .unwrap_or_default()
+        crate::rkyv_write(self)
     }
 
     /// Serialize this memory's payload for the payload store — its rkyv bytes with the
@@ -158,29 +156,13 @@ impl StoredMemory {
     /// point read; the cluster file keeps it for rerank and `get --include_vector`).
     pub fn to_payload_bytes(&self) -> Vec<u8> {
         let stripped = StoredMemory { vector: Vec::new(), ..self.clone() };
-        rkyv::to_bytes::<_, 1024>(&stripped)
-            .map(|b| b.into_vec())
-            .unwrap_or_default()
+        crate::rkyv_write(&stripped)
     }
 
     /// Deserialize a payload record written by [`to_payload_bytes`]. The returned memory's
     /// `vector` is empty. Handles unaligned bytes (sliced out of a fetched block).
     pub fn from_payload_bytes(bytes: &[u8]) -> Option<StoredMemory> {
-        if bytes.is_empty() {
-            return None;
-        }
-        if (bytes.as_ptr() as usize).is_multiple_of(8) {
-            Self::payload_from_aligned(bytes)
-        } else {
-            let mut aligned = rkyv::AlignedVec::with_capacity(bytes.len());
-            aligned.extend_from_slice(bytes);
-            Self::payload_from_aligned(&aligned)
-        }
-    }
-
-    fn payload_from_aligned(bytes: &[u8]) -> Option<StoredMemory> {
-        let archived = rkyv::check_archived_root::<StoredMemory>(bytes).ok()?;
-        Deserialize::<StoredMemory, _>::deserialize(archived, &mut rkyv::Infallible).ok()
+        crate::rkyv_read(bytes)
     }
 }
 

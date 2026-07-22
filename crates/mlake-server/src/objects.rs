@@ -78,7 +78,7 @@ pub fn classify(namespace: &str, path: &str, size_bytes: u64) -> Classified {
             "pk.idx" => ObjectKind::PkIndex,
             "pk.data" => ObjectKind::PkData,
             "radj.idx" => ObjectKind::RadjIndex,
-            "radj.csr" => ObjectKind::RadjData,
+            "radj.data" => ObjectKind::RadjData,
             "entity.idx" => ObjectKind::EntityIndex,
             "entity.data" => ObjectKind::EntityData,
             "time.idx" => ObjectKind::TimeIndex,

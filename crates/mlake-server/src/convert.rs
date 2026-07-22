@@ -152,6 +152,18 @@ fn causal_edge_out(e: &CausalEdge) -> pb::CausalEdge {
 
 /// The stored memory as a wire payload (vector omitted — large, and the client has it).
 fn payload(m: StoredMemory) -> pb::MemoryPayload {
+    payload_with_edges(m, false)
+}
+
+/// `include_edges` adds the indexer-derived kNN edges. They are already materialized on the
+/// memory, so this costs response bytes and nothing else — but the ranking path never uses
+/// them, so it stays off by default rather than paying ~18 bytes per edge on every candidate.
+fn payload_with_edges(m: StoredMemory, include_edges: bool) -> pb::MemoryPayload {
+    let semantic_out = if include_edges {
+        m.semantic_out.iter().map(semantic_edge_out).collect()
+    } else {
+        Vec::new()
+    };
     pb::MemoryPayload {
         text: m.text,
         tags: m.tags,
@@ -160,6 +172,14 @@ fn payload(m: StoredMemory) -> pb::MemoryPayload {
         timestamps: Some(timestamps_out(&m.timestamps)),
         causal_out: m.causal_out.iter().map(causal_edge_out).collect(),
         metadata: m.metadata.into_iter().collect(),
+        semantic_out,
+    }
+}
+
+fn semantic_edge_out(e: &mlake_core::SemanticEdge) -> pb::SemanticEdge {
+    pb::SemanticEdge {
+        target: e.target.0.to_vec(),
+        weight: e.weight.to_f32(),
     }
 }
 
@@ -167,11 +187,19 @@ fn payload(m: StoredMemory) -> pb::MemoryPayload {
 /// ranked it. `include_vector` is opt-in: the embedding dominates the response size and a
 /// caller browsing memories rarely wants it.
 pub fn stored_record(m: StoredMemory, include_vector: bool) -> pb::StoredMemoryRecord {
+    stored_record_with_edges(m, include_vector, false)
+}
+
+pub fn stored_record_with_edges(
+    m: StoredMemory,
+    include_vector: bool,
+    include_edges: bool,
+) -> pb::StoredMemoryRecord {
     pb::StoredMemoryRecord {
         id: m.id.0.to_vec(),
         memory_type: m.memory_type as u32,
         vector: include_vector.then(|| encode_vector(&m.vector)),
-        memory: Some(payload(m)),
+        memory: Some(payload_with_edges(m, include_edges)),
     }
 }
 

@@ -24,7 +24,7 @@ use mlake_wal::{Namespace, WalTail};
 
 use crate::fusion::{rrf, weighted_rrf, FusedHit, RankedArm};
 use crate::generation::{read_fts_split, TagSummary};
-use crate::sstable::{EntityTable, PayloadTable, PkTable, RadjTable, TimeTable};
+use crate::sstable::{EntityTable, PayloadTable, PkTable, RadjTable, RerankTable, TimeTable};
 use crate::{QueryConfig, Result};
 
 /// One arm's contribution to a hit: its 0-based rank within that arm and its raw score
@@ -80,6 +80,7 @@ struct FactTypeState {
     entity: EntityTable,
     time: TimeTable,
     payload: PayloadTable,
+    rerank: RerankTable,
     tail_items: Vec<StoredMemory>,
     tail_fts: TantivyFts,
     doc_count: usize,
@@ -250,6 +251,15 @@ impl QueryNode {
                     };
                     // Old generations have no payload store: an empty table forces the fallback
                     // (materialize from clusters), so a v2 generation still reads correctly.
+                    let rerank = if files.rerank_idx.is_empty() {
+                        RerankTable::open(&[0u8; 16], String::new())?
+                    } else {
+                        let b = ns
+                            .store
+                            .get_immutable(&files.rerank_idx, Some((&metrics, 2)))
+                            .await?;
+                        RerankTable::open(&b, files.rerank_data.clone())?
+                    };
                     let payload = if payload_idx.is_empty() {
                         PayloadTable::open(&[0u8; 16], String::new())?
                     } else {
@@ -276,11 +286,12 @@ impl QueryNode {
                         vector_paths: files.vectors.clone(),
                         tag_summary,
                         gen_fts,
-                        radj: RadjTable::open(&radj_idx, files.radj_csr.clone())?,
+                        radj: RadjTable::open(&radj_idx, files.radj_data.clone())?,
                         pk,
                         entity,
                         time,
                         payload,
+                        rerank,
                         doc_count,
                         tail_items,
                         tail_fts,
@@ -303,6 +314,7 @@ impl QueryNode {
                         entity: EntityTable::open(&[0u8; 16], String::new())?,
                         time: TimeTable::open(&[0u8; 16], String::new())?,
                         payload: PayloadTable::open(&[0u8; 16], String::new())?,
+                        rerank: RerankTable::open(&[0u8; 16], String::new())?,
                         doc_count,
                         tail_items,
                         tail_fts,
@@ -805,8 +817,12 @@ impl QueryNode {
                 let blocks = self.fetch_vector_blocks(state, &probed, metrics, 3).await?;
                 metrics.record_phase(Phase::FetchClusters, t.elapsed());
 
+                // Stage one: scan the 1-bit codes, keeping an error interval per candidate
+                // rather than just a point estimate. RaBitQ's bound is what makes stage two
+                // exact — it says which candidates could still be in the true top-k, so the
+                // rest can be dropped without ever reading their full-precision vector.
                 let t = Instant::now();
-                let mut scored: Vec<(MemoryId, f32)> = Vec::new();
+                let mut cands: Vec<(MemoryId, f32, f32, f32)> = Vec::new(); // id, est, lo, hi
                 for block in &blocks {
                     let mask = block.tag_mask(&tags.tags);
                     // A block whose dictionary cannot satisfy the filter is skipped whole —
@@ -825,15 +841,44 @@ impl QueryNode {
                         {
                             continue;
                         }
-                        scored.push((id, block.score(&prepared, i)));
+                        let (lo, hi) = block.score_bounds(&prepared, i);
+                        cands.push((id, block.score(&prepared, i), lo, hi));
                     }
                 }
-                // The un-indexed tail has no block; it is small and already resident.
+                // The un-indexed tail has no block and is scored exactly, so its interval is
+                // a point — it never needs reranking.
                 for m in &state.tail_items {
                     if tags.matches(&m.tags) && !self.hidden(m) {
-                        scored.push((m.id, mlake_core::cosine_opt(q, &m.vector)));
+                        let sc = mlake_core::cosine_opt(q, &m.vector);
+                        cands.push((m.id, sc, sc, sc));
                     }
                 }
+                metrics.record_phase(Phase::Rerank, t.elapsed());
+
+                // Stage two: rescore exactly, but only what the bound leaves in contention.
+                // `tau` is the k-th best *lower* bound; anything whose upper bound cannot
+                // reach it is provably outside the top-k.
+                let k = depths.vector.max(1);
+                let mut los: Vec<f32> = cands.iter().map(|c| c.2).collect();
+                los.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+                let tau = los.get(k - 1).copied().unwrap_or(f32::NEG_INFINITY);
+                let contenders: Vec<&(MemoryId, f32, f32, f32)> =
+                    cands.iter().filter(|c| c.3 >= tau).collect();
+
+                let t = Instant::now();
+                let ids: Vec<MemoryId> = contenders.iter().map(|c| c.0).collect();
+                let exact = if state.rerank.is_empty() || ids.is_empty() {
+                    HashMap::new()
+                } else {
+                    state.rerank.lookup_batch(&self.ns.store, &ids, Some((metrics, 3))).await?
+                };
+                let mut scored: Vec<(MemoryId, f32)> = contenders
+                    .iter()
+                    // No stored full-precision vector (a tail item, or a generation without
+                    // the rerank tier) keeps its estimate rather than being dropped.
+                    .map(|c| (c.0, exact.get(&c.0).map(|v| mlake_core::cosine_opt(q, v)).unwrap_or(c.1)))
+                    .collect();
+                // Rank on the exact scores, ties broken by id so results are deterministic.
                 scored.sort_by(|a, b| {
                     b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal).then(a.0.cmp(&b.0))
                 });
@@ -1249,7 +1294,7 @@ impl QueryNode {
         }
 
         // Two coalesced reads, issued together (same wave): the seeds' incoming edges over
-        // radj.csr, and the entity postings — the memories sharing each seed entity, from the
+        // radj.data, and the entity postings — the memories sharing each seed entity, from the
         // persisted entity index. The postings are what make the entity arm real: it finds
         // sharers anywhere in the corpus, not just in the clusters the vector arm probed.
         let tr = Instant::now();

@@ -473,6 +473,9 @@ async fn build_type_streaming(
     let per_index = (FoldBudget::bytes(budget.index_mb) / 3).max(4096);
     let mut cluster_sort = ExternalSort::new(FoldBudget::bytes(budget.cluster_mb));
     let mut payload_sort = ExternalSort::new(FoldBudget::bytes(budget.payload_mb));
+    // Full precision for stage two of the search. Spilled like every other column so the
+    // fold's RAM stays bounded by its budget rather than by the corpus.
+    let mut rerank_sort = ExternalSort::new(FoldBudget::bytes(budget.payload_mb));
     let mut pk_sort = ExternalSort::new(per_index);
     let mut entity_sort = ExternalSort::new(per_index);
     let mut time_sort = ExternalSort::new(per_index);
@@ -502,19 +505,27 @@ async fn build_type_streaming(
             break;
         }
         // Parallel: nearest centroid + both serializations per item.
-        let prepared: Vec<(usize, Vec<u8>, Vec<u8>)> = batch
+        let prepared: Vec<(usize, Vec<u8>, Vec<u8>, Vec<u8>)> = batch
             .par_iter()
             .map(|item| {
                 let c = if centroids.is_empty() { 0 } else { centroids.assign(&item.vector) };
-                (c, item.to_rkyv_bytes(), item.to_payload_bytes())
+                let mut vec_bytes = Vec::with_capacity(item.vector.len() * 4);
+                for x in &item.vector {
+                    vec_bytes.extend_from_slice(&x.to_le_bytes());
+                }
+                (c, item.to_rkyv_bytes(), item.to_payload_bytes(), vec_bytes)
             })
             .collect();
         // Serial: feed the sorts / FTS / summaries.
-        for (item, (c, full, payload)) in batch.drain(..).zip(prepared) {
+        for (item, (c, full, payload, vec_bytes)) in batch.drain(..).zip(prepared) {
             sizes[c] += 1;
             cluster_sort.add(cluster_key(c), full)?;
             pk_sort.add(item.id.0, (c as u32).to_le_bytes().to_vec())?;
             payload_sort.add(item.id.0, payload)?;
+            // A memory with no embedding contributes no rerank row: nothing to rescore.
+            if !vec_bytes.is_empty() {
+                rerank_sort.add(item.id.0, vec_bytes)?;
+            }
             for e in &item.entity_ids {
                 entity_sort.add(e.0, item.id.0.to_vec())?;
             }
@@ -601,6 +612,7 @@ async fn build_type_streaming(
     let tsst = std::time::Instant::now();
     let pk = build_sstable_from_merge(pk_sort.finish()?)?;
     let payload = build_sstable_from_merge(payload_sort.finish()?)?;
+    let rerank = build_sstable_from_merge(rerank_sort.finish()?)?;
     let entity = build_sstable_from_merge(entity_sort.finish()?)?;
     let time = build_sstable_from_merge(time_sort.finish()?)?;
     let radj = build_sstable_from_merge(radj_sort.finish()?)?;
@@ -624,6 +636,7 @@ async fn build_type_streaming(
         entity.into(),
         time.into(),
         payload.into(),
+        rerank.into(),
         &tag_summary,
         n,
     )

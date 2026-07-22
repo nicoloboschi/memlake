@@ -420,6 +420,79 @@ impl PayloadTable {
     }
 }
 
+/// The rerank store: MemoryId → the memory's full-precision embedding.
+///
+/// The second stage of the two-stage search. The scan runs over 1-bit codes in the vector
+/// block and produces an error bound per candidate; everything whose bound could still
+/// place it in the true top-k is looked up here and rescored exactly. turbopuffer report
+/// under 1% of the narrowed set needs this, which is what makes it affordable to keep full
+/// precision at all: these bytes are never scanned, only point-fetched.
+///
+/// It is a separate table rather than a column of the payload store because the two are
+/// read for different reasons — payload hydrates what is returned, this rescoreS what might
+/// be returned — and a vector inlined into payload rows would be dragged along by every
+/// hydrate that did not want it.
+pub struct RerankTable {
+    index: SsTableIndex,
+    data_path: String,
+}
+
+impl RerankTable {
+    /// Build from the generation's items. A memory with no embedding contributes no row —
+    /// there is nothing to rescore, and it can never surface on the vector arm anyway.
+    pub fn build(items: &[StoredMemory]) -> (Vec<u8>, Vec<u8>) {
+        let mut entries: Vec<(MemoryId, Vec<u8>)> = items
+            .iter()
+            .filter(|m| !m.vector.is_empty())
+            .map(|m| {
+                let mut bytes = Vec::with_capacity(m.vector.len() * 4);
+                for x in &m.vector {
+                    bytes.extend_from_slice(&x.to_le_bytes());
+                }
+                (m.id, bytes)
+            })
+            .collect();
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut b = SsTableBuilder::new();
+        for (id, bytes) in entries {
+            b.add(id.0, &bytes);
+        }
+        b.finish()
+    }
+
+    pub fn open(idx_bytes: &[u8], data_path: impl Into<String>) -> Result<Self> {
+        Ok(Self {
+            index: SsTableIndex::parse(idx_bytes)?,
+            data_path: data_path.into(),
+        })
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.index.is_empty()
+    }
+
+    /// Fetch full-precision vectors for many ids in one coalesced scatter-gather. Ids with
+    /// no stored embedding are simply absent.
+    pub async fn lookup_batch(
+        &self,
+        store: &Store,
+        ids: &[MemoryId],
+        ctx: Option<(&QueryMetrics, usize)>,
+    ) -> Result<std::collections::HashMap<MemoryId, Vec<f32>>> {
+        let pairs = self.index.get_many(store, &self.data_path, ids, ctx).await?;
+        Ok(pairs
+            .into_iter()
+            .map(|(id, bytes)| {
+                let v = bytes
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect();
+                (id, v)
+            })
+            .collect())
+    }
+}
+
 /// The reverse-adjacency index as an SSTable: target id → its incoming edges. `incoming`
 /// is one cached-index lookup + one ranged GET, not a multi-GB whole read.
 pub struct RadjTable {
@@ -953,8 +1026,8 @@ mod typed_tests {
         ];
         let (idx, data) = RadjTable::build(pairs);
         let store = Store::in_memory();
-        store.put("radj.csr", data).await.unwrap();
-        let radj = RadjTable::open(&idx, "radj.csr").unwrap();
+        store.put("radj.data", data).await.unwrap();
+        let radj = RadjTable::open(&idx, "radj.data").unwrap();
 
         let in1 = radj.incoming(&store, &t1, None).await.unwrap();
         assert_eq!(in1.len(), 2);

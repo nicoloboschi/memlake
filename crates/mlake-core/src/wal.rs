@@ -9,9 +9,6 @@ use rkyv::{Archive, Deserialize, Serialize};
 use crate::id::{EntityId, MemoryId};
 use crate::memory::{Memory, StoredMemory, Timestamps};
 
-/// Alignment rkyv requires to read an archived `WalEntry` in place.
-const ARCHIVE_ALIGNMENT: usize = 8;
-
 /// A partial update to a memory. `ProofCount` is a commutative *relative* delta (read-
 /// modify-write is forbidden on the write path, SPEC §4); the `Set*` variants are *absolute*
 /// field replacements, applied last-write-wins in op order. Together they express a partial
@@ -69,9 +66,7 @@ pub fn apply_deltas(item: &mut StoredMemory, deltas: &[Delta]) {
 /// an event into an external sort, so it needs a standalone codec. Mirrors
 /// [`StoredMemory::to_rkyv_bytes`].
 pub fn deltas_to_rkyv_bytes(deltas: &[Delta]) -> Vec<u8> {
-    rkyv::to_bytes::<_, 1024>(&deltas.to_vec())
-        .map(|b| b.into_vec())
-        .unwrap_or_default()
+    crate::rkyv_write(&deltas.to_vec())
 }
 
 /// Decode a delta list written by [`deltas_to_rkyv_bytes`], tolerating an unaligned slice (it is
@@ -80,10 +75,7 @@ pub fn deltas_from_rkyv_bytes(bytes: &[u8]) -> Option<Vec<Delta>> {
     if bytes.is_empty() {
         return Some(Vec::new());
     }
-    let mut aligned = rkyv::AlignedVec::with_capacity(bytes.len());
-    aligned.extend_from_slice(bytes);
-    let archived = rkyv::check_archived_root::<Vec<Delta>>(&aligned).ok()?;
-    Deserialize::<Vec<Delta>, _>::deserialize(archived, &mut rkyv::Infallible).ok()
+    crate::rkyv_read(bytes)
 }
 
 #[derive(Archive, Deserialize, Serialize, Clone, PartialEq, Debug)]
@@ -123,25 +115,10 @@ impl WalEntry {
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, crate::Error> {
-        // rkyv reads the buffer in place, so it must satisfy the archive's alignment.
-        // Bytes handed back by an HTTP response body carry no alignment guarantee — this
-        // is why the in-memory store worked while S3 failed — so realign by copying when
-        // needed. The copy only happens on the WAL tail path, which is bounded and small;
-        // the warm path reads mmapped generation files, which are page-aligned already.
-        if (bytes.as_ptr() as usize).is_multiple_of(ARCHIVE_ALIGNMENT) {
-            Self::from_aligned_bytes(bytes)
-        } else {
-            let mut aligned = rkyv::AlignedVec::with_capacity(bytes.len());
-            aligned.extend_from_slice(bytes);
-            Self::from_aligned_bytes(&aligned)
-        }
-    }
-
-    fn from_aligned_bytes(bytes: &[u8]) -> Result<Self, crate::Error> {
-        let archived = rkyv::check_archived_root::<WalEntry>(bytes)
-            .map_err(|e| crate::Error::Decode(e.to_string()))?;
-        Deserialize::<WalEntry, _>::deserialize(archived, &mut rkyv::Infallible)
-            .map_err(|e| crate::Error::Decode(format!("{e:?}")))
+        // Shared validated, alignment-tolerant rkyv read (see `rkyv_io`). Bytes from an HTTP
+        // response body carry no alignment guarantee, and a corrupt object must be an error, not
+        // UB — both handled there. `None` (empty or failed validation) maps to a decode error.
+        crate::rkyv_read(bytes).ok_or_else(|| crate::Error::Decode("wal entry".into()))
     }
 }
 
@@ -208,7 +185,7 @@ mod tests {
         padded[1..].copy_from_slice(&encoded);
         let misaligned = &padded[1..];
         assert_ne!(
-            misaligned.as_ptr() as usize % ARCHIVE_ALIGNMENT,
+            misaligned.as_ptr() as usize % 8,
             0,
             "test setup must actually produce a misaligned slice"
         );
