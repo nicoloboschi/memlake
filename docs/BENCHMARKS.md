@@ -12,6 +12,13 @@ The BEIR accuracy comparison (also e2e via the client-server) is at the bottom. 
 throughput vary with hardware — these were taken on a 14-core machine against a local MinIO.
 Update this page when a run materially changes a number.
 
+> **Scale + per-arm profiling → [`benchmarks-scale.md`](benchmarks-scale.md).** This page is the
+> 100k end-to-end (client→gRPC→S3) view. The 1M scale ladder, the per-arm latency breakdown
+> (vector / BM25 / graph / temporal), the concurrent-request percentiles, and the optimization
+> history (graph **644ms→~8.7ms**, FTS/hybrid **~44ms→~8ms**, the payload store, the temporal
+> pool cap, the parallelized fold) all live there, measured in-process at 1M where the wins are
+> visible. This page's arm timings inherit those improvements.
+
 ---
 
 ## Write & index throughput (100k, 3 memory_types)
@@ -39,7 +46,14 @@ Both dominant phases (`train`, `derive_links`) are CPU-bound and scale with core
 serial originally (~140s each ≈ 300s total); parallelizing them (rayon, determinism preserved
 for G-6) is what brought a fresh 100k build down to ~55–75s. The k-means output stays
 byte-identical for a given seed — only the assignment/seeding compute is parallel; the f64
-accumulation order is fixed.
+accumulation order is fixed. At millions of items the two remaining serial O(N·√N) passes
+(the cluster-size histogram and per-item assignment) also run across cores now — the `train`
+phase dropped **67s→~20s per memory_type at 1M** (see the scale doc).
+
+The fold also builds a **payload store** (`payload.idx`/`payload.data`): one addressable row per
+memory (embedding stripped) so a point read — an FTS/graph hit, a `get` — fetches one memory
+via a ranged GET instead of deserializing its whole cluster file. It adds ~17% to stored bytes
+(vector-stripped rows) and is what took FTS/graph query latency from ~44ms to ~8ms at 1M.
 
 ### Cost (100k)
 
@@ -50,11 +64,12 @@ $0.0043/GB-month stored. S3 Standard us-east-1, from counted store ops.
 
 ## Read latency & roundtrips (100k, bounded 64MB/512MB cache)
 
-memlake serves exactly one query shape: **a single call across all memory_types running all
-three arms** (dense vector + BM25 + graph). It returns the raw per-arm scores; the client
-fuses. Measured with `EVENTUAL` consistency; the server caches the open snapshot per
-namespace, so a warm read is pure in-memory arm evaluation over the local cache — **0
-object-storage roundtrips**. `3way+tags` adds a tag filter.
+memlake serves exactly one query shape: **a single call across all memory_types running the
+arms** (dense vector + BM25 + graph, and the temporal arm when a time window is given). It
+returns the raw per-arm scores; the client fuses. Reads are always strongly consistent; the
+server caches the open snapshot per namespace and reuses it after one cheap WAL-head check, so a
+warm read is pure in-memory arm evaluation over the local cache — **0 object-storage
+roundtrips**. `3way+tags` adds a tag filter.
 
 | Workload | cold p50 | cold p99 | cold rt | warm p50 | warm p99 | warm rt |
 |---|---:|---:|---:|---:|---:|---:|
