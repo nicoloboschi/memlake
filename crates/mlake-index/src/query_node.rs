@@ -467,6 +467,21 @@ impl QueryNode {
         state.tail_items.iter().map(|m| m.vector.len()).find(|&n| n > 0)
     }
 
+    /// Which of `ids` are already present in an INDEXED segment (not the tail). Used by the flush
+    /// to size its supersede overlay to genuine re-upserts (ids that shadow an older copy) rather
+    /// than every upsert. One coalesced pk lookup per segment.
+    pub async fn segment_ids(&self, ids: &[MemoryId]) -> Result<HashSet<MemoryId>> {
+        let metrics = QueryMetrics::new();
+        let mut found: HashSet<MemoryId> = HashSet::new();
+        for ft in self.per_type.values() {
+            for seg in &ft.segments {
+                let by_cluster = seg.pk.lookup_batch(&self.ns.store, ids, Some((&metrics, 1))).await?;
+                found.extend(by_cluster.keys().copied());
+            }
+        }
+        Ok(found)
+    }
+
     /// Fetch memories by id, without ranking anything. Each id is resolved through its fact
     /// type's pk SSTable to a cluster, then the distinct clusters are read in one coalesced
     /// wave — so the cost is bounded by the number of *clusters* touched, not the corpus.

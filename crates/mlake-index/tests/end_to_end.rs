@@ -1789,6 +1789,43 @@ async fn flush_appends_l0_and_matches_full_rebuild() {
     assert_eq!(ids_a, ids_b, "vector rankings match across flush vs full rebuild");
 }
 
+/// A flush derives semantic links against the WHOLE corpus, not just its own slice: a new item
+/// flushed into an L0 segment links to a same-family item that lives in the older segment.
+#[tokio::test]
+async fn flush_derives_links_across_segments() {
+    use mlake_index::fold;
+    use mlake_index::streaming::FoldBudget;
+    let opts = IndexOptions::default(); // derive_links = true
+    let budget = FoldBudget::default();
+    let hi = usize::MAX;
+
+    let ns = namespace(Store::in_memory(), "ns").await;
+    let mut w = Writer::new(ns.clone());
+    // First build: items 0..40 (family 1 = i % 10 == 1). Ids 1, 11, 31 are family 1, memory_type 1.
+    w.commit((0..40).map(|i| Op::Upsert(rich_item(i))).collect()).await.unwrap();
+    fold(&ns, &Tokenizer::default(), opts, budget, hi).await.unwrap();
+
+    // Flush a NEW item with family-1's vector (a copy of item 1 under a fresh id).
+    let mut newitem = rich_item(1);
+    newitem.id = MemoryId::from_key("m100");
+    newitem.text = "new family one".into();
+    w.commit(vec![Op::Upsert(newitem)]).await.unwrap();
+    fold(&ns, &Tokenizer::default(), opts, budget, hi).await.unwrap();
+    assert_eq!(ns.read_manifest().await.unwrap().0.segments.len(), 2, "the new item flushed to an L0");
+
+    // Its links reach into the OLDER segment's family-1 members.
+    let node = QueryNode::open(&ns, Tokenizer::default()).await.unwrap();
+    let got = node.get_many(&[MemoryId::from_key("m100")], true).await.unwrap();
+    assert_eq!(got.len(), 1);
+    let targets: std::collections::BTreeSet<MemoryId> =
+        got[0].semantic_out.iter().map(|e| e.target).collect();
+    let fam1 = [MemoryId::from_key("m1"), MemoryId::from_key("m11"), MemoryId::from_key("m31")];
+    assert!(
+        fam1.iter().any(|id| targets.contains(id)),
+        "flushed item links across the segment boundary to an older family-1 item, got {targets:?}"
+    );
+}
+
 /// Phase 4: after enough flushes the segment count reaches the fan-out and a fold compacts them
 /// all back into one segment — bounding the per-query fan-out — without losing or corrupting data.
 #[tokio::test]

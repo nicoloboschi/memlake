@@ -131,6 +131,11 @@ pub async fn flush(ns: &Namespace, tokenizer: &Tokenizer, opts: IndexOptions) ->
         touched.insert(id.0);
         items.push(item);
     }
+    // The pre-flush snapshot: used to re-materialize patched older items, detect re-upserts, and
+    // derive semantic links against the whole corpus (existing segments + this slice, via its tail).
+    let node = crate::QueryNode::open(ns, tokenizer.clone()).await?;
+    let metrics = mlake_store::QueryMetrics::new();
+
     // Patches to ids not upserted in this slice target an older segment: re-materialize the full
     // item (with vector), apply the patch, and re-index it here — it supersedes the old copy.
     let patch_only: Vec<MemoryId> = scan
@@ -140,7 +145,6 @@ pub async fn flush(ns: &Namespace, tokenizer: &Tokenizer, opts: IndexOptions) ->
         .copied()
         .collect();
     if !patch_only.is_empty() {
-        let node = crate::QueryNode::open(ns, tokenizer.clone()).await?;
         for mut item in node.get_many(&patch_only, true).await? {
             if let Some(deltas) = scan.pending_patches.get(&item.id) {
                 mlake_core::wal::apply_deltas(&mut item, deltas);
@@ -150,13 +154,25 @@ pub async fn flush(ns: &Namespace, tokenizer: &Tokenizer, opts: IndexOptions) ->
         }
     }
 
-    // Supersede overlay: this segment kills, in older segments, every id it deletes or touches. (An
-    // id with no older copy is harmless. v1 over-approximates with all touched ids to avoid per-id
-    // existence lookups; compaction bounds the accumulated set.)
+    // Supersede overlay: kill, in older segments, every id this flush deletes plus every touched id
+    // that ALSO exists in a segment (a genuine re-upsert — a brand-new id has no older copy to hide,
+    // so it is left out, keeping the overlay small).
+    let touched_ids: Vec<MemoryId> = touched.iter().map(|id| MemoryId(*id)).collect();
+    let reupserts = node.segment_ids(&touched_ids).await?;
     let mut superseded: Vec<MemoryId> = scan.tombstones.clone();
-    superseded.extend(touched.iter().map(|id| MemoryId(*id)));
+    superseded.extend(reupserts);
     superseded.sort_unstable();
     superseded.dedup();
+
+    // Derive semantic kNN links for the new items against the whole corpus (SPEC §5.2): each item's
+    // neighbours are found by a vector query over the existing index + this slice, so links reach
+    // across segments. The reverse edges land in this segment's radj (keyed by target), which the
+    // graph arm unions across segments. Done here, so the per-type build below skips its in-slice
+    // derivation.
+    if opts.derive_links {
+        derive_corpus_links(&node, &mut items, &metrics).await?;
+    }
+    let build_opts = IndexOptions { derive_links: false, ..opts };
 
     // Build the L0 segment: a fresh per-type index over the slice's items (no copy-forward).
     let seg_id = mlake_core::MemoryId::new_v4().as_uuid().simple().to_string();
@@ -168,8 +184,8 @@ pub async fn flush(ns: &Namespace, tokenizer: &Tokenizer, opts: IndexOptions) ->
     let all: HashSet<[u8; 16]> = touched;
     let mut indexes: BTreeMap<u8, mlake_core::manifest::FactTypeIndex> = BTreeMap::new();
     for (ft, ft_items) in items_by_ft {
-        let fti =
-            build_memory_type_index(ns, &seg_id, ft, ft_items, &all, &all, None, None, opts).await?;
+        let fti = build_memory_type_index(ns, &seg_id, ft, ft_items, &all, &all, None, None, build_opts)
+            .await?;
         indexes.insert(ft, fti);
     }
 
@@ -205,6 +221,45 @@ pub async fn flush(ns: &Namespace, tokenizer: &Tokenizer, opts: IndexOptions) ->
         None => false,
     };
     Ok(IndexOutcome { generation: version, doc_count, published })
+}
+
+/// Derive semantic kNN links for `items` against the current corpus (SPEC §5.2): one vector query
+/// per item over the pre-flush index + this slice (via its tail), so a new item's neighbours reach
+/// across every segment, not just its own flush. Keeps only cosine ≥ threshold, capped at
+/// `MAX_SEMANTIC_OUT`, overwriting `semantic_out`. O(new items) queries — the accepted incremental
+/// `O(new · N)` link-derivation cost.
+async fn derive_corpus_links(
+    node: &crate::QueryNode,
+    items: &mut [StoredMemory],
+    metrics: &mlake_store::QueryMetrics,
+) -> Result<()> {
+    let tags = mlake_core::TagFilter::new(Vec::new(), mlake_core::TagsMatch::Any);
+    // A few over the cap so self and any tombstoned hit can be dropped and still fill the slots.
+    let depths =
+        crate::ArmDepths { vector: MAX_SEMANTIC_OUT + 4, text: 0, graph: 0, nprobe: 16 };
+    for item in items.iter_mut() {
+        if item.vector.is_empty() {
+            continue;
+        }
+        let self_id = item.id;
+        let raw = node
+            .query_raw_metered(item.memory_type, Some(&item.vector), None, &tags, depths, None, metrics)
+            .await?;
+        let mut neigh: Vec<(MemoryId, f32)> = raw
+            .into_iter()
+            .filter_map(|h| h.dense.map(|d| (h.id, d.score)))
+            .filter(|(id, sim)| *id != self_id && *sim >= SEMANTIC_LINK_THRESHOLD)
+            .collect();
+        neigh.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal).then(a.0.cmp(&b.0))
+        });
+        neigh.truncate(MAX_SEMANTIC_OUT);
+        item.semantic_out = neigh
+            .into_iter()
+            .map(|(id, sim)| SemanticEdge { target: id, weight: Weight::from_f32(sim) })
+            .collect();
+    }
+    Ok(())
 }
 
 /// Cheap live-document estimate for fold selection: the previous generation's indexed count
