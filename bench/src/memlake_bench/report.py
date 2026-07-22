@@ -49,8 +49,8 @@ def render() -> str:
             f"- model: `{(any_payload.get('config') or {}).get('model', '?')}` "
             f"(dim {(any_payload.get('config') or {}).get('dim', '?')})",
             "",
-            "| Engine | Arm | nDCG@10 | Recall@100 | MRR@10 | p50 ms | p90 ms | p99 ms |",
-            "|---|---|--:|--:|--:|--:|--:|--:|",
+            "| Engine | Arm | nDCG@10 | Recall@100 | MRR@10 | ANN r@1 | ANN r@10 | ANN r@100 | p50 ms | p90 ms | p99 ms |",
+            "|---|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|",
         ]
         for engine in sorted(engines):
             arms = engines[engine].get("arms", {})
@@ -61,6 +61,8 @@ def render() -> str:
                 lines.append(
                     f"| {engine} | {arm_name} | {_fmt(arm.get('ndcg@10'))} | "
                     f"{_fmt(arm.get('recall@100'))} | {_fmt(arm.get('mrr@10'))} | "
+                    f"{_fmt(arm.get('ann_recall@1'))} | {_fmt(arm.get('ann_recall@10'))} | "
+                    f"{_fmt(arm.get('ann_recall@100'))} | "
                     f"{_lat(arm, 'p50_ms')} | {_lat(arm, 'p90_ms')} | {_lat(arm, 'p99_ms')} |"
                 )
         lines.append("")

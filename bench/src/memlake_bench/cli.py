@@ -73,7 +73,18 @@ def cmd_baseline_memlake(args) -> int:
     emb = embed.load(args.dataset)
     graph = bool(getattr(args, "graph", False))
     engine_name = "memlake+graph" if graph else "memlake"
-    payload = memlake_grpc.run(beir, emb, top_k=args.top_k, graph=graph, engine_name=engine_name)
+    # Exhaustive ground truth for ann_recall@k: what a brute-force scan over the whole
+    # corpus would have returned. This is the metric that moves when the codec, nprobe or
+    # clustering change — nDCG can sit still while the index quietly stops finding things,
+    # because what it drops was never in the qrels.
+    truth = None
+    if not getattr(args, "no_ann_recall", False):
+        from .engines import exact as exact_engine
+
+        truth = exact_engine.dense_ground_truth(emb, args.top_k)
+    payload = memlake_grpc.run(
+        beir, emb, top_k=args.top_k, graph=graph, engine_name=engine_name, truth=truth
+    )
     results.save(args.dataset, engine_name, payload)
     _print_summary(payload)
     return 0
@@ -154,7 +165,8 @@ def _print_summary(payload: dict) -> None:
         lat = m.get("latency", {})
         print(
             f"{arm:8} {m['ndcg@10']:>9.4f} {m['recall@100']:>9.4f} {m['mrr@10']:>9.4f} "
-            f"{lat.get('p50_ms', 0):>8.1f} {lat.get('p99_ms', 0):>8.1f}"
+            + (f"ann@10 {m['ann_recall@10']:>7.4f} " if "ann_recall@10" in m else "")
+            + f"{lat.get('p50_ms', 0):>8.1f} {lat.get('p99_ms', 0):>8.1f}"
         )
     print()
 

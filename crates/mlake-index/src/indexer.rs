@@ -47,7 +47,7 @@ impl Default for IndexOptions {
             derive_links: true,
             seed: 42,
             force_retrain: false,
-            vector_codec: VectorCodec::Binary,
+            vector_codec: VectorCodec::Int8,
         }
     }
 }

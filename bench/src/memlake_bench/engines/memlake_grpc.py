@@ -8,10 +8,12 @@ query's ranking over the wire — the exact deployed path. Every arm is scored w
 
 from __future__ import annotations
 
+import os
+
 import time
 import uuid
 
-from memlake_client import EVENTUAL, MemlakeClient, memory
+from memlake_client import MemlakeClient, memory
 
 from .. import metrics, server
 from ..datasets import Beir
@@ -43,7 +45,8 @@ def _rank(client, query_text, qvec, *, top_k, graph, id_to_doc) -> dict:
     Returns {arm_name: ranked_doc_ids}."""
     hits = client.query(
         NS, vector=qvec, text=query_text, memory_types=[MT],
-        vector_top_k=top_k, text_top_k=top_k, graph_top_k=top_k, consistency=EVENTUAL,
+        vector_top_k=top_k, text_top_k=top_k, graph_top_k=top_k,
+        nprobe=int(os.environ.get("MEMLAKE_BENCH_NPROBE", "0")),
     )
 
     def arm_docs(present, rank_of) -> list:
@@ -68,6 +71,7 @@ def run(
     mem_mb: int = 256,
     disk_mb: int = 4096,
     engine_name: str = "memlake",
+    truth: metrics.Run | None = None,
 ) -> dict:
     binary = server.build_binary()
     id_to_doc = {_id_bytes(d): d for d in beir.corpus_ids}
@@ -113,7 +117,14 @@ def run(
         client.close()
 
     arms_out = {
-        arm: metrics.evaluate(run, beir.qrels, latencies if arm == "hybrid" else [])
+        arm: metrics.evaluate(
+            run,
+            beir.qrels,
+            latencies if arm == "hybrid" else [],
+            # Only the dense arm is comparable to an exhaustive *vector* scan; scoring the
+            # text or fused arms against it would measure the wrong thing.
+            truth=truth if arm == "dense" else None,
+        )
         for arm, run in runs.items()
     }
 

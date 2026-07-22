@@ -8,6 +8,18 @@ to published leaderboards:
             computed from the full sorted qrel list truncated at k.
   Recall@k  |retrieved_at_k ∩ relevant| / |relevant|  (binary: rel > 0)
   MRR@k     1 / rank of first relevant doc within top-k, else 0.
+
+There is a second, different question these cannot answer: not "did we return
+relevant documents" but "did the index return what an exhaustive scan would
+have". That is `ann_recall_at_k`, and it is the metric that moves when
+quantization, nprobe or clustering change — a lossy codec can hold nDCG steady
+while quietly failing to find what brute force finds, because the documents it
+drops were never in the qrels to begin with.
+
+turbopuffer measure exactly this continuously in production, sampling 1% of live
+queries against an exhaustive search and holding recall@10 above 90-95%. We run
+it over the whole query set in the benchmark instead, which is the same
+measurement without the sampling.
 """
 
 from __future__ import annotations
@@ -49,6 +61,28 @@ def recall_at_k(run: Run, qrels: Qrels, k: int = 100) -> float:
     return float(np.mean(scores)) if scores else 0.0
 
 
+def ann_recall_at_k(run: Run, truth: Run, k: int = 10) -> float:
+    """Fraction of the exhaustive top-k that the index actually returned.
+
+    `truth` is a run produced by brute force over the whole corpus, so this
+    measures index fidelity alone — it is independent of whether those documents
+    were relevant, and independent of the embedding model's quality. A perfect
+    score means the approximation cost nothing; it does not mean the results are
+    good, which is what the qrels metrics are for.
+
+    Queries absent from `truth`, or with an empty exhaustive result, are skipped
+    rather than scored 0 — they carry no information about the index.
+    """
+    scores = []
+    for qid, ideal in truth.items():
+        gold = set(ideal[:k])
+        if not gold:
+            continue
+        got = set(run.get(qid, [])[:k])
+        scores.append(len(gold & got) / len(gold))
+    return float(np.mean(scores)) if scores else 0.0
+
+
 def mrr_at_k(run: Run, qrels: Qrels, k: int = 10) -> float:
     scores = []
     for qid, ranked in run.items():
@@ -78,13 +112,26 @@ def latency_stats(latencies_ms: list[float]) -> dict[str, float]:
     }
 
 
-def evaluate(run: Run, qrels: Qrels, latencies_ms: list[float] | None = None) -> dict:
-    return {
+def evaluate(
+    run: Run,
+    qrels: Qrels,
+    latencies_ms: list[float] | None = None,
+    truth: Run | None = None,
+) -> dict:
+    """Quality against the qrels, plus — when `truth` is given — fidelity against an
+    exhaustive scan. The two answer different questions and can move independently."""
+    out = {
         "ndcg@10": round(ndcg_at_k(run, qrels, 10), 5),
         "recall@100": round(recall_at_k(run, qrels, 100), 5),
         "mrr@10": round(mrr_at_k(run, qrels, 10), 5),
         "latency": {k: round(v, 3) for k, v in latency_stats(latencies_ms or []).items()},
     }
+    if truth is not None:
+        # Reported at several k: a lossy codec typically holds the deep set and loses
+        # ordering at the head, so ann_recall@10 degrades well before @100 does.
+        for k in (1, 10, 100):
+            out[f"ann_recall@{k}"] = round(ann_recall_at_k(run, truth, k), 5)
+    return out
 
 
 # ---------------------------------------------------------------- RRF fusion

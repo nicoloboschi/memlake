@@ -38,6 +38,18 @@ def _dense_search(emb: Embeddings, top_k: int) -> tuple[metrics.Run, list[float]
     return run, lat
 
 
+def dense_ground_truth(emb: Embeddings, top_k: int = TOP_K) -> metrics.Run:
+    """The exhaustive dense ranking, for scoring an index against brute force.
+
+    This is the same full scan the `exact` engine reports as a baseline, exposed on its own
+    so any engine can be measured against it. It is what turbopuffer compare live queries
+    with to publish continuous recall; we run it over the whole query set rather than a 1%
+    sample, which is the same measurement without the sampling error.
+    """
+    run, _ = _dense_search(emb, top_k)
+    return run
+
+
 def _sparse_search(
     beir: Beir, bm25: BM25, top_k: int
 ) -> tuple[metrics.Run, list[float]]:
