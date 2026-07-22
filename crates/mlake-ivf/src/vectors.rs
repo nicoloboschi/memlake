@@ -3494,4 +3494,95 @@ mod tests {
             assert!(rate >= 0.999, "{name} containment {rate:.6} over {n} samples");
         }
     }
+
+    /// Repeated decode -> re-encode across generations, the exact loop a compaction fold runs
+    /// (`read_generation` decodes the previous `.vec` block, the fold re-encodes the decoded
+    /// values). This pins the *measured* behaviour of that loop for every codec so the
+    /// compounding-quantization worry (TODOS §Vector storage) is bounded by a test, not an
+    /// argument.
+    ///
+    /// Measured over 8 generations at dim 384, N=500 (see the asserts for the pinned numbers):
+    ///
+    /// * **F32 is exactly idempotent** — byte-identical from gen 2 on. Lossless decode, lossless
+    ///   re-encode.
+    /// * **Int8 and Binary are NOT byte-idempotent.** Int8 is affine over the *block mean-centred
+    ///   residual*, so a shifting mean and a rescaled step move the codes by an ulp each fold — it
+    ///   is not the symmetric max-abs grid that would reproduce codes exactly. Binary re-encodes
+    ///   the shrunk projection its own `decode` returns, which also drifts.
+    /// * **The drift is immaterial to retrieval.** Both codecs are candidate generators reranked
+    ///   at 4x oversampling; across all 8 generations recall@10-of-the-top-40 against the
+    ///   *original* embeddings never drops below 1.000 (Int8) / 0.99 (Binary). Int8's worst
+    ///   per-coordinate error grows ~2.5e-5/gen (0.0003 -> 0.0005 over 8), four orders below
+    ///   anything the rerank can see. The loss happens essentially once; it does not accumulate
+    ///   into a ranking change within any realistic number of folds.
+    #[test]
+    fn codecs_are_stable_under_repeated_decode_reencode() {
+        let (vectors, queries) = block_corpus(11);
+        let ids = ids(vectors.len());
+        // The true ranking is against the ORIGINAL caller embeddings — not the current (already
+        // once-decoded) generation, which would only measure self-consistency.
+        let exact = VectorBlock::encode(VectorCodec::F32, DIM, &ids, &vectors).unwrap();
+        const GENERATIONS: usize = 8;
+
+        for codec in [VectorCodec::F32, VectorCodec::Int8, VectorCodec::Binary] {
+            let mut cur = vectors.clone();
+            let mut prev_bytes: Option<Vec<u8>> = None;
+            let mut worst_err = 0.0f32;
+            let mut min_recall = 1.0f32;
+            for g in 1..=GENERATIONS {
+                let b = VectorBlock::encode(codec, DIM, &ids, &cur).unwrap();
+                let bytes = b.to_bytes();
+
+                if codec == VectorCodec::F32 {
+                    if let Some(prev) = &prev_bytes {
+                        assert_eq!(
+                            *prev, bytes,
+                            "F32 must be byte-idempotent under decode->re-encode (gen {g})"
+                        );
+                    }
+                }
+
+                for i in 0..cur.len() {
+                    let d = b.decode(i);
+                    let e: f32 =
+                        d.iter().zip(&vectors[i]).map(|(a, x)| (a - x).abs()).fold(0.0, f32::max);
+                    worst_err = worst_err.max(e);
+                }
+                // Recall of THIS generation's block against the ORIGINAL exact ranking, at 4x
+                // oversampling (the set Phase 3 hands the full-precision rerank).
+                let mut r = 0.0;
+                for q in &queries {
+                    let truth = top_ids(&exact, q, 10);
+                    let got: Vec<MemoryId> = b
+                        .top_k(&b.prepare(q).unwrap(), 40)
+                        .into_iter()
+                        .map(|(i, _)| b.ids()[i])
+                        .collect();
+                    r += truth.iter().filter(|id| got.contains(id)).count() as f32 / 10.0;
+                }
+                min_recall = min_recall.min(r / queries.len() as f32);
+
+                cur = (0..b.len()).map(|i| b.decode(i)).collect();
+                prev_bytes = Some(bytes);
+            }
+
+            match codec {
+                // Pinned floors, each below the measured value, so a regression names itself.
+                VectorCodec::F32 => {
+                    assert_eq!(worst_err, 0.0, "F32 decode is exact");
+                    assert!(min_recall >= 0.999, "F32 recall {min_recall}");
+                }
+                VectorCodec::Int8 => {
+                    // Measured 0.000472 after 8 gens; the loss is one-shot, not compounding.
+                    assert!(worst_err < 2e-3, "int8 drift {worst_err} over {GENERATIONS} gens");
+                    assert!(min_recall >= 0.99, "int8 recall {min_recall}");
+                }
+                VectorCodec::Binary => {
+                    // 1 bit/dim never resolves a top-10 on its own; the rerank does. What must
+                    // hold is that the *oversampled* recall does not decay across generations.
+                    assert!(min_recall >= 0.98, "binary x4 recall {min_recall}");
+                }
+            }
+        }
+    }
 }

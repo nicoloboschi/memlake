@@ -8,7 +8,7 @@
 use mlake_core::manifest::segment_prefix;
 use mlake_core::{GenerationFiles, StoredMemory};
 use mlake_fts::{TantivyFts, Tokenizer};
-use mlake_ivf::{Centroids, ClusterFile};
+use mlake_ivf::{Centroids, ClusterFile, VectorCodec};
 use mlake_store::{QueryMetrics, Store};
 use serde::{Deserialize, Serialize};
 
@@ -23,6 +23,13 @@ pub struct Generation {
     pub generation: u64,
     pub centroids: Centroids,
     pub clusters: Vec<Vec<StoredMemory>>,
+    /// The codec each cluster's `.vec` block was written under, read from the (self-describing)
+    /// block header, parallel to `clusters` by index. `None` for a cluster whose block could not
+    /// be attributed a codec. This is what lets a fold detect a codec change and re-encode a
+    /// copied-forward cluster instead of reusing its old-codec block verbatim — the migration that
+    /// copy-forward-by-reference otherwise skips forever (docs/vector-storage.md, TODOS §Vector
+    /// storage). It costs nothing to collect: `read_generation` has already parsed the block.
+    pub codecs: Vec<Option<VectorCodec>>,
 }
 
 /// File names within a generation *attempt* prefix. The prefix is unique per index
@@ -357,6 +364,7 @@ pub async fn read_generation(
         .try_collect()
         .await?;
     let mut clusters = Vec::with_capacity(cluster_objects.len());
+    let mut codecs = Vec::with_capacity(cluster_objects.len());
     for (i, obj) in cluster_objects.iter().enumerate() {
         let mut items = ClusterFile::from_bytes(&obj.bytes)?.items;
         let Some(vobj) = vector_objects.get(i) else {
@@ -372,6 +380,9 @@ pub async fn read_generation(
                 block.len()
             ))));
         }
+        // The codec the block was written under, so the fold can tell whether copying this
+        // cluster forward would silently pin it to a stale encoding.
+        codecs.push(Some(block.codec()));
         for (j, item) in items.iter_mut().enumerate() {
             item.vector = block.decode(j);
         }
@@ -382,6 +393,7 @@ pub async fn read_generation(
         generation,
         centroids,
         clusters,
+        codecs,
     })
 }
 

@@ -511,6 +511,13 @@ async fn build_memory_type_index(
     let old_paths = prev_index.map(|p| &p.files.clusters).unwrap_or(&empty_paths);
     let tw = std::time::Instant::now();
     let old_vec_paths = prev_index.map(|p| &p.files.vectors).unwrap_or(&empty_paths);
+    // The codec each old cluster's `.vec` block was written under (self-describing header, read by
+    // `read_generation`). Copy-forward reuses that block verbatim, so a cluster may only be copied
+    // forward when its stored codec still matches `opts.vector_codec` — otherwise flipping the
+    // codec would leave every untouched cluster pinned to the old encoding forever. This is the
+    // migration copy-forward otherwise skips (docs/vector-storage.md, TODOS §Vector storage).
+    let empty_codecs: Vec<Option<mlake_ivf::VectorCodec>> = Vec::new();
+    let old_codecs = prev_gen.map(|p| &p.codecs).unwrap_or(&empty_codecs);
     let mut cluster_paths: Vec<Option<String>> = vec![None; k];
     let mut vector_paths: Vec<Option<String>> = vec![None; k];
     let mut dirty_writes = Vec::new();
@@ -523,6 +530,10 @@ async fn build_memory_type_index(
             // joined positionally, so a mismatched pair would silently misattribute every
             // embedding in the cluster.
             && i < old_vec_paths.len()
+            // The stored codec must match the requested one; a mismatch forces a re-encode so a
+            // codec change actually migrates. Missing/unknown codec (`None`) also forces it —
+            // re-encoding is always safe, only ever costing one extra PUT.
+            && old_codecs.get(i).copied().flatten() == Some(opts.vector_codec)
             && !cluster_changed(&clusters[i], &old_clusters[i], touched);
         if can_copy_forward {
             cluster_paths[i] = Some(old_paths[i].clone());
@@ -1073,4 +1084,136 @@ pub fn bench_derive_links(
     let elapsed = t.elapsed();
     let total: usize = items.iter().map(|i| i.semantic_out.len()).sum();
     (elapsed, total)
+}
+
+#[cfg(test)]
+mod migration_tests {
+    use super::*;
+    use mlake_ivf::VectorCodec;
+    use mlake_store::Store;
+    use mlake_wal::Namespace;
+
+    /// A deterministic, structured set of embeddings: a few topics so k-means yields several
+    /// clusters, all at dim `DIM`. No randomness crate — a cheap hash keeps it reproducible.
+    fn items(n: usize) -> Vec<StoredMemory> {
+        const DIM: usize = 16;
+        (0..n)
+            .map(|i| {
+                let topic = (i % 4) as f32;
+                let vector: Vec<f32> = (0..DIM)
+                    .map(|d| {
+                        let h = (i.wrapping_mul(2654435761) ^ (d * 40503)) as f32;
+                        topic + (d as f32) + ((h % 97.0) / 97.0) * 0.1
+                    })
+                    .collect();
+                StoredMemory {
+                    id: MemoryId::from_key(&format!("m{i}")),
+                    vector,
+                    text: format!("memory {i}"),
+                    index_text: String::new(),
+                    memory_type: 1,
+                    tags: Vec::new(),
+                    timestamps: Default::default(),
+                    proof_count: 0,
+                    entity_ids: Vec::new(),
+                    semantic_out: Vec::new(),
+                    causal_out: Vec::new(),
+                    metadata: Vec::new(),
+                    write_seq: i as u64,
+                }
+            })
+            .collect()
+    }
+
+    fn opts(codec: VectorCodec) -> IndexOptions {
+        IndexOptions { derive_links: false, seed: 42, force_retrain: false, vector_codec: codec }
+    }
+
+    async fn ns() -> Namespace {
+        let ns = Namespace::new("mig", Store::in_memory());
+        ns.create_if_absent("tok").await.unwrap();
+        ns
+    }
+
+    /// The `.vec` block a cluster path points at, decoded far enough to report its codec.
+    async fn codec_at(ns: &Namespace, path: &str) -> VectorCodec {
+        let bytes = ns.store.get(path, None).await.unwrap();
+        mlake_ivf::VectorBlock::from_bytes(&bytes.bytes).unwrap().codec()
+    }
+
+    /// Build gen 1 (fresh) then gen 2 (assign-only, prev wired in) with the SAME codec: the
+    /// unchanged clusters must copy forward by reference — the same object paths, no re-PUT.
+    /// This is the guard that the migration change did not silently disable copy-forward
+    /// (SCALE.md Phase 3).
+    #[tokio::test]
+    async fn unchanged_codec_copies_clusters_forward() {
+        let ns = ns().await;
+        let all: std::collections::HashSet<[u8; 16]> = items(40).iter().map(|i| i.id.0).collect();
+        let empty: std::collections::HashSet<[u8; 16]> = std::collections::HashSet::new();
+
+        let fti1 =
+            build_memory_type_index(&ns, "seg1", 1, items(40), &all, &all, None, None, opts(VectorCodec::F32))
+                .await
+                .unwrap();
+        let gen1 = crate::generation::read_generation(&ns.store, &fti1.files, 1, None).await.unwrap();
+
+        // Gen 2: same items, same codec, nothing touched — assign-only over gen 1's centroids.
+        let fti2 = build_memory_type_index(
+            &ns, "seg2", 1, items(40), &empty, &empty, Some(&gen1), Some(&fti1), opts(VectorCodec::F32),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            fti2.files.clusters, fti1.files.clusters,
+            "unchanged clusters must reuse the previous generation's cluster paths"
+        );
+        assert_eq!(
+            fti2.files.vectors, fti1.files.vectors,
+            "unchanged clusters must reuse the previous generation's .vec paths (copy-forward)"
+        );
+    }
+
+    /// The bug this task fixes: flipping `vector_codec` between generations must re-encode the
+    /// copied-forward clusters rather than reuse their old-codec `.vec` blocks. Everything else
+    /// (membership, touched set) is identical, so a difference can only come from the codec gate.
+    #[tokio::test]
+    async fn codec_change_reencodes_copied_forward_clusters() {
+        let ns = ns().await;
+        let all: std::collections::HashSet<[u8; 16]> = items(40).iter().map(|i| i.id.0).collect();
+        let empty: std::collections::HashSet<[u8; 16]> = std::collections::HashSet::new();
+
+        // Gen 1 under F32 — a lossless codec, so gen 2's re-read vectors are byte-identical and
+        // cluster membership is guaranteed unchanged. That isolates the codec as the only reason
+        // a cluster is rewritten.
+        let fti1 =
+            build_memory_type_index(&ns, "seg1", 1, items(40), &all, &all, None, None, opts(VectorCodec::F32))
+                .await
+                .unwrap();
+        let gen1 = crate::generation::read_generation(&ns.store, &fti1.files, 1, None).await.unwrap();
+        for path in fti1.files.vectors.iter().filter(|p| !p.is_empty()) {
+            assert_eq!(codec_at(&ns, path).await, VectorCodec::F32);
+        }
+
+        // Gen 2: identical items, but the codec flips to Int8.
+        let fti2 = build_memory_type_index(
+            &ns, "seg2", 1, items(40), &empty, &empty, Some(&gen1), Some(&fti1), opts(VectorCodec::Int8),
+        )
+        .await
+        .unwrap();
+
+        // Every non-empty cluster must have a NEW path (re-encoded), and its block must now be
+        // Int8 — the migration actually happened.
+        for (i, (new, old)) in fti2.files.vectors.iter().zip(&fti1.files.vectors).enumerate() {
+            if new.is_empty() {
+                continue;
+            }
+            assert_ne!(new, old, "cluster {i} .vec must be re-encoded, not copied forward");
+            assert_eq!(
+                codec_at(&ns, new).await,
+                VectorCodec::Int8,
+                "cluster {i} must be re-encoded in the new codec"
+            );
+        }
+    }
 }

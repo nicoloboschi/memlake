@@ -187,3 +187,55 @@ going through int8 first is de-risking the rerank path, not the compression itse
 
 The thing not to do is start with the codec while leaving the layout alone. That is the
 version of this work that costs recall and returns 2.7×.
+
+## The codec is per-block, and a codec change migrates incrementally
+
+A `.vec` block is self-describing: its header carries the codec, so reads stay correct with
+any mix of encodings in the index at once. That is what makes the codec safe to change — but
+it is also what let a change *silently never take effect*. Cluster files copy forward by
+reference when unchanged (`cluster_changed` is false, SCALE.md Phase 3), and copy-forward
+reused the old `.vec` block verbatim. So flipping `IndexOptions::vector_codec` left every
+untouched cluster in the old encoding indefinitely. This was observed directly: an
+Int8-vs-Binary A/B returned byte-identical BEIR numbers because the second run was still
+reading Binary blocks copied forward from the first.
+
+**The fix.** `read_generation` records each cluster's stored codec from its block header
+(`Generation::codecs`), and the copy-forward gate now also requires that codec to equal the
+requested one. A cluster may copy forward only when it is genuinely unchanged *and* already in
+the target codec; otherwise it is re-encoded. Copy-forward still fires in the common case (same
+codec) — the object paths are reused, asserted by
+`indexer::migration_tests::unchanged_codec_copies_clusters_forward`.
+
+**One fold or incremental?** Incremental, and it already is. A codec change is *not* forced
+through one enormous re-encode of the whole corpus. Each fold re-encodes only the clusters it
+already visits: a `flush` writes its new L0 segment in the new codec immediately; a compaction
+(`index`) re-encodes everything it merges. Old segments a compaction has not yet reached keep
+their old-codec blocks and are read correctly (self-describing). The mixed state is explicit
+(per-block codec in the header, per-cluster codec in `Generation`) and safe (reads already
+tolerate it). The one honest gap: a completely static corpus never folds or compacts, so its
+old-codec blocks never migrate until some write or a deliberate compaction triggers a rewrite.
+A codec-mismatch compaction trigger would close that; it is left for the segmented-index work.
+
+## What the rerank tier is (and is not) faithful to
+
+From generation 2 onward, a compaction fold re-joins vectors by *decoding* the previous `.vec`
+block (`read_generation` → `VectorBlock::decode`), and then re-encodes those decoded values —
+both the scan block and the full-precision `rerank.data` tier are built from the same decoded
+values in the same fold. Two consequences, both measured in
+`vectors::tests::codecs_are_stable_under_repeated_decode_reencode`:
+
+* **The guarantee we offer is internal consistency, not fidelity to the caller's embedding.**
+  The query's exact f32 rescore (`rerank.data`) is consistent with what the scan block ranks —
+  they are the same decoded values — but after a quantized generation, *neither* is the
+  caller's original embedding. "Full precision" in the rerank tier means "full precision of the
+  decoded value", not "the bytes the client sent".
+* **The quantization loss is one-shot, not compounding.** The worry was that each fold quantizes
+  an already-quantized vector, so error accumulates across generations. Measured over 8
+  decode→re-encode generations at dim 384: **F32 is exactly byte-idempotent**; **Int8 and Binary
+  are not** (Int8 is affine over the block-mean-centred residual, so a shifting mean and rescaled
+  step move the codes by an ulp each fold — it is not a symmetric max-abs grid that would
+  reproduce codes exactly), **but the drift is immaterial** — Int8's worst per-coordinate error
+  grows ~2.5e-5/generation (four orders below anything the rerank can see) and both codecs'
+  recall@10 at 4× oversampling against the *original* ranking holds flat across all 8 generations
+  (Int8 1.000, Binary ≥ 0.99). The loss happens essentially once; it does not accumulate into a
+  ranking change within any realistic number of folds.

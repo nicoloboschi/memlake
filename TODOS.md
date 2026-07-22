@@ -468,13 +468,25 @@ green; what follows is what is left.
       `ann_recall@10` on a clean rebuild, because the rerank stage makes the
       scan codec's error irrelevant to the final ranking. Binary is ~6.5× smaller
       in the scan tier, so there is no reason to pay for Int8 codes.
-- [ ] **A codec change does not re-encode existing clusters.** Copy-forward
+- [x] **A codec change does not re-encode existing clusters.** ~~Copy-forward
       reuses `.vec` blocks by reference, so flipping the codec silently leaves
-      old generations in the old encoding. Blocks are self-describing so reads
-      stay correct — but a migration never happens, and the first attempt at
-      measuring Binary vs Int8 returned identical numbers for exactly this
-      reason. Needs either a forced re-encode on codec change, or an explicit
-      "the codec is per-generation, not per-index" statement in the docs.
+      old generations in the old encoding.~~ **FIXED.** `read_generation` now
+      records each cluster's stored codec from its (self-describing) block header
+      (`Generation::codecs`), and the copy-forward gate requires that codec to
+      equal `IndexOptions::vector_codec` — a mismatch forces a re-encode, so a
+      codec change migrates. Copy-forward still fires in the common (same-codec)
+      case: paths are reused, asserted by
+      `unchanged_codec_copies_clusters_forward`; the migration by
+      `codec_change_reencodes_copied_forward_clusters`. Migration is incremental
+      (each fold/compaction re-encodes only what it visits; mixed state is safe
+      because reads are per-block codec-aware) — no forced whole-corpus fold. See
+      docs/vector-storage.md §"The codec is per-block". The compounding-quantization
+      worry (each fold decodes then re-encodes) is pinned as one-shot, not
+      accumulating, by `codecs_are_stable_under_repeated_decode_reencode`: F32 is
+      byte-idempotent, Int8/Binary drift is immaterial (recall holds flat over 8
+      generations). Remaining gap: a fully static corpus never folds, so it needs
+      a codec-mismatch compaction trigger to migrate — left for the segmented-index
+      work.
 - [ ] **The rerank SSTable spends ~3117 B to hold a 1536 B vector** — roughly 2×
       overhead, unexplained. Worth understanding before this scales.
 - [x] **`nprobe` is resolved by the index, not the client.** `nprobe = 0` now means
