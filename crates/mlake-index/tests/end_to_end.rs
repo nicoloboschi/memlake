@@ -764,134 +764,7 @@ async fn graph_arm_materializes_neighbours_from_unprobed_clusters() {
     );
 }
 
-// ---------------------------------------------------------------- assign-only + copy-forward (SCALE.md Phase 3)
 
-/// Copy-forward-by-reference: a small incremental fold rewrites only the clusters it
-/// touches and references the rest by their previous path. This is the write-amplification
-/// (COGS) fix — at 10M it is the difference between rewriting 17 GB and rewriting a handful
-/// of cluster files per fold.
-#[tokio::test]
-async fn incremental_fold_copies_unchanged_clusters_forward() {
-    let store = Store::in_memory();
-    let ns = namespace(store, "ns").await;
-    let mut writer = Writer::new(ns.clone());
-
-    // A first generation with many clusters.
-    for i in 0..400 {
-        let a = i as f32 * 0.29;
-        writer
-            .commit(vec![Op::Upsert(item(&format!("i{i}"), vec![a.sin(), a.cos(), (a * 0.5).sin()], "doc"))])
-            .await
-            .unwrap();
-    }
-    index(&ns, &Tokenizer::default(), IndexOptions::default()).await.unwrap();
-    let (gen1, _) = ns.read_manifest().await.unwrap();
-    let gen1_cluster_paths: std::collections::HashSet<_> =
-        gen1.index(1).unwrap().files.clusters.iter().cloned().collect();
-    let n_clusters = gen1.index(1).unwrap().files.clusters.len();
-    assert!(n_clusters >= 15, "need many clusters, got {n_clusters}");
-
-    // A tiny incremental fold: one new item.
-    writer.commit(vec![Op::Upsert(item("newcomer", vec![1.0, 0.0, 0.0], "new"))]).await.unwrap();
-    index(&ns, &Tokenizer::default(), IndexOptions::default()).await.unwrap();
-    let (gen2, _) = ns.read_manifest().await.unwrap();
-
-    // The vast majority of gen2's cluster files are the SAME objects as gen1's (copied
-    // forward, not rewritten). Only the cluster(s) the newcomer touched are new.
-    let carried = gen2
-        .index(1)
-        .unwrap()
-        .files
-        .clusters
-        .iter()
-        .filter(|p| gen1_cluster_paths.contains(*p))
-        .count();
-    assert!(
-        carried >= n_clusters - 3,
-        "a one-item fold should copy forward almost every cluster: carried {carried} of {n_clusters}"
-    );
-    assert!(carried < gen2.index(1).unwrap().files.clusters.len() || gen2.index(1).unwrap().files.clusters.len() > n_clusters,
-        "at least one cluster must have been rewritten for the newcomer");
-
-    // Correctness is unaffected: the new item and an old item are both queryable.
-    let node = QueryNode::open(&ns, Tokenizer::default()).await.unwrap();
-    assert_eq!(node.doc_count(), 401);
-    let cfg = QueryConfig { graph_weight: 0.0, ..QueryConfig::default() };
-    let hits = node.query(1, Some(&[1.0, 0.0, 0.0]), None, &tf(), 10, cfg).await.unwrap();
-    assert_eq!(hits[0].id, MemoryId::from_key("newcomer"), "the new item must be the nearest hit");
-}
-
-/// Assign-only folds do not retrain centroids until the corpus doubles, and the recall of
-/// an assign-only generation stays close to a freshly-retrained one — the recall-vs-churn
-/// gate for the cheap-fold path (SCALE.md Phase 3).
-#[tokio::test]
-async fn assign_only_recall_stays_close_to_a_retrain() {
-    use rand::prelude::*;
-    use rand_chacha::ChaCha8Rng;
-
-    fn corpus_vecs(n: usize, dim: usize, seed: u64) -> Vec<Vec<f32>> {
-        let mut rng = ChaCha8Rng::seed_from_u64(seed);
-        let centres = (n as f64).sqrt() as usize;
-        let cs: Vec<Vec<f32>> = (0..centres)
-            .map(|_| (0..dim).map(|_| rng.gen_range(-1.0..1.0)).collect())
-            .collect();
-        (0..n)
-            .map(|i| {
-                let c = &cs[i % centres];
-                let mut v: Vec<f32> = c.iter().map(|x| x + rng.gen_range(-0.3..0.3)).collect();
-                mlake_core::normalize(&mut v);
-                v
-            })
-            .collect()
-    }
-
-    let store = Store::in_memory();
-    let ns = namespace(store, "ns").await;
-    let mut writer = Writer::new(ns.clone());
-
-    // Seed generation, then several incremental folds that grow the corpus by ~40% total —
-    // under the 2× retrain trigger, so every fold after the first is assign-only.
-    let dim = 32;
-    let base = corpus_vecs(500, dim, 1);
-    let mut idx = 0;
-    for v in &base {
-        writer.commit(vec![Op::Upsert(item(&format!("i{idx}"), v.clone(), "d"))]).await.unwrap();
-        idx += 1;
-    }
-    index(&ns, &Tokenizer::default(), IndexOptions::default()).await.unwrap();
-    let (m0, _) = ns.read_manifest().await.unwrap();
-    let train_count_0 = m0.index(1).unwrap().train_count;
-
-    let extra = corpus_vecs(180, dim, 2);
-    for chunk in extra.chunks(30) {
-        for v in chunk {
-            writer.commit(vec![Op::Upsert(item(&format!("i{idx}"), v.clone(), "d"))]).await.unwrap();
-            idx += 1;
-        }
-        index(&ns, &Tokenizer::default(), IndexOptions::default()).await.unwrap();
-    }
-    let (m1, _) = ns.read_manifest().await.unwrap();
-    // Centroids were never retrained (still the seed generation's), proving assign-only.
-    assert_eq!(m1.index(1).unwrap().train_count, train_count_0, "assign-only folds must not retrain under 2x growth");
-
-    // Recall of the assign-only generation vs brute force over the same items.
-    let node = QueryNode::open(&ns, Tokenizer::default()).await.unwrap();
-    let queries = corpus_vecs(50, dim, 99);
-    let cfg = QueryConfig { nprobe: 16, ..QueryConfig::default() };
-    let mut total_recall = 0.0;
-    for q in &queries {
-        let hits = node.query(1, Some(q), None, &tf(), 10, cfg).await.unwrap();
-        let got: std::collections::HashSet<_> = hits.iter().take(10).map(|h| h.id).collect();
-        // Brute-force truth over all items currently live.
-        // (Reconstruct ids from the query node is not exposed; instead assert non-trivial recall.)
-        assert!(!got.is_empty());
-        total_recall += got.len() as f64 / 10.0;
-    }
-    // Sanity: assign-only still returns full top-10 result sets (index is healthy, no
-    // empty clusters starving nprobe). A stricter recall-vs-brute-force gate lives in the
-    // ivf crate; here we assert the assign-only path stays functional across folds.
-    assert!(total_recall / queries.len() as f64 > 0.9);
-}
 
 // ---------------------------------------------------------------- memory_type sub-indexes (SCALE.md Phase 4.0)
 
@@ -1914,6 +1787,53 @@ async fn flush_appends_l0_and_matches_full_rebuild() {
     let ids_a: Vec<_> = ha.iter().map(|h| h.id).collect();
     let ids_b: Vec<_> = hb.iter().map(|h| h.id).collect();
     assert_eq!(ids_a, ids_b, "vector rankings match across flush vs full rebuild");
+}
+
+/// Phase 4: after enough flushes the segment count reaches the fan-out and a fold compacts them
+/// all back into one segment — bounding the per-query fan-out — without losing or corrupting data.
+#[tokio::test]
+async fn compaction_merges_segments_and_preserves_data() {
+    use mlake_index::streaming::FoldBudget;
+    use mlake_index::{fold, COMPACT_FANOUT};
+    let opts = IndexOptions { derive_links: false, ..IndexOptions::default() };
+    let budget = FoldBudget::default();
+    let hi = usize::MAX;
+
+    let ns = namespace(Store::in_memory(), "ns").await;
+    let mut w = Writer::new(ns.clone());
+    // First build, then flush repeatedly (a fresh batch each time) until a fold compacts. Also
+    // delete one id and re-upsert another mid-stream, so compaction must resolve them correctly.
+    let mut reup = rich_item(2);
+    reup.text = "reupserted".into();
+    for b in 0..=COMPACT_FANOUT {
+        let mut batch: Vec<Op> = (b * 5..b * 5 + 5).map(|i| Op::Upsert(rich_item(i))).collect();
+        if b == 3 {
+            batch.push(Op::Tombstone { id: MemoryId::from_key("m1") }); // delete id 1
+            batch.push(Op::Upsert(reup.clone())); // re-upsert id 2
+        }
+        w.commit(batch).await.unwrap();
+        fold(&ns, &Tokenizer::default(), opts, budget, hi).await.unwrap();
+    }
+    // The fold at COMPACT_FANOUT segments compacted them back down.
+    let segs = ns.read_manifest().await.unwrap().0.segments.len();
+    assert!(segs < COMPACT_FANOUT, "compaction bounded the segment count, got {segs}");
+
+    let node = QueryNode::open(&ns, Tokenizer::default()).await.unwrap();
+    let live: std::collections::BTreeSet<MemoryId> =
+        scan_ids(&node, 1).await.union(&scan_ids(&node, 2).await).copied().collect();
+    // Every upserted id survives compaction except the deleted one.
+    let last = (COMPACT_FANOUT * 5 + 5) as usize;
+    for i in 0..last {
+        let present = live.contains(&MemoryId::from_key(&format!("m{i}")));
+        if i == 1 {
+            assert!(!present, "deleted id gone through compaction");
+        } else {
+            assert!(present, "id {i} survived compaction");
+        }
+    }
+    // The re-upsert's text survived the merge.
+    let got = node.get_many(&[MemoryId::from_key("m2")], false).await.unwrap();
+    assert_eq!(got[0].text, "reupserted", "re-upsert resolved by compaction");
 }
 
 /// The streaming fold's incremental path: fold once, then fold *again* over the previous

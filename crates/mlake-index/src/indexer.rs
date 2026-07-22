@@ -85,9 +85,12 @@ pub async fn fold(
     streaming_threshold_docs: usize,
 ) -> Result<IndexOutcome> {
     let (manifest, _etag) = ns.read_manifest().await?;
-    if manifest.segments.is_empty() {
-        // First build: one bounded full segment. Auto-select in-RAM vs streaming by size — the
-        // in-RAM fold is O(N) RAM, so a corpus too big for memory uses the external-memory fold.
+    // A full rebuild happens on the first build (no segments) and on compaction (too many
+    // segments): `index`/`index_streaming` merge ALL segments + the tail into one fresh segment.
+    // In between, a fold just flushes the tail into a new L0 segment (O(tail)).
+    if manifest.segments.is_empty() || manifest.segments.len() >= COMPACT_FANOUT {
+        // Auto-select in-RAM vs streaming by size — the in-RAM merge is O(N) RAM, so a corpus too
+        // big for memory uses the external-memory fold.
         let corpus = estimate_corpus_docs(ns).await?;
         if corpus >= streaming_threshold_docs {
             crate::streaming::index_streaming_with_budget(ns, tokenizer, opts, budget).await
@@ -99,6 +102,10 @@ pub async fn fold(
         flush(ns, tokenizer, opts).await
     }
 }
+
+/// Segment count at which a fold compacts (merges all segments into one) instead of flushing. Keeps
+/// the per-query segment fan-out — and the roundtrip budget — a small constant (see INV-7).
+pub const COMPACT_FANOUT: usize = 8;
 
 /// Flush the un-indexed WAL tail into a NEW L0 segment and append it (the LSM flush — O(tail), not
 /// O(corpus)). Deletes and re-upserts in the slice become the segment's supersede overlay, hiding
@@ -232,28 +239,44 @@ pub async fn index(ns: &Namespace, tokenizer: &Tokenizer, opts: IndexOptions) ->
     let (manifest, etag) = ns.read_manifest().await?;
     let head = ns.wal_head().await?;
 
-    // Phase 1 keeps a single full segment, so "the previous generation" is that one segment.
-    // (Phase 2+ compaction reads across the input segments instead.)
-    let prev_seg = manifest.segments.first();
-    // Load each existing fact type's previous items (for the fold + copy-forward).
-    let mut prev_by_ft: std::collections::BTreeMap<u8, mlake_index_prev::Generation> =
-        std::collections::BTreeMap::new();
-    for ft in manifest.memory_types() {
-        let Some(fti) = prev_seg.and_then(|s| s.index(ft)) else { continue };
-        let gen =
-            crate::generation::read_generation(&ns.store, &fti.files, manifest.version, None).await?;
-        prev_by_ft.insert(ft, gen);
+    // Resolve the live set across ALL segments (this is the compaction merge; on a first build the
+    // list is empty). A newer segment (higher seq_hi) shadows an older copy of a re-upserted or
+    // deleted id via the segments' supersede overlays; segment predicate-deletes are materialized.
+    let mut kill: std::collections::HashMap<[u8; 16], u64> = std::collections::HashMap::new();
+    let mut seg_predicates: Vec<(u64, mlake_core::Predicate)> = Vec::new();
+    for seg in &manifest.segments {
+        let tomb = crate::generation::read_tombstones(&ns.store, &seg.tombstones, None).await?;
+        for id in tomb.superseded {
+            let e = kill.entry(id.0).or_insert(0);
+            *e = (*e).max(seg.seq_hi);
+        }
+        seg_predicates.extend(tomb.predicates);
     }
-
-    // Fold the whole live item set (across all fact types), applying the tail.
     let mut by_id: std::collections::BTreeMap<[u8; 16], StoredMemory> =
         std::collections::BTreeMap::new();
-    for gen in prev_by_ft.values() {
-        for cluster in &gen.clusters {
-            for item in cluster {
-                by_id.insert(item.id.0, item.clone());
+    for seg in &manifest.segments {
+        // Newest-first, so an already-present id (from a newer segment) wins.
+        for ft in seg.memory_types() {
+            let fti = seg.index(ft).unwrap();
+            let gen =
+                crate::generation::read_generation(&ns.store, &fti.files, manifest.version, None)
+                    .await?;
+            for cluster in &gen.clusters {
+                for item in cluster {
+                    if by_id.contains_key(&item.id.0)
+                        || kill.get(&item.id.0).is_some_and(|&s| s > seg.seq_hi)
+                    {
+                        continue; // a newer segment provided this id, or deleted/re-upserted it
+                    }
+                    by_id.insert(item.id.0, item.clone());
+                }
             }
         }
+    }
+    if !seg_predicates.is_empty() {
+        by_id.retain(|_, m| {
+            !seg_predicates.iter().any(|(seq, p)| m.write_seq < *seq && p.matches(m))
+        });
     }
 
     let scan = WalTail::new(ns)
@@ -310,18 +333,11 @@ pub async fn index(ns: &Namespace, tokenizer: &Tokenizer, opts: IndexOptions) ->
     let mut indexes: std::collections::BTreeMap<u8, mlake_core::manifest::FactTypeIndex> =
         std::collections::BTreeMap::new();
     for (ft, ft_items) in items_by_ft {
-        let fti = build_memory_type_index(
-            ns,
-            &seg_id,
-            ft,
-            ft_items,
-            &new_ids,
-            &touched,
-            prev_by_ft.get(&ft),
-            prev_seg.and_then(|s| s.index(ft)),
-            opts,
-        )
-        .await?;
+        // A full rebuild of the merged live set — no copy-forward (that is the flush's job); prev
+        // is None so this segment is fresh, retrained, with its centroids over the merged set.
+        let fti =
+            build_memory_type_index(ns, &seg_id, ft, ft_items, &new_ids, &touched, None, None, opts)
+                .await?;
         indexes.insert(ft, fti);
     }
 
@@ -361,11 +377,6 @@ pub async fn index(ns: &Namespace, tokenizer: &Tokenizer, opts: IndexOptions) ->
     })
 }
 
-// Alias so the module can name Generation without importing it at the top (it is only used
-// in this function's type annotation).
-mod mlake_index_prev {
-    pub use crate::generation::Generation;
-}
 
 /// Build one fact type's independent generation (assign-only + copy-forward + local split +
 /// IVF link derivation) from its slice of the live items, and return its manifest entry.
