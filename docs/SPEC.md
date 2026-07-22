@@ -115,7 +115,7 @@ struct StoredItem {
   causal_out: Vec<(Uuid, LinkType, f16)>, // causes/caused_by/enables/prevents
 }
 ```
-Items are small ⇒ full payload lives inline in the cluster file. Fetching seed clusters yields seed adjacency for free (zero extra graph roundtrips for outgoing links). Files MUST be readable via mmap with zero-copy access (rkyv archived access; no serde on the warm path).
+Items are small ⇒ full payload lives inline in the cluster file. Fetching seed clusters yields seed adjacency for free (zero extra graph roundtrips for outgoing links). Files are rkyv-archived so they CAN be read zero-copy. Today they are not: the read path validates the buffer and then fully deserializes it into an owned item graph, and the disk cache reads with `fs::read` rather than mmap — so a warm hit still costs a copy plus one allocation per field per member. The scan path no longer pays this (it reads the flat `cluster-{i}.vec` block instead), so the cost now falls only on hydrating the winners. Closing the gap is tracked in TODOS.
 
 ### 3.4 Reverse adjacency (`radj.data` + `radj.idx`)
 An SSTable over incoming semantic + causal edges, sorted by target id (same `.idx`/`.data` format as

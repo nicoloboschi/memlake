@@ -383,3 +383,25 @@ green; what follows is what is left.
 - [ ] **On isotropic data the bound narrows nothing** (99.95% of the block enters
       rerank). Correct, and useless — a caller must not assume the rerank set is
       always small.
+
+## Read path: the zero-copy claim, and the cache
+
+- [ ] **We deserialize; we do not read zero-copy.** `rkyv_read` validates with
+      `check_archived_root` — which yields a perfectly usable `&Archived<T>` —
+      and then throws it away by calling `Deserialize` into an owned graph: a
+      fresh `String` per text, a `Vec` per tag list, per member. Three copies on
+      a cold read (S3 body, realignment when the buffer is not 8-byte aligned,
+      then the item graph) and an allocation storm on every hydrate. SPEC used to
+      assert this was zero-copy; that line is now corrected rather than aspirational.
+      The fix is to operate on `&Archived<StoredMemory>` at the call sites — the
+      accessors already exist. Lower value than it looks: after the vector/payload
+      split this cost falls only on hydrated winners, not on every probed member.
+- [ ] **The disk cache reads with `fs::read`, not mmap** (`cache.rs`), so a warm
+      hit copies the whole blob into memory. mmap is the other half of the same
+      claim. Wants blobs written 8-byte aligned so the realignment copy disappears too.
+- [ ] **Cache eviction is LRU, not FIFO/CLOCK — and every *read* takes the write
+      lock** to bump `last_used`. For content-addressed immutable blocks that is a
+      questionable trade: LRU buys hit rate on skewed access, but the per-hit
+      mutation makes the cache a contention point under concurrent queries, and a
+      ring buffer would also give sequential disk writes. Worth measuring under
+      concurrency before assuming LRU is right here.
