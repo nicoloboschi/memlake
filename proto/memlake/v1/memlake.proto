@@ -618,8 +618,9 @@ message CacheStatsRequest {
 }
 
 // One cached object. `in_memory` and `on_disk` are INDEPENDENT, not a single tier: a
-// memory eviction demotes an object to disk without dropping its bytes, and a later hit
-// promotes it back, so an object is commonly resident in both at once.
+// memory eviction demotes an object to disk without dropping its bytes, so an object is
+// commonly resident in both at once. A disk hit does NOT promote it back into memory —
+// the cache is a CLOCK ring, where a hit sets a reference bit instead of moving the entry.
 message CacheEntry {
   // Derived from the object key's first segment.
   string namespace = 1;
@@ -631,8 +632,11 @@ message CacheEntry {
   uint64 bytes = 4;
   bool in_memory = 5;
   bool on_disk = 6;
-  // Rank in LRU order, 0 = most recently used. Derived from a monotonic counter, so it
-  // orders entries against each other and says nothing about wall-clock time.
+  // Rank in ADMISSION order, 0 = most recently admitted. Derived from a monotonic
+  // counter, so it orders entries against each other and says nothing about wall-clock
+  // time. Not a recency rank: under CLOCK a hit sets a reference bit rather than moving
+  // the entry, so a long-resident hot object keeps a high rank. (The field name predates
+  // the policy change; it is kept to avoid breaking clients.)
   uint32 lru_rank = 7;
 }
 
@@ -654,7 +658,8 @@ message CacheStatsResponse {
   uint64 hits = 8;
   uint64 misses = 9;
 
-  // Most-recently-used first, bounded by the request's limit.
+  // Most-recently-ADMITTED first, bounded by the request's limit. The ring is ordered by
+  // admission and a hit does not reorder it, so this is not a recency ranking.
   repeated CacheEntry entries = 10;
   // Entries the cache holds in total, before `limit` truncated the list.
   uint64 total_entries = 11;

@@ -15,7 +15,7 @@ pub mod latency;
 pub mod metrics;
 pub mod store;
 
-pub use cache::{CacheEntry, CacheKey, DiskCache};
+pub use cache::{CacheEntry, CacheKey, DiskCache, EvictionPolicy};
 pub use metrics::{Phase, QueryMetrics, StoreMetrics, StoreSnapshot, COLD_ROUNDTRIP_BUDGET};
 pub use store::{Etag, S3Config, Store, Versioned};
 

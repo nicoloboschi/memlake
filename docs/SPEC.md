@@ -203,12 +203,16 @@ RT4  parallel ranged GETs: radj.data blocks | linked-candidate items (via pk.idx
 ### 6.2 Cache
 - Unified NVMe cache: content-addressed by `(namespace, path, etag)`. Two tiers with
   **independent** byte budgets — a bounded in-RAM tier and the NVMe tier, which survives a
-  restart — each a **FIFO ring**: entries are ordered by admission and a read never reorders
-  them, so a hit takes a shared lock or none, and eviction is a pointer bump rather than a
-  scan. Not LRU: the per-hit `last_used` bump made every cache *read* take the write lock.
-  The measured cost on skewed access is small (see `TODOS.md` §"Read path"). A memory
-  eviction *demotes* to disk; only a disk eviction unlinks the blob. Memory and disk tiers
-  therefore overlap rather than partition.
+  restart — each a **CLOCK ring**: entries are ordered by admission and a read never reorders
+  them, so a hit takes the state lock only *shared* and eviction is a pointer walk rather than
+  a scan for a minimum. Not LRU: the per-hit `last_used` bump made every cache *read* take
+  the write lock. A hit instead sets an atomic **reference bit**, and eviction advances a hand
+  that clears a set bit and skips that entry — its second chance — evicting the first entry
+  whose bit is already clear; an entry is admitted with the bit clear, so a one-shot read is
+  not protected. That recovers the hit rate plain FIFO gave up and then some: measured over an
+  IVF-probe trace CLOCK is 0.4–2.2 points *ahead* of LRU outside the thrash regime (table in
+  `TODOS.md` §"Read path"). A memory eviction *demotes* to disk; only a disk eviction unlinks
+  the blob. Memory and disk tiers therefore overlap rather than partition.
 - Disk-tier hits are served by **mmap**, so a warm hit costs no copy of the blob. That is
   one copy removed, not zero-copy end to end: consumers still deserialize via `rkyv_read`.
   Blobs are published by rename and evicted by unlink, so a mapping stays valid for as long

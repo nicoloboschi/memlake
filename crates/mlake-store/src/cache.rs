@@ -5,56 +5,100 @@
 //! never needs revalidation, and deleting the cache directory can only change latency,
 //! never a query result (INV-4).
 //!
-//! # Why FIFO and not LRU
+//! # Why CLOCK
 //!
-//! Both tiers are **FIFO rings**: an entry is ordered by when it was *admitted* and nothing
-//! reorders it afterwards. LRU would keep a hot working set better, but it has to mutate
-//! the entry on every hit, which means every cache *read* takes the write lock — the cache
-//! becomes a contention point exactly when concurrent queries make it matter. FIFO buys:
+//! Both tiers are **CLOCK rings**. An entry is ordered by when it was *admitted* and a hit
+//! never reorders it; instead a hit sets the entry's **reference bit**, and eviction walks a
+//! hand along the ring, clearing a set bit and skipping that entry (its second chance) and
+//! taking the first entry whose bit is already clear.
 //!
-//! * a read only ever takes the lock *shared*, so concurrent queries do not serialise on
-//!   it — the one exception is adopting a blob left behind by a previous process, which is
-//!   restart recovery and happens at most once per key,
-//! * eviction is a pointer bump — pop the oldest slot — instead of a scan for the minimum,
-//! * deletes follow the order the writes went in, rather than LRU's scattered pattern —
-//!   claimed to suit NVMe better, but unmeasured; the lock is what this rests on.
+//! The constraint this is built around is the lock. LRU has to mutate the entry on every
+//! hit, so every cache *read* takes the write lock — the cache becomes a contention point
+//! exactly when concurrent queries make it matter. A ring removes that: a read takes the
+//! lock only *shared* (setting the reference bit is an atomic store through a shared
+//! borrow), so concurrent queries do not serialise on it. The one exception is adopting a
+//! blob left behind by a previous process, which is restart recovery and happens at most
+//! once per key. Eviction stays a pointer walk rather than a scan for a minimum, and deletes
+//! still follow roughly the order the writes went in — claimed to suit NVMe better, but
+//! unmeasured; the lock is what this rests on.
 //!
-//! The cost is hit rate under skew, and it is **not** small. Measured against the LRU this
-//! replaced, over an IVF-probe-shaped trace (256 clusters, Zipf-skewed, 16 distinct probes
-//! per query plus three always-hot blocks — harness in `tests/cache_skew.rs`, full table in
-//! `TODOS.md` §"Read path"), FIFO gives up 4–15 points of hit ratio wherever the cache is a
-//! small fraction of the corpus:
+//! Plain FIFO also buys the shared-lock read, and that is what this was for one revision.
+//! It cost too much: with nothing marking an entry as used, the few small objects *every*
+//! query reads — centroids, footers, `pk.idx` — are admitted once and then lapped by cluster
+//! traffic, so they are re-fetched on a cycle. Measured over an IVF-probe-shaped trace (256
+//! clusters, Zipf-skewed, 16 distinct probes per query plus three always-hot blocks; harness
+//! in `tests/cache_skew.rs`, which runs all three policies over the byte-identical trace):
 //!
 //! ```text
-//! cache/corpus     5%      10%     25%     50%
-//! LRU  (s=1.1)   0.0781  0.4491  0.6758  0.8314
-//! FIFO (s=1.1)   0.0895  0.3327  0.5937  0.7940
+//! hit ratio        cache/corpus:    5%      10%     25%     50%
+//! zipf s=1.1   LRU                0.0780  0.4493  0.6769  0.8442
+//!              FIFO               0.0895  0.3327  0.5937  0.7940
+//!              CLOCK              0.0889  0.4708  0.6898  0.8500
+//! zipf s=1.5   LRU                0.0994  0.5948  0.8137  0.9226
+//!              FIFO               0.1450  0.4479  0.7344  0.8839
+//!              CLOCK              0.1047  0.6172  0.8218  0.9269
+//! uniform      LRU                0.0165  0.2154  0.3465  0.5657
+//! (control)    FIFO               0.0170  0.1379  0.3193  0.5546
+//!              CLOCK              0.0164  0.2157  0.3470  0.5666
 //! ```
 //!
-//! It is only better in the leftmost column, where the probe working set exceeds the cache
-//! and LRU thrashes instead. Most of the loss is one specific effect: the few small objects
-//! *every* query reads — centroids, footers, `pk.idx` — are admitted once and then age out,
-//! because a hit no longer refreshes them, so cluster traffic laps the ring and evicts them
-//! on a cycle. That is why the loss shows up even on a uniform control trace (0.2153 →
-//! 0.1379 at 10%), where policy should not matter at all. It makes the small in-RAM tier
-//! for those objects (SPEC §6.2's ARC layer, still unbuilt) load-bearing rather than an
-//! optimisation.
+//! CLOCK does not merely recover most of FIFO's 3–15 point loss — outside the leftmost
+//! column it is 0.4 to 2.2 points *ahead of LRU*, because a one-shot admission arrives with
+//! its bit clear and dies at its FIFO position, whereas LRU promotes every cold cluster it
+//! touches to most-recently-used and evicts hot entries to make room. (Admitting with the
+//! bit *set* was tried and is worse everywhere — 0.4133 vs 0.4708 at s=1.1/10% — so the
+//! scan resistance is the load-bearing part, not the second chance alone.)
 //!
-//! So this is a contention-over-hit-rate trade made with the number in hand, not a free
-//! win. If the hit ratio turns out to matter more than the lock does, the next move is
-//! CLOCK — one atomic reference bit set on hit (still no reordering, still no write lock)
-//! and a second chance on eviction — which recovers most of LRU's hit rate without giving
-//! the shared-lock read back.
+//! The 5% column is the thrash regime: 16 distinct probes per query is already more than the
+//! cache holds, so every policy laps itself once per query and no reference bit survives to
+//! the hand's next pass. FIFO's small edge there is what surviving by position rather than
+//! by policy looks like; everything is under 0.15 and the cache is not the answer at that
+//! size.
+//!
+//! The uniform control is the diagnostic, not a performance number: where the access
+//! distribution is flat, policy should not matter, and FIFO's 0.2154 → 0.1379 was that
+//! lapping bug showing through. CLOCK is back at 0.2157, within noise of LRU. The
+//! always-hot objects' own hit ratio makes it explicit: 0.999 under CLOCK and LRU, 0.503
+//! under FIFO. That un-blocks SPEC §6.2's small in-RAM tier for centroids/footers/`pk.idx`
+//! from being load-bearing back to being the optimisation it was meant to be.
+//!
+//! The LRU column is a re-measurement, not the old code: it is [`EvictionPolicy::Lru`] here,
+//! which refreshes an entry's position in *both* rings on a hit. The LRU that was replaced
+//! only refreshed the memory tier's recency on a memory hit, so it scored 0.8314 rather than
+//! 0.8442 in the s=1.1/50% cell — every other cell reproduces to ±0.001. The baseline CLOCK
+//! is being judged against is therefore slightly *stronger* than the code that was there.
 
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::RwLock;
 
 use bytes::Bytes;
 
 use crate::Result;
+
+/// Which entry the ring gives up when a tier is over budget.
+///
+/// [`Clock`](EvictionPolicy::Clock) is what the cache runs; the other two exist so the
+/// choice stays re-measurable against a number rather than an argument — the harness in
+/// `tests/cache_skew.rs` runs all three over the same trace, which is where the table in
+/// the module docs comes from. Do not select [`Lru`](EvictionPolicy::Lru) in a serving
+/// path: it is the only variant whose *hit* takes the state lock for writing, which is the
+/// contention the ring was built to remove.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum EvictionPolicy {
+    /// Second chance: a hit sets a reference bit (an atomic store under a *shared* lock);
+    /// eviction advances a hand, clearing a set bit and skipping that entry, evicting the
+    /// first entry it finds with the bit already clear.
+    #[default]
+    Clock,
+    /// Strict admission order: a hit does nothing at all, and eviction pops the oldest slot.
+    Fifo,
+    /// Least-recently-used: a hit re-admits the entry at the back of both rings, which
+    /// costs the *write* lock on every hit. Measurement baseline only.
+    Lru,
+}
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct CacheKey {
@@ -106,7 +150,8 @@ pub struct CacheEntry {
     pub on_disk: bool,
     /// Position in the ring: the value of the admission counter when this entry was last
     /// *admitted*. Only meaningful relative to other entries — a monotonic counter, not a
-    /// timestamp, and under FIFO it is not touched by reads.
+    /// timestamp. Under CLOCK a hit sets a reference bit rather than moving the entry, so
+    /// this is not touched by reads and is not a recency rank.
     pub admitted: u64,
 }
 
@@ -135,11 +180,15 @@ struct MemEntry {
     bytes: Bytes,
     /// Admission sequence, matched against the ring slot to spot a stale slot.
     seq: u64,
+    /// CLOCK's reference bit. Set by a hit through a *shared* borrow — that is why it is an
+    /// atomic and not a `bool` — and cleared by the hand as it passes.
+    referenced: AtomicBool,
 }
 
 struct DiskEntry {
     size: u64,
     seq: u64,
+    referenced: AtomicBool,
 }
 
 /// A two-tier cache with **independent, bounded** memory and disk budgets, so a query node
@@ -149,20 +198,22 @@ struct DiskEntry {
 /// * The **disk tier** is the NVMe spill, bounded by `disk_budget`, and survives a process
 ///   restart.
 ///
-/// Both are FIFO rings (see the module docs). A memory eviction *demotes* an item to disk
+/// Both are CLOCK rings (see the module docs). A memory eviction *demotes* an item to disk
 /// (the bytes stay on disk, and a later read maps them back in); only a disk eviction
 /// deletes the file. Neither tier can exceed its budget, so peak RAM and peak disk are both
 /// capped by construction.
 ///
 /// Unlike the LRU this replaced, a disk hit does **not** promote back into memory: the ring
 /// is admission-ordered, so re-admitting on every hit would be exactly the per-hit mutation
-/// FIFO exists to avoid — and since a disk hit is served by an mmap that the page cache
-/// already backs, copying it onto the heap as well would cost RAM to buy nothing.
+/// the ring exists to avoid — and since a disk hit is served by an mmap that the page cache
+/// already backs, copying it onto the heap as well would cost RAM to buy nothing. A hit
+/// records itself in the one way that does not need the write lock: a reference bit.
 pub struct DiskCache {
     dir: PathBuf,
     state: RwLock<CacheState>,
     mem_budget: u64,
     disk_budget: u64,
+    policy: EvictionPolicy,
     /// Counters live outside the state lock so a hit never needs to take it for writing.
     hits: AtomicU64,
     misses: AtomicU64,
@@ -173,7 +224,9 @@ pub struct DiskCache {
 
 struct CacheState {
     mem: HashMap<CacheKey, MemEntry>,
-    /// The memory ring: admission order, oldest at the front. May hold stale slots for
+    /// The memory ring: admission order, oldest at the front, and the hand is its front.
+    /// A second chance pops a slot and pushes it back unchanged, so the ring stays a
+    /// `VecDeque` rather than a circular buffer with an index. May hold stale slots for
     /// keys that were re-admitted or dropped; `seq` identifies them on the way out.
     mem_ring: VecDeque<(CacheKey, u64)>,
     mem_bytes: u64,
@@ -190,12 +243,25 @@ impl DiskCache {
         mem_budget: u64,
         disk_budget: u64,
     ) -> Result<Self> {
+        Self::with_policy(dir, mem_budget, disk_budget, EvictionPolicy::default())
+    }
+
+    /// As [`with_budgets`](Self::with_budgets), with the eviction policy chosen explicitly.
+    /// Only the measurement harness has a reason to pass anything but the default — see
+    /// [`EvictionPolicy`].
+    pub fn with_policy(
+        dir: impl Into<PathBuf>,
+        mem_budget: u64,
+        disk_budget: u64,
+        policy: EvictionPolicy,
+    ) -> Result<Self> {
         let dir = dir.into();
         std::fs::create_dir_all(&dir)?;
         Ok(Self {
             dir,
             mem_budget,
             disk_budget,
+            policy,
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
             tmp_nonce: AtomicU64::new(0),
@@ -217,17 +283,29 @@ impl DiskCache {
     }
 
     pub fn get(&self, key: &CacheKey) -> Option<Bytes> {
-        // Memory tier under a *shared* lock: nothing is mutated, so concurrent readers all
+        // Memory tier under a *shared* lock: the only mutation is an atomic store into the
+        // entry's reference bit, which needs no exclusive access, so concurrent readers all
         // proceed. This is the whole point of the ring.
-        if let Some(bytes) = self
-            .state
-            .read()
-            .unwrap()
-            .mem
-            .get(key)
-            .map(|e| e.bytes.clone())
-        {
+        let hit = {
+            let state = self.state.read().unwrap();
+            state.mem.get(key).map(|e| {
+                if self.policy == EvictionPolicy::Clock {
+                    e.referenced.store(true, Ordering::Relaxed);
+                    // The disk copy is referenced too. Without this the hottest objects —
+                    // the ones that always answer from memory — would never have their disk
+                    // bit set, and a disk eviction drops the memory copy with the file.
+                    if let Some(d) = state.disk.get(key) {
+                        d.referenced.store(true, Ordering::Relaxed);
+                    }
+                }
+                e.bytes.clone()
+            })
+        };
+        if let Some(bytes) = hit {
             self.hits.fetch_add(1, Ordering::Relaxed);
+            if self.policy == EvictionPolicy::Lru {
+                self.renew(key);
+            }
             return Some(bytes);
         }
 
@@ -245,14 +323,29 @@ impl DiskCache {
         // once per key per process — this is restart recovery, not per-hit bookkeeping.
         // (The read guard is scoped explicitly: `RwLock` is not reentrant, and taking the
         // write lock below while still holding it would deadlock.)
-        let unaccounted = { !self.state.read().unwrap().disk.contains_key(key) };
+        let unaccounted = {
+            let state = self.state.read().unwrap();
+            match state.disk.get(key) {
+                Some(d) => {
+                    if self.policy == EvictionPolicy::Clock {
+                        d.referenced.store(true, Ordering::Relaxed);
+                    }
+                    false
+                }
+                None => true,
+            }
+        };
         if unaccounted {
             let mut state = self.state.write().unwrap();
             let size = bytes.len() as u64;
             let seq = state.next_seq;
             // Vacant-only: another thread may have adopted the same key in between.
             if let Entry::Vacant(slot) = state.disk.entry(key.clone()) {
-                slot.insert(DiskEntry { size, seq });
+                slot.insert(DiskEntry {
+                    size,
+                    seq,
+                    referenced: AtomicBool::new(false),
+                });
                 state.next_seq += 1;
                 state.disk_bytes += size;
                 state.disk_ring.push_back((key.clone(), seq));
@@ -261,8 +354,35 @@ impl DiskCache {
                 // mapping keeps the inode alive past its last link.
                 self.evict_disk(&mut state);
             }
+        } else if self.policy == EvictionPolicy::Lru {
+            self.renew(key);
         }
         Some(bytes)
+    }
+
+    /// LRU's per-hit mutation: give the entry a fresh sequence number and a fresh slot at
+    /// the back of each ring it is in, leaving its old slots behind as stale ones. **Takes
+    /// the write lock** — measurement baseline only; see [`EvictionPolicy`].
+    fn renew(&self, key: &CacheKey) {
+        let mut state = self.state.write().unwrap();
+        let seq = state.next_seq;
+        state.next_seq += 1;
+        let mut renewed = false;
+        if let Some(e) = state.mem.get_mut(key) {
+            e.seq = seq;
+            renewed = true;
+        }
+        if renewed {
+            state.mem_ring.push_back((key.clone(), seq));
+        }
+        renewed = false;
+        if let Some(e) = state.disk.get_mut(key) {
+            e.seq = seq;
+            renewed = true;
+        }
+        if renewed {
+            state.disk_ring.push_back((key.clone(), seq));
+        }
     }
 
     /// Admit bytes into both tiers: the tail of the disk ring and the tail of the memory
@@ -282,7 +402,18 @@ impl DiskCache {
         // overflows the disk budget.
         let seq = state.next_seq;
         state.next_seq += 1;
-        if let Some(old) = state.mem.insert(key.clone(), MemEntry { bytes, seq }) {
+        // Admitted with the reference bit *clear*: an entry earns protection by being read
+        // again, so a one-shot admission is evicted at its FIFO position instead of costing
+        // a full sweep of the hand. That is what keeps CLOCK scan-resistant here — a fold
+        // or a cold probe run cannot protect itself just by arriving.
+        if let Some(old) = state.mem.insert(
+            key.clone(),
+            MemEntry {
+                bytes,
+                seq,
+                referenced: AtomicBool::new(false),
+            },
+        ) {
             state.mem_bytes -= old.bytes.len() as u64;
         }
         state.mem_bytes += len;
@@ -290,7 +421,14 @@ impl DiskCache {
         self.evict_mem(&mut state);
 
         if on_disk {
-            if let Some(old) = state.disk.insert(key.clone(), DiskEntry { size: len, seq }) {
+            if let Some(old) = state.disk.insert(
+                key.clone(),
+                DiskEntry {
+                    size: len,
+                    seq,
+                    referenced: AtomicBool::new(false),
+                },
+            ) {
                 state.disk_bytes -= old.size;
             }
             state.disk_bytes += len;
@@ -317,34 +455,81 @@ impl DiskCache {
         }
     }
 
-    /// Drop the oldest memory slots until the tier is inside its budget. The bytes stay on
-    /// disk, so this is a demotion, not a deletion.
-    fn evict_mem(&self, state: &mut CacheState) {
-        while state.mem_bytes > self.mem_budget {
-            let Some((key, seq)) = state.mem_ring.pop_front() else {
-                break;
-            };
-            // A stale slot: the key was re-admitted (a newer slot holds it) or already
-            // dropped by a disk eviction. Skipping it is the pointer bump.
-            if state.mem.get(&key).map(|e| e.seq) != Some(seq) {
+    /// Advance the hand to the next victim, or `None` when the ring is empty.
+    ///
+    /// The hand is the front of the ring. A slot whose reference bit is set gets a *second
+    /// chance*: the bit is cleared and the slot goes to the back, unchanged — same key,
+    /// same sequence — so it is not a re-admission and does not disturb the byte
+    /// accounting. Stale slots (a key re-admitted, or already dropped by a disk eviction)
+    /// are discarded on the way past, which is the FIFO pointer bump this kept.
+    ///
+    /// **Terminates.** Second chances are capped at the ring's length: at most that many
+    /// entries can have their bit set, the sweep clears every one it passes, and no bit can
+    /// be set meanwhile because a hit sets bits under the *read* lock while this runs under
+    /// the write lock. So the cap is never reached before a clear bit is found — it is a
+    /// belt-and-braces bound, not the reason the loop ends.
+    fn next_victim(
+        ring: &mut VecDeque<(CacheKey, u64)>,
+        live_seq: impl Fn(&CacheKey) -> Option<u64>,
+        referenced: impl Fn(&CacheKey) -> bool,
+        clock: bool,
+    ) -> Option<(CacheKey, u64)> {
+        let mut chances = ring.len();
+        while let Some((key, seq)) = ring.pop_front() {
+            if live_seq(&key) != Some(seq) {
+                continue; // stale slot: drop it and keep walking
+            }
+            if clock && chances > 0 && referenced(&key) {
+                chances -= 1;
+                ring.push_back((key, seq));
                 continue;
             }
+            return Some((key, seq));
+        }
+        None
+    }
+
+    /// Drop memory slots until the tier is inside its budget, picking each victim with the
+    /// hand. The bytes stay on disk, so this is a demotion, not a deletion.
+    fn evict_mem(&self, state: &mut CacheState) {
+        let clock = self.policy == EvictionPolicy::Clock;
+        while state.mem_bytes > self.mem_budget {
+            let mem = &state.mem;
+            let Some((key, _)) = Self::next_victim(
+                &mut state.mem_ring,
+                |k| mem.get(k).map(|e| e.seq),
+                // `swap` is the "clear it and skip" half of the second chance.
+                |k| {
+                    mem.get(k)
+                        .is_some_and(|e| e.referenced.swap(false, Ordering::Relaxed))
+                },
+                clock,
+            ) else {
+                break;
+            };
             if let Some(e) = state.mem.remove(&key) {
                 state.mem_bytes -= e.bytes.len() as u64;
             }
         }
     }
 
-    /// Drop the oldest disk slots until the tier is inside its budget, deleting the file
-    /// and any resident memory copy with it.
+    /// Drop disk slots until the tier is inside its budget, deleting the file and any
+    /// resident memory copy with it.
     fn evict_disk(&self, state: &mut CacheState) {
+        let clock = self.policy == EvictionPolicy::Clock;
         while state.disk_bytes > self.disk_budget {
-            let Some((key, seq)) = state.disk_ring.pop_front() else {
+            let disk = &state.disk;
+            let Some((key, _)) = Self::next_victim(
+                &mut state.disk_ring,
+                |k| disk.get(k).map(|e| e.seq),
+                |k| {
+                    disk.get(k)
+                        .is_some_and(|e| e.referenced.swap(false, Ordering::Relaxed))
+                },
+                clock,
+            ) else {
                 break;
             };
-            if state.disk.get(&key).map(|e| e.seq) != Some(seq) {
-                continue;
-            }
             let _ = std::fs::remove_file(self.dir.join(key.filename()));
             if let Some(e) = state.disk.remove(&key) {
                 state.disk_bytes -= e.size;
@@ -534,21 +719,18 @@ mod tests {
         assert_eq!(c.get(&b).unwrap(), Bytes::from_static(b"b"));
     }
 
-    /// The ring evicts by admission order, and a read does not change that order — which is
-    /// exactly what lets a read take a shared lock. (Under the LRU this replaced, the `get`
-    /// below would have saved `a` and condemned `b`.)
+    /// With no reference bits set, the hand evicts in admission order — CLOCK degenerates
+    /// to the FIFO ring it was grown from when nothing has been re-read.
     #[test]
-    fn evicts_in_admission_order_and_reads_do_not_reorder() {
+    fn unreferenced_entries_evict_in_admission_order() {
         let dir = tempfile::tempdir().unwrap();
         // Disk fits two 4-byte blobs; memory fits one.
         let c = DiskCache::with_budgets(dir.path(), 4, 8).unwrap();
         let a = CacheKey::new("ns", "a", "e");
         let b = CacheKey::new("ns", "b", "e");
+        let e = CacheKey::new("ns", "e", "e");
         c.put(a.clone(), Bytes::from_static(b"aaaa"));
         c.put(b.clone(), Bytes::from_static(b"bbbb"));
-        // Reading `a` does *not* move it to the back of the ring.
-        assert!(c.get(&a).is_some());
-        let e = CacheKey::new("ns", "e", "e");
         c.put(e.clone(), Bytes::from_static(b"eeee"));
 
         assert!(c.disk_bytes() <= 8);
@@ -556,6 +738,69 @@ mod tests {
         assert!(c.get(&a).is_none(), "the oldest admission is the victim");
         assert!(c.get(&b).is_some(), "the next-oldest survives");
         assert!(c.get(&e).is_some(), "the newest survives");
+    }
+
+    /// A hit sets the reference bit, so the hand spares that entry once and takes the next
+    /// one instead. This is the whole difference from FIFO — and the reason the always-hot
+    /// small objects stop being lapped by cluster traffic. Note the read still only takes
+    /// the lock *shared*: the bit is an atomic store, not a reordering.
+    #[test]
+    fn a_hit_buys_a_second_chance() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = DiskCache::with_budgets(dir.path(), 4, 8).unwrap();
+        let a = CacheKey::new("ns", "a", "e");
+        let b = CacheKey::new("ns", "b", "e");
+        c.put(a.clone(), Bytes::from_static(b"aaaa"));
+        c.put(b.clone(), Bytes::from_static(b"bbbb"));
+        // Reading `a` does not move it, but it does mark it.
+        assert!(c.get(&a).is_some());
+        let e = CacheKey::new("ns", "e", "e");
+        c.put(e.clone(), Bytes::from_static(b"eeee"));
+
+        assert!(c.disk_bytes() <= 8);
+        assert!(c.get(&a).is_some(), "the referenced entry was spared");
+        assert!(c.get(&b).is_none(), "the unreferenced one is the victim");
+        assert!(c.get(&e).is_some(), "the newest survives");
+    }
+
+    /// The second chance is *one* chance: the hand clears the bit as it passes, so an entry
+    /// read once and then ignored is evicted on the hand's next lap. Without the clear, a
+    /// single ancient hit would pin an entry forever.
+    #[test]
+    fn a_second_chance_is_not_permanent() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = DiskCache::with_budgets(dir.path(), 4, 8).unwrap();
+        let a = CacheKey::new("ns", "a", "e");
+        c.put(a.clone(), Bytes::from_static(b"aaaa"));
+        assert!(c.get(&a).is_some()); // sets `a`'s bit, once
+
+        for i in 0..4 {
+            c.put(
+                CacheKey::new("ns", &format!("f{i}"), "e"),
+                Bytes::from_static(b"ffff"),
+            );
+        }
+        assert!(c.get(&a).is_none(), "the bit was cleared on the first pass");
+    }
+
+    /// Every entry referenced: the hand must not spin. One sweep clears every bit, and the
+    /// entry it comes back to is then evictable — so the tier still ends inside its budget.
+    #[test]
+    fn a_fully_referenced_ring_still_evicts() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = DiskCache::with_budgets(dir.path(), 40, 40).unwrap();
+        let keys: Vec<CacheKey> = (0..4)
+            .map(|i| CacheKey::new("ns", &format!("k{i}"), "e"))
+            .collect();
+        for k in &keys {
+            c.put(k.clone(), Bytes::from(vec![0u8; 10]));
+            assert!(c.get(k).is_some()); // set every reference bit
+        }
+        // One more admission than fits: something has to go, referenced or not.
+        let extra = CacheKey::new("ns", "extra", "e");
+        c.put(extra.clone(), Bytes::from(vec![0u8; 10]));
+        assert!(c.disk_bytes() <= 40, "budget held: {}", c.disk_bytes());
+        assert_eq!(c.disk_len(), 4, "exactly one entry was evicted");
     }
 
     #[test]

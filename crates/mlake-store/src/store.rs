@@ -310,9 +310,11 @@ impl Store {
     ///
     /// It is opt-in on purpose, and [`Store::put`] stays read-through. A fold writes the
     /// *whole* generation, and no imminent query probes most of it, so admitting all of it
-    /// trades a warm working set for cold data — and because the cache is a FIFO ring, a
-    /// single fold that writes more than the disk budget laps the ring and leaves nothing
-    /// behind but its own tail. Which call sites should use this — plausibly only the small
+    /// trades a warm working set for cold data — and because entries are admitted into the
+    /// ring with their CLOCK reference bit clear, a single fold that writes more than the
+    /// disk budget laps the ring and leaves nothing behind but its own tail. (The bit is
+    /// what stops the fold from evicting the *read* working set on the way past: an entry a
+    /// query has actually touched gets its second chance and the fold's own bulk does not.) Which call sites should use this — plausibly only the small
     /// objects every query is certain to read (centroids, footers, `pk.idx`) and not the
     /// per-cluster bulk — is a follow-up decision to make against the hit-ratio numbers,
     /// not a default. Nothing in the tree calls it yet.

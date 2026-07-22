@@ -284,10 +284,11 @@ async fn cache_entries_report_both_tiers_and_overlap() {
     // The demoted object is still readable — the demotion cost latency, not the bytes.
     assert!(cache.get(&a).is_some(), "the demoted object is still readable");
 
-    // But the read does NOT promote it back into memory. The tiers are FIFO rings ordered
+    // But the read does NOT promote it back into memory. The tiers are CLOCK rings ordered
     // by admission; re-admitting on every hit is the per-hit mutation the ring exists to
-    // avoid, and it would force a reader to take the write lock. `a` keeps its place in the
-    // disk ring and keeps being served from there.
+    // avoid, and it would force a reader to take the write lock. The hit sets `a`'s
+    // reference bit instead, so it keeps its place in the disk ring and is served from
+    // there — earning a second chance when the hand next reaches it.
     let after = cache.entries(None, 100).0;
     let ea2 = after.iter().find(|e| e.path.ends_with("cluster-0.bin")).unwrap();
     assert!(!ea2.in_memory, "a hit does not re-admit into memory");
@@ -300,8 +301,8 @@ async fn cache_entries_report_both_tiers_and_overlap() {
 /// The cache is read-through: `Store::put` writes the object and leaves it out of the
 /// cache, so a replica that folds a generation inline then pays a roundtrip to read back
 /// bytes it had in hand. `put_admitting` is the opt-in that closes that — opt-in rather
-/// than the default, because a fold writes far more than any imminent query probes and on a
-/// FIFO ring it would lap the cache.
+/// than the default, because a fold writes far more than any imminent query probes and its
+/// admissions arrive with the CLOCK reference bit clear, so they would lap the ring.
 #[tokio::test]
 async fn put_admitting_populates_the_read_cache_and_plain_put_does_not() {
     use mlake_store::{DiskCache, StoreMetrics};
