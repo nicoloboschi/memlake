@@ -198,6 +198,11 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("baseline", help="run a retrieval baseline")
     bsub = sp.add_subparsers(dest="engine", required=True)
 
+    _ANN_HELP = (
+        "skip the exhaustive-scan ground truth (ann_recall@k). The scan is O(queries x docs), "
+        "so on the multi-million-doc datasets it costs more than the retrieval being measured."
+    )
+
     e = bsub.add_parser("exact", help="numpy brute-force dense + python BM25 + RRF")
     add_common(e)
     e.add_argument("--top-k", type=int, default=100)
@@ -224,6 +229,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_common(e)
     add_memlake_tuning(e)
     e.add_argument("--top-k", type=int, default=100)
+    e.add_argument("--no-ann-recall", action="store_true", help=_ANN_HELP)
     e.set_defaults(func=cmd_baseline_memlake)
 
     sp = sub.add_parser("all", help="download -> embed -> exact -> qdrant -> memlake -> report")

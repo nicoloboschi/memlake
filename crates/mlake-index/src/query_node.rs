@@ -163,7 +163,9 @@ impl QueryNode {
                 tokenizer.clone(),
             )?;
 
-            let state = match manifest.index(ft) {
+            // Phase 1: a single live segment, so this fact type's index is that segment's entry.
+            // Phase 3 will fan out across all segments and merge per arm.
+            let state = match manifest.segments.first().and_then(|s| s.index(ft)) {
                 Some(fti) => {
                     let files = &fti.files;
                     // The metadata objects (centroids, tag summary, radj/pk sparse indexes, FTS
@@ -330,7 +332,7 @@ impl QueryNode {
             tombstones,
             predicate_tombstones,
             through_seq: head,
-            generation: manifest.generation,
+            generation: manifest.version,
             load_roundtrips: metrics.roundtrips(),
         })
     }

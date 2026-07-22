@@ -131,7 +131,7 @@ impl MemlakeService {
                 // A fold advanced past our write; drop any snapshot opened against the older
                 // generation so the next read sees the freshly-indexed one.
                 self.invalidate(name);
-                return Ok(manifest.generation);
+                return Ok(manifest.version);
             }
             // Inline fold on the write path: auto-select with default budget/threshold.
             fold(
@@ -352,15 +352,20 @@ impl Memlake for MemlakeService {
                 memory_type: mt as u32,
                 doc_count: node.doc_count_of(mt) as u64,
                 cluster_count: node.cluster_count_of(mt) as u32,
-                train_count: manifest.index(mt).map(|i| i.train_count).unwrap_or(0),
-                has_index: manifest.index(mt).is_some(),
+                train_count: manifest
+                    .segments
+                    .iter()
+                    .filter_map(|s| s.index(mt))
+                    .map(|i| i.train_count)
+                    .sum(),
+                has_index: manifest.segments.iter().any(|s| s.index(mt).is_some()),
             })
             .collect();
 
         Ok(Response::new(pb::StatsResponse {
             namespace: req.namespace,
-            generation: manifest.generation,
-            prev_generation: manifest.prev_generation,
+            generation: manifest.version,
+            prev_generation: None,
             // The *live* head, not `manifest.wal_head`: the indexer writes the manifest's
             // head and cursor to the same value, so their difference is always zero. The
             // backlog is the number this view exists to show, so it is worth one LIST.
@@ -807,7 +812,7 @@ impl Memlake for MemlakeService {
             total_objects,
             total_bytes,
             live_bytes,
-            generation: manifest.generation,
+            generation: manifest.version,
             next_page_token: if (next as u64) < total_objects {
                 next.to_string()
             } else {

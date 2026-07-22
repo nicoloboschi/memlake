@@ -101,16 +101,9 @@ pub fn classify(namespace: &str, path: &str, size_bytes: u64) -> Classified {
 pub fn live_paths(namespace: &str, manifest: &Manifest) -> HashSet<String> {
     let mut live: HashSet<String> = HashSet::new();
     live.insert(format!("{namespace}/manifest.json"));
-    for ft in manifest.memory_types() {
-        if let Some(index) = manifest.index(ft) {
-            live.extend(index.files.all_paths().map(str::to_string));
-            if let Some(prev) = &index.prev_files {
-                // The previous generation is retained on purpose: it is the GC grace
-                // window for readers still holding the older manifest.
-                live.extend(prev.all_paths().map(str::to_string));
-            }
-        }
-    }
+    // All live segments plus the grace-window (prev) segments — the latter retained on purpose so
+    // readers still holding the older manifest do not observe deleted files.
+    live.extend(manifest.all_referenced_paths().map(str::to_string));
     live
 }
 

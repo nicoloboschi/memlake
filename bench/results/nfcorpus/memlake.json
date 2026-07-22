@@ -1,62 +1,43 @@
 {
   "engine": "memlake",
   "config": {
-    "note": "in-process IVF vector + hand-rolled BM25 + weighted RRF, same cached bge-small vectors as qdrant",
-    "nprobe": 64,
-    "rrf_k": 60.0,
-    "vector_weight": 1.0,
-    "fts_weight": 1.0,
-    "arm_depth": 200,
-    "bm25_k1": 1.2,
-    "bm25_b": 0.75,
-    "model": "BAAI/bge-small-en-v1.5",
-    "dim": 384
+    "note": "e2e via gRPC: python client -> mlake-server -> S3 (MinIO); same cached bge-small vectors as qdrant",
+    "graph": false
   },
   "corpus_size": 3633,
   "n_queries": 323,
-  "index_seconds": 4.565,
+  "index_seconds": 11.84,
   "arms": {
-    "sparse": {
-      "ndcg@10": 0.32352,
-      "recall@100": 0.2477,
-      "mrr@10": 0.52345,
-      "latency": {
-        "mean_ms": 0.218,
-        "p50_ms": 0.172,
-        "p90_ms": 0.436,
-        "p99_ms": 0.843,
-        "max_ms": 2.798,
-        "n_queries": 323
-      }
-    },
-    "hybrid": {
-      "ndcg@10": 0.36382,
-      "recall@100": 0.31613,
-      "mrr@10": 0.57044,
-      "latency": {
-        "mean_ms": 5.74,
-        "p50_ms": 3.248,
-        "p90_ms": 6.164,
-        "p99_ms": 74.851,
-        "max_ms": 167.899,
-        "n_queries": 323
-      }
-    },
     "dense": {
       "ndcg@10": 0.3429,
       "recall@100": 0.31088,
       "mrr@10": 0.52696,
+      "latency": {},
+      "ann_recall@1": 0.99381,
+      "ann_recall@10": 0.99938,
+      "ann_recall@100": 0.99988
+    },
+    "sparse": {
+      "ndcg@10": 0.3243,
+      "recall@100": 0.2478,
+      "mrr@10": 0.52372,
+      "latency": {}
+    },
+    "hybrid": {
+      "ndcg@10": 0.36198,
+      "recall@100": 0.31437,
+      "mrr@10": 0.56703,
       "latency": {
-        "mean_ms": 4.374,
-        "p50_ms": 3.084,
-        "p90_ms": 5.686,
-        "p99_ms": 29.243,
-        "max_ms": 101.556,
+        "mean_ms": 524.32,
+        "p50_ms": 147.675,
+        "p90_ms": 170.819,
+        "p99_ms": 13288.135,
+        "max_ms": 39537.24,
         "n_queries": 323
       }
     }
   },
   "dataset": "nfcorpus",
-  "generated_at": "2026-07-21T07:58:53+00:00",
+  "generated_at": "2026-07-22T13:53:59+00:00",
   "platform": "Darwin arm64 py3.13.2"
 }

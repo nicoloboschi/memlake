@@ -97,7 +97,7 @@ pub async fn fold(
 /// (a LIST, no GETs — so it stays O(1) roundtrips even when the tail is the whole first build).
 async fn estimate_corpus_docs(ns: &Namespace) -> Result<usize> {
     let (manifest, _etag) = ns.read_manifest().await?;
-    let prev_docs: usize = manifest.indexes.values().map(|i| i.train_count as usize).sum();
+    let prev_docs: usize = manifest.doc_count() as usize;
     let head = ns.wal_head().await?;
 
     let mut tail_bytes: u64 = 0;
@@ -124,14 +124,16 @@ pub async fn index(ns: &Namespace, tokenizer: &Tokenizer, opts: IndexOptions) ->
     let (manifest, etag) = ns.read_manifest().await?;
     let head = ns.wal_head().await?;
 
+    // Phase 1 keeps a single full segment, so "the previous generation" is that one segment.
+    // (Phase 2+ compaction reads across the input segments instead.)
+    let prev_seg = manifest.segments.first();
     // Load each existing fact type's previous items (for the fold + copy-forward).
     let mut prev_by_ft: std::collections::BTreeMap<u8, mlake_index_prev::Generation> =
         std::collections::BTreeMap::new();
     for ft in manifest.memory_types() {
-        let fti = manifest.index(ft).unwrap();
+        let Some(fti) = prev_seg.and_then(|s| s.index(ft)) else { continue };
         let gen =
-            crate::generation::read_generation(&ns.store, &fti.files, manifest.generation, None)
-                .await?;
+            crate::generation::read_generation(&ns.store, &fti.files, manifest.version, None).await?;
         prev_by_ft.insert(ft, gen);
     }
 
@@ -183,7 +185,7 @@ pub async fn index(ns: &Namespace, tokenizer: &Tokenizer, opts: IndexOptions) ->
         item.semantic_out.retain(|e| live.contains(&e.target.0));
     }
 
-    let generation = manifest.generation + 1;
+    let version = manifest.version + 1;
     let doc_count = items.len();
 
     // Partition the live items by fact type (BTreeMap keeps a deterministic type order).
@@ -193,35 +195,44 @@ pub async fn index(ns: &Namespace, tokenizer: &Tokenizer, opts: IndexOptions) ->
         items_by_ft.entry(item.memory_type).or_default().push(item);
     }
 
-    // Build an independent generation per fact type that still has items.
-    let nonce = mlake_core::MemoryId::new_v4().as_uuid().simple().to_string();
+    // Phase 1: the in-RAM fold produces ONE full segment (a full rebuild over the whole live set),
+    // published as the sole live segment. Phase 2 switches to flushing just the tail into a new L0
+    // segment and appending it.
+    let seg_id = mlake_core::MemoryId::new_v4().as_uuid().simple().to_string();
     let mut indexes: std::collections::BTreeMap<u8, mlake_core::manifest::FactTypeIndex> =
         std::collections::BTreeMap::new();
     for (ft, ft_items) in items_by_ft {
         let fti = build_memory_type_index(
             ns,
-            generation,
-            &nonce,
+            &seg_id,
             ft,
             ft_items,
             &new_ids,
             &touched,
             prev_by_ft.get(&ft),
-            manifest.index(ft),
+            prev_seg.and_then(|s| s.index(ft)),
             opts,
         )
         .await?;
         indexes.insert(ft, fti);
     }
 
+    let segment = mlake_core::Segment {
+        id: seg_id,
+        level: 0,
+        seq_lo: 0,
+        seq_hi: head,
+        doc_count: doc_count as u64,
+        indexes,
+    };
     let mut next = manifest.clone();
-    next.generation = generation;
+    next.version = version;
     next.wal_index_cursor = head;
     next.wal_head = head;
     next.prev_wal_index_cursor = manifest.wal_index_cursor;
-    next.prev_generation = Some(manifest.generation);
     next.tokenizer_config_hash = tokenizer.config_hash();
-    next.indexes = indexes;
+    next.prev_segments = manifest.segments.clone();
+    next.segments = vec![segment];
 
     let published = match etag {
         Some(etag) => ns.swap_manifest(&etag, &next).await.map(|_| true).or_else(|e| {
@@ -235,7 +246,7 @@ pub async fn index(ns: &Namespace, tokenizer: &Tokenizer, opts: IndexOptions) ->
     };
 
     Ok(IndexOutcome {
-        generation,
+        generation: version,
         doc_count,
         published,
     })
@@ -252,8 +263,7 @@ mod mlake_index_prev {
 #[allow(clippy::too_many_arguments)]
 async fn build_memory_type_index(
     ns: &Namespace,
-    generation: u64,
-    nonce: &str,
+    seg_id: &str,
     memory_type: u8,
     mut items: Vec<StoredMemory>,
     new_ids: &std::collections::HashSet<[u8; 16]>,
@@ -308,7 +318,7 @@ async fn build_memory_type_index(
     }
 
     // Per-fact-type prefix so different types never collide on object keys.
-    let prefix = format!("{}/mt{memory_type}/gen-{generation}-{nonce}", ns.name);
+    let prefix = format!("{}/mt{memory_type}", mlake_core::manifest::segment_prefix(&ns.name, seg_id));
 
     // Copy-forward unchanged clusters (skip their PUT); rewrite only dirty ones.
     let empty: Vec<Vec<StoredMemory>> = Vec::new();
@@ -494,11 +504,7 @@ async fn build_memory_type_index(
     .await?;
     phase_log("write_meta", twg);
 
-    Ok(mlake_core::manifest::FactTypeIndex {
-        prev_files: prev_index.map(|p| p.files.clone()),
-        train_count,
-        files,
-    })
+    Ok(mlake_core::manifest::FactTypeIndex { train_count, files })
 }
 
 /// Log an index phase's duration to stderr when `MEMLAKE_TIMING` is set. Cheap enough to

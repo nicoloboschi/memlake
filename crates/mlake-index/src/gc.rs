@@ -56,13 +56,13 @@ pub async fn gc_with_min_age(ns: &Namespace, min_age: Duration) -> Result<GcOutc
 
     let cutoff = chrono::Utc::now() - chrono::Duration::from_std(min_age).unwrap_or_default();
 
-    // Collect unreferenced generation objects that are old enough to be safe. Generation
-    // files live at `{ns}/mt{ft}/gen-{G}-{nonce}/…`; the WAL is `{ns}/wal/…` and the
-    // manifest is `{ns}/manifest.json`, neither of which contains `/gen-`. So a generation
-    // object is any listed path under the namespace containing `/gen-`.
+    // Collect unreferenced segment objects that are old enough to be safe. Segment files live at
+    // `{ns}/seg-{seg_id}/mt{ft}/…`; the WAL is `{ns}/wal/…` and the manifest is
+    // `{ns}/manifest.json`, neither of which contains `/seg-`. So a segment object is any listed
+    // path under the namespace containing `/seg-`.
     let ns_prefix = format!("{}/", ns.name);
     for (path, modified) in ns.store.list_with_age(&ns.name).await? {
-        if !path.starts_with(&ns_prefix) || !path.contains("/gen-") {
+        if !path.starts_with(&ns_prefix) || !path.contains("/seg-") {
             continue;
         }
         if referenced.contains(&path) {

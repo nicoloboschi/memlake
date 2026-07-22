@@ -162,7 +162,7 @@ async fn reindexing_is_stable_and_advances_the_cursor() {
     assert_eq!(second.doc_count, 2);
 
     let (manifest, _) = ns.read_manifest().await.unwrap();
-    assert_eq!(manifest.generation, 2);
+    assert_eq!(manifest.version, 2);
     // Everything is now indexed: nothing left in the tail.
     assert_eq!(manifest.index_lag(), 0);
 
@@ -405,7 +405,7 @@ async fn crash_before_manifest_swap_leaves_the_old_generation_serving() {
         mlake_fts::Tokenizer::default(),
     )
     .unwrap();
-    let orphan_prefix = format!("{}/gen-99-orphanattempt", ns.name);
+    let orphan_prefix = format!("{}/seg-99orphanattempt", ns.name);
     let orphan_files = mlake_index::write_generation(
         &ns.store,
         &orphan_prefix,
@@ -425,7 +425,7 @@ async fn crash_before_manifest_swap_leaves_the_old_generation_serving() {
     .await
     .unwrap();
     let _ = &orphan_files;
-    assert_eq!(manifest.generation, 1, "manifest must still point at the pre-crash generation");
+    assert_eq!(manifest.version, 1, "manifest must still point at the pre-crash generation");
 
     // The namespace still serves generation 1 correctly.
     let node = QueryNode::open(&ns, Tokenizer::default()).await.unwrap();
@@ -571,8 +571,8 @@ async fn concurrent_generation_builds_write_disjoint_files() {
         Tokenizer::default(),
     )
     .unwrap();
-    let prefix_a = mlake_index::generation::attempt_prefix("ns", 1, "attemptA");
-    let prefix_b = mlake_index::generation::attempt_prefix("ns", 1, "attemptB");
+    let prefix_a = mlake_index::generation::attempt_prefix("ns", "attemptA");
+    let prefix_b = mlake_index::generation::attempt_prefix("ns", "attemptB");
 
     let files_a = write_generation(
         &ns.store,

@@ -21,7 +21,7 @@ pub use memory::{
 };
 pub use predicate::Predicate;
 pub use tags::{TagFilter, TagsMatch};
-pub use manifest::{GenerationFiles, Manifest};
+pub use manifest::{FactTypeIndex, GenerationFiles, Manifest, Segment};
 pub use wal::{apply_delta, apply_deltas, Delta, Op, WalEntry};
 
 #[derive(thiserror::Error, Debug)]

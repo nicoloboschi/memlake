@@ -5,7 +5,7 @@
 //! CAS-swaps the manifest to point at it, so a reader either sees the entire old
 //! generation or the entire new one, never a mixture.
 
-use mlake_core::manifest::generation_prefix;
+use mlake_core::manifest::segment_prefix;
 use mlake_core::{GenerationFiles, StoredMemory};
 use mlake_fts::{TantivyFts, Tokenizer};
 use mlake_ivf::{Centroids, ClusterFile};
@@ -84,10 +84,10 @@ fn rerank_data_key(prefix: &str) -> String {
     format!("{prefix}/rerank.data")
 }
 
-/// A unique per-attempt generation prefix. The nonce ensures two nodes building the same
-/// generation number never collide on object keys.
-pub fn attempt_prefix(namespace: &str, generation: u64, nonce: &str) -> String {
-    format!("{}-{nonce}", generation_prefix(namespace, generation))
+/// A unique per-attempt segment prefix. The `seg_id` nonce ensures two nodes building the same
+/// logical segment never collide on object keys.
+pub fn attempt_prefix(namespace: &str, seg_id: &str) -> String {
+    segment_prefix(namespace, seg_id)
 }
 
 /// Generation-level statistics, for observability and compaction decisions.

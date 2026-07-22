@@ -29,6 +29,20 @@ DATASETS: dict[str, dict] = {
     "trec-covid": {"approx_docs": 171_332, "split": "test"},
     "arguana": {"approx_docs": 8_674, "split": "test"},
     "scidocs": {"approx_docs": 25_657, "split": "test"},
+    # Mid-size: still embeddable on one machine in minutes-to-an-hour.
+    "touche2020": {"approx_docs": 382_545, "split": "test"},
+    "quora": {"approx_docs": 522_931, "split": "test"},
+    "trec-news": {"approx_docs": 594_977, "split": "test"},
+    # Large: these dominate published BEIR tables but embedding them locally is an
+    # overnight job, and `ann_recall` needs an exhaustive scan per query on top — which is
+    # O(queries x docs) and becomes the bottleneck well before retrieval does. Use
+    # --no-ann-recall on these unless you mean it.
+    "nq": {"approx_docs": 2_681_468, "split": "test"},
+    "dbpedia-entity": {"approx_docs": 4_635_922, "split": "test"},
+    "hotpotqa": {"approx_docs": 5_233_329, "split": "test"},
+    "fever": {"approx_docs": 5_416_568, "split": "test"},
+    "climate-fever": {"approx_docs": 5_416_593, "split": "test"},
+    "msmarco": {"approx_docs": 8_841_823, "split": "dev"},
 }
 
 

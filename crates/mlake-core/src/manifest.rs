@@ -15,8 +15,9 @@ use serde::{Deserialize, Serialize};
 /// buffer"). Bumped to 2 for the `write_seq` + opaque `metadata` + 16-byte `EntityId` changes;
 /// to 3 for the payload store (`payload.idx`/`payload.data`), which a reader must find to
 /// hydrate hits; to 4 for the split vector blocks (`cluster-{i}.vec`) and the rerank tier
-/// (`rerank.idx`/`rerank.data`) the two-stage search reads.
-pub const FORMAT_VERSION: u32 = 4;
+/// (`rerank.idx`/`rerank.data`) the two-stage search reads; to 5 for the segmented manifest
+/// (a list of LSM segments instead of one generation — see docs/segmented-index.md).
+pub const FORMAT_VERSION: u32 = 5;
 
 /// Paths to the files making up a generation. Stored as an explicit struct rather than a
 /// map so a missing file is a deserialization error rather than a runtime surprise.
@@ -102,15 +103,11 @@ impl GenerationFiles {
     }
 }
 
-/// One memory_type's independent index within a bank. Fact types share nothing — no links,
-/// vectors, or postings — so each carries its own generation files and its own assign-only
-/// retrain state (SCALE.md Phase 4).
+/// One memory_type's files within a single segment. Fact types share nothing — no links,
+/// vectors, or postings — so each carries its own files and its own retrain count.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug, Default)]
 pub struct FactTypeIndex {
     pub files: GenerationFiles,
-    /// The previous generation's files for this fact type, retained as the GC grace window.
-    #[serde(default)]
-    pub prev_files: Option<GenerationFiles>,
     /// Memory count when this fact type's centroids were last trained (assign-only trigger).
     #[serde(default)]
     pub train_count: u64,
@@ -118,39 +115,70 @@ pub struct FactTypeIndex {
 
 impl FactTypeIndex {
     fn all_paths(&self) -> impl Iterator<Item = &str> {
-        self.files.all_paths().chain(
-            self.prev_files
-                .iter()
-                .flat_map(|f| f.all_paths())
-                .collect::<Vec<_>>(),
-        )
+        self.files.all_paths()
+    }
+}
+
+/// One immutable segment: a self-contained mini-index over a slice of the WAL, at a level in the
+/// LSM stack. A flush appends a new L0 segment (its `seq` slice); compaction merges segments into a
+/// higher level (see docs/segmented-index.md). Queries fan out across all live segments and merge.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug, Default)]
+pub struct Segment {
+    /// Content nonce — the segment's immutable object prefix, so it is safe to GC by identity.
+    pub id: String,
+    /// LSM level: 0 = newest/smallest (a flush), higher = compacted.
+    pub level: u32,
+    /// Inclusive WAL sequence range this segment covers.
+    pub seq_lo: u64,
+    pub seq_hi: u64,
+    /// Live item count across all fact types in this segment.
+    pub doc_count: u64,
+    /// Per-fact-type files within this segment.
+    pub indexes: BTreeMap<u8, FactTypeIndex>,
+}
+
+impl Segment {
+    fn all_paths(&self) -> impl Iterator<Item = &str> {
+        self.indexes.values().flat_map(|idx| idx.all_paths())
+    }
+
+    /// This segment's fact types.
+    pub fn memory_types(&self) -> impl Iterator<Item = u8> + '_ {
+        self.indexes.keys().copied()
+    }
+
+    /// This fact type's files within this segment, if present.
+    pub fn index(&self, memory_type: u8) -> Option<&FactTypeIndex> {
+        self.indexes.get(&memory_type)
     }
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 pub struct Manifest {
     pub format_version: u32,
-    pub generation: u64,
-    /// Last WAL sequence folded into the current generation. Readers scan the WAL tail past
-    /// this point to satisfy strong consistency.
+    /// Monotonic manifest version — bumped on every swap, for debugging and ordering (not a
+    /// generation number anymore; the index is a set of segments, not one generation).
+    pub version: u64,
+    /// Last WAL sequence folded into a segment. Readers scan the WAL tail past this point to
+    /// satisfy strong consistency.
     pub wal_index_cursor: u64,
     /// Last committed WAL sequence as of this manifest write.
     pub wal_head: u64,
     /// Guards against querying a split built with a different tokenizer than the query
     /// parser uses — a silent, hard-to-debug recall failure otherwise.
     pub tokenizer_config_hash: String,
-    /// Kept alive for the GC grace period so in-flight readers holding the previous
-    /// manifest do not observe deleted files.
-    pub prev_generation: Option<u64>,
-    /// The previous generation's WAL cursor. WAL entries at or below the *current* cursor
-    /// are folded, but a strong reader that read the previous manifest is scanning
-    /// `(prev_wal_index_cursor, head]`, so GC must keep entries above this watermark.
+    /// The previous manifest's WAL cursor. A strong reader that read the previous manifest is
+    /// scanning `(prev_wal_index_cursor, head]`, so GC must keep WAL entries above this watermark.
     #[serde(default)]
     pub prev_wal_index_cursor: u64,
-    /// Per-fact-type independent indexes. A bank namespace holds one WAL and this map; each
-    /// entry is a fully separate generation. Empty until the first fold indexes something.
+    /// The live segments, newest-first within a level. Empty until the first flush indexes
+    /// something. Queries read across all of them.
     #[serde(default)]
-    pub indexes: BTreeMap<u8, FactTypeIndex>,
+    pub segments: Vec<Segment>,
+    /// Segments dropped by the last swap (superseded by a flush/compaction), kept alive for the
+    /// GC grace period so in-flight readers holding the previous manifest still see their files.
+    #[serde(default)]
+    pub prev_segments: Vec<Segment>,
 }
 
 impl Manifest {
@@ -158,38 +186,51 @@ impl Manifest {
     pub fn empty(tokenizer_config_hash: impl Into<String>) -> Self {
         Self {
             format_version: FORMAT_VERSION,
-            generation: 0,
+            version: 0,
             wal_index_cursor: 0,
             wal_head: 0,
             tokenizer_config_hash: tokenizer_config_hash.into(),
-            prev_generation: None,
             prev_wal_index_cursor: 0,
-            indexes: BTreeMap::new(),
+            segments: Vec::new(),
+            prev_segments: Vec::new(),
         }
     }
 
-    /// This fact type's index, or `None` if the bank has never indexed that type.
+    /// The newest segment's index for a fact type. **Phase-1 convenience** while there is a single
+    /// segment; a multi-segment query must fan out across [`Manifest::segments`] and merge, not use
+    /// this. Returns `None` if no segment has that type.
     pub fn index(&self, memory_type: u8) -> Option<&FactTypeIndex> {
-        self.indexes.get(&memory_type)
+        self.segments.iter().find_map(|s| s.index(memory_type))
     }
 
-    /// The fact types this bank currently has an index for.
+    /// The fact types any live segment has an index for (deduplicated, ascending).
     pub fn memory_types(&self) -> impl Iterator<Item = u8> + '_ {
-        self.indexes.keys().copied()
+        let set: std::collections::BTreeSet<u8> =
+            self.segments.iter().flat_map(|s| s.memory_types()).collect();
+        set.into_iter()
     }
 
     /// True when nothing has been indexed yet, so all reads come from the WAL tail.
     pub fn is_empty(&self) -> bool {
-        self.indexes.is_empty()
+        self.segments.iter().all(|s| s.indexes.is_empty())
     }
 
-    /// Every object path any fact type's current or previous generation references. GC
-    /// keeps exactly these and reclaims the rest.
+    /// Total live doc count summed across segments (upper bound — cross-segment shadowing is
+    /// resolved at query time, not counted here).
+    pub fn doc_count(&self) -> u64 {
+        self.segments.iter().map(|s| s.doc_count).sum()
+    }
+
+    /// Every object path any live or grace-window segment references. GC keeps exactly these and
+    /// reclaims the rest.
     pub fn all_referenced_paths(&self) -> impl Iterator<Item = &str> {
-        self.indexes.values().flat_map(|idx| idx.all_paths())
+        self.segments
+            .iter()
+            .chain(self.prev_segments.iter())
+            .flat_map(|s| s.all_paths())
     }
 
-    /// Number of WAL entries not yet folded into a generation.
+    /// Number of WAL entries not yet folded into a segment.
     pub fn index_lag(&self) -> u64 {
         self.wal_head.saturating_sub(self.wal_index_cursor)
     }
@@ -230,9 +271,10 @@ pub fn wal_path(namespace: &str, seq: u64) -> String {
     format!("{namespace}/wal/{seq:08}.bin")
 }
 
-/// Prefix under which a generation's files live.
-pub fn generation_prefix(namespace: &str, generation: u64) -> String {
-    format!("{namespace}/gen-{generation}")
+/// Prefix under which one segment's files live. `seg_id` is a content nonce, so the prefix is
+/// unique and immutable — safe to GC by identity once the manifest no longer references it.
+pub fn segment_prefix(namespace: &str, seg_id: &str) -> String {
+    format!("{namespace}/seg-{seg_id}")
 }
 
 #[cfg(test)]

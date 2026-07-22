@@ -324,7 +324,9 @@ pub async fn index_streaming_with_budget(
 ) -> Result<IndexOutcome> {
     let (manifest, etag) = ns.read_manifest().await?;
     let head = ns.wal_head().await?;
-    let generation = manifest.generation + 1;
+    let version = manifest.version + 1;
+    // Phase 1: read the single previous segment. Phase 2+ compaction reads across input segments.
+    let prev_seg = manifest.segments.first();
 
     // ---- Phase 1: resolve live items with bounded RAM ----
     //
@@ -343,7 +345,7 @@ pub async fn index_streaming_with_budget(
 
     // Previous generation: one event per live item, streamed cluster-by-cluster (one resident).
     for ft in manifest.memory_types() {
-        let fti = manifest.index(ft).unwrap();
+        let Some(fti) = prev_seg.and_then(|s| s.index(ft)) else { continue };
         for path in &fti.files.clusters {
             if path.is_empty() {
                 continue;
@@ -400,8 +402,8 @@ pub async fn index_streaming_with_budget(
     }
     phase_log("resolve", tr);
 
-    // ---- Phase 2: build each memory_type's generation from its spill ----
-    let nonce = mlake_core::MemoryId::new_v4().as_uuid().simple().to_string();
+    // ---- Phase 2: build each memory_type's index from its spill ----
+    let seg_id = mlake_core::MemoryId::new_v4().as_uuid().simple().to_string();
     let mut indexes: BTreeMap<u8, mlake_core::manifest::FactTypeIndex> = BTreeMap::new();
     let mut doc_count = 0usize;
 
@@ -412,21 +414,29 @@ pub async fn index_streaming_with_budget(
         let n = spill.len();
         doc_count += n;
         let fti = build_type_streaming(
-            ns, generation, &nonce, ft, spill, sample, n, tokenizer, opts.seed, opts.vector_codec, budget,
+            ns, &seg_id, ft, spill, sample, n, tokenizer, opts.seed, opts.vector_codec, budget,
         )
         .await?;
         indexes.insert(ft, fti);
     }
 
-    // ---- Publish (same CAS swap as the in-RAM fold) ----
+    // ---- Publish: one full segment (same CAS swap as the in-RAM fold) ----
+    let segment = mlake_core::Segment {
+        id: seg_id,
+        level: 0,
+        seq_lo: 0,
+        seq_hi: head,
+        doc_count: doc_count as u64,
+        indexes,
+    };
     let mut next = manifest.clone();
-    next.generation = generation;
+    next.version = version;
     next.wal_index_cursor = head;
     next.wal_head = head;
     next.prev_wal_index_cursor = manifest.wal_index_cursor;
-    next.prev_generation = Some(manifest.generation);
     next.tokenizer_config_hash = tokenizer.config_hash();
-    next.indexes = indexes;
+    next.prev_segments = manifest.segments.clone();
+    next.segments = vec![segment];
 
     let published = match etag {
         Some(etag) => ns.swap_manifest(&etag, &next).await.map(|_| true).or_else(|e| {
@@ -439,14 +449,13 @@ pub async fn index_streaming_with_budget(
         None => false,
     };
 
-    Ok(IndexOutcome { generation, doc_count, published })
+    Ok(IndexOutcome { generation: version, doc_count, published })
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn build_type_streaming(
     ns: &Namespace,
-    generation: u64,
-    nonce: &str,
+    seg_id: &str,
     memory_type: u8,
     spill: ItemSpill,
     sample: Vec<Vec<f32>>,
@@ -456,7 +465,7 @@ async fn build_type_streaming(
     codec: VectorCodec,
     budget: FoldBudget,
 ) -> Result<mlake_core::manifest::FactTypeIndex> {
-    let prefix = format!("{}/mt{memory_type}/gen-{generation}-{nonce}", ns.name);
+    let prefix = format!("{}/mt{memory_type}", mlake_core::manifest::segment_prefix(&ns.name, seg_id));
     let ttr = std::time::Instant::now();
     let k = mlake_ivf::centroid_count(n);
     // The dimension the vector blocks encode against; 0 for a type with no embeddings.
@@ -643,7 +652,7 @@ async fn build_type_streaming(
     .await?;
     phase_log("write_gen", twg);
 
-    Ok(mlake_core::manifest::FactTypeIndex { prev_files: None, train_count: n as u64, files })
+    Ok(mlake_core::manifest::FactTypeIndex { train_count: n as u64, files })
 }
 
 /// Write one cluster's pair: the payload file and its vector block, in the same member
