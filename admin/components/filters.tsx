@@ -56,7 +56,7 @@ export function useKnownTypes(namespace: string): number[] | null {
     void (async () => {
       try {
         const s = await getJson<StatsJson>(
-          `/api/namespaces/${encodeURIComponent(namespace)}/stats?consistency=EVENTUAL`,
+          `/api/namespaces/${encodeURIComponent(namespace)}/stats`,
           ac.signal,
         );
         setTypes(s.types.map((t) => t.memoryType));

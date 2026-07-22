@@ -15,7 +15,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use tonic::{Request, Response, Status};
 
 use crate::pb::memlake_server::Memlake;
-use crate::{convert, pb};
+use crate::{convert, objects, pb};
 
 /// Bounded number of inline fold attempts a `wait_for_index` write makes before giving up.
 /// One fold folds the whole tail up to the current head, so a single pass normally covers the
@@ -628,7 +628,130 @@ impl Memlake for MemlakeService {
             total_entries: total_entries as u64,
         }))
     }
+
+    async fn list_objects(
+        &self,
+        req: Request<pb::ListObjectsRequest>,
+    ) -> Result<Response<pb::ListObjectsResponse>, Status> {
+        let req = req.into_inner();
+        if req.namespace.is_empty() {
+            return Err(Status::invalid_argument("namespace is required"));
+        }
+        let limit = match req.limit {
+            0 => DEFAULT_OBJECT_LIMIT,
+            n => (n as usize).min(MAX_OBJECT_LIMIT),
+        };
+        let ns = self.namespace(&req.namespace);
+        let (manifest, _etag) = ns.read_manifest().await.map_err(internal)?;
+        let live = objects::live_paths(&req.namespace, &manifest);
+
+        // One LIST answers the whole namespace, sizes included.
+        let listed = self
+            .store
+            .list_with_size(&format!("{}/", req.namespace))
+            .await
+            .map_err(internal)?;
+
+        // Totals span the namespace, not the page — a page's bytes would say nothing about
+        // how much storage the namespace actually occupies.
+        let mut total_bytes = 0u64;
+        let mut live_bytes = 0u64;
+        let mut all: Vec<(objects::Classified, bool)> = Vec::with_capacity(listed.len());
+        for (path, size) in listed {
+            let c = objects::classify(&req.namespace, &path, size);
+            // A WAL entry is live while the indexer has not folded it past the watermark a
+            // reader could still be scanning from; generation files are live iff the
+            // current manifest references them.
+            let is_live = match c.seq {
+                Some(seq) => seq > manifest.prev_wal_index_cursor,
+                None => live.contains(&c.path),
+            };
+            total_bytes += size;
+            if is_live {
+                live_bytes += size;
+            }
+            all.push((c, is_live));
+        }
+        let total_objects = all.len() as u64;
+
+        // Newest generation first, then by kind, so the current generation's files read as
+        // a group above the superseded ones.
+        all.sort_by(|a, b| {
+            b.0.generation
+                .cmp(&a.0.generation)
+                .then((a.0.kind as i32).cmp(&(b.0.kind as i32)))
+                .then(a.0.path.cmp(&b.0.path))
+        });
+
+        let start: usize = if req.page_token.is_empty() {
+            0
+        } else {
+            req.page_token
+                .parse()
+                .map_err(|_| Status::invalid_argument("malformed page_token"))?
+        };
+        let page: Vec<pb::ObjectInfo> = all
+            .iter()
+            .skip(start)
+            .take(limit)
+            .map(|(c, is_live)| convert::object_info(c, *is_live))
+            .collect();
+        let next = start + page.len();
+
+        Ok(Response::new(pb::ListObjectsResponse {
+            objects: page,
+            total_objects,
+            total_bytes,
+            live_bytes,
+            generation: manifest.generation,
+            next_page_token: if (next as u64) < total_objects {
+                next.to_string()
+            } else {
+                String::new()
+            },
+        }))
+    }
+
+    async fn decode_object(
+        &self,
+        req: Request<pb::DecodeObjectRequest>,
+    ) -> Result<Response<pb::DecodeObjectResponse>, Status> {
+        let req = req.into_inner();
+        if req.namespace.is_empty() || req.path.is_empty() {
+            return Err(Status::invalid_argument("namespace and path are required"));
+        }
+        // Confine reads to the namespace's own prefix: `path` comes from a client, and an
+        // inspection tool must not become a way to read arbitrary bucket keys.
+        if !req.path.starts_with(&format!("{}/", req.namespace)) {
+            return Err(Status::invalid_argument(
+                "path must be inside the namespace's prefix",
+            ));
+        }
+        let limit = match req.limit {
+            0 => DEFAULT_DECODE_ITEMS,
+            n => (n as usize).min(MAX_DECODE_ITEMS),
+        };
+
+        let classified = objects::classify(&req.namespace, &req.path, 0);
+        let decoded = objects::decode(&self.store, classified.kind, &req.path, limit).await?;
+        let size_bytes = self.store.head(&req.path).await.unwrap_or(0);
+
+        Ok(Response::new(pb::DecodeObjectResponse {
+            kind: classified.kind as i32,
+            json: serde_json::to_string_pretty(&decoded.json).map_err(internal)?,
+            size_bytes,
+            total_items: decoded.total_items,
+            truncated: decoded.truncated,
+            undecodable_reason: decoded.undecodable_reason,
+        }))
+    }
 }
+
+/// Object-listing page sizes, and the ceiling on items pulled out of one decoded container.
+const DEFAULT_OBJECT_LIMIT: usize = 200;
+const MAX_OBJECT_LIMIT: usize = 2000;
+const DEFAULT_DECODE_ITEMS: usize = 50;
+const MAX_DECODE_ITEMS: usize = 1000;
 
 /// Cache listing sizes. A warm node holds thousands of blocks; this is an inspection call.
 const DEFAULT_CACHE_LIMIT: usize = 100;

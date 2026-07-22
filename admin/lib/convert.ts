@@ -18,13 +18,18 @@ import type {
   CausalEdgeJson,
   ClusterJson,
   ClusterMemberJson,
+  DecodeObjectJson,
   HitJson,
   IndexLayoutJson,
   LinkType,
+  ListObjectsJson,
   ListWalJson,
   MemoryPayloadJson,
+  ObjectInfoJson,
   ObjectKind,
+  ObjectKindSummaryJson,
   StatsJson,
+  StorageObjectKind,
   StoredMemoryJson,
   TimestampsJson,
   TypeStatsJson,
@@ -32,12 +37,15 @@ import type {
   WalEntryJson,
   WalOpJson,
 } from "./types";
-import { LINK_TYPES } from "./types";
+import { LINK_TYPES, STORAGE_OBJECT_KINDS } from "./types";
 import type {
   CacheStatsResponse,
+  DecodeObjectResponse,
   IndexLayoutResponse,
+  ListObjectsResponse,
   ListWalResponse,
   StatsResponse,
+  WireObjectInfo,
   WireArmScore,
   WireCacheEntry,
   WireCausalEdge,
@@ -472,6 +480,151 @@ function cmpU64Desc(a: string, b: string): number {
   } catch {
     return 0;
   }
+}
+
+// ---- Object storage (the physical view) -------------------------------------
+
+/**
+ * The server classifies each key itself, so unlike the cache page nothing is
+ * inferred here. An enum member this build has no name for still round-trips as
+ * a string; it is mapped to UNKNOWN so the UI never renders a bare integer.
+ */
+function storageKind(v: string | number | null | undefined): StorageObjectKind {
+  if (typeof v === "string" && (STORAGE_OBJECT_KINDS as readonly string[]).includes(v)) {
+    return v as StorageObjectKind;
+  }
+  return "OBJECT_KIND_UNKNOWN";
+}
+
+export function objectInfoToJson(o: WireObjectInfo): ObjectInfoJson {
+  return {
+    path: o.path ?? "",
+    sizeBytes: u64(o.sizeBytes),
+    kind: storageKind(o.kind),
+    generation: u64(o.generation),
+    // memory_type 0 is a legitimate type, so the flag — not the value — decides
+    // whether the key carried one at all.
+    memoryType: o.hasMemoryType ? (o.memoryType ?? 0) : null,
+    seq: u64(o.seq),
+    live: Boolean(o.live),
+  };
+}
+
+export function listObjectsToJson(
+  r: ListObjectsResponse,
+  elapsedMs: number,
+): ListObjectsJson {
+  const objects = (r.objects ?? []).map(objectInfoToJson);
+  const totalObjects = u64(r.totalObjects);
+  const totalBytes = u64(r.totalBytes);
+  const liveBytes = u64(r.liveBytes);
+  const deadBytes = diffU64(totalBytes, liveBytes);
+
+  let deadShare: number | null = null;
+  try {
+    const t = BigInt(totalBytes);
+    // An empty namespace is "no answer", not 0% dead.
+    if (t > 0n) deadShare = Number((BigInt(deadBytes) * 1000000n) / t) / 1000000;
+  } catch {
+    /* leave null: better nothing than a wrong share */
+  }
+
+  // Grouped over THIS PAGE only. The response's totals are namespace-wide, but
+  // per-kind bytes are not reported, so the summary can only describe what was
+  // listed — and the view says so whenever the listing is partial.
+  let pageBytes = 0n;
+  const kinds = new Map<
+    StorageObjectKind,
+    { count: number; bytes: bigint; deadCount: number; deadBytes: bigint }
+  >();
+  for (const o of objects) {
+    const cur =
+      kinds.get(o.kind) ?? { count: 0, bytes: 0n, deadCount: 0, deadBytes: 0n };
+    cur.count += 1;
+    if (!o.live) cur.deadCount += 1;
+    try {
+      const b = BigInt(o.sizeBytes);
+      cur.bytes += b;
+      if (!o.live) cur.deadBytes += b;
+      pageBytes += b;
+    } catch {
+      /* skip a malformed size rather than losing the whole group */
+    }
+    kinds.set(o.kind, cur);
+  }
+
+  // Biggest first: "what is actually consuming this namespace's storage" is the
+  // question the summary answers.
+  const byKind: ObjectKindSummaryJson[] = [...kinds.entries()]
+    .map(([kind, v]) => ({
+      kind,
+      count: v.count,
+      bytes: v.bytes.toString(),
+      deadCount: v.deadCount,
+      deadBytes: v.deadBytes.toString(),
+    }))
+    .sort((a, b) => cmpU64Desc(a.bytes, b.bytes) || a.kind.localeCompare(b.kind));
+
+  const nextPageToken = r.nextPageToken ?? "";
+  let complete = false;
+  try {
+    complete = !nextPageToken && BigInt(totalObjects) <= BigInt(objects.length);
+  } catch {
+    complete = false;
+  }
+
+  return {
+    objects,
+    totalObjects,
+    totalBytes,
+    liveBytes,
+    deadBytes,
+    deadShare,
+    generation: u64(r.generation),
+    nextPageToken,
+    pageBytes: pageBytes.toString(),
+    byKind,
+    complete,
+    elapsedMs,
+  };
+}
+
+/**
+ * `DecodeObjectResponse.json` is a debugging view whose shape follows the
+ * on-disk formats — deliberately not a contract. It is re-indented here purely
+ * so the panel can show it, and passed through verbatim when it does not parse.
+ * Nothing reads a field out of it.
+ */
+export function decodeObjectToJson(
+  r: DecodeObjectResponse,
+  path: string,
+  limit: number,
+  elapsedMs: number,
+): DecodeObjectJson {
+  const raw = r.json ?? "";
+  let json = raw;
+  let jsonPretty = false;
+  if (raw.trim()) {
+    try {
+      json = JSON.stringify(JSON.parse(raw), null, 2);
+      jsonPretty = true;
+    } catch {
+      json = raw;
+    }
+  }
+  const reason = (r.undecodableReason ?? "").trim();
+  return {
+    path,
+    kind: storageKind(r.kind),
+    json,
+    jsonPretty,
+    sizeBytes: u64(r.sizeBytes),
+    totalItems: u64(r.totalItems),
+    truncated: Boolean(r.truncated),
+    undecodableReason: reason ? reason : null,
+    limit,
+    elapsedMs,
+  };
 }
 
 export function statsToJson(s: StatsResponse, elapsedMs: number): StatsJson {

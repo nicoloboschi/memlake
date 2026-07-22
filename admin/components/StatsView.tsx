@@ -12,7 +12,6 @@ import {
   KeyValue,
   Loading,
   Panel,
-  SegmentedControl,
   StatTile,
   Td,
   TableShell,
@@ -47,7 +46,7 @@ export function StatsView({ namespace }: { namespace: string }) {
 
   useEffect(() => {
     const ac = new AbortController();
-    // Fetch on mount / on consistency change: synchronising with the server is
+    // Fetch on mount: synchronising with the server is
     // exactly what this effect is for; the setState is the loading flag.
     // eslint-disable-next-line react-hooks/set-state-in-effect
     void load(ac.signal);
@@ -91,7 +90,7 @@ export function StatsView({ namespace }: { namespace: string }) {
                 label="un-indexed backlog"
                 value={groupDigits(data.backlog)}
                 tone={backlogTone}
-                hint="wal_head − wal_index_cursor: what a STRONG query pays to scan"
+                hint="wal_head − wal_index_cursor: what every query pays to scan"
               />
               <StatTile
                 label="generation"

@@ -94,6 +94,16 @@ class MemlakeStub:
                 request_serializer=memlake_dot_v1_dot_memlake__pb2.CacheStatsRequest.SerializeToString,
                 response_deserializer=memlake_dot_v1_dot_memlake__pb2.CacheStatsResponse.FromString,
                 _registered_method=True)
+        self.ListObjects = channel.unary_unary(
+                '/memlake.v1.Memlake/ListObjects',
+                request_serializer=memlake_dot_v1_dot_memlake__pb2.ListObjectsRequest.SerializeToString,
+                response_deserializer=memlake_dot_v1_dot_memlake__pb2.ListObjectsResponse.FromString,
+                _registered_method=True)
+        self.DecodeObject = channel.unary_unary(
+                '/memlake.v1.Memlake/DecodeObject',
+                request_serializer=memlake_dot_v1_dot_memlake__pb2.DecodeObjectRequest.SerializeToString,
+                response_deserializer=memlake_dot_v1_dot_memlake__pb2.DecodeObjectResponse.FromString,
+                _registered_method=True)
 
 
 class MemlakeServicer:
@@ -224,6 +234,24 @@ class MemlakeServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def ListObjects(self, request, context):
+        """Every object a namespace owns in object storage, classified by kind, with whether the
+        current manifest still references it. This is the physical view — what is actually on
+        S3 — as opposed to `Stats`, which is the logical one.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def DecodeObject(self, request, context):
+        """Decode one stored object into readable JSON. A debugging and teaching tool: it exists
+        so an operator can see what is really inside a cluster file or a WAL entry, not as a
+        data access path — reading memories is `Get`/`Scan`/`Query`.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_MemlakeServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -286,6 +314,16 @@ def add_MemlakeServicer_to_server(servicer, server):
                     servicer.CacheStats,
                     request_deserializer=memlake_dot_v1_dot_memlake__pb2.CacheStatsRequest.FromString,
                     response_serializer=memlake_dot_v1_dot_memlake__pb2.CacheStatsResponse.SerializeToString,
+            ),
+            'ListObjects': grpc.unary_unary_rpc_method_handler(
+                    servicer.ListObjects,
+                    request_deserializer=memlake_dot_v1_dot_memlake__pb2.ListObjectsRequest.FromString,
+                    response_serializer=memlake_dot_v1_dot_memlake__pb2.ListObjectsResponse.SerializeToString,
+            ),
+            'DecodeObject': grpc.unary_unary_rpc_method_handler(
+                    servicer.DecodeObject,
+                    request_deserializer=memlake_dot_v1_dot_memlake__pb2.DecodeObjectRequest.FromString,
+                    response_serializer=memlake_dot_v1_dot_memlake__pb2.DecodeObjectResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -612,6 +650,60 @@ class Memlake:
             '/memlake.v1.Memlake/CacheStats',
             memlake_dot_v1_dot_memlake__pb2.CacheStatsRequest.SerializeToString,
             memlake_dot_v1_dot_memlake__pb2.CacheStatsResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ListObjects(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/memlake.v1.Memlake/ListObjects',
+            memlake_dot_v1_dot_memlake__pb2.ListObjectsRequest.SerializeToString,
+            memlake_dot_v1_dot_memlake__pb2.ListObjectsResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def DecodeObject(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/memlake.v1.Memlake/DecodeObject',
+            memlake_dot_v1_dot_memlake__pb2.DecodeObjectRequest.SerializeToString,
+            memlake_dot_v1_dot_memlake__pb2.DecodeObjectResponse.FromString,
             options,
             channel_credentials,
             insecure,

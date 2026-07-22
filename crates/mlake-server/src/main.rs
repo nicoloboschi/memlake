@@ -8,6 +8,7 @@
 //! the environment and touch the same bucket.
 
 mod convert;
+mod objects;
 mod pb;
 mod service;
 

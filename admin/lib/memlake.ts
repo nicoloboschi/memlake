@@ -15,7 +15,7 @@ import path from "node:path";
 import * as grpc from "@grpc/grpc-js";
 import * as protoLoader from "@grpc/proto-loader";
 
-import type { Consistency, TagFilterInput, TagsMatch } from "./types";
+import type { TagFilterInput, TagsMatch } from "./types";
 
 export const DEFAULT_ADDR = "localhost:50051";
 export const DEFAULT_PROTO_PATH = "../proto/memlake/v1/memlake.proto";
@@ -113,7 +113,6 @@ export interface ListNamespacesResponse {
 
 export interface StatsRequest {
   namespace: string;
-  consistency: Consistency;
 }
 export interface StatsResponse {
   namespace: string;
@@ -134,7 +133,6 @@ export interface GetRequest {
   namespace: string;
   ids: Uint8Array[];
   includeVector: boolean;
-  consistency: Consistency;
 }
 export interface GetResponse {
   memories: WireStoredMemoryRecord[];
@@ -147,7 +145,6 @@ export interface ScanRequest {
   pageToken: string;
   includeVector: boolean;
   tags?: WireTagFilter;
-  consistency: Consistency;
 }
 export interface ScanResponse {
   memories: WireStoredMemoryRecord[];
@@ -164,7 +161,6 @@ export interface QueryRequest {
   textTopK: number;
   graphTopK: number;
   nprobe: number;
-  consistency: Consistency;
   // proto3 `optional int64`: leave both undefined to skip the temporal arm.
   // With `longs: String` these go over the wire as decimal strings.
   temporalFrom?: string;
@@ -255,7 +251,6 @@ export interface IndexLayoutRequest {
   namespace: string;
   memoryType: number;
   memberSample: number;
-  consistency: Consistency;
 }
 
 export interface IndexLayoutResponse {
@@ -297,6 +292,55 @@ export interface CacheStatsResponse {
   misses: string;
   entries: WireCacheEntry[];
   totalEntries: string;
+}
+
+// ---- Object storage browser -------------------------------------------------
+
+export interface WireObjectInfo {
+  path: string;
+  sizeBytes: string;
+  /** `enums: String` — the enum member name, e.g. "CLUSTER". */
+  kind: string;
+  /** 0 when the key carries no generation (manifest, WAL entries). */
+  generation: string;
+  memoryType: number;
+  /** memory_type is a real 0, so the flag is the only way to say "absent". */
+  hasMemoryType: boolean;
+  seq: string;
+  /** False = no longer referenced by the current manifest, i.e. GC fodder. */
+  live: boolean;
+}
+
+export interface ListObjectsRequest {
+  namespace: string;
+  limit: number;
+  pageToken: string;
+}
+
+export interface ListObjectsResponse {
+  objects: WireObjectInfo[];
+  totalObjects: string;
+  totalBytes: string;
+  liveBytes: string;
+  generation: string;
+  nextPageToken: string;
+}
+
+export interface DecodeObjectRequest {
+  namespace: string;
+  path: string;
+  limit: number;
+}
+
+export interface DecodeObjectResponse {
+  kind: string;
+  /** A debugging view of the object, NOT a stable contract. Never parsed for meaning. */
+  json: string;
+  sizeBytes: string;
+  totalItems: string;
+  truncated: boolean;
+  /** Non-empty when the format is opaque to memlake (the tantivy split). */
+  undecodableReason: string;
 }
 
 // ---- errors -----------------------------------------------------------------
@@ -396,6 +440,8 @@ type MemlakeStub = grpc.Client & {
   ListWal: UnaryCall<ListWalRequest, ListWalResponse>;
   IndexLayout: UnaryCall<IndexLayoutRequest, IndexLayoutResponse>;
   CacheStats: UnaryCall<CacheStatsRequest, CacheStatsResponse>;
+  ListObjects: UnaryCall<ListObjectsRequest, ListObjectsResponse>;
+  DecodeObject: UnaryCall<DecodeObjectRequest, DecodeObjectResponse>;
 };
 
 interface MemlakeGlobal {
@@ -551,6 +597,20 @@ export const memlake = {
   cacheStats(req: CacheStatsRequest, deadlineMs?: number) {
     return unary<CacheStatsRequest, CacheStatsResponse>(
       "CacheStats",
+      req,
+      deadlineMs,
+    );
+  },
+  listObjects(req: ListObjectsRequest, deadlineMs?: number) {
+    return unary<ListObjectsRequest, ListObjectsResponse>(
+      "ListObjects",
+      req,
+      deadlineMs,
+    );
+  },
+  decodeObject(req: DecodeObjectRequest, deadlineMs?: number) {
+    return unary<DecodeObjectRequest, DecodeObjectResponse>(
+      "DecodeObject",
       req,
       deadlineMs,
     );

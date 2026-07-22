@@ -17,10 +17,8 @@ import {
   ARMS,
   ARM_HELP,
   ARM_SCORE_KIND,
-  CONSISTENCIES,
   type Arm,
   type ArmScoreJson,
-  type Consistency,
   type EmbedStatusJson,
   type HitJson,
   type QueryJson,
@@ -53,8 +51,6 @@ import {
 } from "@/components/filters";
 import { MemoryDetail } from "@/components/MemoryDetail";
 
-const CONSISTENCY_OPTIONS = CONSISTENCIES.map((c) => ({ value: c, label: c }));
-
 const VECTOR_MODES = [
   { value: "embed" as const, label: "embed text", title: "embed the query text server-side with bge-small-en-v1.5" },
   { value: "raw" as const, label: "raw vector", title: "paste a JSON float array to send verbatim" },
@@ -80,7 +76,6 @@ export function QueryView({ namespace }: { namespace: string }) {
   const [textTopK, setTextTopK] = useState(50);
   const [graphTopK, setGraphTopK] = useState(50);
   const [nprobe, setNprobe] = useState(0);
-  const [consistency, setConsistency] = useState<Consistency>("STRONG");
   const [vectorMode, setVectorMode] = useState<"embed" | "raw" | "none">("embed");
   const [rawVector, setRawVector] = useState("");
   const [temporalFrom, setTemporalFrom] = useState("");
@@ -114,6 +109,7 @@ export function QueryView({ namespace }: { namespace: string }) {
     const ac = new AbortController();
     // Read the model's load state on mount so the query box can say whether the
     // first request will pay for a ~90MB download.
+     
     // eslint-disable-next-line react-hooks/set-state-in-effect
     void refreshEmbedStatus(ac.signal);
     return () => ac.abort();
@@ -169,7 +165,6 @@ export function QueryView({ namespace }: { namespace: string }) {
       textTopK,
       graphTopK,
       nprobe,
-      consistency,
       vectorMode,
       vector,
       temporalFrom: temporalFrom.trim() || null,
@@ -208,7 +203,6 @@ export function QueryView({ namespace }: { namespace: string }) {
     textTopK,
     graphTopK,
     nprobe,
-    consistency,
     vectorMode,
     rawVector,
     temporalFrom,
@@ -228,14 +222,6 @@ export function QueryView({ namespace }: { namespace: string }) {
         <Panel
           title="query"
           subtitle="One call runs all three arms over one shared snapshot. `vector` drives dense + graph; `text` drives full-text."
-          actions={
-            <SegmentedControl
-              value={consistency}
-              onChange={setConsistency}
-              options={CONSISTENCY_OPTIONS}
-              disabled={loading}
-            />
-          }
         >
           <Field
             label="text"

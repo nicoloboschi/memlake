@@ -83,6 +83,16 @@ service Memlake {
   // cluster-wide view. Nothing it reports affects correctness — a cold cache changes
   // latency only (INV-4).
   rpc CacheStats(CacheStatsRequest) returns (CacheStatsResponse);
+
+  // Every object a namespace owns in object storage, classified by kind, with whether the
+  // current manifest still references it. This is the physical view — what is actually on
+  // S3 — as opposed to `Stats`, which is the logical one.
+  rpc ListObjects(ListObjectsRequest) returns (ListObjectsResponse);
+
+  // Decode one stored object into readable JSON. A debugging and teaching tool: it exists
+  // so an operator can see what is really inside a cluster file or a WAL entry, not as a
+  // data access path — reading memories is `Get`/`Scan`/`Query`.
+  rpc DecodeObject(DecodeObjectRequest) returns (DecodeObjectResponse);
 }
 
 // ---- Value types -----------------------------------------------------------
@@ -570,4 +580,87 @@ message CacheStatsResponse {
   repeated CacheEntry entries = 10;
   // Entries the cache holds in total, before `limit` truncated the list.
   uint64 total_entries = 11;
+}
+
+// ---- Object storage browser ------------------------------------------------
+
+// What a stored object is, inferred from its key. The layout is
+// `{namespace}/manifest.json`, `{namespace}/wal/{seq}.bin`, and
+// `{namespace}/mt{type}/gen-{N}-{nonce}/{file}`.
+enum ObjectKind {
+  OBJECT_KIND_UNKNOWN = 0;
+  MANIFEST = 1;        // the one mutable object: the pointer defining the current generation
+  WAL_ENTRY = 2;       // one atomic group-commit batch
+  CLUSTER = 3;         // an IVF cluster's memories
+  CENTROIDS = 4;       // the trained centroid table
+  PK_INDEX = 5;        // sparse index over pk.data
+  PK_DATA = 6;         // id -> cluster, in SSTable blocks
+  RADJ_INDEX = 7;      // sparse index over radj.csr
+  RADJ_DATA = 8;       // reverse adjacency (incoming edges) blocks
+  ENTITY_INDEX = 9;
+  ENTITY_DATA = 10;    // EntityId -> [MemoryId] postings
+  TIME_INDEX = 11;
+  TIME_DATA = 12;      // effective timestamp -> [MemoryId]
+  FTS_SPLIT = 13;      // the tantivy split; opaque to memlake, not decodable here
+  STATS = 14;
+  TAG_SUMMARY = 15;    // per-cluster tag unions, for pruning before fetch
+  PAYLOAD_INDEX = 16;
+  PAYLOAD_DATA = 17;   // MemoryId -> memory bytes, so a hit hydrates without a cluster read
+}
+
+message ListObjectsRequest {
+  string namespace = 1;
+  uint32 limit = 2;              // 0 uses the server default
+  string page_token = 3;         // opaque; empty starts at the beginning
+}
+
+message ObjectInfo {
+  string path = 1;
+  uint64 size_bytes = 2;
+  ObjectKind kind = 3;
+  // Parsed out of the key where the layout carries them, else 0. `generation` is absent
+  // for the manifest and WAL entries; `memory_type` only appears under `mt{n}/`.
+  uint64 generation = 4;
+  uint32 memory_type = 5;
+  bool has_memory_type = 6;
+  // WAL entries only: the claimed sequence.
+  uint64 seq = 7;
+  // Whether the CURRENT manifest still references this object. False means it is garbage
+  // awaiting GC — a superseded generation, or a WAL entry already folded. Immutability
+  // means nothing is ever rewritten, so dead objects accumulate until GC reclaims them.
+  bool live = 8;
+}
+
+message ListObjectsResponse {
+  repeated ObjectInfo objects = 1;
+  uint64 total_objects = 2;      // across the whole namespace, before paging
+  uint64 total_bytes = 3;
+  uint64 live_bytes = 4;         // bytes the current manifest still references
+  uint64 generation = 5;         // the manifest's current generation, for context
+  string next_page_token = 6;    // empty when exhausted
+}
+
+message DecodeObjectRequest {
+  string namespace = 1;
+  string path = 2;               // as returned by ListObjects
+  // Max items to decode out of a container (cluster memories, WAL ops, SSTable records).
+  // 0 uses the server default. One cluster file can hold thousands of memories.
+  uint32 limit = 3;
+}
+
+message DecodeObjectResponse {
+  ObjectKind kind = 1;
+  // The decoded object rendered as JSON. Shape depends on `kind` and is deliberately NOT a
+  // stable contract — it is a human-readable debugging view, and it changes when the
+  // on-disk formats change. Do not parse it programmatically.
+  string json = 2;
+  uint64 size_bytes = 3;
+  // Items the object holds in total, and whether `json` shows all of them.
+  uint64 total_items = 4;
+  bool truncated = 5;
+  // Set when the object has no standalone decoding, with the reason: the FTS split is an
+  // opaque tantivy blob, and an SSTable's `.data` half is addressed by byte range through
+  // its sibling `.idx` rather than read sequentially. `json` then carries only metadata.
+  // This is an explanation, not an error — the object is intact and being read normally.
+  string undecodable_reason = 6;
 }

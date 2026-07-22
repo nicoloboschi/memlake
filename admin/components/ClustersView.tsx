@@ -5,8 +5,6 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { isAbort, postJson } from "@/lib/client";
 import { cmpU64, fmtMs, groupDigits, sharePct } from "@/lib/format";
 import {
-  CONSISTENCIES,
-  type Consistency,
   type IndexLayoutJson,
   type IndexLayoutRequestBody,
 } from "@/lib/types";
@@ -18,7 +16,6 @@ import {
   Loading,
   NumberInput,
   Panel,
-  SegmentedControl,
   StatTile,
   Tag,
   Td,
@@ -28,8 +25,6 @@ import {
 import { ClusterScatter } from "@/components/ClusterScatter";
 import { useKnownTypes } from "@/components/filters";
 
-const CONSISTENCY_OPTIONS = CONSISTENCIES.map((c) => ({ value: c, label: c }));
-
 type SortKey = "clusterId" | "size" | "tags" | "hasUntagged";
 type SortDir = "asc" | "desc";
 
@@ -38,7 +33,6 @@ export function ClustersView({ namespace }: { namespace: string }) {
 
   const [memoryType, setMemoryType] = useState(0);
   const [memberSample, setMemberSample] = useState(0);
-  const [consistency, setConsistency] = useState<Consistency>("EVENTUAL");
 
   const [data, setData] = useState<IndexLayoutJson | null>(null);
   const [error, setError] = useState<unknown>(null);
@@ -53,7 +47,7 @@ export function ClustersView({ namespace }: { namespace: string }) {
   const abortRef = useRef<AbortController | null>(null);
 
   const run = useCallback(
-    async (type: number, sample: number, cons: Consistency) => {
+    async (type: number, sample: number) => {
       abortRef.current?.abort();
       const ac = new AbortController();
       abortRef.current = ac;
@@ -63,7 +57,6 @@ export function ClustersView({ namespace }: { namespace: string }) {
       const body: IndexLayoutRequestBody = {
         memoryType: type,
         memberSample: sample,
-        consistency: cons,
       };
       try {
         const res = await postJson<IndexLayoutJson>(
@@ -85,8 +78,9 @@ export function ClustersView({ namespace }: { namespace: string }) {
   );
 
   useEffect(() => {
+     
     // eslint-disable-next-line react-hooks/set-state-in-effect
-    void run(memoryType, memberSample, consistency);
+    void run(memoryType, memberSample);
     return () => abortRef.current?.abort();
     // Re-reads are explicit; a member sample is a real object-storage read.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -98,9 +92,10 @@ export function ClustersView({ namespace }: { namespace: string }) {
       const first = knownTypes[0];
       // Stats told us which types actually exist; adopt the first real one
       // rather than leaving the page asking for a type that isn't there.
+       
       // eslint-disable-next-line react-hooks/set-state-in-effect
       setMemoryType(first);
-      void run(first, memberSample, consistency);
+      void run(first, memberSample);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [knownTypes]);
@@ -149,17 +144,6 @@ export function ClustersView({ namespace }: { namespace: string }) {
       <Panel
         title="ivf layout"
         subtitle="How k-means partitioned ONE memory_type. Types are independent indexes, so this is one type at a time — there is no combined view to show."
-        actions={
-          <SegmentedControl
-            value={consistency}
-            onChange={(c) => {
-              setConsistency(c);
-              void run(memoryType, memberSample, c);
-            }}
-            options={CONSISTENCY_OPTIONS}
-            disabled={loading}
-          />
-        }
       >
         <div className="flex items-end gap-4 flex-wrap">
           <Field label="memory_type" className="w-32">
@@ -181,7 +165,7 @@ export function ClustersView({ namespace }: { namespace: string }) {
                   disabled={loading}
                   onClick={() => {
                     setMemoryType(t);
-                    void run(t, memberSample, consistency);
+                    void run(t, memberSample);
                   }}
                   className={`font-mono text-[10px] leading-4 px-1.5 py-px rounded-sm border ${
                     memoryType === t
@@ -214,7 +198,7 @@ export function ClustersView({ namespace }: { namespace: string }) {
             variant="primary"
             className="mb-1"
             disabled={loading}
-            onClick={() => void run(memoryType, memberSample, consistency)}
+            onClick={() => void run(memoryType, memberSample)}
           >
             {loading ? "loading…" : "IndexLayout"}
           </Button>
@@ -242,7 +226,7 @@ export function ClustersView({ namespace }: { namespace: string }) {
         <ErrorBanner
           error={error}
           what={`IndexLayout(${namespace}, type ${memoryType})`}
-          onRetry={() => void run(memoryType, memberSample, consistency)}
+          onRetry={() => void run(memoryType, memberSample)}
         />
       )}
 

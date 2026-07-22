@@ -295,7 +295,7 @@ export function Toggle({
   );
 }
 
-/** Segmented control — used for STRONG/EVENTUAL and for sort mode. */
+/** Segmented control — used for sort and view modes. */
 export function SegmentedControl<T extends string>({
   value,
   onChange,

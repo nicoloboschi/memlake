@@ -6,8 +6,6 @@ import { isAbort, postJson } from "@/lib/client";
 import { fmtMs, truncate } from "@/lib/format";
 import { shortId } from "@/lib/ids";
 import {
-  CONSISTENCIES,
-  type Consistency,
   type GetJson,
   type ScanJson,
   type ScanRequestBody,
@@ -22,7 +20,6 @@ import {
   Loading,
   NumberInput,
   Panel,
-  SegmentedControl,
   Tag,
   Td,
   TableShell,
@@ -38,8 +35,6 @@ import {
 } from "@/components/filters";
 import { MemoryDetail } from "@/components/MemoryDetail";
 
-const CONSISTENCY_OPTIONS = CONSISTENCIES.map((c) => ({ value: c, label: c }));
-
 export function BrowseView({ namespace }: { namespace: string }) {
   const knownTypes = useKnownTypes(namespace);
 
@@ -49,7 +44,6 @@ export function BrowseView({ namespace }: { namespace: string }) {
   const [tagsMode, setTagsMode] = useState<TagsMatch>("ANY");
   const [limit, setLimit] = useState(50);
   const [includeVector, setIncludeVector] = useState(false);
-  const [consistency, setConsistency] = useState<Consistency>("EVENTUAL");
 
   /**
    * The scan cursor is opaque and only valid against the generation that
@@ -85,7 +79,6 @@ export function BrowseView({ namespace }: { namespace: string }) {
         pageToken: tokens[tokens.length - 1] ?? "",
         includeVector,
         tags: buildTagFilter(tagsRaw, tagsMode),
-        consistency,
       };
       try {
         const res = await postJson<ScanJson>(
@@ -104,12 +97,13 @@ export function BrowseView({ namespace }: { namespace: string }) {
         if (abortRef.current === ac) setLoading(false);
       }
     },
-    [namespace, typesRaw, tagsRaw, tagsMode, limit, includeVector, consistency],
+    [namespace, typesRaw, tagsRaw, tagsMode, limit, includeVector],
   );
 
   // First page on mount. Filter changes require an explicit re-scan, since a
   // scan is a full walk and should not fire on every keystroke.
   useEffect(() => {
+     
     // eslint-disable-next-line react-hooks/set-state-in-effect
     void run([""]);
     return () => abortRef.current?.abort();
@@ -127,14 +121,6 @@ export function BrowseView({ namespace }: { namespace: string }) {
         <Panel
           title="scan filters"
           subtitle="Scan is a full walk in cluster order — its cost grows with the corpus. It exists for browsing and debugging; use Query to find things."
-          actions={
-            <SegmentedControl
-              value={consistency}
-              onChange={setConsistency}
-              options={CONSISTENCY_OPTIONS}
-              disabled={loading}
-            />
-          }
         >
           <div className="grid gap-3 md:grid-cols-2">
             <MemoryTypesField
@@ -330,7 +316,6 @@ export function BrowseView({ namespace }: { namespace: string }) {
           key={selected.id}
           namespace={namespace}
           record={selected}
-          consistency={consistency}
           onClose={() => setSelected(null)}
         />
       )}
@@ -346,12 +331,10 @@ export function BrowseView({ namespace }: { namespace: string }) {
 function MemoryDrawer({
   namespace,
   record,
-  consistency,
   onClose,
 }: {
   namespace: string;
   record: StoredMemoryJson;
-  consistency: Consistency;
   onClose: () => void;
 }) {
   // Remounted (via `key`) whenever a different row is selected, so this initial
@@ -366,7 +349,7 @@ function MemoryDrawer({
     try {
       const res = await postJson<GetJson>(
         `/api/namespaces/${encodeURIComponent(namespace)}/get`,
-        { ids: [record.id], includeVector: true, consistency },
+        { ids: [record.id], includeVector: true },
       );
       if (res.memories.length === 0) {
         setGetError(

@@ -329,6 +329,21 @@ pub fn cache_entry(rank: usize, e: mlake_store::CacheEntry) -> pb::CacheEntry {
     }
 }
 
+/// A stored object as a browser row. `live` is the interesting bit: everything except the
+/// manifest is immutable, so superseded generations linger as garbage until GC.
+pub fn object_info(c: &crate::objects::Classified, live: bool) -> pb::ObjectInfo {
+    pb::ObjectInfo {
+        path: c.path.clone(),
+        size_bytes: c.size_bytes,
+        kind: c.kind as i32,
+        generation: c.generation,
+        memory_type: c.memory_type.unwrap_or(0) as u32,
+        has_memory_type: c.memory_type.is_some(),
+        seq: c.seq.unwrap_or(0),
+        live,
+    }
+}
+
 pub fn cluster_member(cluster_id: u32, m: StoredMemory) -> pb::ClusterMember {
     pb::ClusterMember {
         id: m.id.0.to_vec(),

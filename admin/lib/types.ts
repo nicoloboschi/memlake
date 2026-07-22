@@ -270,7 +270,7 @@ export interface WalEntryJson {
   counts: WalOpCountsJson;
   /**
    * True once the indexer has folded this entry into a generation
-   * (seq <= wal_index_cursor). Un-folded entries are exactly what a STRONG
+   * (seq <= wal_index_cursor). Un-folded entries are exactly what every
    * query pays to scan on every read.
    */
   folded: boolean;
@@ -419,6 +419,126 @@ export interface CacheStatsJson {
 
 export interface CacheStatsRequestBody {
   namespace: string;
+  limit: number;
+}
+
+// ---- Object storage (the physical view) -------------------------------------
+
+/**
+ * Mirror of the proto's `ObjectKind`, as the string names proto-loader hands
+ * back (`enums: String`). Ordered for display: the two namespace-level objects
+ * first, then a generation's files roughly in the order a cold query touches
+ * them, unclassified last. The prose for each lives in `lib/objectKinds.ts`.
+ *
+ * NOTE this is a different thing from `ObjectKind` above: that one is a cache
+ * display convenience inferred from a path by the UI, this one is the server's
+ * own classification of a stored object.
+ */
+export const STORAGE_OBJECT_KINDS = [
+  "MANIFEST",
+  "WAL_ENTRY",
+  "CENTROIDS",
+  "CLUSTER",
+  "PK_INDEX",
+  "PK_DATA",
+  "PAYLOAD_INDEX",
+  "PAYLOAD_DATA",
+  "RADJ_INDEX",
+  "RADJ_DATA",
+  "ENTITY_INDEX",
+  "ENTITY_DATA",
+  "TIME_INDEX",
+  "TIME_DATA",
+  "FTS_SPLIT",
+  "TAG_SUMMARY",
+  "STATS",
+  "OBJECT_KIND_UNKNOWN",
+] as const;
+export type StorageObjectKind = (typeof STORAGE_OBJECT_KINDS)[number];
+
+export interface ObjectInfoJson {
+  path: string;
+  sizeBytes: string;
+  kind: StorageObjectKind;
+  /**
+   * Parsed out of the key. "0" means the key does not carry one at all — the
+   * manifest and WAL entries live above any generation — so render it as absent
+   * rather than as generation zero.
+   */
+  generation: string;
+  /** null when `has_memory_type` was false: only `mt{n}/` keys carry one. */
+  memoryType: number | null;
+  /** WAL entries only; "0" elsewhere. */
+  seq: string;
+  /**
+   * Whether the CURRENT manifest still references this object. False means
+   * garbage awaiting GC — a superseded generation, or a folded WAL entry. Since
+   * nothing is ever rewritten, dead objects accumulating between GC runs is
+   * normal, not an error.
+   */
+  live: boolean;
+}
+
+export interface ObjectKindSummaryJson {
+  kind: StorageObjectKind;
+  count: number;
+  bytes: string;
+  deadCount: number;
+  deadBytes: string;
+}
+
+export interface ListObjectsJson {
+  objects: ObjectInfoJson[];
+  /** Namespace-wide, before paging. */
+  totalObjects: string;
+  totalBytes: string;
+  liveBytes: string;
+  /** `total_bytes - live_bytes`, computed with BigInt and clamped at 0. */
+  deadBytes: string;
+  /** 0..1 share of bytes no longer referenced, or null when the namespace is empty. */
+  deadShare: number | null;
+  /** The manifest's current generation, for context. */
+  generation: string;
+  /** Opaque cursor; empty means the listing is exhausted. */
+  nextPageToken: string;
+  /** Sum of `size_bytes` over the objects ON THIS PAGE only. */
+  pageBytes: string;
+  /** Grouped over this page only — the summary says so when it is partial. */
+  byKind: ObjectKindSummaryJson[];
+  /** True when this single page holds every object the namespace owns. */
+  complete: boolean;
+  elapsedMs: number;
+}
+
+export interface ListObjectsRequestBody {
+  limit: number;
+  pageToken: string;
+}
+
+export interface DecodeObjectJson {
+  path: string;
+  kind: StorageObjectKind;
+  /**
+   * The server's human-readable rendering of the object, re-indented here when
+   * it parses as JSON. Its shape follows the on-disk formats and is explicitly
+   * NOT a stable contract — display it, never read semantics out of it.
+   */
+  json: string;
+  /** False when the payload did not parse as JSON and is shown verbatim. */
+  jsonPretty: boolean;
+  sizeBytes: string;
+  /** Items the object holds in total, against `truncated`. */
+  totalItems: string;
+  truncated: boolean;
+  /** Set when memlake does not parse this format (the tantivy FTS split). */
+  undecodableReason: string | null;
+  /** The item limit actually sent, so the UI can name it. */
+  limit: number;
+  elapsedMs: number;
+}
+
+export interface DecodeObjectRequestBody {
+  path: string;
   limit: number;
 }
 

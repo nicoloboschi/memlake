@@ -199,7 +199,7 @@ export function WalView({ namespace }: { namespace: string }) {
                 label="un-indexed backlog"
                 value={groupDigits(data.backlog)}
                 tone={backlog === 0n ? "ok" : backlog > 1000n ? "danger" : "warn"}
-                hint="entries every STRONG query scans on every read"
+                hint="entries every query scans on every read"
               />
               <StatTile
                 label="wal_head"
@@ -300,14 +300,14 @@ export function WalView({ namespace }: { namespace: string }) {
             {allFolded && (
               <BoundaryNote tone="folded">
                 every entry on this page is folded (seq ≤ wal_index_cursor{" "}
-                {groupDigits(data.walIndexCursor)}) — a STRONG query scans none
+                {groupDigits(data.walIndexCursor)}) — every query scans none
                 of them
               </BoundaryNote>
             )}
             {allUnfolded && (
               <BoundaryNote tone="unfolded">
                 every entry on this page is UN-folded (seq &gt; wal_index_cursor{" "}
-                {groupDigits(data.walIndexCursor)}) — a STRONG query scans all of
+                {groupDigits(data.walIndexCursor)}) — every query scans all of
                 them on every read
               </BoundaryNote>
             )}
@@ -422,7 +422,7 @@ function WalRow({
               </span>
               <span className="h-px flex-1 bg-warn/40" />
               <span className="font-mono text-[10px] text-warn">
-                below: un-folded — scanned by every STRONG query
+                below: un-folded — scanned by every query
               </span>
             </div>
           </td>
