@@ -8,12 +8,14 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use mlake_fts::Tokenizer;
-use mlake_index::{index, IndexOptions, QueryNode, ScanCursor};
+use mlake_index::streaming::FoldBudget;
+use mlake_index::{fold, IndexOptions, QueryNode, ScanCursor, DEFAULT_STREAMING_THRESHOLD_DOCS};
 use mlake_store::{QueryMetrics, Store};
 use mlake_wal::{Namespace, Writer};
 use tokio::sync::Mutex as AsyncMutex;
 use tonic::{Request, Response, Status};
 
+use crate::limiter::QueryLimiter;
 use crate::pb::memlake_server::Memlake;
 use crate::{convert, objects, pb};
 
@@ -32,6 +34,12 @@ struct Snapshot {
     through_seq: u64,
 }
 
+/// Default concurrent-retrieval cap when none is configured. Sized so `permits × per-query
+/// working set` stays comfortably inside a typical pod: at ≤10M a query reranks ~nprobe×√N
+/// memories (tens of MB), so 32 in flight is a few hundred MB — tune via `--max-concurrent-queries`
+/// / `MEMLAKE_MAX_CONCURRENT_QUERIES` to trade throughput for a tighter memory ceiling.
+pub const DEFAULT_MAX_CONCURRENT_QUERIES: usize = 32;
+
 pub struct MemlakeService {
     store: Store,
     tokenizer: Tokenizer,
@@ -41,6 +49,9 @@ pub struct MemlakeService {
     writers: Mutex<HashMap<String, Arc<AsyncMutex<Writer>>>>,
     /// Last opened snapshot per namespace, reused across queries when still current.
     snapshots: Mutex<HashMap<String, Arc<Snapshot>>>,
+    /// Admission control for the memory-heavy retrieval paths (`query`, `get`), so peak working
+    /// memory is bounded by the permit count instead of by request concurrency.
+    query_limiter: QueryLimiter,
 }
 
 impl MemlakeService {
@@ -50,7 +61,20 @@ impl MemlakeService {
             tokenizer,
             writers: Mutex::new(HashMap::new()),
             snapshots: Mutex::new(HashMap::new()),
+            query_limiter: QueryLimiter::new(DEFAULT_MAX_CONCURRENT_QUERIES),
         }
+    }
+
+    /// Set the cap on concurrently-executing retrieval requests — the knob that bounds the
+    /// server's peak query memory (`max × per-query working set`).
+    pub fn with_max_concurrent_queries(mut self, max: usize) -> Self {
+        self.query_limiter = QueryLimiter::new(max);
+        self
+    }
+
+    /// The effective concurrent-retrieval cap, for the startup log.
+    pub fn max_concurrent_queries(&self) -> usize {
+        self.query_limiter.permits()
     }
 
     fn namespace(&self, name: &str) -> Namespace {
@@ -109,9 +133,16 @@ impl MemlakeService {
                 self.invalidate(name);
                 return Ok(manifest.generation);
             }
-            index(&ns, &self.tokenizer, IndexOptions::default())
-                .await
-                .map_err(internal)?;
+            // Inline fold on the write path: auto-select with default budget/threshold.
+            fold(
+                &ns,
+                &self.tokenizer,
+                IndexOptions::default(),
+                FoldBudget::default(),
+                DEFAULT_STREAMING_THRESHOLD_DOCS,
+            )
+            .await
+            .map_err(internal)?;
         }
         Err(Status::deadline_exceeded(format!(
             "write seq {seq} was not indexed after {MAX_INDEX_ATTEMPTS} fold attempts"
@@ -233,6 +264,12 @@ impl Memlake for MemlakeService {
             _ => None,
         };
 
+        // Admission control: hold a permit for the whole query so at most `permits` queries
+        // rerank clusters at once — the server's peak query memory is bounded by the permit
+        // count, not by how many requests arrive together. Under load this awaits (backpressure),
+        // it does not reject.
+        let _permit = self.query_limiter.acquire().await;
+
         let ns = self.namespace(&req.namespace);
         // Reuse the cached open snapshot when still current (see `snapshot`): a warm read is
         // pure in-memory arm evaluation over the shared Store cache, 0 fresh roundtrips.
@@ -352,6 +389,11 @@ impl Memlake for MemlakeService {
             return Ok(Response::new(pb::GetResponse { memories: Vec::new() }));
         }
 
+        // `get` with `include_vector` fetches whole cluster files, so it shares the query
+        // admission cap; the payload-only path is cheap but is gated too for a single, simple
+        // memory ceiling over the retrieval paths.
+        let _permit = self.query_limiter.acquire().await;
+
         let ns = self.namespace(&req.namespace);
         let snap = self.snapshot(&ns).await?;
         let found = snap.node.get_many(&ids, req.include_vector).await.map_err(internal)?;
@@ -361,6 +403,45 @@ impl Memlake for MemlakeService {
                 .map(|m| convert::stored_record(m, req.include_vector))
                 .collect(),
         }))
+    }
+
+    async fn entity_stats(
+        &self,
+        req: Request<pb::EntityStatsRequest>,
+    ) -> Result<Response<pb::EntityStatsResponse>, Status> {
+        let req = req.into_inner();
+        if req.namespace.is_empty() {
+            return Err(Status::invalid_argument("namespace is required"));
+        }
+        let mut types: Vec<u8> = req
+            .memory_types
+            .iter()
+            .map(|&t| convert::memory_type_u8(t))
+            .collect::<Result<Vec<_>, _>>()?;
+        types.sort_unstable();
+        types.dedup();
+
+        let entities: Option<Vec<mlake_core::EntityId>> = if req.entity_ids.is_empty() {
+            None
+        } else {
+            Some(convert::entity_ids_in(&req.entity_ids)?)
+        };
+
+        let ns = self.namespace(&req.namespace);
+        let snap = self.snapshot(&ns).await?;
+        let counts = snap
+            .node
+            .entity_counts(&types, entities.as_deref())
+            .await
+            .map_err(internal)?;
+
+        let mut entities: Vec<pb::EntityCount> = counts
+            .into_iter()
+            .map(|(id, n)| pb::EntityCount { entity_id: id.0.to_vec(), memory_count: n })
+            .collect();
+        // Deterministic order so a paging caller sees a stable list.
+        entities.sort_by(|a, b| b.memory_count.cmp(&a.memory_count).then(a.entity_id.cmp(&b.entity_id)));
+        Ok(Response::new(pb::EntityStatsResponse { entities }))
     }
 
     async fn scan(
@@ -375,7 +456,16 @@ impl Memlake for MemlakeService {
             0 => DEFAULT_SCAN_LIMIT,
             n => (n as usize).min(MAX_SCAN_LIMIT),
         };
-        let tags = convert::tag_filter(req.tags);
+        // Tags and metadata are one conjunction, the same shape `DeleteByPredicate` takes.
+        // memory_types stays out of it — the walk below already visits one type at a time.
+        let tag_filter = convert::tag_filter(req.tags);
+        let filter = mlake_core::Predicate {
+            memory_types: Vec::new(),
+            metadata_equals: req.metadata_equals.into_iter().collect(),
+            tags: tag_filter.tags.clone(),
+            tags_mode: tag_filter.mode as u8,
+        };
+        let mut skip = req.skip as usize;
 
         let ns = self.namespace(&req.namespace);
         let snap = self.snapshot(&ns).await?;
@@ -412,15 +502,25 @@ impl Memlake for MemlakeService {
         let mut out = Vec::new();
         let mut next_token = String::new();
         while let Some((&ty, rest)) = pending.split_first() {
+            // While skipping, pull full pages and discard them: the walk is the same, the
+            // caller just does not pay the round trips.
+            let want = if skip > 0 { limit } else { limit - out.len() };
             let (items, next) = node
-                .scan(ty, cursor, limit - out.len(), &tags)
+                .scan(ty, cursor, want, &filter)
                 .await
                 .map_err(internal)?;
+            let mut items = items;
+            if skip > 0 {
+                let dropped = skip.min(items.len());
+                items.drain(..dropped);
+                skip -= dropped;
+            }
             out.extend(items.into_iter().map(|m| convert::stored_record(m, req.include_vector)));
 
             match next {
-                // This type still has more and the page is full: stop here.
-                Some(c) if out.len() >= limit => {
+                // This type still has more and the page is full: stop here. Still
+                // skipping means the page is not full yet, however many we discarded.
+                Some(c) if skip == 0 && out.len() >= limit => {
                     next_token = page_token(node.generation, ty, c);
                     break;
                 }
@@ -429,7 +529,7 @@ impl Memlake for MemlakeService {
                 // Type exhausted: move to the next one.
                 None => {
                     cursor = ScanCursor::default();
-                    if out.len() >= limit && !rest.is_empty() {
+                    if skip == 0 && out.len() >= limit && !rest.is_empty() {
                         next_token = page_token(node.generation, rest[0], cursor);
                         break;
                     }
@@ -803,12 +903,15 @@ fn parse_page_token(token: &str, generation: u64) -> Result<Option<(u8, ScanCurs
 /// a crashed holder's lease becomes stealable this long after its last acquire.
 const INDEX_LEASE_TTL_SECS: u64 = 60;
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run_indexer(
     store: Store,
     tokenizer: Tokenizer,
     namespaces: Vec<String>,
     interval: std::time::Duration,
     lease_holder: String,
+    budget: FoldBudget,
+    streaming_threshold: usize,
 ) -> anyhow::Result<()> {
     loop {
         let targets = if namespaces.is_empty() {
@@ -825,7 +928,7 @@ pub async fn run_indexer(
                 tracing::debug!(namespace = name, "index skipped (peer holds lease)");
                 continue;
             }
-            match index(&ns, &tokenizer, IndexOptions::default()).await {
+            match fold(&ns, &tokenizer, IndexOptions::default(), budget, streaming_threshold).await {
                 Ok(outcome) => tracing::info!(
                     namespace = name,
                     generation = outcome.generation,

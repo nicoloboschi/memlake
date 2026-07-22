@@ -59,7 +59,7 @@ fn id_exact(bytes: &[u8]) -> Result<MemoryId, Status> {
     Ok(MemoryId::from_bytes(arr))
 }
 
-fn entity_ids_in(raw: &[Vec<u8>]) -> Result<Vec<EntityId>, Status> {
+pub fn entity_ids_in(raw: &[Vec<u8>]) -> Result<Vec<EntityId>, Status> {
     raw.iter()
         .map(|b| {
             let arr: [u8; 16] = b

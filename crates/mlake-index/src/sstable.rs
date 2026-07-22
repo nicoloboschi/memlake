@@ -549,6 +549,42 @@ impl EntityTable {
             .map(|(k, bytes)| (EntityId(k.0), decode_ids(&bytes, cap)))
             .collect())
     }
+
+    /// How many memories carry each entity, without materializing the postings.
+    ///
+    /// The value for an entity is its `MemoryId`s concatenated, so the count is the byte
+    /// length over 16 — no decode, and `candidates_batch`'s per-entity cap does not apply.
+    /// Pass `entities` to count a subset, or `None` to walk every key in the index (what an
+    /// orphan sweep wants).
+    pub async fn counts(
+        &self,
+        store: &Store,
+        entities: Option<&[EntityId]>,
+        ctx: Option<(&QueryMetrics, usize)>,
+    ) -> Result<std::collections::HashMap<EntityId, u64>> {
+        match entities {
+            Some(ids) => {
+                let keys: Vec<MemoryId> = ids.iter().map(|e| MemoryId(e.0)).collect();
+                let pairs = self.index.get_many(store, &self.data_path, &keys, ctx).await?;
+                Ok(pairs
+                    .into_iter()
+                    .map(|(k, bytes)| (EntityId(k.0), (bytes.len() / 16) as u64))
+                    .collect())
+            }
+            None => {
+                // Whole key space: the entity index is 16 bytes per (entity, memory) pair,
+                // so reading all of it is far cheaper than touching cluster payloads.
+                let pairs = self
+                    .index
+                    .scan_range(store, &self.data_path, &[0u8; 16], &[0xFFu8; 16], ctx)
+                    .await?;
+                Ok(pairs
+                    .into_iter()
+                    .map(|(k, bytes)| (EntityId(k), (bytes.len() / 16) as u64))
+                    .collect())
+            }
+        }
+    }
 }
 
 fn decode_ids(bytes: &[u8], cap: usize) -> Vec<MemoryId> {

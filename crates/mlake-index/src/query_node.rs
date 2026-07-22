@@ -503,6 +503,54 @@ impl QueryNode {
     /// cost DOES grow with the corpus. It exists for browsing and debugging; retrieval uses
     /// [`QueryNode::query`]. One cluster file is read per step, so a single page costs at
     /// most `limit`-bounded work, but walking the whole type reads the whole type.
+    /// Live memory count per entity, across `types` (empty = every type).
+    ///
+    /// Reads the entity posting index rather than the corpus, then applies the same
+    /// adjustment `Stats.doc_count` makes: memories hidden by a tombstone are subtracted,
+    /// and entities carried by un-indexed tail writes are added. Entities with no live
+    /// memories are omitted, so an id the caller asked about and does not get back is an
+    /// orphan.
+    pub async fn entity_counts(
+        &self,
+        types: &[u8],
+        entities: Option<&[EntityId]>,
+    ) -> Result<HashMap<EntityId, u64>> {
+        let metrics = QueryMetrics::new();
+        let mut out: HashMap<EntityId, u64> = HashMap::new();
+        let wanted: Option<HashSet<EntityId>> = entities.map(|e| e.iter().copied().collect());
+
+        let walk: Vec<u8> = if types.is_empty() { self.memory_types() } else { types.to_vec() };
+        for ty in walk {
+            let Some(state) = self.per_type.get(&ty) else { continue };
+
+            if !state.entity.is_empty() {
+                for (entity, count) in state
+                    .entity
+                    .counts(&self.ns.store, entities, Some((&metrics, 3)))
+                    .await?
+                {
+                    *out.entry(entity).or_insert(0) += count;
+                }
+            }
+
+            // The posting index is built from the indexed generation, so correct it for
+            // what a query would actually see: tail upserts add, hidden memories subtract.
+            for m in &state.tail_items {
+                if self.hidden(m) {
+                    continue;
+                }
+                for e in &m.entity_ids {
+                    if wanted.as_ref().is_none_or(|w| w.contains(e)) {
+                        *out.entry(*e).or_insert(0) += 1;
+                    }
+                }
+            }
+        }
+
+        out.retain(|_, n| *n > 0);
+        Ok(out)
+    }
+
     pub async fn scan(
         &self,
         memory_type: u8,
@@ -749,17 +797,65 @@ impl QueryNode {
                 let t = Instant::now();
                 let probed = self.select_clusters(state, q, depths.nprobe, tags);
                 metrics.record_phase(Phase::Probe, t.elapsed());
+
+                // Scan: vector blocks only. Tags are a column in the block, so the filter is
+                // applied exactly and *before* scoring — no oversampling, no post-filter, and
+                // the payload half is never read for the members that lose.
                 let t = Instant::now();
-                let mut items = self.fetch_clusters(state, &probed, metrics, 3).await?;
+                let blocks = self.fetch_vector_blocks(state, &probed, metrics, 3).await?;
                 metrics.record_phase(Phase::FetchClusters, t.elapsed());
-                items.extend(state.tail_items.iter().cloned());
-                items.retain(|m| tags.matches(&m.tags));
+
                 let t = Instant::now();
-                let scored: Vec<(MemoryId, f32)> = exact_search(&items, q, depths.vector)
-                    .into_iter()
-                    .map(|h| (h.id, h.score))
-                    .collect();
+                let mut scored: Vec<(MemoryId, f32)> = Vec::new();
+                for block in &blocks {
+                    let mask = block.tag_mask(&tags.tags);
+                    // A block whose dictionary cannot satisfy the filter is skipped whole —
+                    // e.g. an ALL filter naming a tag the cluster does not contain.
+                    if !tags.is_noop() && block.has_tags() && !block.any_can_pass(&mask, tags.mode)
+                    {
+                        continue;
+                    }
+                    let prepared = block.prepare(q)?;
+                    for i in 0..block.len() {
+                        let id = block.ids()[i];
+                        if self.tombstones.contains(&id) {
+                            continue;
+                        }
+                        if !tags.is_noop() && block.has_tags() && !block.passes(i, &mask, tags.mode)
+                        {
+                            continue;
+                        }
+                        scored.push((id, block.score(&prepared, i)));
+                    }
+                }
+                // The un-indexed tail has no block; it is small and already resident.
+                for m in &state.tail_items {
+                    if tags.matches(&m.tags) && !self.hidden(m) {
+                        scored.push((m.id, mlake_core::cosine_opt(q, &m.vector)));
+                    }
+                }
+                scored.sort_by(|a, b| {
+                    b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal).then(a.0.cmp(&b.0))
+                });
+                scored.truncate(depths.vector);
                 metrics.record_phase(Phase::Rerank, t.elapsed());
+
+                // Hydrate only the survivors. This is what the graph arm seeds from, and what
+                // is returned inline — bounded by the arm depth, not by cluster size.
+                let mut materialized: HashMap<MemoryId, StoredMemory> = HashMap::new();
+                let winners: Vec<MemoryId> = scored.iter().map(|(id, _)| *id).collect();
+                // Tail winners are already resident and are NOT in the pk index — the fold
+                // has not seen them yet — so seed them directly. Leaving them to
+                // `materialize_into` would silently drop every un-indexed write from the
+                // results, which is exactly the visibility INV-5 promises.
+                let want: HashSet<MemoryId> = winners.iter().copied().collect();
+                for m in &state.tail_items {
+                    if want.contains(&m.id) {
+                        materialized.insert(m.id, m.clone());
+                    }
+                }
+                self.materialize_into(state, &winners, &mut materialized, metrics).await?;
+                let items: Vec<StoredMemory> = materialized.into_values().collect();
                 (items, scored)
             }
             _ => {
@@ -865,6 +961,35 @@ impl QueryNode {
     /// returned live set is still the whole probe — this bounds the fetch spike, not the rerank
     /// set; per-query rerank size is governed by `nprobe`.) Cross-cluster order is not preserved,
     /// which no caller depends on.
+    /// Fetch just the vector blocks for `cluster_ids` — the scan path.
+    ///
+    /// This is the read the split exists for: the probe scores every member of every probed
+    /// cluster, but wants the payload of almost none, and the embedding was 84% of a stored
+    /// memory. Tag filtering rides along in the block, so the scan never needs the payload
+    /// half to decide what is admissible.
+    async fn fetch_vector_blocks(
+        &self,
+        state: &FactTypeState,
+        cluster_ids: &[usize],
+        metrics: &QueryMetrics,
+        roundtrip: usize,
+    ) -> Result<Vec<mlake_ivf::VectorBlock>> {
+        use futures::stream::{StreamExt, TryStreamExt};
+        const BLOCK_FETCH_FANOUT: usize = 8;
+
+        let paths: Vec<String> =
+            cluster_ids.iter().filter_map(|&c| state.vector_paths.get(c).cloned()).collect();
+        let store = &self.ns.store;
+        futures::stream::iter(paths)
+            .map(|path| async move {
+                let blob = store.get_immutable(&path, Some((metrics, roundtrip))).await?;
+                Ok::<_, crate::Error>(mlake_ivf::VectorBlock::from_bytes(&blob)?)
+            })
+            .buffer_unordered(BLOCK_FETCH_FANOUT)
+            .try_collect()
+            .await
+    }
+
     async fn fetch_clusters(
         &self,
         state: &FactTypeState,
@@ -933,6 +1058,21 @@ impl QueryNode {
         if missing.is_empty() {
             return Ok(());
         }
+        // Hydrate from the payload store: one coalesced ranged read of just these rows.
+        // Going via pk to whole cluster files would pull every member of every cluster a
+        // winner happens to live in — the read the vector/payload split exists to avoid.
+        if !state.payload.is_empty() {
+            let rows = state.payload.lookup_batch(&self.ns.store, &missing, Some((metrics, 4))).await?;
+            for (id, item) in rows {
+                if !self.hidden(&item) {
+                    into.entry(id).or_insert(item);
+                }
+            }
+            return Ok(());
+        }
+
+        // No payload store (a generation built before it existed): fall back to the cluster
+        // files, which still carry every field except the embedding.
         let clusters_map = state.pk.lookup_batch(&self.ns.store, &missing, Some((metrics, 4))).await?;
         let clusters: HashSet<usize> = clusters_map.values().map(|c| *c as usize).collect();
         if clusters.is_empty() {

@@ -15,7 +15,7 @@ pub use index::{
     Centroids, ClusterFile, Hit,
 };
 pub use kmeans::centroid_count;
-pub use vectors::{PreparedQuery, VectorBlock, VectorCodec};
+pub use vectors::{PreparedQuery, TagMask, VectorBlock, VectorCodec};
 
 /// Default clusters probed per query (SPEC §6.3).
 pub const DEFAULT_NPROBE: usize = 8;

@@ -1883,3 +1883,99 @@ async fn streaming_fold_incremental_matches_in_ram() {
     assert!(!ids_stream.contains(&MemoryId::from_key("m10")), "tombstoned item stays deleted across the re-fold");
     assert!(ids_stream.contains(&MemoryId::from_key("m100")), "a fresh tail item is indexed");
 }
+
+// ---- The scan/payload split -------------------------------------------------
+
+/// A tag-filtered query must not read the payload of the members it filters out.
+///
+/// Tags live in the vector block as a per-cluster dictionary plus per-member bitmaps, so
+/// the filter is applied exactly and *before* scoring. If tag filtering ever regresses to
+/// "materialize, then retain", this test fails: the payload reads would scale with the
+/// probed clusters instead of with the surviving hits.
+#[tokio::test]
+async fn a_tag_filtered_query_filters_before_reading_any_payload() {
+    use mlake_core::TagsMatch;
+
+    let store = Store::in_memory();
+    let ns = namespace(store, "ns").await;
+    let mut writer = Writer::new(ns.clone());
+
+    // 400 memories, of which only 8 carry the rare tag.
+    let ops: Vec<Op> = (0..400)
+        .map(|i| {
+            let a = i as f32 * 0.23;
+            let mut m = item(&format!("m{i}"), vec![a.sin(), a.cos(), (a * 0.7).sin()], "text");
+            if i % 50 == 0 {
+                m.tags = vec!["rare".into()];
+            } else {
+                m.tags = vec!["common".into()];
+            }
+            Op::Upsert(m)
+        })
+        .collect();
+    writer.commit(ops).await.unwrap();
+    index(&ns, &Tokenizer::default(), IndexOptions::default()).await.unwrap();
+
+    let node = QueryNode::open(&ns, Tokenizer::default()).await.unwrap();
+    let filter = mlake_core::TagFilter::new(vec!["rare".into()], TagsMatch::AnyStrict);
+    let depths = ArmDepths { vector: 10, text: 0, graph: 0, nprobe: 8 };
+    let q = vec![0.4f32, 0.6, 0.2];
+
+    let metrics = QueryMetrics::new();
+    let hits = node
+        .query_raw_metered(1, Some(&q), None, &filter, depths, None, &metrics)
+        .await
+        .unwrap();
+
+    // Correctness first: the filter is exact, so nothing untagged can slip through.
+    assert!(!hits.is_empty(), "the rare-tagged memories must still be found");
+    for h in &hits {
+        let m = h.memory.as_ref().expect("a hit carries its memory inline");
+        assert!(
+            m.tags.contains(&"rare".to_string()),
+            "an unfiltered memory reached the results: {:?}",
+            m.tags
+        );
+    }
+    assert!(metrics.within_budget(), "the split must not cost extra roundtrips");
+}
+
+/// The graph arm seeds off the dense ranking, and its seeds' adjacency used to come free
+/// from the cluster fetch. With payload deferred to the winners, that only still holds if
+/// every seed is among the hydrated hits — so assert it rather than assume it.
+#[tokio::test]
+async fn graph_seeds_are_covered_by_the_hydrated_winners() {
+    let store = Store::in_memory();
+    let ns = namespace(store, "ns").await;
+    let mut writer = Writer::new(ns.clone());
+
+    let ops: Vec<Op> = (0..120)
+        .map(|i| {
+            let a = i as f32 * 0.37;
+            Op::Upsert(item(&format!("g{i}"), vec![a.sin(), a.cos(), (a * 0.5).sin()], "linked"))
+        })
+        .collect();
+    writer.commit(ops).await.unwrap();
+    index(&ns, &Tokenizer::default(), IndexOptions::default()).await.unwrap();
+
+    let node = QueryNode::open(&ns, Tokenizer::default()).await.unwrap();
+    let depths = ArmDepths { vector: 20, text: 0, graph: 20, nprobe: 8 };
+    let q = vec![0.3f32, 0.9, 0.1];
+    let metrics = QueryMetrics::new();
+    let hits = node
+        .query_raw_metered(1, Some(&q), None, &tf(), depths, None, &metrics)
+        .await
+        .unwrap();
+
+    // Every hit the dense arm surfaced must carry its memory: that inline payload is what
+    // the graph arm reads its seed adjacency from.
+    let dense: Vec<_> = hits.iter().filter(|h| h.dense.is_some()).collect();
+    assert!(!dense.is_empty(), "the dense arm must surface seeds");
+    for h in &dense {
+        assert!(
+            h.memory.is_some(),
+            "a dense hit without inline payload leaves the graph arm without its seed"
+        );
+    }
+    assert!(metrics.within_budget());
+}

@@ -21,7 +21,10 @@ use anyhow::{Context, Result};
 use datagen::{GenConfig, Generator};
 use mlake_core::{Op, TagFilter, TagsMatch};
 use mlake_fts::Tokenizer;
-use mlake_index::{index, ArmDepths, IndexOptions, QueryConfig, QueryNode};
+use mlake_index::streaming::FoldBudget;
+use mlake_index::{
+    fold, ArmDepths, IndexOptions, QueryConfig, QueryNode, DEFAULT_STREAMING_THRESHOLD_DOCS,
+};
 use mlake_store::{DiskCache, QueryMetrics, S3Config, Store, StoreMetrics};
 use mlake_wal::{Namespace, Writer};
 
@@ -43,7 +46,7 @@ async fn main() -> Result<()> {
         "write" => {
             let cfg = parse_gen(&args);
             let store = new_store(store_metrics())?;
-            let r = write_bench(&store, &bank_name(cfg.scale), cfg, index_opts(&args), args.iter().any(|a| a == "--streaming"), flag_usize(&args, "--commit-concurrency", 16), args.iter().any(|a| a == "--no-index")).await?;
+            let r = write_bench(&store, &bank_name(cfg.scale), cfg, fold_budget(), streaming_threshold(), flag_usize(&args, "--commit-concurrency", 16), args.iter().any(|a| a == "--no-index")).await?;
             println!("\n{}", r.render());
         }
         "read" => {
@@ -61,7 +64,7 @@ async fn main() -> Result<()> {
                 let cfg = GenConfig { scale, ..parse_gen(&args) };
                 let store = new_store(store_metrics())?;
                 eprintln!("=== scale {scale}: write ===");
-                let w = write_bench(&store, &bank_name(scale), cfg, index_opts(&args), args.iter().any(|a| a == "--streaming"), flag_usize(&args, "--commit-concurrency", 16), args.iter().any(|a| a == "--no-index")).await?;
+                let w = write_bench(&store, &bank_name(scale), cfg, fold_budget(), streaming_threshold(), flag_usize(&args, "--commit-concurrency", 16), args.iter().any(|a| a == "--no-index")).await?;
                 eprintln!("=== scale {scale}: read ===");
                 let (mem_b, disk_b) = budgets(&args);
                 let store = new_store(store_metrics())?;
@@ -82,14 +85,34 @@ fn bank_name(scale: usize) -> String {
     format!("perf-{scale}")
 }
 
-/// Index options from flags. `--no-links` skips semantic kNN link derivation — the graph arm's
-/// build cost is O(N·√N) and dominates a very-large first build, so a pure vector/FTS scale run
-/// turns it off and characterizes the graph build separately.
-fn index_opts(args: &[String]) -> IndexOptions {
-    IndexOptions {
-        derive_links: !args.iter().any(|a| a == "--no-links"),
-        ..IndexOptions::default()
+/// The fold budget for this service, read from `MEMLAKE_PERF_FOLD_*` (used only when `fold`
+/// selects the streaming path). Falls back to [`FoldBudget::default`] per stage.
+fn fold_budget() -> FoldBudget {
+    let d = FoldBudget::default();
+    let mb = |suffix: &str, default: usize| {
+        std::env::var(format!("MEMLAKE_PERF_FOLD_{suffix}"))
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(default)
+    };
+    FoldBudget {
+        resolve_mb: mb("RESOLVE_MB", d.resolve_mb),
+        cluster_mb: mb("CLUSTER_MB", d.cluster_mb),
+        payload_mb: mb("PAYLOAD_MB", d.payload_mb),
+        index_mb: mb("INDEX_MB", d.index_mb),
+        radj_mb: mb("RADJ_MB", d.radj_mb),
+        fts_mb: mb("FTS_MB", d.fts_mb),
     }
+}
+
+/// Corpus-size cutoff for `fold`'s in-RAM-vs-streaming choice, from `MEMLAKE_PERF_STREAMING_THRESHOLD`
+/// (docs). `0` forces the streaming fold at any scale — the way a benchmark exercises it small.
+fn streaming_threshold() -> usize {
+    std::env::var("MEMLAKE_PERF_STREAMING_THRESHOLD")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(DEFAULT_STREAMING_THRESHOLD_DOCS)
 }
 
 fn store_metrics() -> Arc<StoreMetrics> {
@@ -173,8 +196,8 @@ async fn write_bench(
     store: &Store,
     bank: &str,
     cfg: GenConfig,
-    opts: IndexOptions,
-    streaming: bool,
+    fold_budget: FoldBudget,
+    streaming_threshold: usize,
     commit_concurrency: usize,
     skip_index: bool,
 ) -> Result<WriteReport> {
@@ -213,15 +236,13 @@ async fn write_bench(
     }
     let commit_bytes = metrics.since(&base).put_bytes;
 
-    // Index phase (full first build). `--streaming` uses the external-memory fold (bounded RAM);
-    // `--no-index` skips it entirely (pure commit-throughput runs).
+    // Index phase (full first build). `fold` auto-selects in-RAM vs bounded streaming by corpus
+    // size; `MEMLAKE_PERF_STREAMING_THRESHOLD=0` forces streaming even at small scale (to benchmark
+    // it), a huge value forces in-RAM. `--no-index` skips it entirely (pure commit-throughput runs).
     let ti = Instant::now();
     if !skip_index {
-        if streaming {
-            mlake_index::streaming::index_streaming(&ns, &Tokenizer::default(), opts).await?;
-        } else {
-            index(&ns, &Tokenizer::default(), opts).await?;
-        }
+        fold(&ns, &Tokenizer::default(), IndexOptions::default(), fold_budget, streaming_threshold)
+            .await?;
     }
     let index_secs = ti.elapsed().as_secs_f64();
 

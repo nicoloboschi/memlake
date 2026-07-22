@@ -61,6 +61,58 @@ pub struct IndexOutcome {
     pub published: bool,
 }
 
+/// Above this many estimated live documents, the in-RAM fold's O(N) RAM gets risky (it caps a
+/// 36 GB box at ~5–6M), so [`fold`] switches to the bounded external-memory (streaming) fold.
+pub const DEFAULT_STREAMING_THRESHOLD_DOCS: usize = 4_000_000;
+
+/// Rough per-document byte size (upsert incl. embedding), used only to turn cheap WAL-tail LIST
+/// sizes into a document-count estimate for the fold selector. Over-estimating docs errs toward
+/// the safe (bounded-RAM) streaming fold, which is the conservative direction.
+const NOMINAL_DOC_BYTES: u64 = 2048;
+
+/// The fold entry point: **auto-selects** which fold to run. Below `streaming_threshold_docs` the
+/// in-RAM [`index`] fold runs — faster, incremental copy-forward, and it derives semantic links.
+/// At or above it, the bounded-RAM [`crate::streaming::index_streaming_with_budget`] runs so a
+/// corpus too big for memory still folds (at the cost of a full rebuild and no in-fold links).
+///
+/// `budget` is only consulted on the streaming path. Set `streaming_threshold_docs` to `0` to
+/// force streaming (e.g. to benchmark it at small scale) or `usize::MAX` to force in-RAM.
+pub async fn fold(
+    ns: &Namespace,
+    tokenizer: &Tokenizer,
+    opts: IndexOptions,
+    budget: crate::streaming::FoldBudget,
+    streaming_threshold_docs: usize,
+) -> Result<IndexOutcome> {
+    let corpus = estimate_corpus_docs(ns).await?;
+    if corpus >= streaming_threshold_docs {
+        crate::streaming::index_streaming_with_budget(ns, tokenizer, opts, budget).await
+    } else {
+        index(ns, tokenizer, opts).await
+    }
+}
+
+/// Cheap live-document estimate for fold selection: the previous generation's indexed count
+/// (exact, from the manifest) plus the un-indexed WAL tail approximated from its object sizes
+/// (a LIST, no GETs — so it stays O(1) roundtrips even when the tail is the whole first build).
+async fn estimate_corpus_docs(ns: &Namespace) -> Result<usize> {
+    let (manifest, _etag) = ns.read_manifest().await?;
+    let prev_docs: usize = manifest.indexes.values().map(|i| i.train_count as usize).sum();
+    let head = ns.wal_head().await?;
+
+    let mut tail_bytes: u64 = 0;
+    let mut start = manifest.wal_index_cursor + 1;
+    loop {
+        let (objs, next) = ns.list_wal(start, 100_000).await?;
+        tail_bytes += objs.iter().filter(|o| o.seq <= head).map(|o| o.size_bytes).sum::<u64>();
+        match next {
+            Some(n) if n <= head => start = n,
+            _ => break,
+        }
+    }
+    Ok(prev_docs + (tail_bytes / NOMINAL_DOC_BYTES) as usize)
+}
+
 /// Build the next generation for a namespace and publish it.
 /// Fold the bank's WAL into a new generation for each fact type and publish one manifest.
 ///
@@ -297,7 +349,15 @@ async fn build_memory_type_index(
                 m.vector = Vec::new();
             }
             let cf = ClusterFile { centroid_id: i as u32, items };
-            let block = VectorBlock::encode(opts.vector_codec, vector_dim, &ids, &vectors)?;
+            // Tags travel with the codes so the probe can filter without the payload half.
+            let member_tags: Vec<Vec<String>> = clusters[i].iter().map(|m| m.tags.clone()).collect();
+            let block = VectorBlock::encode_with_tags(
+                opts.vector_codec,
+                vector_dim,
+                &ids,
+                &vectors,
+                &member_tags,
+            )?;
             let block_bytes = block.to_bytes();
             let store = ns.store.clone();
             let prefix = prefix.clone();

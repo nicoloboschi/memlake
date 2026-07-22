@@ -8,46 +8,43 @@ Hindsight can stop falling back or degrading.
 Current state: in memlake mode Hindsight writes **nothing** memory-shaped to
 Postgres — no `memory_units`, no `memory_links`, no `unit_entities`. Retain, all
 four recall arms (dense, full-text, graph, temporal), the curation list and
-single-unit reads, bank fact counts, deletes, the curation edit and document
-export all run through memlake. LoComo scores identically to the Postgres path
-(14/15 on conv-26) with `nprobe=32`.
+single-unit reads, bank fact counts, deletes, the curation edit, document export
+and **consolidation** all run through memlake. LoComo scores identically to the
+Postgres path (14/15 on conv-26) with `nprobe=32`.
 
 Ordered by what blocks the most.
 
 ---
 
-## 1. Observation ↔ fact edges (`source_memory_ids`)
+## 1. ~~Observation ↔ fact edges~~ ✅ RESOLVED — no memlake work needed
 
-The single highest-leverage gap: one relation unblocks five surfaces.
+Decided: Hindsight **denormalises** observations instead of asking memlake for an
+edge relation. Every primitive it needed already existed.
 
-In Postgres an observation carries `source_memory_ids`, and Hindsight leans on it
-at **runtime** rather than denormalising. Notably an observation has *no*
-`unit_entities` rows of its own — `_entity_rows_for_units_sql` inherits its
-entities from its source facts on every read, so editing a source fact's entities
-is immediately reflected in the observation.
+An observation is now written as an ordinary memory (`memory_type=3`) that
+carries the **union of its sources' entity ids** resolved at write time, so it is
+searchable and renderable on its own terms with no special case. Create and
+update are the same call — an upsert of a stable id — so a reinforced observation
+is replaced in place and never leaves the index.
 
-memlake has no equivalent, so today:
+Sources ride in the metadata bag twice, because the two directions want different
+shapes: a JSON list for the forward read, and one `src:<uuid>` key per source for
+the backward one. The per-source keys mean "observations built on fact X" is an
+equals predicate, which `DeleteByPredicate` already accepts — so stale-observation
+cleanup needs no new RPC either.
 
-- [ ] **Observations come back with no entities.** World/experience facts resolve
-      fine (the memory carries its own `entity_ids`), but observations have
-      nothing to inherit from.
-- [ ] **`include_source_facts` returns nothing** — recall cannot show the facts
-      behind an observation.
-- [ ] **`prefer_observations` dedup is inert** — it drops source facts already
-      covered by a returned observation, which needs the edge.
-- [ ] **Observation history has no source resolution.**
-- [ ] **Stale-observation cleanup cannot run.** When a source fact is deleted or
-      re-ingested its observations are stale; Hindsight logs and skips rather than
-      querying an empty table and reporting a clean sweep.
+Verified end to end on the 239-fact LoComo bank: 84 observations created, 20
+updated in place, 83 live, each carrying its sources and inherited entities.
 
-What is needed: `source_memory_ids` carried on the memory (forward) plus reverse
-adjacency for the backward walk, exposed as a bidirectional expansion.
+What this trades away, deliberately: Postgres inherits an observation's entities
+from its sources on *every read*, so editing a source fact's entities changes the
+observation immediately. Denormalised, they only catch up the next time
+consolidation touches that observation.
 
-**Design note worth deciding together:** the alternative is for Hindsight to
-denormalise — write the union of the source facts' `entity_ids` onto the
-observation at consolidation time. That needs no memlake change, but it loses the
-runtime-freshness property Postgres has today: an entity edit would no longer
-propagate to existing observations. Cheaper, strictly weaker.
+One residue: the backward direction works for *deletes* (predicate) but not for
+*reads* — finding observations for a source without deleting them still needs a
+walk, because `Scan` takes no metadata predicate. That is §5's push-down item, not
+a separate gap.
 
 ---
 
@@ -66,21 +63,25 @@ not have to be on the hot path.
 
 ---
 
-## 3. Consolidation support
+## 3. ~~Consolidation~~ ✅ RUNNING
 
-Consolidation is the one Hindsight subsystem still fully disabled — it refuses to
-run rather than reading an empty table and reporting a clean pass. Restoring it
-needs three things, two of which already exist:
+Consolidation creates, updates and deletes observations through the provider,
+stamps its sources, and completes a full pass over a real bank (239 facts → 80
+observations created, 27 updated in place, 77 live).
 
-- [x] Partial update (`Patch`) — for stamping `consolidated_at`.
-- [x] `Scan` — for walking candidate memories.
-- [ ] **A queryable "unconsolidated" predicate.** The job selects memories where
-      `consolidated_at IS NULL`. That flag lives in the metadata bag, which is not
-      indexable, so the only implementation today is a full corpus walk filtered
-      in Python on every consolidation cycle. Needs either an indexed/filterable
-      metadata field, or a scan-side metadata predicate — the same shape
-      `DeleteByPredicate` already accepts.
-- [ ] §1's observation↔fact edges (consolidation is what writes them).
+Its candidate query is now pushed down: memories carry a positive
+`consolidated` flag (`"0"` / `"1"`) so `metadata_equals` can select the backlog,
+rather than the server shipping every page for Hindsight to discard. See §5 for
+why a positive flag was needed instead of matching the marker's absence.
+
+Two behaviours worth knowing, neither blocking:
+
+- Failed memories are stamped with the same marker as successful ones — there is
+  no separate `consolidation_failed_at` — so a permanently-failing memory is
+  retried once and then treated as done rather than retried forever.
+- `_filter_live_source_memories` is a visibility check, not a lock: there is no
+  transaction to join, so a source deleted between the check and the write leaves
+  an observation citing it. The next pass rebuilds from what is still live.
 
 ---
 
@@ -130,17 +131,24 @@ needs three things, two of which already exist:
 `Scan` is a cursor walk, which is right for browsing but leaves four gaps for the
 curation UI and export:
 
-- [ ] **No push-down for metadata predicates.** `document_id`, text search and
-      consolidation state are filtered per page in Python, so a page can come back
-      short and `total` reports what the walk saw rather than a true count.
-      `DeleteByPredicate` already accepts a metadata predicate — the same shape on
-      `Scan` would close this, §3, and the export path in one move.
+- [x] **Metadata predicate on `Scan` — DONE.** `metadata_equals` reuses
+      `core::Predicate`, the same matcher `DeleteByPredicate` uses, so tags and
+      metadata are one conjunction with one implementation. Hindsight now pushes
+      down `document_id` in the curation list, the consolidation candidate filter,
+      and the backward observation lookup.
+  - [ ] **No way to match key *absence*.** The predicate is equality-only, so
+        "not yet consolidated" — the absence of a marker — is inexpressible.
+        Hindsight works around it by writing a positive flag (`consolidated: "0"`,
+        flipped to `"1"`), which is fine but means every such state needs a
+        pre-declared field. A `metadata_missing` / `metadata_not_equals` form
+        would remove the workaround.
 - [ ] **No ordering.** The SQL path returns `ORDER BY mentioned_at DESC NULLS
       LAST, created_at DESC`; a scan walks in cluster order, so the curation list
       comes back in storage order.
-- [ ] **Offset paging costs pages.** The API takes offset/limit, `Scan` takes a
-      cursor, so reaching an offset means walking to it. Hindsight caps the walk at
-      50 pages and logs when it truncates.
+- [x] **Offset/skip paging — DONE.** `skip` discards N matching memories before
+      filling the page; verified byte-identical to following the cursor. Hindsight
+      uses it for offset in the curation list, falling back to the page walk only
+      when a text search forces client-side filtering.
 - [ ] **No tag histogram — but the index is most of the way there.**
       `list_tags` is `SELECT tag, COUNT(*) … GROUP BY tag` in SQL; against memlake
       Hindsight walks the corpus and counts in Python, which is O(corpus) per call.
@@ -187,6 +195,68 @@ curation UI and export:
       `list_memory_units` always reports `state: "valid"`. Needs either a
       soft-delete/archived state that `Scan` can filter on, or an explicit
       "restore tombstoned id" op.
+
+---
+
+## 6b. ~~Graph maintenance~~ ✅ — `EntityStats` added and wired
+
+Hindsight's maintenance job has three passes. One is obsolete here, one now works
+through a new RPC, one has to be skipped.
+
+* **Relink top-up — obsolete.** `memory_links` is never written: semantic links
+  are re-derived by the indexer from the whole corpus on every fold, and temporal
+  links are not edges at all (the arm reads timestamps), so a delete cannot leave
+  one dangling.
+* **Orphan entity prune — works, via `EntityStats`.** The SQL version keys off
+  `unit_entities`, which is empty by design, so its `NOT EXISTS` matches *every*
+  entity — an unguarded run deleted 161 of 161 on a real bank. It now asks the
+  provider which entities are actually carried.
+* **Stale-cooccurrence prune — skipped, and must stay skipped.** Same shape of
+  bug: `NOT EXISTS (… INTERSECT …)` over an empty `unit_entities` is always true,
+  so it would delete every co-occurrence row.
+
+- [x] **`EntityStats` — DONE and verified.** `EntityId -> live memory count`, read
+      from the entity posting SSTable (`EntityTable::counts`): the value is the
+      memory ids concatenated, so a count is `len / 16` — no decode, no cluster
+      reads, cost scaling with entities rather than corpus. Applies the same
+      tail/tombstone adjustment `Stats.doc_count` makes; entities with no live
+      memories are omitted, so an id you ask about and do not get back is an orphan.
+
+      It serves two callers, which is why it mattered more than a background sweep:
+      `list_entities` surfaces a per-entity count in the **API**, where a
+      scan-based recount would be O(corpus) *per request*. It is also the more
+      accurate number — the `mention_count` column it replaces only ever increments,
+      since nothing decrements it on delete.
+
+      Verified on a 160-entity bank: `list_entities` returns Caroline 153,
+      Melanie 126, family 28; the orphan sweep runs and correctly prunes nothing
+      when every entity is live.
+
+      Note this was **not** the same work as the tag histogram (§5): the entity
+      posting already stores what is needed, whereas `ClusterTagSummary` stores a
+      set and would have to become a multiset.
+
+### Correction: `entity_cooccurrences` is *not* dead
+
+An earlier revision of this file claimed nothing reads it. Wrong — it has two
+readers, both via `fq_table()` which a naive grep misses:
+
+1. `get_entity_graph()` (`memory_engine.py:9745`), exposed at `http.py:4408`;
+2. entity resolution's disambiguation signal (`entity_resolver.py:350`, `:476`, `:582`).
+
+It also references only `entities`, never `memory_units`, so it works unchanged
+in memlake mode. Hindsight now splits the writer: the `unit_entities` insert is
+skipped (FK to `memory_units`), the co-occurrence cache still runs. Verified: 352
+co-occurrence rows written and a 160-node / 352-edge entity graph rendered with
+`unit_entities` at zero.
+
+- [ ] **Residual leak: stale co-occurrences accumulate.** Pairs whose witnessing
+      memories have all been deleted linger, because deciding that needs
+      `unit_entities`. Recomputing from the provider is possible but O(corpus).
+      The rows are inert — they inflate the entity graph slightly and add weak
+      disambiguation signal — so this is hygiene, not correctness. Options: accept
+      it, recompute periodically, or have memlake expose entity *pair* counts the
+      way it now exposes per-entity counts.
 
 ---
 

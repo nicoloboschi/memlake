@@ -478,20 +478,26 @@ class MemlakeClient:
         page_token: str = "",
         limit: int = 0,
         include_vector: bool = False,
+        metadata_equals: Optional[dict[str, str]] = None,
+        tags: Optional[Sequence[str]] = None,
+        tags_mode: int = ANY,
+        skip: int = 0,
     ) -> pb.ScanResponse:
         """One page of a full scan in cluster order. Follow `next_page_token` until empty. A
         scan is eventually-complete browsing, not a consistent iterator (writes mid-walk can
         shift later pages)."""
-        return self._call(
-            "Scan",
-            pb.ScanRequest(
-                namespace=namespace,
-                memory_types=list(memory_types or []),
-                page_token=page_token,
-                limit=limit,
-                include_vector=include_vector,
-            ),
+        req = pb.ScanRequest(
+            namespace=namespace,
+            memory_types=list(memory_types or []),
+            page_token=page_token,
+            limit=limit,
+            include_vector=include_vector,
+            metadata_equals=dict(metadata_equals or {}),
+            skip=skip,
         )
+        if tags:
+            req.tags.CopyFrom(pb.TagFilter(tags=list(tags), mode=tags_mode))
+        return self._call("Scan", req)
 
     def scan_all_ids(self, namespace: str, *, memory_types: Optional[Sequence[int]] = None) -> list:
         """Every visible id in a namespace, walking all scan pages. O(corpus) — for tests and
@@ -513,6 +519,29 @@ class MemlakeClient:
             pb.ListWalRequest(namespace=namespace, start_seq=start_seq, limit=limit,
                               include_ops=include_ops),
         )
+
+    def entity_stats(
+        self,
+        namespace: str,
+        *,
+        memory_types: Optional[Sequence[int]] = None,
+        entity_ids: Optional[Sequence[bytes]] = None,
+    ) -> dict:
+        """Live memory count per entity, as `{entity_id_bytes: count}`.
+
+        Reads the entity posting index, so cost scales with the number of entities rather
+        than the corpus. Entities with no live memories are absent from the result — an id
+        you asked about and do not get back is an orphan. Counts reflect the indexed
+        generation plus the un-indexed WAL tail."""
+        resp = self._call(
+            "EntityStats",
+            pb.EntityStatsRequest(
+                namespace=namespace,
+                memory_types=list(memory_types or []),
+                entity_ids=list(entity_ids or []),
+            ),
+        )
+        return {e.entity_id: e.memory_count for e in resp.entities}
 
     def list_namespaces(self) -> list:
         """Every namespace in the bucket (one LIST). Not routed to a preferred node — any node

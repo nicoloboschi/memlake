@@ -11,10 +11,19 @@
 //! top region, not the exact scores — but they do have to preserve it, so every codec here
 //! is measured against the f32 ranking in the tests below rather than assumed to be fine.
 //!
+//! Beside the codes sits the *tag column*: a per-cluster dictionary of the distinct tags its
+//! members carry, plus one bitmap per member. Filtering used to be applied over materialized
+//! memories, which meant a scan that avoided reading payload could not filter at all — the
+//! whole point of splitting the vectors out. Making tags a scan-side column keeps filtering
+//! **exact and pre-search**: [`VectorBlock::passes`] is a handful of `AND`s over bytes the
+//! scan has already fetched, so a filtered probe is the same read as an unfiltered one, and
+//! the k it returns is a true k rather than an oversampled guess that a post-filter thins.
+//!
 //! Everything is pure computation: no I/O, no async. The storage layer owns where these
 //! bytes live.
 
-use mlake_core::MemoryId;
+use mlake_core::{MemoryId, TagsMatch};
+use std::collections::BTreeSet;
 
 /// How one cluster's vectors are encoded on disk.
 ///
@@ -58,10 +67,21 @@ impl VectorCodec {
 const MAGIC: [u8; 4] = *b"MLVB";
 
 /// Bumped only for an incompatible layout change; `from_bytes` rejects anything else.
-const FORMAT_VERSION: u8 = 1;
+///
+/// v2 added the tag column. There is no backwards compatibility: a v1 block is rejected
+/// rather than read as an untagged v2 one, because "this block has no tag information" and
+/// "this block's members have no tags" are different facts and only the writer knows which.
+const FORMAT_VERSION: u8 = 2;
 
-/// `magic | version | codec | reserved | dim | count`.
+/// `magic | version | codec | flags | reserved | dim | count`.
 const HEADER_LEN: usize = 16;
+
+/// Header flag bit: the block carries a tag dictionary and per-member bitmaps.
+///
+/// Explicit rather than inferred from a non-empty dictionary, because a block whose members
+/// are *all* untagged has an empty dictionary and still filters (the strict modes must
+/// exclude its members; `Exact` with an empty request must select them).
+const FLAG_HAS_TAGS: u8 = 0b0000_0001;
 
 /// A [`MemoryId`] is a raw 16-byte UUID.
 const ID_LEN: usize = 16;
@@ -98,6 +118,70 @@ pub struct VectorBlock {
     /// Codes for every member, contiguous and fixed-stride: member `i` starts at
     /// `i * bytes_per_vector(codec, dim)`.
     codes: Vec<u8>,
+    /// Whether the tag column below is meaningful. See [`FLAG_HAS_TAGS`].
+    has_tags: bool,
+    /// The block's distinct tags, sorted and deduplicated. Sorted for two reasons: a tag's
+    /// dictionary position is then a pure function of the block's contents, which is what
+    /// makes encoding byte-identical across replays (G-6), and [`VectorBlock::tag_mask`] can
+    /// compile a query against it by binary search instead of a linear scan.
+    tag_dict: Vec<String>,
+    /// One bitmap per member, `ceil(|tag_dict| / 8)` bytes each, laid out contiguously in
+    /// member order: bit `t` of member `i` is set iff member `i` carries `tag_dict[t]`.
+    ///
+    /// **Known cost, deliberately uncapped.** The width is linear in the *block's* distinct
+    /// tag count, so a cluster whose members share a small vocabulary costs almost nothing
+    /// (32 distinct tags = 4 B/member, ~7% of a 60 B binary code) while a cluster where every
+    /// member carries a unique tag costs `count/8` bytes per member — quadratic in the block,
+    /// and at 500 members that is 63 B/member, more than the code it rides beside. There is
+    /// no cap, no fallback to a sparse or roaring encoding, and no spill of a long tail to
+    /// payload. That is a conscious omission, not an oversight: the fixed stride is what
+    /// makes [`VectorBlock::passes`] branch-free and what lets the whole column be range-read
+    /// with the codes. If a real namespace ever shows a high-cardinality per-cluster
+    /// vocabulary, the fix is a sparse encoding behind the same [`TagMask`] API, and the test
+    /// `the_bitmap_costs_what_we_claim_per_member` is where the number to beat is pinned.
+    tag_bits: Vec<u8>,
+    /// Bitwise OR of every member bitmap — the block's tag union, for [`VectorBlock::any_can_pass`].
+    /// Derived, never serialized.
+    tag_union: Vec<u8>,
+    /// Whether any member is untagged (an all-zero bitmap). Derived, never serialized.
+    any_untagged: bool,
+}
+
+/// A tag filter compiled against one block's dictionary.
+///
+/// Compiling is the only place a string comparison happens on the query path: it resolves
+/// each request tag to a dictionary position once per block per query, after which
+/// [`VectorBlock::passes`] is pure bitwise work. Because a mask is bound to the dictionary it
+/// was compiled against, it is not portable between blocks — [`VectorBlock::tag_mask`] is
+/// cheap precisely so it can be called per block.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct TagMask {
+    /// The request tags that exist in this block's dictionary, as a bitmap of the same width
+    /// as a member's.
+    bits: Vec<u8>,
+    /// Width of `bits`, kept explicitly so a mask compiled against a different block is
+    /// detectable rather than silently misaligned.
+    width: usize,
+    /// How many *distinct* request tags resolved to a dictionary entry.
+    present: usize,
+    /// How many *distinct* request tags are absent from this block's dictionary.
+    ///
+    /// This is the field that makes absent tags exact rather than approximate. An absent tag
+    /// is one no member of this block carries, so:
+    /// * for `Any`/`AnyStrict` it can never contribute an overlap — it simply sets no bit,
+    ///   and the remaining request tags decide;
+    /// * for `All`/`AllStrict`/`Exact` it makes `request ⊆ member tags` unsatisfiable for
+    ///   *every* member, so `missing > 0` is a whole-block answer, which is exactly what
+    ///   [`VectorBlock::any_can_pass`] exploits to skip the block without scoring it.
+    missing: usize,
+}
+
+impl TagMask {
+    /// Number of distinct request tags, present or absent. Zero means "no filter" for every
+    /// mode except `Exact`, where it is the untagged scope.
+    fn requested(&self) -> usize {
+        self.present + self.missing
+    }
 }
 
 /// A query vector prepared once per query for a given codec + dim.
@@ -140,6 +224,42 @@ impl VectorBlock {
         dim: usize,
         ids: &[MemoryId],
         vectors: &[Vec<f32>],
+    ) -> Result<Self, mlake_core::Error> {
+        Self::encode_inner(codec, dim, ids, vectors, None)
+    }
+
+    /// Encode with a per-cluster tag dictionary and per-member bitmaps.
+    ///
+    /// `member_tags[i]` are the tags of member `i`; it must align 1:1 with `ids`/`vectors`.
+    /// Duplicates within a member's list and duplicates across members collapse into the one
+    /// dictionary entry, so the encoding does not depend on how the caller happened to order
+    /// or repeat them (G-6).
+    ///
+    /// The result answers [`VectorBlock::has_tags`] with `true` even when every member is
+    /// untagged: that is a filterable fact, not an absence of information.
+    pub fn encode_with_tags(
+        codec: VectorCodec,
+        dim: usize,
+        ids: &[MemoryId],
+        vectors: &[Vec<f32>],
+        member_tags: &[Vec<String>],
+    ) -> Result<Self, mlake_core::Error> {
+        if member_tags.len() != ids.len() {
+            return Err(mlake_core::Error::Encode(format!(
+                "{} tag lists for {} ids: the tag column is positional",
+                member_tags.len(),
+                ids.len()
+            )));
+        }
+        Self::encode_inner(codec, dim, ids, vectors, Some(member_tags))
+    }
+
+    fn encode_inner(
+        codec: VectorCodec,
+        dim: usize,
+        ids: &[MemoryId],
+        vectors: &[Vec<f32>],
+        member_tags: Option<&[Vec<String>]>,
     ) -> Result<Self, mlake_core::Error> {
         if ids.len() != vectors.len() {
             return Err(mlake_core::Error::Encode(format!(
@@ -186,28 +306,74 @@ impl VectorBlock {
         }
         debug_assert_eq!(codes.len(), stride * vectors.len());
 
+        let (has_tags, tag_dict, tag_bits) = match member_tags {
+            None => (false, Vec::new(), Vec::new()),
+            Some(per_member) => {
+                // Sorted + deduplicated, so the dictionary — and therefore every bit
+                // position — is a pure function of the block's contents.
+                let dict: Vec<String> = per_member
+                    .iter()
+                    .flatten()
+                    .collect::<BTreeSet<&String>>()
+                    .into_iter()
+                    .cloned()
+                    .collect();
+                let width = dict.len().div_ceil(8);
+                let mut bits = vec![0u8; width * per_member.len()];
+                for (i, tags) in per_member.iter().enumerate() {
+                    let row = &mut bits[i * width..(i + 1) * width];
+                    for t in tags {
+                        // Present by construction: the dictionary is the union of these.
+                        if let Ok(t) = dict.binary_search(t) {
+                            row[t / 8] |= 1 << (t % 8);
+                        }
+                    }
+                }
+                (true, dict, bits)
+            }
+        };
+        let (tag_union, any_untagged) = tag_summary(&tag_bits, tag_dict.len().div_ceil(8), ids.len());
+
         Ok(Self {
             codec: Some(codec),
             dim,
             ids: ids.to_vec(),
             mean,
             codes,
+            has_tags,
+            tag_dict,
+            tag_bits,
+            tag_union,
+            any_untagged,
         })
     }
 
-    /// Serialize to bytes. Self-describing: codec, dim and count are in the header.
+    /// Serialize to bytes. Self-describing: codec, dim, count and the tag column are all in
+    /// the stream.
     ///
-    /// `[magic 4][version 1][codec 1][reserved 2][dim u32][count u32]`, then `count` ids,
-    /// then the block mean (quantized codecs only), then the codes.
+    /// `[magic 4][version 1][codec 1][flags 1][reserved 1][dim u32][count u32]`, then `count`
+    /// ids, then the block mean (quantized codecs only), then the tag column when
+    /// [`FLAG_HAS_TAGS`] is set, then the codes.
+    ///
+    /// The tag column is `[dict len u32]`, then that many `[len u32][utf8]` entries, then
+    /// `count` bitmaps of `ceil(dict len / 8)` bytes. It sits *before* the codes so the codes
+    /// remain the tail: a reader that has parsed everything else knows the exact number of
+    /// bytes that must remain, which is what makes the length check below an equality.
     pub fn to_bytes(&self) -> Vec<u8> {
         let codec = self.codec();
         let stride = Self::bytes_per_vector(codec, self.dim);
-        let mut out =
-            Vec::with_capacity(HEADER_LEN + self.ids.len() * ID_LEN + self.codes.len() + self.mean.len() * 4);
+        let mut out = Vec::with_capacity(
+            HEADER_LEN
+                + self.ids.len() * ID_LEN
+                + self.mean.len() * 4
+                + self.tag_bits.len()
+                + self.codes.len(),
+        );
         out.extend_from_slice(&MAGIC);
         out.push(FORMAT_VERSION);
         out.push(codec.tag());
-        out.extend_from_slice(&0u16.to_le_bytes());
+        out.push(if self.has_tags { FLAG_HAS_TAGS } else { 0 });
+        out.push(0);
         out.extend_from_slice(&(self.dim as u32).to_le_bytes());
         out.extend_from_slice(&(self.ids.len() as u32).to_le_bytes());
         for id in &self.ids {
@@ -216,9 +382,31 @@ impl VectorBlock {
         for x in &self.mean {
             out.extend_from_slice(&x.to_le_bytes());
         }
+        if self.has_tags {
+            out.extend_from_slice(&(self.tag_dict.len() as u32).to_le_bytes());
+            for t in &self.tag_dict {
+                out.extend_from_slice(&(t.len() as u32).to_le_bytes());
+                out.extend_from_slice(t.as_bytes());
+            }
+            out.extend_from_slice(&self.tag_bits);
+        }
         out.extend_from_slice(&self.codes);
-        debug_assert_eq!(out.len(), HEADER_LEN + self.ids.len() * (ID_LEN + stride) + self.mean.len() * 4);
+        debug_assert_eq!(
+            out.len(),
+            HEADER_LEN
+                + self.ids.len() * (ID_LEN + stride)
+                + self.mean.len() * 4
+                + self.tag_section_len()
+        );
         out
+    }
+
+    /// Bytes the tag column occupies in the serialized form.
+    fn tag_section_len(&self) -> usize {
+        if !self.has_tags {
+            return 0;
+        }
+        4 + self.tag_dict.iter().map(|t| 4 + t.len()).sum::<usize>() + self.tag_bits.len()
     }
 
     /// Parse. Must reject any malformed or truncated input with an error, never panic and
@@ -244,6 +432,11 @@ impl VectorBlock {
         }
         let codec = VectorCodec::from_tag(bytes[5])
             .ok_or_else(|| bad(&format!("unknown codec {}", bytes[5])))?;
+        let flags = bytes[6];
+        if flags & !FLAG_HAS_TAGS != 0 {
+            return Err(bad(&format!("unknown header flags {flags:#04x}")));
+        }
+        let has_tags = flags & FLAG_HAS_TAGS != 0;
         let dim = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]) as usize;
         let count = u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]) as usize;
 
@@ -258,9 +451,68 @@ impl VectorBlock {
             .checked_mul(4)
             .and_then(|n| n.checked_add(ids_end))
             .ok_or_else(|| bad("mean overflows"))?;
+        if bytes.len() < mean_end {
+            return Err(bad(&format!(
+                "declares {count} ids and a {mean_len}-dim mean ({mean_end} bytes) but has {}",
+                bytes.len()
+            )));
+        }
+
+        // The tag column is the one variable-length section, so it is walked with an explicit
+        // cursor and every step bounds-checked before it is taken.
+        let mut cursor = mean_end;
+        let mut tag_dict: Vec<String> = Vec::new();
+        let mut tag_bits: Vec<u8> = Vec::new();
+        if has_tags {
+            let u32_at = |c: &mut usize| -> Result<usize, mlake_core::Error> {
+                let end = c.checked_add(4).ok_or_else(|| bad("tag column overflows"))?;
+                let s = bytes.get(*c..end).ok_or_else(|| bad("tag column truncated"))?;
+                *c = end;
+                Ok(u32::from_le_bytes([s[0], s[1], s[2], s[3]]) as usize)
+            };
+            let dict_len = u32_at(&mut cursor)?;
+            // A dictionary entry costs at least 4 bytes, so a length past the buffer is a lie
+            // worth rejecting before it becomes an allocation.
+            if dict_len > bytes.len().saturating_sub(cursor) / 4 {
+                return Err(bad(&format!(
+                    "declares {dict_len} dictionary entries, more than the remaining bytes admit"
+                )));
+            }
+            tag_dict.reserve(dict_len);
+            for _ in 0..dict_len {
+                let len = u32_at(&mut cursor)?;
+                let end = cursor
+                    .checked_add(len)
+                    .ok_or_else(|| bad("tag dictionary overflows"))?;
+                let raw = bytes
+                    .get(cursor..end)
+                    .ok_or_else(|| bad("tag dictionary truncated"))?;
+                let t = std::str::from_utf8(raw)
+                    .map_err(|_| bad("tag dictionary holds invalid utf-8"))?;
+                tag_dict.push(t.to_string());
+                cursor = end;
+            }
+            if tag_dict.windows(2).any(|w| w[0] >= w[1]) {
+                // Not merely a tidiness check: `tag_mask` binary-searches this, and a scan
+                // silently missing a filter tag is a wrong answer rather than a loud one.
+                return Err(bad("tag dictionary is not strictly sorted"));
+            }
+            let bitmap_len = count
+                .checked_mul(tag_dict.len().div_ceil(8))
+                .ok_or_else(|| bad("tag bitmaps overflow"))?;
+            let end = cursor
+                .checked_add(bitmap_len)
+                .ok_or_else(|| bad("tag bitmaps overflow"))?;
+            tag_bits = bytes
+                .get(cursor..end)
+                .ok_or_else(|| bad("tag bitmaps truncated"))?
+                .to_vec();
+            cursor = end;
+        }
+
         let total = count
             .checked_mul(Self::bytes_per_vector(codec, dim))
-            .and_then(|n| n.checked_add(mean_end))
+            .and_then(|n| n.checked_add(cursor))
             .ok_or_else(|| bad("code table overflows"))?;
         if bytes.len() != total {
             return Err(bad(&format!(
@@ -277,13 +529,19 @@ impl VectorBlock {
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
+        let (tag_union, any_untagged) = tag_summary(&tag_bits, tag_dict.len().div_ceil(8), count);
 
         Ok(Self {
             codec: Some(codec),
             dim,
             ids,
             mean,
-            codes: bytes[mean_end..].to_vec(),
+            codes: bytes[cursor..].to_vec(),
+            has_tags,
+            tag_dict,
+            tag_bits,
+            tag_union,
+            any_untagged,
         })
     }
 
@@ -311,6 +569,161 @@ impl VectorBlock {
     /// The member ids, in the same order as the codes.
     pub fn ids(&self) -> &[MemoryId] {
         &self.ids
+    }
+
+    /// The block's distinct tags, sorted. Empty when the block was encoded without tags —
+    /// and also when it was encoded with tags but no member carries any. [`Self::has_tags`]
+    /// is what distinguishes those two.
+    pub fn tag_dictionary(&self) -> &[String] {
+        &self.tag_dict
+    }
+
+    /// Whether this block carries tag bitmaps at all.
+    ///
+    /// `false` means the block holds no filtering information, and every tag method here
+    /// degrades to "no filter": [`Self::passes`] admits every member and
+    /// [`Self::any_can_pass`] admits the block. Absence of information is not a reason to
+    /// drop results.
+    pub fn has_tags(&self) -> bool {
+        self.has_tags
+    }
+
+    /// Bytes one member's tag bitmap occupies. `0` when the block carries no tags, or when
+    /// it carries tags but every member is untagged.
+    pub fn tag_bitmap_width(&self) -> usize {
+        self.tag_dict.len().div_ceil(8)
+    }
+
+    /// Compile a filter's tags against this block's dictionary, once per block per query.
+    ///
+    /// The result is bound to this block: bit positions are dictionary positions, and
+    /// dictionaries differ between blocks. Request tags absent from the dictionary are
+    /// counted rather than dropped — see [`TagMask::missing`] for why that distinction is
+    /// what keeps the absent-tag case exact.
+    pub fn tag_mask(&self, tags: &[String]) -> TagMask {
+        let width = self.tag_bitmap_width();
+        let mut bits = vec![0u8; width];
+        let (mut present, mut missing) = (0usize, 0usize);
+        // Distinct, so a request repeating a tag does not count it twice — `TagFilter` works
+        // on sets and the counts here have to mean the same thing.
+        for t in tags.iter().collect::<BTreeSet<&String>>() {
+            match self.tag_dict.binary_search(t) {
+                Ok(pos) => {
+                    present += 1;
+                    bits[pos / 8] |= 1 << (pos % 8);
+                }
+                Err(_) => missing += 1,
+            }
+        }
+        TagMask {
+            bits,
+            width,
+            present,
+            missing,
+        }
+    }
+
+    /// Member `i`'s tag bitmap, or `None` when `i` is out of range.
+    fn member_bits(&self, i: usize) -> Option<&[u8]> {
+        let w = self.tag_bitmap_width();
+        if i >= self.ids.len() {
+            return None;
+        }
+        // A zero-width bitmap has no bytes to slice, and every member is untagged.
+        Some(if w == 0 {
+            &[]
+        } else {
+            self.tag_bits.get(i * w..(i + 1) * w)?
+        })
+    }
+
+    /// Whether member `i` satisfies the filter. Pure bitwise; no payload read.
+    ///
+    /// Exactly equivalent to `TagFilter::new(tags, mode).matches(&member_tags[i])` for the
+    /// `tags` the mask was compiled from — including how each mode treats an untagged
+    /// member, which is the part that is easy to get subtly wrong: `Any`/`All` *include*
+    /// untagged members, the strict modes and `Exact` exclude them. A member is untagged iff
+    /// its bitmap is all zeroes, which is exact because the dictionary is the union of the
+    /// block's own member tags: every tag a member carries has a bit.
+    ///
+    /// Returns `true` for every member when the block carries no tags, and `false` for an
+    /// `i` past the end (there is no such member to admit).
+    pub fn passes(&self, i: usize, mask: &TagMask, mode: TagsMatch) -> bool {
+        debug_assert_eq!(
+            mask.width,
+            self.tag_bitmap_width(),
+            "mask compiled against a different block's dictionary"
+        );
+        let Some(m) = self.member_bits(i) else {
+            return false;
+        };
+        if !self.has_tags || mask.width != self.tag_bitmap_width() {
+            return true;
+        }
+        if mask.requested() == 0 {
+            // Empty request: no filter, except Exact where it selects the untagged scope.
+            return match mode {
+                TagsMatch::Exact => is_zero(m),
+                _ => true,
+            };
+        }
+        let untagged = is_zero(m);
+        match mode {
+            TagsMatch::Any => untagged || overlaps(m, mask),
+            TagsMatch::All => untagged || contains_all(m, mask),
+            TagsMatch::AnyStrict => !untagged && overlaps(m, mask),
+            TagsMatch::AllStrict => !untagged && contains_all(m, mask),
+            TagsMatch::Exact => !untagged && set_eq(m, mask),
+        }
+    }
+
+    /// Whether ANY member could satisfy the filter. `false` means the caller can skip this
+    /// block entirely without scoring it.
+    ///
+    /// A necessary condition, evaluated against the block's tag *union* and whether it holds
+    /// an untagged member — the per-member [`Self::passes`] still decides. It is the bitwise
+    /// twin of `TagFilter::cluster_admits`, and its whole value is the absent-tag case: a
+    /// request tag no member carries makes `All`/`AllStrict`/`Exact` unsatisfiable for the
+    /// entire block, which is a whole cluster's worth of scoring skipped for one comparison.
+    ///
+    /// Never optimistic in the direction that matters: if it returns `false`, `passes`
+    /// returns `false` for every member. It may return `true` where nothing in fact passes
+    /// (`Exact` in particular, where the union admits a request no single member holds).
+    pub fn any_can_pass(&self, mask: &TagMask, mode: TagsMatch) -> bool {
+        if self.ids.is_empty() {
+            return false;
+        }
+        if !self.has_tags || mask.width != self.tag_bitmap_width() {
+            return true;
+        }
+        if mask.requested() == 0 {
+            return match mode {
+                TagsMatch::Exact => self.any_untagged,
+                _ => true,
+            };
+        }
+        let u = &self.tag_union;
+        match mode {
+            TagsMatch::Any => self.any_untagged || overlaps(u, mask),
+            TagsMatch::All => self.any_untagged || contains_all(u, mask),
+            TagsMatch::AnyStrict => overlaps(u, mask),
+            TagsMatch::AllStrict | TagsMatch::Exact => contains_all(u, mask),
+        }
+    }
+
+    /// The tags of member `i`, decoded from its bitmap. For hydrating a hit without payload.
+    ///
+    /// Sorted, because the dictionary is; deduplicated, because a bitmap cannot represent a
+    /// repeat. Empty for an untagged member, for a block without tags, and for an `i` past
+    /// the end.
+    pub fn member_tags(&self, i: usize) -> Vec<String> {
+        let Some(m) = self.member_bits(i) else {
+            return Vec::new();
+        };
+        (0..self.tag_dict.len())
+            .filter(|t| bit_at(m, *t))
+            .map(|t| self.tag_dict[t].clone())
+            .collect()
     }
 
     /// Prepare a query once, then score many members with it.
@@ -460,6 +873,52 @@ fn block_mean(dim: usize, vectors: &[Vec<f32>]) -> Vec<f32> {
     }
     let n = vectors.len().max(1) as f64;
     acc.into_iter().map(|a| (a / n) as f32).collect()
+}
+
+/// The block's tag union and whether any member is untagged, derived once from the bitmaps
+/// so [`VectorBlock::any_can_pass`] is `O(width)` rather than `O(members * width)`.
+fn tag_summary(bits: &[u8], width: usize, count: usize) -> (Vec<u8>, bool) {
+    if width == 0 {
+        // No dictionary: every member is untagged, and the union is empty. `count == 0` is
+        // the empty block, which holds no untagged member because it holds no member.
+        return (Vec::new(), count > 0);
+    }
+    let mut union = vec![0u8; width];
+    let mut any_untagged = false;
+    for row in bits.chunks_exact(width) {
+        let mut zero = true;
+        for (u, b) in union.iter_mut().zip(row) {
+            *u |= *b;
+            zero &= *b == 0;
+        }
+        any_untagged |= zero;
+    }
+    (union, any_untagged)
+}
+
+fn is_zero(bits: &[u8]) -> bool {
+    bits.iter().all(|b| *b == 0)
+}
+
+/// Any request tag present in `bits`. An absent request tag sets no bit in the mask, so it
+/// simply cannot contribute an overlap — which is the correct semantics, not an approximation.
+fn overlaps(bits: &[u8], mask: &TagMask) -> bool {
+    bits.iter().zip(&mask.bits).any(|(m, q)| m & q != 0)
+}
+
+/// Every request tag present in `bits` (request ⊆ bits).
+///
+/// `missing > 0` short-circuits to `false`: a request tag absent from the block's dictionary
+/// is absent from every member, so no member can contain the request.
+fn contains_all(bits: &[u8], mask: &TagMask) -> bool {
+    mask.missing == 0 && bits.iter().zip(&mask.bits).all(|(m, q)| m & q == *q)
+}
+
+/// `bits` is exactly the request set. Requires `missing == 0` for the same reason as
+/// [`contains_all`], and then plain bitmap equality: the dictionary covers every tag either
+/// side can hold, so equal bitmaps mean equal sets.
+fn set_eq(bits: &[u8], mask: &TagMask) -> bool {
+    mask.missing == 0 && bits == mask.bits.as_slice()
 }
 
 /// `[offset | scale | norm]` or `[residual norm | code cosine | norm]`, per codec.
@@ -848,6 +1307,417 @@ mod tests {
             total += spearman(&se, &sa);
         }
         total / queries.len() as f32
+    }
+
+    // --- tags -------------------------------------------------------------------------
+
+    const MODES: [TagsMatch; 5] = [
+        TagsMatch::Any,
+        TagsMatch::All,
+        TagsMatch::AnyStrict,
+        TagsMatch::AllStrict,
+        TagsMatch::Exact,
+    ];
+
+    fn tags(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Vectors nobody looks at: the tag tests are about the column, not the codec.
+    fn filler(n: usize) -> Vec<Vec<f32>> {
+        (0..n).map(|i| vec![i as f32, 1.0]).collect()
+    }
+
+    fn tagged_block(member_tags: &[Vec<String>]) -> VectorBlock {
+        let n = member_tags.len();
+        VectorBlock::encode_with_tags(VectorCodec::F32, 2, &ids(n), &filler(n), member_tags)
+            .unwrap()
+    }
+
+    /// The property the whole column rests on: the bitwise path is not *approximately*
+    /// `TagFilter`, it is `TagFilter`.
+    fn assert_agrees_with_reference(member_tags: &[Vec<String>], request: &[String]) {
+        let block = tagged_block(member_tags);
+        let mask = block.tag_mask(request);
+        for mode in MODES {
+            let reference = mlake_core::TagFilter::new(request.to_vec(), mode);
+            for (i, mt) in member_tags.iter().enumerate() {
+                assert_eq!(
+                    block.passes(i, &mask, mode),
+                    reference.matches(mt),
+                    "{mode:?}: member {i} {mt:?} against request {request:?}"
+                );
+            }
+            if !block.any_can_pass(&mask, mode) {
+                assert!(
+                    (0..block.len()).all(|i| !block.passes(i, &mask, mode)),
+                    "{mode:?}: any_can_pass said no member could pass request {request:?}, \
+                     but one does"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_bitwise_filter_agrees_with_tag_filter_on_every_mode() {
+        // The test that matters. If the bitwise path disagrees with `TagFilter` anywhere the
+        // filter is wrong and silently so, so this sweeps randomized tag sets rather than
+        // hand-picked ones: overlapping, disjoint, subset, superset, duplicated and empty
+        // member sets, against requests that are sometimes drawn from the same vocabulary and
+        // sometimes not.
+        let vocab: Vec<String> = (0..12).map(|i| format!("t{i}")).collect();
+        let mut rng = Rng::seeded(0xA65);
+        for _ in 0..400 {
+            let members = 1 + rng.below(9);
+            let member_tags: Vec<Vec<String>> = (0..members)
+                .map(|_| {
+                    // A quarter of members are untagged: the strict modes exist for them.
+                    if rng.below(4) == 0 {
+                        return Vec::new();
+                    }
+                    let k = 1 + rng.below(4);
+                    (0..k).map(|_| vocab[rng.below(vocab.len())].clone()).collect()
+                })
+                .collect();
+            // Requests draw from a wider vocabulary than the members do, so roughly a third
+            // of request tags are absent from the block's dictionary.
+            let req_len = rng.below(4);
+            let request: Vec<String> = (0..req_len)
+                .map(|_| {
+                    let i = rng.below(vocab.len() + 6);
+                    vocab.get(i).cloned().unwrap_or_else(|| format!("absent{i}"))
+                })
+                .collect();
+            assert_agrees_with_reference(&member_tags, &request);
+        }
+    }
+
+    #[test]
+    fn untagged_members_are_treated_per_mode_exactly_as_the_reference_does() {
+        // Pinned separately from the randomized sweep because this is the asymmetry the whole
+        // five-mode design exists for, and a bug here is invisible on tagged corpora.
+        let member_tags = vec![Vec::new(), tags(&["a"])];
+        let block = tagged_block(&member_tags);
+        let mask = block.tag_mask(&tags(&["a"]));
+        // Any/All include the untagged member; the strict modes and Exact exclude it.
+        assert!(block.passes(0, &mask, TagsMatch::Any));
+        assert!(block.passes(0, &mask, TagsMatch::All));
+        assert!(!block.passes(0, &mask, TagsMatch::AnyStrict));
+        assert!(!block.passes(0, &mask, TagsMatch::AllStrict));
+        assert!(!block.passes(0, &mask, TagsMatch::Exact));
+        for mode in MODES {
+            assert!(block.passes(1, &mask, mode), "{mode:?}: the tagged member matches");
+        }
+
+        // An empty request is "no filter" everywhere except Exact, where it is the untagged
+        // scope — so it inverts which member survives.
+        let empty = block.tag_mask(&[]);
+        for mode in MODES {
+            let want_untagged = mode == TagsMatch::Exact;
+            assert!(block.passes(0, &empty, mode), "{mode:?} on untagged");
+            assert_eq!(block.passes(1, &empty, mode), !want_untagged, "{mode:?} on tagged");
+            assert!(block.any_can_pass(&empty, mode), "{mode:?}");
+        }
+        assert_agrees_with_reference(&member_tags, &[]);
+        assert_agrees_with_reference(&member_tags, &tags(&["a"]));
+    }
+
+    #[test]
+    fn a_block_whose_members_are_all_untagged_still_filters() {
+        // Empty dictionary, zero-width bitmaps — and still a filterable fact, which is why
+        // `has_tags` is a header flag rather than "the dictionary is non-empty".
+        let member_tags = vec![Vec::new(), Vec::new()];
+        let block = tagged_block(&member_tags);
+        assert!(block.has_tags());
+        assert!(block.tag_dictionary().is_empty());
+        assert_eq!(block.tag_bitmap_width(), 0);
+        let mask = block.tag_mask(&tags(&["a"]));
+        for mode in [TagsMatch::AnyStrict, TagsMatch::AllStrict, TagsMatch::Exact] {
+            assert!(!block.any_can_pass(&mask, mode), "{mode:?}");
+            assert!(!block.passes(0, &mask, mode), "{mode:?}");
+        }
+        for mode in [TagsMatch::Any, TagsMatch::All] {
+            assert!(block.passes(0, &mask, mode), "{mode:?} includes untagged");
+        }
+        assert_agrees_with_reference(&member_tags, &tags(&["a"]));
+    }
+
+    #[test]
+    fn a_request_tag_absent_from_the_dictionary_is_exact_not_approximate() {
+        let member_tags = vec![tags(&["a", "b"]), tags(&["a"])];
+        let block = tagged_block(&member_tags);
+        assert_eq!(block.tag_dictionary(), tags(&["a", "b"]));
+
+        // "a" is present, "zz" is not. Any/AnyStrict: the absent tag contributes no bit and
+        // the present one still decides.
+        let mixed = block.tag_mask(&tags(&["a", "zz"]));
+        assert!(block.passes(0, &mixed, TagsMatch::Any));
+        assert!(block.passes(0, &mixed, TagsMatch::AnyStrict));
+        assert!(block.any_can_pass(&mixed, TagsMatch::AnyStrict));
+        // All/AllStrict/Exact need the absent tag, so nothing in the block can match — and
+        // any_can_pass must say so, because skipping the block is the win.
+        for mode in [TagsMatch::All, TagsMatch::AllStrict, TagsMatch::Exact] {
+            assert!(!block.passes(0, &mixed, mode), "{mode:?}");
+            assert!(!block.passes(1, &mixed, mode), "{mode:?}");
+        }
+        assert!(!block.any_can_pass(&mixed, TagsMatch::AllStrict));
+        assert!(!block.any_can_pass(&mixed, TagsMatch::Exact));
+        // `All` still admits the block if it holds an untagged member — and here it does not.
+        assert!(!block.any_can_pass(&mixed, TagsMatch::All));
+
+        // Every request tag absent: even the overlap modes can prune the whole block.
+        let none = block.tag_mask(&tags(&["zz", "yy"]));
+        for mode in MODES {
+            assert!(!block.any_can_pass(&none, mode), "{mode:?}");
+        }
+        assert_agrees_with_reference(&member_tags, &tags(&["a", "zz"]));
+        assert_agrees_with_reference(&member_tags, &tags(&["zz", "yy"]));
+    }
+
+    #[test]
+    fn any_can_pass_is_never_optimistic() {
+        // The one direction that has to hold: `false` is a licence to skip the block without
+        // scoring it, so a false negative silently drops results.
+        let vocab: Vec<String> = (0..6).map(|i| format!("t{i}")).collect();
+        let mut rng = Rng::seeded(99);
+        for _ in 0..300 {
+            let members = 1 + rng.below(6);
+            let member_tags: Vec<Vec<String>> = (0..members)
+                .map(|_| {
+                    if rng.below(5) == 0 {
+                        return Vec::new();
+                    }
+                    (0..1 + rng.below(3))
+                        .map(|_| vocab[rng.below(vocab.len())].clone())
+                        .collect()
+                })
+                .collect();
+            let block = tagged_block(&member_tags);
+            let request: Vec<String> = (0..1 + rng.below(3))
+                .map(|_| {
+                    let i = rng.below(vocab.len() + 3);
+                    vocab.get(i).cloned().unwrap_or_else(|| format!("absent{i}"))
+                })
+                .collect();
+            let mask = block.tag_mask(&request);
+            for mode in MODES {
+                if !block.any_can_pass(&mask, mode) {
+                    for (i, mt) in member_tags.iter().enumerate() {
+                        assert!(
+                            !block.passes(i, &mask, mode),
+                            "{mode:?}: block skipped but member {i} {mt:?} passes {request:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_block_encoded_without_tags_filters_nothing() {
+        // No filter information is "no filtering", not "filter everything out" — the opposite
+        // choice would make an unmigrated block return zero results instead of all of them.
+        let block = VectorBlock::encode(VectorCodec::F32, 2, &ids(3), &filler(3)).unwrap();
+        assert!(!block.has_tags());
+        assert!(block.tag_dictionary().is_empty());
+        let mask = block.tag_mask(&tags(&["a", "b"]));
+        for mode in MODES {
+            assert!(block.any_can_pass(&mask, mode), "{mode:?}");
+            for i in 0..block.len() {
+                assert!(block.passes(i, &mask, mode), "{mode:?} member {i}");
+            }
+        }
+        assert!(block.member_tags(0).is_empty());
+    }
+
+    #[test]
+    fn member_tags_decode_back_to_the_set_that_was_encoded() {
+        let member_tags = vec![
+            tags(&["zeta", "alpha"]),
+            Vec::new(),
+            tags(&["alpha", "alpha", "mid"]),
+        ];
+        let block = tagged_block(&member_tags);
+        assert_eq!(block.tag_dictionary(), tags(&["alpha", "mid", "zeta"]));
+        assert_eq!(block.member_tags(0), tags(&["alpha", "zeta"]), "sorted, not input order");
+        assert_eq!(block.member_tags(1), Vec::<String>::new());
+        assert_eq!(block.member_tags(2), tags(&["alpha", "mid"]), "duplicates collapse");
+        assert_eq!(block.member_tags(9), Vec::<String>::new(), "no such member");
+    }
+
+    #[test]
+    fn out_of_range_members_do_not_pass_and_do_not_panic() {
+        let block = tagged_block(&[tags(&["a"])]);
+        let mask = block.tag_mask(&tags(&["a"]));
+        for mode in MODES {
+            assert!(!block.passes(1, &mask, mode), "{mode:?}");
+            assert!(!block.passes(usize::MAX, &mask, mode), "{mode:?}");
+        }
+        let empty = tagged_block(&[]);
+        assert!(empty.has_tags());
+        for mode in MODES {
+            assert!(!empty.any_can_pass(&empty.tag_mask(&tags(&["a"])), mode), "{mode:?}");
+        }
+    }
+
+    #[test]
+    fn the_tag_column_round_trips_through_bytes() {
+        let member_tags: Vec<Vec<String>> = (0..40)
+            .map(|i| match i % 4 {
+                0 => Vec::new(),
+                1 => tags(&["shared"]),
+                2 => vec![format!("uniq{i}"), "shared".to_string()],
+                _ => tags(&["shared", "other", "utf8-ünïcødé-🏷"]),
+            })
+            .collect();
+        for codec in [VectorCodec::F32, VectorCodec::Int8, VectorCodec::Binary] {
+            let (vectors, _) = corpus(40, DIM, TOPICS, 0.5, 3);
+            let block =
+                VectorBlock::encode_with_tags(codec, DIM, &ids(40), &vectors, &member_tags)
+                    .unwrap();
+            let back = VectorBlock::from_bytes(&block.to_bytes()).unwrap();
+            assert_eq!(back, block, "{codec:?}");
+            assert!(back.has_tags());
+            assert_eq!(back.tag_dictionary(), block.tag_dictionary());
+            for (i, mt) in member_tags.iter().enumerate() {
+                let mut want = mt.clone();
+                want.sort();
+                want.dedup();
+                assert_eq!(back.member_tags(i), want, "{codec:?} member {i}");
+            }
+            // Scoring is untouched by the tag column riding alongside.
+            let plain = VectorBlock::encode(codec, DIM, &ids(40), &vectors).unwrap();
+            assert_eq!(back.codes, plain.codes, "{codec:?}");
+        }
+    }
+
+    #[test]
+    fn a_truncated_or_corrupt_tag_column_is_an_error_not_a_panic() {
+        let member_tags: Vec<Vec<String>> = (0..20)
+            .map(|i| vec![format!("t{}", i % 5), "shared".to_string()])
+            .collect();
+        let (vectors, _) = corpus(20, 16, TOPICS, 0.5, 2);
+        let bytes = VectorBlock::encode_with_tags(VectorCodec::Int8, 16, &ids(20), &vectors, &member_tags)
+            .unwrap()
+            .to_bytes();
+        // Every prefix, not a sampled few: the tag column is the one variable-length section
+        // in the format, so its cursor is the part most likely to walk off the end.
+        for cut in 0..bytes.len() {
+            assert!(
+                VectorBlock::from_bytes(&bytes[..cut]).is_err(),
+                "a {cut}-byte prefix must be rejected, never indexed into"
+            );
+        }
+        assert!(VectorBlock::from_bytes(&bytes).is_ok());
+
+        let mut extra = bytes.clone();
+        extra.push(0);
+        assert!(VectorBlock::from_bytes(&extra).is_err(), "trailing bytes");
+
+        // A v1 block: no compatibility to preserve, so it is rejected rather than guessed at.
+        let mut old = bytes.clone();
+        old[4] = 1;
+        assert!(matches!(
+            VectorBlock::from_bytes(&old),
+            Err(mlake_core::Error::FormatVersion { .. })
+        ));
+
+        // An unknown flag bit means a writer that knew something this reader does not.
+        let mut future = bytes.clone();
+        future[6] = 0b1000_0001;
+        assert!(VectorBlock::from_bytes(&future).is_err());
+
+        // The dictionary count is attacker-controlled in the same way `count` and `dim` are.
+        let dict_at = HEADER_LEN + 20 * ID_LEN + 16 * 4;
+        for value in [u32::MAX, 1 << 20, 0] {
+            let mut lying = bytes.clone();
+            lying[dict_at..dict_at + 4].copy_from_slice(&value.to_le_bytes());
+            assert!(
+                VectorBlock::from_bytes(&lying).is_err(),
+                "a dictionary count of {value} must not be trusted"
+            );
+        }
+        // An individual entry length, likewise.
+        let mut long_entry = bytes.clone();
+        long_entry[dict_at + 4..dict_at + 8].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(VectorBlock::from_bytes(&long_entry).is_err());
+
+        // Invalid utf-8 in a dictionary entry.
+        let mut bad_utf8 = bytes.clone();
+        bad_utf8[dict_at + 8] = 0xFF;
+        assert!(VectorBlock::from_bytes(&bad_utf8).is_err());
+
+        // An out-of-order dictionary would break the binary search in `tag_mask`, which fails
+        // by silently missing a filter tag — the worst possible failure mode for a filter.
+        let mut unsorted = bytes.clone();
+        unsorted[dict_at + 8] = b'z';
+        assert!(VectorBlock::from_bytes(&unsorted).is_err());
+    }
+
+    #[test]
+    fn the_tag_column_encodes_deterministically() {
+        // G-6: byte-identical replays. The dictionary is a sorted set, so neither the order a
+        // member lists its tags in nor the order members appear in can perturb the bytes.
+        let a = vec![tags(&["b", "a", "a"]), tags(&["c"]), Vec::new()];
+        let b = vec![tags(&["a", "b"]), tags(&["c"]), Vec::new()];
+        assert_eq!(tagged_block(&a).to_bytes(), tagged_block(&b).to_bytes());
+        assert_eq!(tagged_block(&a).to_bytes(), tagged_block(&a).to_bytes());
+    }
+
+    #[test]
+    fn encode_with_tags_rejects_a_tag_list_that_disagrees_with_the_member_count() {
+        let err = VectorBlock::encode_with_tags(
+            VectorCodec::F32,
+            2,
+            &ids(2),
+            &filler(2),
+            &[tags(&["a"])],
+        )
+        .unwrap_err();
+        assert!(matches!(err, mlake_core::Error::Encode(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn the_bitmap_costs_what_we_claim_per_member() {
+        // The number the uncapped-width decision is being made against, measured rather than
+        // argued. A realistic cluster: 500 members drawn from a 40-tag vocabulary, 2-3 tags
+        // each — the shape a namespace with a few dozen topic labels actually has.
+        let vocab: Vec<String> = (0..40).map(|i| format!("tag{i}")).collect();
+        let mut rng = Rng::seeded(4242);
+        let member_tags: Vec<Vec<String>> = (0..N)
+            .map(|_| {
+                (0..2 + rng.below(2))
+                    .map(|_| vocab[rng.below(vocab.len())].clone())
+                    .collect()
+            })
+            .collect();
+        let (vectors, _) = block_corpus(11);
+        let tagged =
+            VectorBlock::encode_with_tags(VectorCodec::Binary, DIM, &ids(N), &vectors, &member_tags)
+                .unwrap();
+        let plain = VectorBlock::encode(VectorCodec::Binary, DIM, &ids(N), &vectors).unwrap();
+        let overhead = (tagged.to_bytes().len() - plain.to_bytes().len()) as f32 / N as f32;
+        assert_eq!(tagged.tag_dictionary().len(), 40);
+        assert_eq!(tagged.tag_bitmap_width(), 5, "ceil(40/8)");
+        // Measured: 5.708 B/member — 5 B of bitmap plus 0.708 B of amortized dictionary
+        // (354 B of strings over 500 members) — against the 60 B binary code it rides
+        // beside, i.e. 9.5% of the code and 3.6% of the whole 74 B/member block.
+        assert!((5.0..6.0).contains(&overhead), "tag overhead {overhead} B/member");
+        let ratio = overhead / VectorBlock::bytes_per_vector(VectorCodec::Binary, DIM) as f32;
+        assert!(ratio < 0.10, "tag column is {ratio} of the code it rides beside");
+
+        // The worst case the doc comment warns about, so the ceiling is a measured number
+        // rather than an assertion: every member carrying a unique tag makes the width
+        // count/8, which at 500 members is more than the code itself.
+        let unique: Vec<Vec<String>> = (0..N).map(|i| vec![format!("u{i}")]).collect();
+        let worst =
+            VectorBlock::encode_with_tags(VectorCodec::Binary, DIM, &ids(N), &vectors, &unique)
+                .unwrap();
+        assert_eq!(worst.tag_bitmap_width(), N.div_ceil(8), "63 B/member at N=500");
+        assert!(
+            worst.tag_bitmap_width() > VectorBlock::bytes_per_vector(VectorCodec::Binary, DIM),
+            "if this stopped being true the uncapped width would need no caveat"
+        );
     }
 
     // --- format -----------------------------------------------------------------------

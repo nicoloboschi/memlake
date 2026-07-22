@@ -69,6 +69,11 @@ class MemlakeStub:
                 request_serializer=memlake_dot_v1_dot_memlake__pb2.GetRequest.SerializeToString,
                 response_deserializer=memlake_dot_v1_dot_memlake__pb2.GetResponse.FromString,
                 _registered_method=True)
+        self.EntityStats = channel.unary_unary(
+                '/memlake.v1.Memlake/EntityStats',
+                request_serializer=memlake_dot_v1_dot_memlake__pb2.EntityStatsRequest.SerializeToString,
+                response_deserializer=memlake_dot_v1_dot_memlake__pb2.EntityStatsResponse.FromString,
+                _registered_method=True)
         self.Scan = channel.unary_unary(
                 '/memlake.v1.Memlake/Scan',
                 request_serializer=memlake_dot_v1_dot_memlake__pb2.ScanRequest.SerializeToString,
@@ -183,6 +188,16 @@ class MemlakeServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def EntityStats(self, request, context):
+        """How many memories carry each entity. Reads the entity posting index — the same
+        structure the graph arm expands through — so its cost scales with the number of
+        entities, not the corpus. Counts reflect the indexed generation plus the un-indexed
+        WAL tail, the same adjustment `Stats.doc_count` makes.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def Scan(self, request, context):
         """Page through a memory_type's stored memories in cluster order. This is a full scan by
         construction — the cost DOES grow with the corpus — so it exists for browsing and
@@ -289,6 +304,11 @@ def add_MemlakeServicer_to_server(servicer, server):
                     servicer.Get,
                     request_deserializer=memlake_dot_v1_dot_memlake__pb2.GetRequest.FromString,
                     response_serializer=memlake_dot_v1_dot_memlake__pb2.GetResponse.SerializeToString,
+            ),
+            'EntityStats': grpc.unary_unary_rpc_method_handler(
+                    servicer.EntityStats,
+                    request_deserializer=memlake_dot_v1_dot_memlake__pb2.EntityStatsRequest.FromString,
+                    response_serializer=memlake_dot_v1_dot_memlake__pb2.EntityStatsResponse.SerializeToString,
             ),
             'Scan': grpc.unary_unary_rpc_method_handler(
                     servicer.Scan,
@@ -515,6 +535,33 @@ class Memlake:
             '/memlake.v1.Memlake/Get',
             memlake_dot_v1_dot_memlake__pb2.GetRequest.SerializeToString,
             memlake_dot_v1_dot_memlake__pb2.GetResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def EntityStats(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/memlake.v1.Memlake/EntityStats',
+            memlake_dot_v1_dot_memlake__pb2.EntityStatsRequest.SerializeToString,
+            memlake_dot_v1_dot_memlake__pb2.EntityStatsResponse.FromString,
             options,
             channel_credentials,
             insecure,

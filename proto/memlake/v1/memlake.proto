@@ -53,6 +53,12 @@ service Memlake {
   // SSTable to its cluster, then range-reads only those clusters.
   rpc Get(GetRequest) returns (GetResponse);
 
+  // How many memories carry each entity. Reads the entity posting index — the same
+  // structure the graph arm expands through — so its cost scales with the number of
+  // entities, not the corpus. Counts reflect the indexed generation plus the un-indexed
+  // WAL tail, the same adjustment `Stats.doc_count` makes.
+  rpc EntityStats(EntityStatsRequest) returns (EntityStatsResponse);
+
   // Page through a memory_type's stored memories in cluster order. This is a full scan by
   // construction — the cost DOES grow with the corpus — so it exists for browsing and
   // debugging, never for retrieval. Use `Query` to find things.
@@ -400,6 +406,26 @@ message StoredMemoryRecord {
   Vector vector = 4;                 // present only if include_vector was set
 }
 
+message EntityStatsRequest {
+  string namespace = 1;
+  // Restrict to these memory_types; empty means every type in the snapshot.
+  repeated uint32 memory_types = 2;
+  // Count only these entities (16-byte EntityIds). Empty returns every entity present,
+  // which is what an orphan sweep wants.
+  repeated bytes entity_ids = 3;
+}
+
+message EntityCount {
+  bytes entity_id = 1;          // 16-byte EntityId
+  uint64 memory_count = 2;      // live memories carrying it
+}
+
+message EntityStatsResponse {
+  // Entities with no live memories are absent rather than reported as zero — an id the
+  // caller asked for and does not get back is an orphan.
+  repeated EntityCount entities = 1;
+}
+
 message ScanRequest {
   string namespace = 1;
   // Types to walk, in ascending order. Empty means every type in the snapshot.
@@ -415,6 +441,17 @@ message ScanRequest {
   bool include_vector = 5;
   TagFilter tags = 6;                // omit for no tag filter
   reserved 7;                        // was `Consistency consistency`
+  // Metadata key=value pairs a memory must ALL carry to be returned, AND-ed with `tags`.
+  // Same shape `DeleteByPredicate` takes — e.g. `{"document_id": "d-42"}` to page one
+  // document's memories, or a marker key to page only the memories carrying it. Metadata is
+  // not indexed, so this narrows what a walk *returns*, not what it *reads*: the scan still
+  // touches every cluster. It is the difference between the caller filtering N pages client
+  // side and the server filtering them, not an index lookup.
+  map<string, string> metadata_equals = 8;
+  // Discard this many matching memories before filling the page. Lets a caller reach an
+  // offset without paging to it, at the cost of the server doing the same walk — O(skip),
+  // just without the round trips. Prefer `page_token` when you have one.
+  uint64 skip = 9;
 }
 
 message ScanResponse {

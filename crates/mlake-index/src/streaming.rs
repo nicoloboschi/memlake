@@ -649,6 +649,8 @@ async fn flush_cluster(
         .iter()
         .map(|m| if m.vector.is_empty() { vec![0.0; dim] } else { m.vector.clone() })
         .collect();
+    // Tags travel with the codes so the probe can filter without the payload half.
+    let member_tags: Vec<Vec<String>> = items.iter().map(|m| m.tags.clone()).collect();
     // The embedding moves to the vector block; leaving a copy inline would give back every
     // byte this split exists to save.
     for m in items.iter_mut() {
@@ -656,7 +658,7 @@ async fn flush_cluster(
     }
     let cf = ClusterFile { centroid_id: c as u32, items };
     let cluster = write_cluster_file(&ns.store, prefix, c, &cf).await?;
-    let block = VectorBlock::encode(codec, dim, &ids, &vectors)?;
+    let block = VectorBlock::encode_with_tags(codec, dim, &ids, &vectors, &member_tags)?;
     let vec_path = crate::generation::write_vector_block(&ns.store, prefix, c, block.to_bytes()).await?;
     Ok((cluster, vec_path))
 }

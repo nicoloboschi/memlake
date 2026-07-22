@@ -104,6 +104,36 @@ fn build_store(prefix: &str) -> Result<Store> {
         .with_context(|| format!("building object store (check {prefix}_S3_* env or .env)"))
 }
 
+/// The indexer's per-stage streaming-fold budget, from `MEMLAKE_INDEXER_FOLD_*` (used only when
+/// `fold` picks the streaming path). Falls back to [`FoldBudget::default`] per stage.
+fn indexer_fold_budget() -> mlake_index::streaming::FoldBudget {
+    let d = mlake_index::streaming::FoldBudget::default();
+    let mb = |suffix: &str, default: usize| {
+        std::env::var(format!("MEMLAKE_INDEXER_FOLD_{suffix}"))
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(default)
+    };
+    mlake_index::streaming::FoldBudget {
+        resolve_mb: mb("RESOLVE_MB", d.resolve_mb),
+        cluster_mb: mb("CLUSTER_MB", d.cluster_mb),
+        payload_mb: mb("PAYLOAD_MB", d.payload_mb),
+        index_mb: mb("INDEX_MB", d.index_mb),
+        radj_mb: mb("RADJ_MB", d.radj_mb),
+        fts_mb: mb("FTS_MB", d.fts_mb),
+    }
+}
+
+/// The corpus-size cutoff for `fold`'s in-RAM-vs-streaming choice, from
+/// `MEMLAKE_INDEXER_STREAMING_THRESHOLD` (docs); defaults to [`DEFAULT_STREAMING_THRESHOLD_DOCS`].
+fn indexer_streaming_threshold() -> usize {
+    std::env::var("MEMLAKE_INDEXER_STREAMING_THRESHOLD")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(mlake_index::DEFAULT_STREAMING_THRESHOLD_DOCS)
+}
+
 async fn serve(args: &[String], node: String) -> Result<()> {
     let addr = flag(args, "--addr")
         .unwrap_or_else(|| "0.0.0.0:50051".into())
@@ -155,7 +185,7 @@ async fn indexer(args: &[String], node: String) -> Result<()> {
     // benchmark's index phase — the harness reads the summary for build time and cost, so it
     // never needs an in-process Rust engine.
     if args.iter().any(|a| a == "--once") {
-        return index_once(store, namespaces, args.iter().any(|a| a == "--streaming")).await;
+        return index_once(store, namespaces).await;
     }
 
     let interval = flag(args, "--interval-secs")
@@ -172,20 +202,24 @@ async fn indexer(args: &[String], node: String) -> Result<()> {
         namespaces,
         Duration::from_secs(interval),
         lease_holder(&node),
+        indexer_fold_budget(),
+        indexer_streaming_threshold(),
     )
     .await
 }
 
 /// One metered index pass over the given namespaces (or all discovered), printing a single
 /// JSON line the benchmark parses: elapsed, store ops, stored bytes, docs.
-async fn index_once(store: Store, namespaces: Vec<String>, streaming: bool) -> Result<()> {
-    use mlake_index::{index, IndexOptions};
+async fn index_once(store: Store, namespaces: Vec<String>) -> Result<()> {
+    use mlake_index::{fold, IndexOptions};
     use mlake_wal::Namespace;
 
     let metrics = StoreMetrics::new();
     let store = store.with_store_metrics(metrics.clone());
     let base = metrics.snapshot();
     let start = std::time::Instant::now();
+    let budget = indexer_fold_budget();
+    let threshold = indexer_streaming_threshold();
 
     let targets = if namespaces.is_empty() {
         service::discover_namespaces(&store).await?
@@ -195,14 +229,10 @@ async fn index_once(store: Store, namespaces: Vec<String>, streaming: bool) -> R
     let mut docs = 0usize;
     for name in &targets {
         let ns = Namespace::new(name, store.clone());
-        // `--streaming`: the external-memory fold — bounded RAM (spill + external sort) for a
-        // corpus too large to fold in memory, at the cost of a slower build. The default
-        // in-RAM fold is faster for anything that fits.
-        let outcome = if streaming {
-            mlake_index::streaming::index_streaming(&ns, &Tokenizer::default(), IndexOptions::default()).await?
-        } else {
-            index(&ns, &Tokenizer::default(), IndexOptions::default()).await?
-        };
+        // `fold` auto-selects the in-RAM fold (incremental, links) below the streaming threshold
+        // and the bounded external-memory fold above it (see MEMLAKE_INDEXER_STREAMING_THRESHOLD).
+        let outcome =
+            fold(&ns, &Tokenizer::default(), IndexOptions::default(), budget, threshold).await?;
         docs += outcome.doc_count;
     }
     let elapsed = start.elapsed().as_secs_f64();
