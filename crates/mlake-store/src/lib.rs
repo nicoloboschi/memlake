@@ -17,7 +17,7 @@ pub mod store;
 
 pub use cache::{CacheEntry, CacheKey, DiskCache};
 pub use metrics::{Phase, QueryMetrics, StoreMetrics, StoreSnapshot, COLD_ROUNDTRIP_BUDGET};
-pub use store::{Etag, Store, Versioned};
+pub use store::{Etag, S3Config, Store, Versioned};
 
 pub type Result<T> = std::result::Result<T, Error>;
 

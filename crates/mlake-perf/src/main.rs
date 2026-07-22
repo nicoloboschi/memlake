@@ -22,7 +22,7 @@ use datagen::{GenConfig, Generator};
 use mlake_core::{Op, TagFilter, TagsMatch};
 use mlake_fts::Tokenizer;
 use mlake_index::{index, ArmDepths, IndexOptions, QueryConfig, QueryNode};
-use mlake_store::{DiskCache, QueryMetrics, Store, StoreMetrics};
+use mlake_store::{DiskCache, QueryMetrics, S3Config, Store, StoreMetrics};
 use mlake_wal::{Namespace, Writer};
 
 const COMMIT_BATCH: usize = 5_000;
@@ -96,12 +96,33 @@ fn store_metrics() -> Arc<StoreMetrics> {
     StoreMetrics::new()
 }
 
+/// This service's object-store config, read from its own `MEMLAKE_PERF_S3_*` block. Service-scoped
+/// and self-contained: every service reads its own prefixed vars (no shared/`AWS_*` fallback) and
+/// hands the assembled [`S3Config`] to the store.
+fn s3_config() -> Result<S3Config> {
+    fn req(name: &str) -> Result<String> {
+        std::env::var(name)
+            .ok()
+            .filter(|v| !v.is_empty())
+            .with_context(|| format!("{name} is required"))
+    }
+    fn opt(name: &str) -> Option<String> {
+        std::env::var(name).ok().filter(|v| !v.is_empty())
+    }
+    Ok(S3Config {
+        bucket: req("MEMLAKE_PERF_S3_BUCKET")?,
+        endpoint: opt("MEMLAKE_PERF_S3_ENDPOINT"),
+        access_key: req("MEMLAKE_PERF_S3_ACCESS_KEY")?,
+        secret_key: req("MEMLAKE_PERF_S3_SECRET_KEY")?,
+        region: opt("MEMLAKE_PERF_S3_REGION").unwrap_or_else(|| "us-east-1".into()),
+    })
+}
+
 /// The configured store (MinIO in dev, real S3 in prod) with lifetime op accounting attached.
-/// Config comes from the environment / `.env` — see [`Store::from_env`].
 fn new_store(metrics: Arc<StoreMetrics>) -> Result<Store> {
-    Store::from_env()
+    Store::from_s3_config(&s3_config()?)
         .map(|s| s.with_store_metrics(metrics))
-        .context("building object store (check MEMLAKE_S3_*/AWS_* env or .env)")
+        .context("building object store (check MEMLAKE_PERF_S3_* env or .env)")
 }
 
 // ---------------------------------------------------------------- write bench
@@ -339,8 +360,10 @@ async fn read_bench(
     // whole window before truncating to its pool, and window members scatter across clusters
     // (time and vector-cluster are uncorrelated), so a wide window makes it read a large slice
     // of the corpus — see docs/benchmarks-scale.md.
-    let span: i64 =
-        std::env::var("MEMLAKE_TEMPORAL_SPAN").ok().and_then(|s| s.parse().ok()).unwrap_or(120);
+    let span: i64 = std::env::var("MEMLAKE_PERF_TEMPORAL_SPAN")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(120);
     let windows: Vec<(i64, i64)> = (0..queries)
         .map(|i| gen.time_window(i * cfg.scale / queries.max(1), span))
         .collect();

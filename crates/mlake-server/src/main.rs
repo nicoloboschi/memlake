@@ -8,6 +8,7 @@
 //! the environment and touch the same bucket.
 
 mod convert;
+mod limiter;
 mod objects;
 mod pb;
 mod service;
@@ -17,7 +18,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use mlake_fts::Tokenizer;
-use mlake_store::{DiskCache, Store, StoreMetrics};
+use mlake_store::{DiskCache, S3Config, Store, StoreMetrics};
 use tonic::transport::Server;
 
 use pb::memlake_server::MemlakeServer;
@@ -79,10 +80,28 @@ fn lease_holder(node: &str) -> String {
     format!("{node}#{}", std::process::id())
 }
 
-/// Build the base object store from the environment (`.env` is loaded in `main`). See
-/// [`Store::from_env`] for the full variable list; standard `AWS_*` credentials work as-is.
-fn build_store() -> Result<Store> {
-    Store::from_env().context("building object store (check MEMLAKE_S3_*/AWS_* env or .env)")
+/// Read a service's object-store config from its own `MEMLAKE_<SERVICE>_S3_*` block. Each service
+/// (query vs indexer) owns a complete, self-describing config — service-prefixed and required, no
+/// shared or `AWS_*` fallback. `prefix` is e.g. `MEMLAKE_QUERY` or `MEMLAKE_INDEXER`.
+fn s3_config(prefix: &str) -> Result<S3Config> {
+    let req = |suffix: &str| -> Result<String> {
+        let name = format!("{prefix}_{suffix}");
+        std::env::var(&name).ok().filter(|v| !v.is_empty()).with_context(|| format!("{name} is required"))
+    };
+    let opt = |suffix: &str| std::env::var(format!("{prefix}_{suffix}")).ok().filter(|v| !v.is_empty());
+    Ok(S3Config {
+        bucket: req("S3_BUCKET")?,
+        endpoint: opt("S3_ENDPOINT"),
+        access_key: req("S3_ACCESS_KEY")?,
+        secret_key: req("S3_SECRET_KEY")?,
+        region: opt("S3_REGION").unwrap_or_else(|| "us-east-1".into()),
+    })
+}
+
+/// Build the object store for `prefix`'s service from its config block (`.env` loaded in `main`).
+fn build_store(prefix: &str) -> Result<Store> {
+    Store::from_s3_config(&s3_config(prefix)?)
+        .with_context(|| format!("building object store (check {prefix}_S3_* env or .env)"))
 }
 
 async fn serve(args: &[String], node: String) -> Result<()> {
@@ -94,7 +113,7 @@ async fn serve(args: &[String], node: String) -> Result<()> {
     // Attach a bounded two-tier read cache so the process has predictable memory + disk
     // footprint (both capped by construction). Defaults are conservative; a benchmark or a
     // memory-constrained pod tunes them down.
-    let mut store = build_store()?;
+    let mut store = build_store("MEMLAKE_QUERY")?;
     let mem_mb = flag(args, "--mem-mb").and_then(|s| s.parse::<u64>().ok()).unwrap_or(256);
     let disk_mb = flag(args, "--disk-mb").and_then(|s| s.parse::<u64>().ok()).unwrap_or(4096);
     let cache_dir = flag(args, "--cache-dir")
@@ -105,9 +124,19 @@ async fn serve(args: &[String], node: String) -> Result<()> {
             .context("opening read cache")?,
     );
     store = store.with_cache(cache);
-    let svc = MemlakeService::new(store, Tokenizer::default());
+    // Cap concurrent retrieval requests so peak query memory is `max_queries × per-query working
+    // set`, not unbounded in request concurrency. `--max-concurrent-queries` or
+    // `MEMLAKE_MAX_CONCURRENT_QUERIES`; excess requests queue rather than erroring.
+    let max_queries = flag(args, "--max-concurrent-queries")
+        .or_else(|| std::env::var("MEMLAKE_QUERY_MAX_CONCURRENT").ok())
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(service::DEFAULT_MAX_CONCURRENT_QUERIES);
+    let svc = MemlakeService::new(store, Tokenizer::default()).with_max_concurrent_queries(max_queries);
 
-    tracing::info!(%addr, mem_mb, disk_mb, node = %node, "memlake serving gRPC");
+    tracing::info!(
+        %addr, mem_mb, disk_mb, max_queries = svc.max_concurrent_queries(), node = %node,
+        "memlake serving gRPC"
+    );
     Server::builder()
         .add_service(MemlakeServer::new(svc))
         .serve(addr)
@@ -120,7 +149,7 @@ async fn indexer(args: &[String], node: String) -> Result<()> {
     let namespaces: Vec<String> = flag(args, "--namespaces")
         .map(|s| s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect())
         .unwrap_or_default();
-    let store = build_store()?;
+    let store = build_store("MEMLAKE_INDEXER")?;
 
     // `--once`: run a single metered index pass, print a JSON summary, and exit. This is the
     // benchmark's index phase — the harness reads the summary for build time and cost, so it
