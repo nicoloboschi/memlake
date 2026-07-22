@@ -399,9 +399,14 @@ green; what follows is what is left.
 - [ ] **The disk cache reads with `fs::read`, not mmap** (`cache.rs`), so a warm
       hit copies the whole blob into memory. mmap is the other half of the same
       claim. Wants blobs written 8-byte aligned so the realignment copy disappears too.
-- [ ] **Cache eviction is LRU, not FIFO/CLOCK — and every *read* takes the write
-      lock** to bump `last_used`. For content-addressed immutable blocks that is a
-      questionable trade: LRU buys hit rate on skewed access, but the per-hit
-      mutation makes the cache a contention point under concurrent queries, and a
-      ring buffer would also give sequential disk writes. Worth measuring under
-      concurrency before assuming LRU is right here.
+- [ ] **Move the disk cache to a FIFO ring buffer.** It is LRU today: every hit
+      bumps `last_used` and eviction takes `min_by_key(last_used)`, which means
+      every cache *read* acquires the write lock — the cache becomes a contention
+      point exactly when concurrent queries make it matter most. For
+      content-addressed immutable blocks a ring buffer is the better shape: no
+      per-hit mutation (reads can take a shared lock or none), sequential rather
+      than scattered disk writes, and eviction is a pointer bump instead of a scan
+      for the minimum. The cost is hit rate on skewed access, which LRU protects
+      and FIFO does not — so land it behind the cache-hit-ratio and query-latency
+      numbers the store already tracks, and keep `SPEC.md` §Unified NVMe cache in
+      step (it currently documents LRU).
