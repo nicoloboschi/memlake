@@ -1726,6 +1726,98 @@ async fn streaming_fold_matches_in_ram_fold() {
     );
 }
 
+/// The bounded path under real spilling: fold with a deliberately tiny per-stage budget so
+/// Phase-1 resolution AND the per-type cluster/payload/SSTable sorts all overflow their buffers,
+/// spill sorted runs to disk, and k-way-merge them. The result must still match the in-RAM fold.
+/// This guards the external-memory fold's correctness through the spill+merge path — the small
+/// equivalence test above stays entirely in memory and never exercises it.
+#[tokio::test]
+async fn streaming_fold_bounded_budget_matches_in_ram() {
+    use mlake_core::{Predicate, TagsMatch};
+    use mlake_index::streaming::{index_streaming_with_budget, FoldBudget};
+
+    let no_links = IndexOptions { derive_links: false, ..IndexOptions::default() };
+    // ~8k items ≈ 2 MB of item/event bytes, well over the 1 MB-per-stage budget below, so the
+    // resolution sort and the cluster/payload sorts each spill multiple runs and merge them.
+    const N: usize = 8_000;
+    let write_corpus = |ns: Namespace| async move {
+        let mut w = Writer::new(ns.clone());
+        for chunk in (0..N).collect::<Vec<_>>().chunks(2_000) {
+            let ups: Vec<Op> = chunk.iter().map(|&i| Op::Upsert(rich_item(i))).collect();
+            w.commit(ups).await.unwrap();
+        }
+        // Same tail as the small test: id delete, patch, and a predicate delete (doc=d3).
+        w.commit(vec![
+            Op::Tombstone { id: MemoryId::from_key("m5") },
+            Op::Patch {
+                id: MemoryId::from_key("m6"),
+                deltas: vec![mlake_core::wal::Delta::SetText("patched text".into())],
+            },
+            Op::TombstoneWhere {
+                predicate: Predicate {
+                    memory_types: vec![],
+                    metadata_equals: vec![("doc".into(), "d3".into())],
+                    tags: vec![],
+                    tags_mode: TagsMatch::Any as u8,
+                },
+            },
+        ])
+        .await
+        .unwrap();
+    };
+
+    let ns_a = namespace(Store::in_memory(), "a").await;
+    write_corpus(ns_a.clone()).await;
+    let out_a = index(&ns_a, &Tokenizer::default(), no_links).await.unwrap();
+
+    let ns_b = namespace(Store::in_memory(), "b").await;
+    write_corpus(ns_b.clone()).await;
+    let tiny = FoldBudget {
+        resolve_mb: 1,
+        cluster_mb: 1,
+        payload_mb: 1,
+        index_mb: 1,
+        radj_mb: 1,
+        fts_mb: 1,
+    };
+    let out_b = index_streaming_with_budget(&ns_b, &Tokenizer::default(), no_links, tiny)
+        .await
+        .unwrap();
+
+    assert_eq!(out_a.doc_count, out_b.doc_count, "doc_count must match under spilling");
+    assert!(out_b.published);
+
+    let node_a = QueryNode::open(&ns_a, Tokenizer::default()).await.unwrap();
+    let node_b = QueryNode::open(&ns_b, Tokenizer::default()).await.unwrap();
+    // Identical live set per memory_type — the tail delete/patch/predicate resolved identically
+    // through the external group-by.
+    for mt in [1u8, 2u8] {
+        assert_eq!(
+            scan_ids(&node_a, mt).await,
+            scan_ids(&node_b, mt).await,
+            "live id set for memory_type {mt} must match under spilling"
+        );
+    }
+    let all_b: std::collections::BTreeSet<MemoryId> =
+        scan_ids(&node_b, 1).await.union(&scan_ids(&node_b, 2).await).copied().collect();
+    assert!(!all_b.contains(&MemoryId::from_key("m5")), "id-tombstoned item gone");
+    assert!(!all_b.contains(&MemoryId::from_key("m3")), "predicate-deleted (doc=d3) item gone");
+    // The patch survived the external resolution (a Patch event applied to its base at merge time).
+    let got = node_b.get_many(&[MemoryId::from_key("m6")], false).await.unwrap();
+    assert_eq!(got[0].text, "patched text", "patch applied through the spilling resolution");
+    // Recall through the spilled + merged cluster files: a self-query still tops out on an exact
+    // match. (Many items share m1's vector, so assert recall of the family, not a strict ranking.)
+    let q = rich_item(1).vector;
+    let fam1: std::collections::BTreeSet<MemoryId> = (0..N)
+        .filter(|i| i % 10 == 1 && i % 3 != 0)
+        .map(|i| MemoryId::from_key(&format!("m{i}")))
+        .collect();
+    let vec_only =
+        QueryConfig { nprobe: 1000, graph_weight: 0.0, fts_weight: 0.0, ..QueryConfig::default() };
+    let hits_b = node_b.query(1, Some(&q), None, &tf(), 10, vec_only).await.unwrap();
+    assert!(fam1.contains(&hits_b[0].id), "self-query recalls an exact match through spilled clusters");
+}
+
 /// The streaming fold's incremental path: fold once, then fold *again* over the previous
 /// generation plus a new tail (a delete + fresh upserts). It must still match the in-RAM fold's
 /// live set — this exercises streaming the prior generation's clusters and overlaying the WAL.

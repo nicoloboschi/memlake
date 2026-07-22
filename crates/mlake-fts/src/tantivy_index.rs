@@ -128,11 +128,14 @@ pub struct TantivyFtsBuilder {
 }
 
 impl TantivyFtsBuilder {
-    pub fn new(tokenizer: Tokenizer) -> tantivy::Result<Self> {
+    /// `heap_bytes` caps the writer's in-memory arena before it flushes a segment to the temp dir,
+    /// so the FTS stage's RAM is bounded by the caller's budget. tantivy needs a floor (~15 MB) to
+    /// make progress, enforced here.
+    pub fn new(tokenizer: Tokenizer, heap_bytes: usize) -> tantivy::Result<Self> {
         let (schema, fields) = build_schema();
         let dir = tempfile::tempdir().expect("create temp dir for tantivy split");
         let index = Index::create_in_dir(dir.path(), schema)?;
-        let writer = index.writer(50_000_000)?;
+        let writer = index.writer(heap_bytes.max(15_000_000))?;
         Ok(Self { dir, index, writer, fields, tokenizer, doc_count: 0 })
     }
 

@@ -653,6 +653,16 @@ impl TimeTable {
 /// Edge wire format: `[source:16][kind:1][linktype:1][weight:f32]` = 22 bytes.
 const EDGE_BYTES: usize = 22;
 
+/// Encode one incoming edge to its on-disk bytes. The streaming fold uses this to feed edges
+/// through an external sort (keyed by target) instead of buffering every edge in RAM, then
+/// rebuilds the radj SSTable from the sorted stream — same concatenated-per-target layout as
+/// [`RadjTable::build`].
+pub(crate) fn encode_in_edge(e: &InEdge) -> Vec<u8> {
+    let mut out = Vec::with_capacity(EDGE_BYTES);
+    encode_edge(e, &mut out);
+    out
+}
+
 fn encode_edge(e: &InEdge, out: &mut Vec<u8>) {
     out.extend_from_slice(&e.source.0);
     let (kind, lt) = match e.kind {

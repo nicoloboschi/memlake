@@ -65,6 +65,27 @@ pub fn apply_deltas(item: &mut StoredMemory, deltas: &[Delta]) {
     }
 }
 
+/// rkyv-encode a delta list for storage outside the WAL — the streaming fold spills each patch as
+/// an event into an external sort, so it needs a standalone codec. Mirrors
+/// [`StoredMemory::to_rkyv_bytes`].
+pub fn deltas_to_rkyv_bytes(deltas: &[Delta]) -> Vec<u8> {
+    rkyv::to_bytes::<_, 1024>(&deltas.to_vec())
+        .map(|b| b.into_vec())
+        .unwrap_or_default()
+}
+
+/// Decode a delta list written by [`deltas_to_rkyv_bytes`], tolerating an unaligned slice (it is
+/// read back out of a spilled record whose start is not 8-byte aligned).
+pub fn deltas_from_rkyv_bytes(bytes: &[u8]) -> Option<Vec<Delta>> {
+    if bytes.is_empty() {
+        return Some(Vec::new());
+    }
+    let mut aligned = rkyv::AlignedVec::with_capacity(bytes.len());
+    aligned.extend_from_slice(bytes);
+    let archived = rkyv::check_archived_root::<Vec<Delta>>(&aligned).ok()?;
+    Deserialize::<Vec<Delta>, _>::deserialize(archived, &mut rkyv::Infallible).ok()
+}
+
 #[derive(Archive, Deserialize, Serialize, Clone, PartialEq, Debug)]
 #[archive(check_bytes)]
 pub enum Op {
@@ -214,5 +235,27 @@ mod tests {
     #[test]
     fn proof_count_saturates_at_zero() {
         assert_eq!(fold_proof_count(1, [Delta::ProofCount(-5)].iter()), 0);
+    }
+
+    #[test]
+    fn deltas_codec_round_trips_including_unaligned() {
+        let deltas = vec![
+            Delta::SetText("hello".into()),
+            Delta::ProofCount(3),
+            Delta::SetTags(vec!["a".into(), "b".into()]),
+            Delta::MergeMetadata(vec![("k".into(), "v".into())]),
+        ];
+        let bytes = deltas_to_rkyv_bytes(&deltas);
+        assert_eq!(deltas_from_rkyv_bytes(&bytes).unwrap(), deltas);
+
+        // The streaming fold reads events back at a non-8-byte-aligned offset (tag + seq header),
+        // so decode must copy into an aligned buffer rather than assume alignment.
+        let mut framed = vec![0u8; 9];
+        framed.extend_from_slice(&bytes);
+        assert_eq!(deltas_from_rkyv_bytes(&framed[9..]).unwrap(), deltas);
+
+        // Empty and garbage inputs are handled, not panicked on.
+        assert_eq!(deltas_from_rkyv_bytes(&[]).unwrap(), Vec::<Delta>::new());
+        assert!(deltas_from_rkyv_bytes(&[0xff; 7]).is_none());
     }
 }
