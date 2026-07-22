@@ -1,0 +1,42 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "hindsight-memlake"
+version = "0.1.0"
+description = "memlake as the memories store for Hindsight."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "memlake-client",
+    "hindsight-api-slim>=0.8.4",
+]
+
+# memlake-client ships from this repo, not PyPI: the client and the server it
+# talks to move together, so the integration pins the tree it was built against
+# rather than a release.
+[tool.uv.sources]
+memlake-client = { path = "../../clients/python" }
+
+[tool.hatch.build.targets.wheel]
+packages = ["hindsight_memlake"]
+
+# Mirrors hindsight-api-slim's lint config: this package is read next to it, so
+# it should not look like it came from somewhere else.
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = [
+    "E",      # pycodestyle errors
+    "W",      # pycodestyle warnings
+    "F",      # Pyflakes
+    "I",      # isort
+    "B021",   # flake8-bugbear: f-string used as docstring (leaves __doc__ None)
+]
+ignore = [
+    "E501",   # line too long (handled by the formatter)
+    "E402",   # module import not at top of file
+]
