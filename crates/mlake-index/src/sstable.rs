@@ -38,6 +38,11 @@ pub struct SsTableBuilder {
     cur_first: Option<[u8; 16]>,
     last_key: Option<[u8; 16]>,
     count: u64,
+    /// Flush the current block once it reaches this many bytes. A block is the unit of a ranged
+    /// GET, so this is the read-granularity knob: large packs many records per read (good when the
+    /// table is *scanned* — fewer, bigger requests), small isolates records (good when the table is
+    /// only ever *point-fetched* — a lookup then reads one record, not a whole packed block).
+    block_target: usize,
 }
 
 impl Default for SsTableBuilder {
@@ -48,6 +53,14 @@ impl Default for SsTableBuilder {
 
 impl SsTableBuilder {
     pub fn new() -> Self {
+        Self::with_block_target(BLOCK_TARGET_BYTES)
+    }
+
+    /// A builder whose data blocks are flushed at `block_target` bytes. Point-only tables with
+    /// large fixed-size values (the rerank tier: `dim*4` bytes per vector) pass a small target so
+    /// one ranged GET fetches ~one record instead of the ~10 a 16 KB block would pack around it —
+    /// they are never scanned, so packing buys nothing and only inflates every point read.
+    pub fn with_block_target(block_target: usize) -> Self {
         Self {
             data: Vec::new(),
             blocks: Vec::new(),
@@ -55,6 +68,7 @@ impl SsTableBuilder {
             cur_first: None,
             last_key: None,
             count: 0,
+            block_target: block_target.max(1),
         }
     }
 
@@ -74,7 +88,7 @@ impl SsTableBuilder {
         self.cur.extend_from_slice(&(value.len() as u32).to_le_bytes());
         self.cur.extend_from_slice(value);
         self.count += 1;
-        if self.cur.len() >= BLOCK_TARGET_BYTES {
+        if self.cur.len() >= self.block_target {
             self.flush_block();
         }
     }
@@ -453,7 +467,14 @@ impl RerankTable {
             })
             .collect();
         entries.sort_by(|a, b| a.0.cmp(&b.0));
-        let mut b = SsTableBuilder::new();
+        // One record per block. This table is *never scanned* — only point-fetched by the
+        // two-stage search for the handful of candidates whose error bound leaves them in
+        // contention — so a lookup should read exactly the one vector it wants. A 16 KB block
+        // would pack ~10 fixed-size vectors around it and every point read would drag all 10
+        // (~11× read amplification); flushing per record makes a single ranged GET one vector.
+        // The cost is a proportionally larger sparse index (one entry per vector), but the index
+        // is loaded once and cached, whereas the block is fetched on every rescore.
+        let mut b = SsTableBuilder::with_block_target(1);
         for (id, bytes) in entries {
             b.add(id.0, &bytes);
         }
@@ -984,6 +1005,72 @@ mod tests {
             (metrics.bytes() as usize) < total / 10,
             "a lookup must read one block ({} bytes), not the whole {total}-byte table",
             metrics.bytes()
+        );
+    }
+
+    fn rerank_corpus(n: usize, dim: usize) -> Vec<StoredMemory> {
+        use mlake_core::memory::Timestamps;
+        (0..n)
+            .map(|i| StoredMemory {
+                id: MemoryId::from_key(&format!("m{i:06}")),
+                vector: (0..dim).map(|d| (d as f32) * 0.001 + i as f32).collect(),
+                text: "x".repeat(200),
+                index_text: String::new(),
+                memory_type: 1,
+                tags: vec!["a".into()],
+                timestamps: Timestamps::default(),
+                proof_count: 0,
+                entity_ids: vec![],
+                semantic_out: vec![],
+                causal_out: vec![],
+                metadata: vec![],
+                write_seq: i as u64,
+            })
+            .collect()
+    }
+
+    /// A rerank point lookup must read one vector's worth of bytes, not a packed block of them.
+    /// The table is only ever point-fetched, so one record per block is what keeps a single
+    /// ranged GET (and a scattered `lookup_batch`) from dragging ~10 neighbours per candidate.
+    #[tokio::test]
+    async fn rerank_point_lookup_reads_one_vector_not_a_packed_block() {
+        const N: usize = 600;
+        const DIM: usize = 384;
+        let items = rerank_corpus(N, DIM);
+        let (idx_bytes, data) = RerankTable::build(&items);
+        let vec_bytes = DIM * 4; // 1536 B of actual payload
+
+        // Every record is its own block: the sparse index has one entry per stored vector.
+        let idx = SsTableIndex::parse(&idx_bytes).unwrap();
+        assert_eq!(idx.record_count(), N as u64);
+        assert_eq!(idx.blocks.len(), N, "one record per block for a point-only table");
+
+        let store = Store::in_memory();
+        store.put("rerank.data", data.clone()).await.unwrap();
+        let rt = RerankTable::open(&idx_bytes, "rerank.data").unwrap();
+
+        // A single-candidate lookup reads exactly one record: the 1536 B vector + its 20 B
+        // record framing, and nothing else. (With a 16 KB block it would have read ~11×.)
+        let metrics = QueryMetrics::new();
+        let got = rt
+            .lookup_batch(&store, &[items[N / 2].id], Some((&metrics, 3)))
+            .await
+            .unwrap();
+        assert_eq!(got.get(&items[N / 2].id).unwrap().len(), DIM);
+        assert_eq!(metrics.requests(), 1);
+        assert!(
+            (metrics.bytes() as usize) <= vec_bytes + 64,
+            "a point read fetched {} B; must be ~one vector ({vec_bytes} B), not a packed block",
+            metrics.bytes()
+        );
+
+        // Total on-disk is still within a few % of the raw f32 payload: data is exactly the
+        // records, the extra is the per-record 20 B framing plus the (now one-per-record) index.
+        let raw = N * vec_bytes;
+        let total = idx_bytes.len() + data.len();
+        assert!(
+            total < raw * 106 / 100,
+            "rerank total {total} B must stay within ~6% of raw payload {raw} B"
         );
     }
 
