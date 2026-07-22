@@ -1,0 +1,57 @@
+{
+  "engine": "exact",
+  "config": {
+    "dense": "numpy brute-force cosine (exact)",
+    "sparse": "in-python Okapi BM25 (k1=0.9, b=0.4, stopwords + s-stemmer)",
+    "fusion": "RRF k=60",
+    "top_k": 100,
+    "model": "BAAI/bge-small-en-v1.5",
+    "dim": 384
+  },
+  "corpus_size": 8674,
+  "n_queries": 1406,
+  "arms": {
+    "dense": {
+      "ndcg@10": 0.43403,
+      "recall@100": 0.98791,
+      "mrr@10": 0.30022,
+      "latency": {
+        "mean_ms": 0.276,
+        "p50_ms": 0.207,
+        "p90_ms": 0.493,
+        "p99_ms": 1.07,
+        "max_ms": 2.445,
+        "n_queries": 1406
+      }
+    },
+    "sparse": {
+      "ndcg@10": 0.32405,
+      "recall@100": 0.95377,
+      "mrr@10": 0.20814,
+      "latency": {
+        "mean_ms": 1.046,
+        "p50_ms": 0.938,
+        "p90_ms": 1.636,
+        "p99_ms": 2.892,
+        "max_ms": 4.896,
+        "n_queries": 1406
+      }
+    },
+    "hybrid": {
+      "ndcg@10": 0.40715,
+      "recall@100": 0.98933,
+      "mrr@10": 0.27459,
+      "latency": {
+        "mean_ms": 1.322,
+        "p50_ms": 1.212,
+        "p90_ms": 1.98,
+        "p99_ms": 3.2,
+        "max_ms": 5.208,
+        "n_queries": 1406
+      }
+    }
+  },
+  "dataset": "arguana",
+  "generated_at": "2026-07-22T14:31:56+00:00",
+  "platform": "Darwin arm64 py3.13.2"
+}

@@ -1849,6 +1849,76 @@ async fn streaming_fold_bounded_budget_matches_in_ram() {
 /// generation plus a new tail (a delete + fresh upserts). It must still match the in-RAM fold's
 /// live set — this exercises streaming the prior generation's clusters and overlaying the WAL.
 #[tokio::test]
+async fn flush_appends_l0_and_matches_full_rebuild() {
+    use mlake_index::fold;
+    use mlake_index::streaming::FoldBudget;
+    let opts = IndexOptions { derive_links: false, ..IndexOptions::default() };
+    let budget = FoldBudget::default();
+    let hi = usize::MAX; // force the in-RAM first build (not streaming)
+
+    // The same write history, applied two ways.
+    let batch1: Vec<Op> = (0..40).map(|i| Op::Upsert(rich_item(i))).collect();
+    let mut reup = rich_item(3); // id 3 is memory_type 2
+    reup.text = "re-upserted text".into();
+    let batch2: Vec<Op> = (40..50)
+        .map(|i| Op::Upsert(rich_item(i)))
+        .chain(std::iter::once(Op::Upsert(reup))) // re-upsert id 3 (lives in the older segment)
+        .chain(std::iter::once(Op::Tombstone { id: MemoryId::from_key("m5") })) // delete id 5 (mt 1)
+        .collect();
+
+    // A: fold after each batch → a full segment, then an appended L0 flush.
+    let ns_a = namespace(Store::in_memory(), "a").await;
+    let mut wa = Writer::new(ns_a.clone());
+    wa.commit(batch1.clone()).await.unwrap();
+    fold(&ns_a, &Tokenizer::default(), opts, budget, hi).await.unwrap();
+    assert_eq!(ns_a.read_manifest().await.unwrap().0.segments.len(), 1, "first build is one segment");
+    wa.commit(batch2.clone()).await.unwrap();
+    fold(&ns_a, &Tokenizer::default(), opts, budget, hi).await.unwrap();
+    assert_eq!(ns_a.read_manifest().await.unwrap().0.segments.len(), 2, "flush appended an L0 segment");
+
+    // B: commit both batches, fold once → a single full-rebuild segment.
+    let ns_b = namespace(Store::in_memory(), "b").await;
+    let mut wb = Writer::new(ns_b.clone());
+    wb.commit(batch1).await.unwrap();
+    wb.commit(batch2).await.unwrap();
+    fold(&ns_b, &Tokenizer::default(), opts, budget, hi).await.unwrap();
+    assert_eq!(ns_b.read_manifest().await.unwrap().0.segments.len(), 1);
+
+    let node_a = QueryNode::open(&ns_a, Tokenizer::default()).await.unwrap();
+    let node_b = QueryNode::open(&ns_b, Tokenizer::default()).await.unwrap();
+
+    // Same live set per type — the delete + re-upsert resolved identically across the segment
+    // boundary (via the supersede overlay) as they do in a single full rebuild.
+    for mt in [1u8, 2u8] {
+        assert_eq!(scan_ids(&node_a, mt).await, scan_ids(&node_b, mt).await, "live set mt {mt}");
+    }
+    let all_a: std::collections::BTreeSet<MemoryId> =
+        scan_ids(&node_a, 1).await.union(&scan_ids(&node_a, 2).await).copied().collect();
+    assert!(!all_a.contains(&MemoryId::from_key("m5")), "deleted id gone from the flushed index");
+    assert!(all_a.contains(&MemoryId::from_key("m3")), "re-upserted id present");
+    assert!(all_a.contains(&MemoryId::from_key("m45")), "new id present");
+    assert!(all_a.contains(&MemoryId::from_key("m0")), "old id still present");
+
+    // The re-upsert's NEW text wins over the older segment's stale copy, in both.
+    let ga = node_a.get_many(&[MemoryId::from_key("m3")], false).await.unwrap();
+    let gb = node_b.get_many(&[MemoryId::from_key("m3")], false).await.unwrap();
+    assert_eq!(ga[0].text, "re-upserted text", "flush: newest copy wins");
+    assert_eq!(gb[0].text, "re-upserted text");
+
+    // Vector recall identical: probe every cluster (exact), so the flushed and full indexes must agree.
+    let q = rich_item(1).vector;
+    let vec_only =
+        QueryConfig { nprobe: 1000, graph_weight: 0.0, fts_weight: 0.0, ..QueryConfig::default() };
+    let ha = node_a.query(1, Some(&q), None, &tf(), 10, vec_only).await.unwrap();
+    let hb = node_b.query(1, Some(&q), None, &tf(), 10, vec_only).await.unwrap();
+    let ids_a: Vec<_> = ha.iter().map(|h| h.id).collect();
+    let ids_b: Vec<_> = hb.iter().map(|h| h.id).collect();
+    assert_eq!(ids_a, ids_b, "vector rankings match across flush vs full rebuild");
+}
+
+/// The streaming fold's incremental path: fold once, then fold *again* over the previous
+/// generation plus a new tail. It must still match the in-RAM fold's live set.
+#[tokio::test]
 async fn streaming_fold_incremental_matches_in_ram() {
     async fn build(streaming: bool) -> std::collections::BTreeSet<MemoryId> {
         let no_links = IndexOptions { derive_links: false, ..IndexOptions::default() };

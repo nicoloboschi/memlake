@@ -428,6 +428,7 @@ pub async fn index_streaming_with_budget(
         seq_hi: head,
         doc_count: doc_count as u64,
         indexes,
+        tombstones: String::new(),
     };
     let mut next = manifest.clone();
     next.version = version;

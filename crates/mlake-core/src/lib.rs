@@ -11,10 +11,12 @@ pub mod tags;
 pub mod envelope;
 pub mod manifest;
 pub mod rkyv_io;
+pub mod tombstones;
 pub mod wal;
 
 pub use id::{EntityId, MemoryId};
 pub use rkyv_io::{rkyv_read, rkyv_write};
+pub use tombstones::SegmentTombstones;
 pub use memory::{
     CausalEdge, MemoryType, Memory, LinkType, SemanticEdge, StoredMemory, Timestamps,
     MAX_SEMANTIC_OUT, SEMANTIC_LINK_THRESHOLD,

@@ -1,0 +1,61 @@
+{
+  "engine": "qdrant",
+  "config": {
+    "dense": "Qdrant HNSW, cosine, vectors from the shared embedding cache",
+    "sparse": "fastembed Qdrant/bm25 sparse vectors, IDF applied server-side",
+    "fusion": "Qdrant native RRF (FusionQuery) over both prefetch arms",
+    "top_k": 100,
+    "prefetch_limit": 200,
+    "model": "BAAI/bge-small-en-v1.5",
+    "dim": 384,
+    "url": "http://localhost:6333",
+    "collection": "memlake_bench_arguana"
+  },
+  "corpus_size": 8674,
+  "n_queries": 1406,
+  "index_seconds": 4.1,
+  "arms": {
+    "dense": {
+      "ndcg@10": 0.43398,
+      "recall@100": 0.98791,
+      "mrr@10": 0.30016,
+      "latency": {
+        "mean_ms": 4.958,
+        "p50_ms": 3.929,
+        "p90_ms": 7.449,
+        "p99_ms": 12.824,
+        "max_ms": 366.282,
+        "n_queries": 1406
+      }
+    },
+    "sparse": {
+      "ndcg@10": 0.26394,
+      "recall@100": 0.86913,
+      "mrr@10": 0.1689,
+      "latency": {
+        "mean_ms": 4.435,
+        "p50_ms": 3.596,
+        "p90_ms": 6.773,
+        "p99_ms": 10.721,
+        "max_ms": 159.502,
+        "n_queries": 1406
+      }
+    },
+    "hybrid": {
+      "ndcg@10": 0.39945,
+      "recall@100": 0.98506,
+      "mrr@10": 0.26749,
+      "latency": {
+        "mean_ms": 6.696,
+        "p50_ms": 5.736,
+        "p90_ms": 10.069,
+        "p99_ms": 16.404,
+        "max_ms": 190.608,
+        "n_queries": 1406
+      }
+    }
+  },
+  "dataset": "arguana",
+  "generated_at": "2026-07-22T14:32:24+00:00",
+  "platform": "Darwin arm64 py3.13.2"
+}

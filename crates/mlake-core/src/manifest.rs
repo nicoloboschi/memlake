@@ -135,11 +135,21 @@ pub struct Segment {
     pub doc_count: u64,
     /// Per-fact-type files within this segment.
     pub indexes: BTreeMap<u8, FactTypeIndex>,
+    /// `tombstones.json`: this segment's delete overlay — the ids it supersedes in OLDER segments
+    /// (deletes + re-upserts) and its predicate-deletes. Small (bounded by the flush slice's
+    /// deletes/re-upserts, not the corpus), loaded whole at query open. Empty for a full-rebuild /
+    /// compacted segment, which has already materialized its deletes. See docs/segmented-index.md §6.
+    #[serde(default)]
+    pub tombstones: String,
 }
 
 impl Segment {
     fn all_paths(&self) -> impl Iterator<Item = &str> {
-        self.indexes.values().flat_map(|idx| idx.all_paths())
+        self.indexes
+            .values()
+            .flat_map(|idx| idx.all_paths())
+            .chain(std::iter::once(self.tombstones.as_str()))
+            .filter(|s| !s.is_empty())
     }
 
     /// This segment's fact types.

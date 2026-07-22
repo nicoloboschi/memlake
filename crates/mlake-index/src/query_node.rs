@@ -71,6 +71,10 @@ pub struct ArmDepths {
 /// One fact type's loaded state within ONE segment — the indexed metadata for that segment. A
 /// query fans out across a fact type's segments (newest-first) and merges (see [`FactType`]).
 struct SegmentState {
+    /// This segment's highest WAL seq — the ordering key for the supersede overlay (a newer
+    /// segment has a higher `seq_hi`). An item here is hidden if a segment with a higher `seq_hi`
+    /// supersedes its id.
+    seq_hi: u64,
     centroids: Centroids,
     cluster_paths: Vec<String>,
     vector_paths: Vec<String>,
@@ -99,7 +103,12 @@ struct FactType {
 pub struct QueryNode {
     ns: Namespace,
     per_type: BTreeMap<u8, FactType>,
+    /// Tail deletes — newest of all, so they hide every segment's copy.
     tombstones: HashSet<MemoryId>,
+    /// Cross-segment supersede overlay: `id -> highest seq_hi of a segment that kills it`. An
+    /// indexed item from a segment with `seq_hi = S` is hidden if `seg_superseded[id] > S` (a newer
+    /// segment deleted or re-upserted it). Built from each segment's `tombstones.bin` at open.
+    seg_superseded: HashMap<MemoryId, u64>,
     /// Active predicate deletes from the tail: `(sequence, predicate)`. A generation memory
     /// is hidden if it matches one whose sequence exceeds the memory's `write_seq`. Evaluated
     /// lazily at read; materialized at the next fold.
@@ -154,10 +163,23 @@ impl QueryNode {
             .scan(manifest.wal_index_cursor, Some(head))
             .await?;
         let tombstones: HashSet<MemoryId> = scan.tombstones.iter().copied().collect();
-        let predicate_tombstones = scan.predicate_tombstones.clone();
+        let mut predicate_tombstones = scan.predicate_tombstones.clone();
         let mut tail_by_ft: BTreeMap<u8, Vec<StoredMemory>> = BTreeMap::new();
         for item in scan.upserts.into_values() {
             tail_by_ft.entry(item.memory_type).or_default().push(item);
+        }
+
+        // Each segment's delete overlay: the ids it kills in older segments (keyed by its seq_hi,
+        // so a newer segment wins) plus its predicate-deletes (aggregated with the tail's).
+        let mut seg_superseded: HashMap<MemoryId, u64> = HashMap::new();
+        for seg in &manifest.segments {
+            let tomb =
+                crate::generation::read_tombstones(&ns.store, &seg.tombstones, Some(&metrics)).await?;
+            for id in tomb.superseded {
+                let e = seg_superseded.entry(id).or_insert(0);
+                *e = (*e).max(seg.seq_hi);
+            }
+            predicate_tombstones.extend(tomb.predicates);
         }
 
         // Fact types to load: those with an index, plus any that appear only in the tail.
@@ -280,6 +302,7 @@ impl QueryNode {
                     };
 
                     segments.push(SegmentState {
+                        seq_hi: seg.seq_hi,
                         doc_count: pk.record_count() as usize,
                         centroids: Centroids::from_bytes(&centroids_bytes)?,
                         cluster_paths: files.clusters.clone(),
@@ -327,6 +350,7 @@ impl QueryNode {
             ns: ns.clone(),
             per_type,
             tombstones,
+            seg_superseded,
             predicate_tombstones,
             through_seq: head,
             generation: manifest.version,
@@ -923,7 +947,8 @@ impl QueryNode {
             let prepared = block.prepare(q)?;
             for i in 0..block.len() {
                 let id = block.ids()[i];
-                if self.tombstones.contains(&id) {
+                // Drop tail-deleted ids and ids a newer segment supersedes (deleted / re-upserted).
+                if self.superseded(&id, state.seq_hi) {
                     continue;
                 }
                 if !tags.is_noop() && block.has_tags() && !block.passes(i, &mask, tags.mode) {
@@ -1033,14 +1058,23 @@ impl QueryNode {
             .collect()
     }
 
-    /// Whether a memory is deleted — by id (tombstone) or by a tail predicate delete that
-    /// post-dates its last write. Evaluated on the full record (predicates read metadata).
+    /// Whether a memory is deleted — by id (tombstone) or by a predicate delete that post-dates
+    /// its last write. Evaluated on the full record (predicates read metadata). Applied to already
+    /// newest-resolved items; the segment-position supersede is [`Self::superseded`].
     fn hidden(&self, m: &StoredMemory) -> bool {
         self.tombstones.contains(&m.id)
             || self
                 .predicate_tombstones
                 .iter()
                 .any(|(seq, p)| m.write_seq < *seq && p.matches(m))
+    }
+
+    /// Whether an indexed item from a segment with `seg_seq_hi` is superseded — a tail delete, or a
+    /// NEWER segment (higher seq_hi) that deleted or re-upserted its id. This is the cross-segment
+    /// shadow: an older segment's stale copy of a re-upserted/deleted id must not surface.
+    fn superseded(&self, id: &MemoryId, seg_seq_hi: u64) -> bool {
+        self.tombstones.contains(id)
+            || self.seg_superseded.get(id).is_some_and(|&s| s > seg_seq_hi)
     }
 
     /// Fetch the items in the given clusters of a fact type.
@@ -1130,7 +1164,11 @@ impl QueryNode {
             .try_collect()
             .await?;
         // Drop tombstoned + predicate-deleted memories so no arm can surface them.
-        Ok(per_cluster.into_iter().flatten().filter(|item| !self.hidden(item)).collect())
+        Ok(per_cluster
+            .into_iter()
+            .flatten()
+            .filter(|item| !self.hidden(item) && !self.superseded(&item.id, state.seq_hi))
+            .collect())
     }
 
     /// Materialize `ids` (those not already present) into `into`, searching each segment
@@ -1176,7 +1214,8 @@ impl QueryNode {
         if !state.payload.is_empty() {
             let rows = state.payload.lookup_batch(&self.ns.store, &missing, Some((metrics, 4))).await?;
             for (id, item) in rows {
-                if !self.hidden(&item) {
+                // Skip a stale copy a newer segment superseded, and predicate/tombstone-hidden ones.
+                if !self.hidden(&item) && !self.superseded(&id, state.seq_hi) {
                     into.entry(id).or_insert(item);
                 }
             }

@@ -90,6 +90,38 @@ pub fn attempt_prefix(namespace: &str, seg_id: &str) -> String {
     segment_prefix(namespace, seg_id)
 }
 
+fn tombstones_key(seg_prefix: &str) -> String {
+    format!("{seg_prefix}/tombstones.bin")
+}
+
+/// Write a segment's delete overlay, returning its path (empty string if there is nothing to
+/// record, so a clean full-rebuild segment writes no object).
+pub async fn write_tombstones(
+    store: &Store,
+    seg_prefix: &str,
+    t: &mlake_core::SegmentTombstones,
+) -> Result<String> {
+    if t.superseded.is_empty() && t.predicates.is_empty() {
+        return Ok(String::new());
+    }
+    let key = tombstones_key(seg_prefix);
+    store.put(&key, mlake_core::rkyv_write(t)).await?;
+    Ok(key)
+}
+
+/// Read a segment's delete overlay; an empty path (a clean segment) yields the default (no deletes).
+pub async fn read_tombstones(
+    store: &Store,
+    path: &str,
+    metrics: Option<&QueryMetrics>,
+) -> Result<mlake_core::SegmentTombstones> {
+    if path.is_empty() {
+        return Ok(mlake_core::SegmentTombstones::default());
+    }
+    let bytes = store.get_immutable(path, metrics.map(|m| (m, 2))).await?;
+    Ok(mlake_core::rkyv_read(&bytes).unwrap_or_default())
+}
+
 /// Generation-level statistics, for observability and compaction decisions.
 #[derive(Serialize, Deserialize, Default)]
 pub struct Stats {

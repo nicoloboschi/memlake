@@ -84,12 +84,120 @@ pub async fn fold(
     budget: crate::streaming::FoldBudget,
     streaming_threshold_docs: usize,
 ) -> Result<IndexOutcome> {
-    let corpus = estimate_corpus_docs(ns).await?;
-    if corpus >= streaming_threshold_docs {
-        crate::streaming::index_streaming_with_budget(ns, tokenizer, opts, budget).await
+    let (manifest, _etag) = ns.read_manifest().await?;
+    if manifest.segments.is_empty() {
+        // First build: one bounded full segment. Auto-select in-RAM vs streaming by size — the
+        // in-RAM fold is O(N) RAM, so a corpus too big for memory uses the external-memory fold.
+        let corpus = estimate_corpus_docs(ns).await?;
+        if corpus >= streaming_threshold_docs {
+            crate::streaming::index_streaming_with_budget(ns, tokenizer, opts, budget).await
+        } else {
+            index(ns, tokenizer, opts).await
+        }
     } else {
-        index(ns, tokenizer, opts).await
+        // Steady state: flush the WAL tail into a new L0 segment and append it — O(tail).
+        flush(ns, tokenizer, opts).await
     }
+}
+
+/// Flush the un-indexed WAL tail into a NEW L0 segment and append it (the LSM flush — O(tail), not
+/// O(corpus)). Deletes and re-upserts in the slice become the segment's supersede overlay, hiding
+/// the older copies at query time. See docs/segmented-index.md §4.
+pub async fn flush(ns: &Namespace, tokenizer: &Tokenizer, opts: IndexOptions) -> Result<IndexOutcome> {
+    use std::collections::{BTreeMap, HashSet};
+
+    let (manifest, etag) = ns.read_manifest().await?;
+    let head = ns.wal_head().await?;
+    if head <= manifest.wal_index_cursor {
+        return Ok(IndexOutcome { generation: manifest.version, doc_count: 0, published: false });
+    }
+    let cursor = manifest.wal_index_cursor;
+    let scan = WalTail::new(ns).scan(cursor, Some(head)).await?;
+
+    // Resolve the slice's live items: upserts, with in-slice patches applied.
+    let mut items: Vec<StoredMemory> = Vec::new();
+    let mut touched: HashSet<[u8; 16]> = HashSet::new();
+    for (id, mut item) in scan.upserts {
+        if let Some(deltas) = scan.pending_patches.get(&id) {
+            mlake_core::wal::apply_deltas(&mut item, deltas);
+        }
+        touched.insert(id.0);
+        items.push(item);
+    }
+    // Patches to ids not upserted in this slice target an older segment: re-materialize the full
+    // item (with vector), apply the patch, and re-index it here — it supersedes the old copy.
+    let patch_only: Vec<MemoryId> = scan
+        .pending_patches
+        .keys()
+        .filter(|id| !touched.contains(&id.0))
+        .copied()
+        .collect();
+    if !patch_only.is_empty() {
+        let node = crate::QueryNode::open(ns, tokenizer.clone()).await?;
+        for mut item in node.get_many(&patch_only, true).await? {
+            if let Some(deltas) = scan.pending_patches.get(&item.id) {
+                mlake_core::wal::apply_deltas(&mut item, deltas);
+            }
+            touched.insert(item.id.0);
+            items.push(item);
+        }
+    }
+
+    // Supersede overlay: this segment kills, in older segments, every id it deletes or touches. (An
+    // id with no older copy is harmless. v1 over-approximates with all touched ids to avoid per-id
+    // existence lookups; compaction bounds the accumulated set.)
+    let mut superseded: Vec<MemoryId> = scan.tombstones.clone();
+    superseded.extend(touched.iter().map(|id| MemoryId(*id)));
+    superseded.sort_unstable();
+    superseded.dedup();
+
+    // Build the L0 segment: a fresh per-type index over the slice's items (no copy-forward).
+    let seg_id = mlake_core::MemoryId::new_v4().as_uuid().simple().to_string();
+    let doc_count = items.len();
+    let mut items_by_ft: BTreeMap<u8, Vec<StoredMemory>> = BTreeMap::new();
+    for item in items {
+        items_by_ft.entry(item.memory_type).or_default().push(item);
+    }
+    let all: HashSet<[u8; 16]> = touched;
+    let mut indexes: BTreeMap<u8, mlake_core::manifest::FactTypeIndex> = BTreeMap::new();
+    for (ft, ft_items) in items_by_ft {
+        let fti =
+            build_memory_type_index(ns, &seg_id, ft, ft_items, &all, &all, None, None, opts).await?;
+        indexes.insert(ft, fti);
+    }
+
+    // Write the delete overlay and publish the new L0 segment at the head of the list.
+    let seg_prefix = mlake_core::manifest::segment_prefix(&ns.name, &seg_id);
+    let tomb = mlake_core::SegmentTombstones { superseded, predicates: scan.predicate_tombstones };
+    let tomb_path = crate::generation::write_tombstones(&ns.store, &seg_prefix, &tomb).await?;
+
+    let segment = mlake_core::Segment {
+        id: seg_id,
+        level: 0,
+        seq_lo: cursor + 1,
+        seq_hi: head,
+        doc_count: doc_count as u64,
+        indexes,
+        tombstones: tomb_path,
+    };
+    let version = manifest.version + 1;
+    let mut next = manifest.clone();
+    next.version = version;
+    next.wal_index_cursor = head;
+    next.wal_head = head;
+    next.prev_wal_index_cursor = manifest.wal_index_cursor;
+    next.prev_segments = Vec::new(); // a flush drops no segment, so there is no grace window
+    next.segments = std::iter::once(segment).chain(manifest.segments).collect();
+
+    let published = match etag {
+        Some(etag) => ns
+            .swap_manifest(&etag, &next)
+            .await
+            .map(|_| true)
+            .or_else(|e| if e.is_conflict() { Ok(false) } else { Err(e) })?,
+        None => false,
+    };
+    Ok(IndexOutcome { generation: version, doc_count, published })
 }
 
 /// Cheap live-document estimate for fold selection: the previous generation's indexed count
@@ -224,6 +332,7 @@ pub async fn index(ns: &Namespace, tokenizer: &Tokenizer, opts: IndexOptions) ->
         seq_hi: head,
         doc_count: doc_count as u64,
         indexes,
+        tombstones: String::new(),
     };
     let mut next = manifest.clone();
     next.version = version;
