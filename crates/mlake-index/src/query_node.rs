@@ -352,7 +352,10 @@ impl QueryNode {
     /// Cluster files backing one fact type's current generation. Zero for a type that
     /// exists only in the un-indexed tail.
     pub fn cluster_count_of(&self, memory_type: u8) -> usize {
-        self.per_type.get(&memory_type).map(|s| s.cluster_paths.len()).unwrap_or(0)
+        self.per_type
+            .get(&memory_type)
+            .map(|ft| ft.segments.iter().map(|s| s.cluster_paths.len()).sum())
+            .unwrap_or(0)
     }
 
     /// How k-means partitioned one fact type: each cluster's centroid, trained size, and
@@ -366,12 +369,13 @@ impl QueryNode {
     /// so exclude un-indexed WAL-tail writes, which is why they can disagree with
     /// [`QueryNode::doc_count_of`].
     pub fn cluster_layout(&self, memory_type: u8) -> Option<ClusterLayout<'_>> {
-        let state = self.per_type.get(&memory_type)?;
+        // The newest segment's partitioning (a visualization; each segment has its own k-means).
+        let seg = self.per_type.get(&memory_type)?.segments.first()?;
         Some(ClusterLayout {
-            dim: state.centroids.dim,
-            centroids: &state.centroids.vectors,
-            sizes: &state.centroids.sizes,
-            tag_summary: &state.tag_summary,
+            dim: seg.centroids.dim,
+            centroids: &seg.centroids.vectors,
+            sizes: &seg.centroids.sizes,
+            tag_summary: &seg.tag_summary,
         })
     }
 
@@ -386,7 +390,8 @@ impl QueryNode {
         memory_type: u8,
         budget: usize,
     ) -> Result<Vec<(u32, StoredMemory)>> {
-        let Some(state) = self.per_type.get(&memory_type) else {
+        // A visualization sample from the newest segment's layout.
+        let Some(state) = self.per_type.get(&memory_type).and_then(|ft| ft.segments.first()) else {
             return Ok(Vec::new());
         };
         let total = state.cluster_paths.len();
@@ -429,9 +434,11 @@ impl QueryNode {
     /// present only in the un-indexed tail has none yet, so its first embedded memory
     /// stands in. `None` means nothing in this type carries an embedding, so there is no
     /// dimension to violate.
-    fn expected_dim(state: &FactTypeState) -> Option<usize> {
-        if !state.centroids.is_empty() && state.centroids.dim > 0 {
-            return Some(state.centroids.dim);
+    fn expected_dim(state: &FactType) -> Option<usize> {
+        for seg in &state.segments {
+            if !seg.centroids.is_empty() && seg.centroids.dim > 0 {
+                return Some(seg.centroids.dim);
+            }
         }
         state.tail_items.iter().map(|m| m.vector.len()).find(|&n| n > 0)
     }
@@ -451,46 +458,48 @@ impl QueryNode {
             return Ok(Vec::new());
         }
 
+        // The tail is newest, so it wins over any indexed copy.
         let mut found: HashMap<MemoryId, StoredMemory> = HashMap::new();
-        for state in self.per_type.values() {
-            for item in &state.tail_items {
+        for ft in self.per_type.values() {
+            for item in &ft.tail_items {
                 if wanted.contains(&item.id) {
                     found.insert(item.id, item.clone());
                 }
             }
         }
 
-        // Anything the tail did not answer must come from an indexed generation. Each fact
-        // type is a separate index, so an id is resolved against every type's index.
-        for state in self.per_type.values() {
-            let missing: Vec<MemoryId> =
-                wanted.iter().copied().filter(|id| !found.contains_key(id)).collect();
-            if missing.is_empty() {
-                break;
-            }
-            if !include_vector {
-                // Fast path: the caller does not want the embedding, so read each memory's row
-                // from the payload store (one coalesced ranged GET) instead of deserializing
-                // its whole cluster file. Returned memories carry an empty `vector`.
-                for (id, item) in
-                    state.payload.lookup_batch(&self.ns.store, &missing, Some((&metrics, 1))).await?
-                {
-                    if wanted.contains(&id) {
-                        found.entry(id).or_insert(item);
-                    }
+        // Anything the tail did not answer comes from a segment. Resolve against every fact type's
+        // segments, newest-first, so a re-upserted id's current (newest-segment) copy wins.
+        for ft in self.per_type.values() {
+            for seg in &ft.segments {
+                let missing: Vec<MemoryId> =
+                    wanted.iter().copied().filter(|id| !found.contains_key(id)).collect();
+                if missing.is_empty() {
+                    break;
                 }
-                continue;
-            }
-            let by_cluster = state.pk.lookup_batch(&self.ns.store, &missing, Some((&metrics, 1))).await?;
-            if by_cluster.is_empty() {
-                continue;
-            }
-            let mut clusters: Vec<usize> = by_cluster.values().map(|&c| c as usize).collect();
-            clusters.sort_unstable();
-            clusters.dedup();
-            for item in self.fetch_clusters(state, &clusters, &metrics, 2).await? {
-                if wanted.contains(&item.id) {
-                    found.entry(item.id).or_insert(item);
+                if !include_vector {
+                    // Fast path: read each row from the payload store, not its whole cluster file.
+                    for (id, item) in
+                        seg.payload.lookup_batch(&self.ns.store, &missing, Some((&metrics, 1))).await?
+                    {
+                        if wanted.contains(&id) {
+                            found.entry(id).or_insert(item);
+                        }
+                    }
+                    continue;
+                }
+                let by_cluster =
+                    seg.pk.lookup_batch(&self.ns.store, &missing, Some((&metrics, 1))).await?;
+                if by_cluster.is_empty() {
+                    continue;
+                }
+                let mut clusters: Vec<usize> = by_cluster.values().map(|&c| c as usize).collect();
+                clusters.sort_unstable();
+                clusters.dedup();
+                for item in self.fetch_clusters(seg, &clusters, &metrics, 2).await? {
+                    if wanted.contains(&item.id) {
+                        found.entry(item.id).or_insert(item);
+                    }
                 }
             }
         }
@@ -532,21 +541,23 @@ impl QueryNode {
 
         let walk: Vec<u8> = if types.is_empty() { self.memory_types() } else { types.to_vec() };
         for ty in walk {
-            let Some(state) = self.per_type.get(&ty) else { continue };
+            let Some(ft) = self.per_type.get(&ty) else { continue };
 
-            if !state.entity.is_empty() {
-                for (entity, count) in state
-                    .entity
-                    .counts(&self.ns.store, entities, Some((&metrics, 3)))
-                    .await?
-                {
-                    *out.entry(entity).or_insert(0) += count;
+            for seg in &ft.segments {
+                if !seg.entity.is_empty() {
+                    for (entity, count) in seg
+                        .entity
+                        .counts(&self.ns.store, entities, Some((&metrics, 3)))
+                        .await?
+                    {
+                        *out.entry(entity).or_insert(0) += count;
+                    }
                 }
             }
 
-            // The posting index is built from the indexed generation, so correct it for
+            // The posting index is built from the indexed segments, so correct it for
             // what a query would actually see: tail upserts add, hidden memories subtract.
-            for m in &state.tail_items {
+            for m in &ft.tail_items {
                 if self.hidden(m) {
                     continue;
                 }
@@ -569,33 +580,31 @@ impl QueryNode {
         limit: usize,
         filter: &Predicate,
     ) -> Result<(Vec<StoredMemory>, Option<ScanCursor>)> {
-        let Some(state) = self.per_type.get(&memory_type) else {
+        let Some(ft) = self.per_type.get(&memory_type) else {
             return Ok((Vec::new(), None));
         };
         let metrics = QueryMetrics::new();
-        // The virtual tail cluster sits just past the real ones, so one walk covers both the
-        // indexed generation and the un-indexed overlay a query would also see.
-        let tail_cluster = state.cluster_paths.len();
-        // An id can sit in both a cluster and the tail — a re-upsert of an already-indexed
-        // memory. The tail version is newer and wins, exactly as it does for a query, so the
-        // indexed copy is skipped and each memory is yielded once.
-        let superseded: HashSet<MemoryId> = state.tail_items.iter().map(|m| m.id).collect();
+        // One flat walk over every segment's clusters (newest-first), then the virtual tail
+        // cluster just past them — so a scan covers exactly what a query would see.
+        let flat: Vec<(usize, usize)> = ft
+            .segments
+            .iter()
+            .enumerate()
+            .flat_map(|(si, s)| (0..s.cluster_paths.len()).map(move |c| (si, c)))
+            .collect();
+        let tail_cluster = flat.len();
+        // An id can sit in a cluster and be superseded by the tail (a re-upsert); the tail wins.
+        // (Cross-segment shadowing of re-upserts lands with Phase 2's supersede tombstones.)
+        let superseded: HashSet<MemoryId> = ft.tail_items.iter().map(|m| m.id).collect();
         let (mut cluster, mut offset) = (cursor.cluster, cursor.offset);
         let mut out = Vec::new();
 
         while out.len() < limit && cluster <= tail_cluster {
             let items: Vec<StoredMemory> = if cluster == tail_cluster {
-                state
-                    .tail_items
-                    .iter()
-                    .filter(|m| !self.hidden(m))
-                    .cloned()
-                    .collect()
+                ft.tail_items.iter().filter(|m| !self.hidden(m)).cloned().collect()
             } else {
-                // Hide anything a query would hide: a tail upsert supersedes the indexed copy,
-                // and a tail id-tombstone or predicate-tombstone hides it entirely. Without the
-                // `hidden` check a deleted-but-still-indexed memory would surface in a scan.
-                self.fetch_clusters(state, &[cluster], &metrics, 3).await?
+                let (si, lc) = flat[cluster];
+                self.fetch_clusters(&ft.segments[si], &[lc], &metrics, 3).await?
                     .into_iter()
                     .filter(|m| !superseded.contains(&m.id) && !self.hidden(m))
                     .collect()
@@ -636,29 +645,29 @@ impl QueryNode {
         let metrics = QueryMetrics::new();
         let mut ids = Vec::new();
         for mt in types {
-            let Some(state) = self.per_type.get(&mt) else { continue };
+            let Some(ft) = self.per_type.get(&mt) else { continue };
             // Tail overrides the indexed copy of a re-upserted id (newer wins), same as a scan.
-            let superseded: HashSet<MemoryId> = state.tail_items.iter().map(|m| m.id).collect();
-            let tail_cluster = state.cluster_paths.len();
-            for cluster in 0..=tail_cluster {
-                let items: Vec<StoredMemory> = if cluster == tail_cluster {
-                    state
-                        .tail_items
-                        .iter()
-                        .filter(|m| !self.tombstones.contains(&m.id))
-                        .cloned()
-                        .collect()
-                } else {
-                    self.fetch_clusters(state, &[cluster], &metrics, 3)
+            let superseded: HashSet<MemoryId> = ft.tail_items.iter().map(|m| m.id).collect();
+            // Every segment's clusters, then the tail.
+            for seg in &ft.segments {
+                for cluster in 0..seg.cluster_paths.len() {
+                    for m in self
+                        .fetch_clusters(seg, &[cluster], &metrics, 3)
                         .await?
                         .into_iter()
                         .filter(|m| !superseded.contains(&m.id))
-                        .collect()
-                };
-                for m in &items {
-                    if tags.matches(&m.tags) && metadata_contains_all(&m.metadata, metadata_equals) {
-                        ids.push(m.id);
+                    {
+                        if tags.matches(&m.tags)
+                            && metadata_contains_all(&m.metadata, metadata_equals)
+                        {
+                            ids.push(m.id);
+                        }
                     }
+                }
+            }
+            for m in ft.tail_items.iter().filter(|m| !self.tombstones.contains(&m.id)) {
+                if tags.matches(&m.tags) && metadata_contains_all(&m.metadata, metadata_equals) {
+                    ids.push(m.id);
                 }
             }
         }
@@ -762,10 +771,13 @@ impl QueryNode {
         let missing: Vec<MemoryId> =
             by_id.keys().filter(|id| !materialized.contains_key(id)).copied().collect();
         if !missing.is_empty() {
-            for (id, item) in
-                state.payload.lookup_batch(&self.ns.store, &missing, Some((metrics, 3))).await?
-            {
-                materialized.entry(id).or_insert(item);
+            // Hydrate across segments, newest-first, via each segment's payload store.
+            for seg in &state.segments {
+                for (id, item) in
+                    seg.payload.lookup_batch(&self.ns.store, &missing, Some((metrics, 3))).await?
+                {
+                    materialized.entry(id).or_insert(item);
+                }
             }
         }
         metrics.check_budget(&self.ns.name, "query");
@@ -789,7 +801,7 @@ impl QueryNode {
     #[allow(clippy::type_complexity)]
     async fn run_arms(
         &self,
-        state: &FactTypeState,
+        state: &FactType,
         vector: Option<&[f32]>,
         text: Option<&str>,
         tags: &TagFilter,
@@ -801,97 +813,40 @@ impl QueryNode {
         Vec<(MemoryId, f32)>,
         HashMap<MemoryId, StoredMemory>,
     )> {
-        // Vector arm: probe + fetch the candidate clusters once (RT3); the graph arm reuses
-        // the materialized memories. Tags are applied inline (memories carry their tags).
+        // Vector arm: run the two-stage search (RaBitQ scan + exact rerank) per segment, score
+        // the shared tail exactly, and merge — newest source (tail, then newest segment) wins for a
+        // re-upserted id. The per-segment search is unchanged; only the merge is new.
         let (probed_items, vector_scored) = match vector {
-            Some(q) if depths.vector > 0 && !state.centroids.is_empty() => {
+            Some(q) if depths.vector > 0 && state.segments.iter().any(|s| !s.centroids.is_empty()) => {
+                let mut merged: HashMap<MemoryId, f32> = HashMap::new();
+                // Tail first (newest): scored exactly, so `or_insert` below lets it shadow an older
+                // segment's stale copy of the same id.
                 let t = Instant::now();
-                let probed = self.select_clusters(state, q, depths.nprobe, tags);
-                metrics.record_phase(Phase::Probe, t.elapsed());
-
-                // Scan: vector blocks only. Tags are a column in the block, so the filter is
-                // applied exactly and *before* scoring — no oversampling, no post-filter, and
-                // the payload half is never read for the members that lose.
-                let t = Instant::now();
-                let blocks = self.fetch_vector_blocks(state, &probed, metrics, 3).await?;
-                metrics.record_phase(Phase::FetchClusters, t.elapsed());
-
-                // Stage one: scan the 1-bit codes, keeping an error interval per candidate
-                // rather than just a point estimate. RaBitQ's bound is what makes stage two
-                // exact — it says which candidates could still be in the true top-k, so the
-                // rest can be dropped without ever reading their full-precision vector.
-                let t = Instant::now();
-                let mut cands: Vec<(MemoryId, f32, f32, f32)> = Vec::new(); // id, est, lo, hi
-                for block in &blocks {
-                    let mask = block.tag_mask(&tags.tags);
-                    // A block whose dictionary cannot satisfy the filter is skipped whole —
-                    // e.g. an ALL filter naming a tag the cluster does not contain.
-                    if !tags.is_noop() && block.has_tags() && !block.any_can_pass(&mask, tags.mode)
-                    {
-                        continue;
-                    }
-                    let prepared = block.prepare(q)?;
-                    for i in 0..block.len() {
-                        let id = block.ids()[i];
-                        if self.tombstones.contains(&id) {
-                            continue;
-                        }
-                        if !tags.is_noop() && block.has_tags() && !block.passes(i, &mask, tags.mode)
-                        {
-                            continue;
-                        }
-                        let (lo, hi) = block.score_bounds(&prepared, i);
-                        cands.push((id, block.score(&prepared, i), lo, hi));
-                    }
-                }
-                // The un-indexed tail has no block and is scored exactly, so its interval is
-                // a point — it never needs reranking.
                 for m in &state.tail_items {
                     if tags.matches(&m.tags) && !self.hidden(m) {
-                        let sc = mlake_core::cosine_opt(q, &m.vector);
-                        cands.push((m.id, sc, sc, sc));
+                        merged.entry(m.id).or_insert(mlake_core::cosine_opt(q, &m.vector));
                     }
                 }
-                metrics.record_phase(Phase::Rerank, t.elapsed());
-
-                // Stage two: rescore exactly, but only what the bound leaves in contention.
-                // `tau` is the k-th best *lower* bound; anything whose upper bound cannot
-                // reach it is provably outside the top-k.
-                let k = depths.vector.max(1);
-                let mut los: Vec<f32> = cands.iter().map(|c| c.2).collect();
-                los.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
-                let tau = los.get(k - 1).copied().unwrap_or(f32::NEG_INFINITY);
-                let contenders: Vec<&(MemoryId, f32, f32, f32)> =
-                    cands.iter().filter(|c| c.3 >= tau).collect();
-
-                let t = Instant::now();
-                let ids: Vec<MemoryId> = contenders.iter().map(|c| c.0).collect();
-                let exact = if state.rerank.is_empty() || ids.is_empty() {
-                    HashMap::new()
-                } else {
-                    state.rerank.lookup_batch(&self.ns.store, &ids, Some((metrics, 3))).await?
-                };
-                let mut scored: Vec<(MemoryId, f32)> = contenders
-                    .iter()
-                    // No stored full-precision vector (a tail item, or a generation without
-                    // the rerank tier) keeps its estimate rather than being dropped.
-                    .map(|c| (c.0, exact.get(&c.0).map(|v| mlake_core::cosine_opt(q, v)).unwrap_or(c.1)))
-                    .collect();
-                // Rank on the exact scores, ties broken by id so results are deterministic.
+                for seg in &state.segments {
+                    for (id, sc) in
+                        self.vector_arm_segment(seg, q, depths.vector, depths.nprobe, tags, metrics).await?
+                    {
+                        merged.entry(id).or_insert(sc);
+                    }
+                }
+                // The global top-k over all segments + tail is a subset of the union of each
+                // segment's (and the tail's) top-k, so merging exact scores and truncating is exact.
+                let mut scored: Vec<(MemoryId, f32)> = merged.into_iter().collect();
                 scored.sort_by(|a, b| {
                     b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal).then(a.0.cmp(&b.0))
                 });
                 scored.truncate(depths.vector);
                 metrics.record_phase(Phase::Rerank, t.elapsed());
 
-                // Hydrate only the survivors. This is what the graph arm seeds from, and what
-                // is returned inline — bounded by the arm depth, not by cluster size.
+                // Hydrate the survivors across segments + tail. Tail winners are resident and not
+                // in any pk index yet (INV-5 visibility), so seed them directly.
                 let mut materialized: HashMap<MemoryId, StoredMemory> = HashMap::new();
                 let winners: Vec<MemoryId> = scored.iter().map(|(id, _)| *id).collect();
-                // Tail winners are already resident and are NOT in the pk index — the fold
-                // has not seen them yet — so seed them directly. Leaving them to
-                // `materialize_into` would silently drop every un-indexed write from the
-                // results, which is exactly the visibility INV-5 promises.
                 let want: HashSet<MemoryId> = winners.iter().copied().collect();
                 for m in &state.tail_items {
                     if want.contains(&m.id) {
@@ -899,8 +854,7 @@ impl QueryNode {
                     }
                 }
                 self.materialize_into(state, &winners, &mut materialized, metrics).await?;
-                let items: Vec<StoredMemory> = materialized.into_values().collect();
-                (items, scored)
+                (materialized.into_values().collect(), scored)
             }
             _ => {
                 let mut items = state.tail_items.clone();
@@ -933,6 +887,81 @@ impl QueryNode {
         Ok((vector_scored, fts_scored, graph_scored, materialized))
     }
 
+    /// The two-stage vector search over ONE segment: probe → scan its 1-bit blocks with RaBitQ
+    /// error bounds → exact-rerank only the contenders → its exact-scored top-`depth`. The tail is
+    /// scored by the caller (it is shared across segments), so this reads only the segment's blocks.
+    /// The scan / bound / contender / rerank logic is unchanged — this is the per-segment black box
+    /// the merge in `run_arms` calls once per segment.
+    async fn vector_arm_segment(
+        &self,
+        state: &SegmentState,
+        q: &[f32],
+        depth: usize,
+        nprobe: usize,
+        tags: &TagFilter,
+        metrics: &QueryMetrics,
+    ) -> Result<Vec<(MemoryId, f32)>> {
+        if state.centroids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let t = Instant::now();
+        let probed = self.select_clusters(state, q, nprobe, tags);
+        metrics.record_phase(Phase::Probe, t.elapsed());
+
+        let t = Instant::now();
+        let blocks = self.fetch_vector_blocks(state, &probed, metrics, 3).await?;
+        metrics.record_phase(Phase::FetchClusters, t.elapsed());
+
+        // Stage one: scan the 1-bit codes, keeping an error interval (est, lo, hi) per candidate.
+        let t = Instant::now();
+        let mut cands: Vec<(MemoryId, f32, f32, f32)> = Vec::new(); // id, est, lo, hi
+        for block in &blocks {
+            let mask = block.tag_mask(&tags.tags);
+            if !tags.is_noop() && block.has_tags() && !block.any_can_pass(&mask, tags.mode) {
+                continue;
+            }
+            let prepared = block.prepare(q)?;
+            for i in 0..block.len() {
+                let id = block.ids()[i];
+                if self.tombstones.contains(&id) {
+                    continue;
+                }
+                if !tags.is_noop() && block.has_tags() && !block.passes(i, &mask, tags.mode) {
+                    continue;
+                }
+                let (lo, hi) = block.score_bounds(&prepared, i);
+                cands.push((id, block.score(&prepared, i), lo, hi));
+            }
+        }
+        metrics.record_phase(Phase::Rerank, t.elapsed());
+
+        // Stage two: rescore exactly, but only what the bound leaves in contention. `tau` is the
+        // k-th best lower bound; anything whose upper bound cannot reach it is outside the top-k.
+        let k = depth.max(1);
+        let mut los: Vec<f32> = cands.iter().map(|c| c.2).collect();
+        los.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+        let tau = los.get(k - 1).copied().unwrap_or(f32::NEG_INFINITY);
+        let contenders: Vec<&(MemoryId, f32, f32, f32)> = cands.iter().filter(|c| c.3 >= tau).collect();
+
+        let t = Instant::now();
+        let ids: Vec<MemoryId> = contenders.iter().map(|c| c.0).collect();
+        let exact = if state.rerank.is_empty() || ids.is_empty() {
+            HashMap::new()
+        } else {
+            state.rerank.lookup_batch(&self.ns.store, &ids, Some((metrics, 3))).await?
+        };
+        let mut scored: Vec<(MemoryId, f32)> = contenders
+            .iter()
+            .map(|c| (c.0, exact.get(&c.0).map(|v| mlake_core::cosine_opt(q, v)).unwrap_or(c.1)))
+            .collect();
+        scored.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal).then(a.0.cmp(&b.0))
+        });
+        scored.truncate(depth);
+        metrics.record_phase(Phase::Rerank, t.elapsed());
+        Ok(scored)
+    }
+
     /// Choose which clusters to fetch for the vector arm.
     ///
     /// Without a tag filter (or without per-cluster tag summaries) this is the plain
@@ -950,7 +979,7 @@ impl QueryNode {
     /// probe broadly and capped so a huge one does not turn a probe into a scan. The
     /// divisor is calibrated against `ann_recall@10` in the BEIR harness — if that metric
     /// regresses, this constant is the first thing to look at.
-    fn resolve_nprobe(state: &FactTypeState, nprobe: usize) -> usize {
+    fn resolve_nprobe(state: &SegmentState, nprobe: usize) -> usize {
         if nprobe > 0 {
             return nprobe;
         }
@@ -962,7 +991,7 @@ impl QueryNode {
 
     fn select_clusters(
         &self,
-        state: &FactTypeState,
+        state: &SegmentState,
         query: &[f32],
         nprobe: usize,
         tags: &TagFilter,
@@ -1032,7 +1061,7 @@ impl QueryNode {
     /// half to decide what is admissible.
     async fn fetch_vector_blocks(
         &self,
-        state: &FactTypeState,
+        state: &SegmentState,
         cluster_ids: &[usize],
         metrics: &QueryMetrics,
         roundtrip: usize,
@@ -1055,7 +1084,7 @@ impl QueryNode {
 
     async fn fetch_clusters(
         &self,
-        state: &FactTypeState,
+        state: &SegmentState,
         cluster_ids: &[usize],
         metrics: &QueryMetrics,
         roundtrip: usize,
@@ -1104,20 +1133,40 @@ impl QueryNode {
         Ok(per_cluster.into_iter().flatten().filter(|item| !self.hidden(item)).collect())
     }
 
-    /// Materialize `ids` (those not already present) into `into`: one coalesced pk lookup +
-    /// cluster fetch. Tombstoned/absent ids resolve to nothing.
+    /// Materialize `ids` (those not already present) into `into`, searching each segment
+    /// newest-first so a re-upserted id resolves to its current (newest-segment) copy.
+    /// Tombstoned/absent ids resolve to nothing.
     async fn materialize_into(
         &self,
-        state: &FactTypeState,
+        state: &FactType,
         ids: &[MemoryId],
         into: &mut HashMap<MemoryId, StoredMemory>,
         metrics: &QueryMetrics,
     ) -> Result<()> {
-        let missing: Vec<MemoryId> = ids
-            .iter()
-            .filter(|id| !into.contains_key(id) && !self.tombstones.contains(id))
-            .copied()
-            .collect();
+        for seg in &state.segments {
+            let missing: Vec<MemoryId> = ids
+                .iter()
+                .filter(|id| !into.contains_key(id) && !self.tombstones.contains(id))
+                .copied()
+                .collect();
+            if missing.is_empty() {
+                return Ok(());
+            }
+            self.materialize_from_segment(seg, &missing, into, metrics).await?;
+        }
+        Ok(())
+    }
+
+    /// Materialize `missing` ids from a single segment's payload store (or its cluster files as a
+    /// fallback), inserting any it resolves into `into` without overwriting an existing (newer) entry.
+    async fn materialize_from_segment(
+        &self,
+        state: &SegmentState,
+        missing: &[MemoryId],
+        into: &mut HashMap<MemoryId, StoredMemory>,
+        metrics: &QueryMetrics,
+    ) -> Result<()> {
+        let missing: Vec<MemoryId> = missing.to_vec();
         if missing.is_empty() {
             return Ok(());
         }
@@ -1158,7 +1207,7 @@ impl QueryNode {
     /// centre, then spread one hop through links (semantic + causal). Returns `(id, score)`.
     async fn temporal_arm(
         &self,
-        state: &FactTypeState,
+        state: &FactType,
         query: &[f32],
         from: i64,
         to: i64,
@@ -1176,16 +1225,18 @@ impl QueryNode {
                 .unwrap_or(default)
         };
 
-        // 1. Entry-point pool: ids whose effective_ts is in the window (one ranged scan) plus
-        //    in-window tail items.
-        let mut window_ids = if state.time.is_empty() {
-            Vec::new()
-        } else {
-            state
-                .time
-                .in_window(&self.ns.store, from, to, tmp::TEMPORAL_WINDOW_CAP, Some((metrics, 4)))
-                .await?
-        };
+        // 1. Entry-point pool: ids whose effective_ts is in the window (one ranged scan per
+        //    segment's time index) plus in-window tail items.
+        let mut window_ids: Vec<MemoryId> = Vec::new();
+        for seg in &state.segments {
+            if !seg.time.is_empty() {
+                window_ids.extend(
+                    seg.time
+                        .in_window(&self.ns.store, from, to, tmp::TEMPORAL_WINDOW_CAP, Some((metrics, 4)))
+                        .await?,
+                );
+            }
+        }
         for m in &state.tail_items {
             if eff(m).is_some_and(|ts| ts >= from && ts <= to) {
                 window_ids.push(m.id);
@@ -1229,7 +1280,14 @@ impl QueryNode {
         }
 
         // 4. One hop through links: seeds' inline outgoing (semantic + causal) + radj incoming.
-        let incoming = state.radj.incoming_batch(&self.ns.store, &seeds, Some((metrics, 4))).await?;
+        // Incoming edges may live in any segment (an edge is stored where its target is), so union
+        // each segment's radj for the seeds.
+        let mut incoming: HashMap<MemoryId, Vec<InEdge>> = HashMap::new();
+        for seg in &state.segments {
+            for (id, edges) in seg.radj.incoming_batch(&self.ns.store, &seeds, Some((metrics, 4))).await? {
+                incoming.entry(id).or_default().extend(edges);
+            }
+        }
         // (neighbor, weight, boost)
         let mut links: Vec<(MemoryId, f32, f32)> = Vec::new();
         for seed in &seeds {
@@ -1268,9 +1326,16 @@ impl QueryNode {
         Ok(scores.into_iter().collect())
     }
 
-    /// The FTS arm's ranked hits with their raw BM25 scores.
-    fn fts_arm(&self, state: &FactTypeState, text: &str, depth: usize, tags: &TagFilter) -> Vec<(MemoryId, f32)> {
-        let mut hits = state.gen_fts.search_filtered(text, depth, tags);
+    /// The FTS arm's ranked hits with their raw BM25 scores, merged across segments + the tail.
+    ///
+    /// Each segment's split is searched independently and the hits are pooled. BM25 idf is
+    /// per-segment (its own df), so pooling raw scores across segments is approximate — the same
+    /// tradeoff Lucene makes when it merges per-segment scores. A newer segment (or the tail)
+    /// shadows an older copy of the same id via the dedup below (hits sorted by score, but
+    /// deduped keeping the first occurrence — see the note).
+    fn fts_arm(&self, state: &FactType, text: &str, depth: usize, tags: &TagFilter) -> Vec<(MemoryId, f32)> {
+        let mut hits: Vec<mlake_fts::FtsHit> = Vec::new();
+        // Tail first so a re-upserted id's tail hit wins the dedup over an older segment's.
         hits.extend(
             state
                 .tail_fts
@@ -1278,6 +1343,15 @@ impl QueryNode {
                 .into_iter()
                 .filter(|h| !self.tombstones.contains(&h.id)),
         );
+        for seg in &state.segments {
+            hits.extend(
+                seg.gen_fts
+                    .search_filtered(text, depth, tags)
+                    .into_iter()
+                    .filter(|h| !self.tombstones.contains(&h.id)),
+            );
+        }
+        // Keep the best (highest) score per id: sort by score desc, then drop later duplicates.
         hits.sort_by(|a, b| {
             b.score
                 .partial_cmp(&a.score)
@@ -1292,7 +1366,7 @@ impl QueryNode {
     #[allow(clippy::too_many_arguments)]
     async fn graph_arm(
         &self,
-        state: &FactTypeState,
+        state: &FactType,
         vector_ranking: &[MemoryId],
         probed_items: &[StoredMemory],
         depth: usize,
@@ -1323,10 +1397,22 @@ impl QueryNode {
         }
         let seed_entities: Vec<EntityId> = seed_entities.into_iter().collect();
         let per_entity_cap = GraphParams::default().per_entity_cap;
-        let (incoming, entity_candidates) = futures::try_join!(
-            state.radj.incoming_batch(&self.ns.store, &seed_ids, Some((metrics, 4))),
-            state.entity.candidates_batch(&self.ns.store, &seed_entities, per_entity_cap, Some((metrics, 4))),
-        )?;
+        // Edges and entity postings can live in any segment (stored where the target/entity is),
+        // so union each segment's radj + entity index for the seeds.
+        let mut incoming: HashMap<MemoryId, Vec<InEdge>> = HashMap::new();
+        let mut entity_candidates: HashMap<EntityId, Vec<MemoryId>> = HashMap::new();
+        for seg in &state.segments {
+            let (inc, ents) = futures::try_join!(
+                seg.radj.incoming_batch(&self.ns.store, &seed_ids, Some((metrics, 4))),
+                seg.entity.candidates_batch(&self.ns.store, &seed_entities, per_entity_cap, Some((metrics, 4))),
+            )?;
+            for (id, edges) in inc {
+                incoming.entry(id).or_default().extend(edges);
+            }
+            for (e, cands) in ents {
+                entity_candidates.entry(e).or_default().extend(cands);
+            }
+        }
         metrics.record_phase(Phase::GraphRadj, tr.elapsed());
 
         // Score structurally — NO candidate hydration. Activation comes entirely from the
@@ -1358,10 +1444,12 @@ impl QueryNode {
         let tf = Instant::now();
         let ranked_ids: Vec<MemoryId> =
             ranked.iter().map(|r| r.id).filter(|id| !by_id.contains_key(id)).collect();
-        for (id, item) in
-            state.payload.lookup_batch(&self.ns.store, &ranked_ids, Some((metrics, 4))).await?
-        {
-            by_id.entry(id).or_insert(item);
+        for seg in &state.segments {
+            for (id, item) in
+                seg.payload.lookup_batch(&self.ns.store, &ranked_ids, Some((metrics, 4))).await?
+            {
+                by_id.entry(id).or_insert(item);
+            }
         }
         metrics.record_phase(Phase::GraphFetch, tf.elapsed());
         let out = ranked

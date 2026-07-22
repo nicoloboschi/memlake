@@ -13,18 +13,18 @@
   },
   "corpus_size": 3633,
   "n_queries": 323,
-  "index_seconds": 2.87,
+  "index_seconds": 0.0,
   "arms": {
     "dense": {
       "ndcg@10": 0.34365,
       "recall@100": 0.31088,
       "mrr@10": 0.5298,
       "latency": {
-        "mean_ms": 9.611,
-        "p50_ms": 5.394,
-        "p90_ms": 16.351,
-        "p99_ms": 83.326,
-        "max_ms": 174.044,
+        "mean_ms": 2.902,
+        "p50_ms": 2.319,
+        "p90_ms": 4.052,
+        "p99_ms": 10.649,
+        "max_ms": 20.935,
         "n_queries": 323
       }
     },
@@ -33,29 +33,29 @@
       "recall@100": 0.24911,
       "mrr@10": 0.51744,
       "latency": {
-        "mean_ms": 10.42,
-        "p50_ms": 4.229,
-        "p90_ms": 14.245,
-        "p99_ms": 164.474,
-        "max_ms": 311.055,
+        "mean_ms": 2.327,
+        "p50_ms": 1.828,
+        "p90_ms": 3.957,
+        "p99_ms": 8.976,
+        "max_ms": 10.987,
         "n_queries": 323
       }
     },
     "hybrid": {
-      "ndcg@10": 0.36222,
+      "ndcg@10": 0.36258,
       "recall@100": 0.31654,
-      "mrr@10": 0.56917,
+      "mrr@10": 0.57149,
       "latency": {
-        "mean_ms": 13.85,
-        "p50_ms": 6.961,
-        "p90_ms": 17.809,
-        "p99_ms": 156.954,
-        "max_ms": 247.293,
+        "mean_ms": 3.75,
+        "p50_ms": 3.139,
+        "p90_ms": 5.653,
+        "p99_ms": 12.967,
+        "max_ms": 16.758,
         "n_queries": 323
       }
     }
   },
   "dataset": "nfcorpus",
-  "generated_at": "2026-07-22T13:48:41+00:00",
+  "generated_at": "2026-07-22T14:07:25+00:00",
   "platform": "Darwin arm64 py3.13.2"
 }
