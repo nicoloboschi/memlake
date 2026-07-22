@@ -35,6 +35,13 @@ use crate::spill::{ExternalSort, ItemSpill, Merge};
 use crate::sstable::{ts_key, RadjTable};
 use crate::Result;
 
+/// Log a streaming-fold phase's duration when `MEMLAKE_TIMING` is set (matches the in-RAM fold).
+fn phase_log(phase: &str, start: std::time::Instant) {
+    if std::env::var("MEMLAKE_TIMING").is_ok() {
+        eprintln!("[stream] {phase}: {:.2}s", start.elapsed().as_secs_f64());
+    }
+}
+
 /// Total external-sort buffer budget per memory_type, split across the five sorts. Peak RAM is
 /// roughly this plus one open cluster and the FTS writer's arena.
 const SORT_BUDGET_BYTES: usize = 512 * 1024 * 1024;
@@ -163,6 +170,7 @@ pub async fn index_streaming(
     let seqs = wal_seqs(ns, manifest.wal_index_cursor, head).await?;
 
     // Pass 1: id-level state.
+    let tp1 = std::time::Instant::now();
     let mut state: HashMap<[u8; 16], WalId> = HashMap::new();
     let mut preds: Vec<(u64, Predicate)> = Vec::new();
     for &seq in &seqs {
@@ -189,6 +197,7 @@ pub async fn index_streaming(
         }
     }
 
+    phase_log("wal_pass1", tp1);
     let predicate_deleted = |m: &StoredMemory| -> bool {
         preds.iter().any(|(seq, p)| m.write_seq < *seq && p.matches(m))
     };
@@ -196,6 +205,7 @@ pub async fn index_streaming(
     let mut resolver = Resolver::new(opts.seed);
 
     // Overlay the previous generation, streamed cluster-by-cluster.
+    let tpg = std::time::Instant::now();
     for ft in manifest.memory_types() {
         let fti = manifest.index(ft).unwrap();
         for path in &fti.files.clusters {
@@ -220,7 +230,9 @@ pub async fn index_streaming(
         }
     }
 
+    phase_log("prev_gen", tpg);
     // Pass 2: re-stream the WAL and emit each winning upsert's resolved item.
+    let tp2 = std::time::Instant::now();
     for &seq in &seqs {
         let entry = ns.read_wal_entry(seq).await?;
         for op in entry.ops {
@@ -240,6 +252,7 @@ pub async fn index_streaming(
             resolver.emit(item)?;
         }
     }
+    phase_log("wal_pass2", tp2);
 
     // ---- Phase 2: build each memory_type's generation from its spill ----
     let nonce = mlake_core::MemoryId::new_v4().as_uuid().simple().to_string();
@@ -295,10 +308,13 @@ async fn build_type_streaming(
     seed: u64,
 ) -> Result<mlake_core::manifest::FactTypeIndex> {
     let prefix = format!("{}/mt{memory_type}/gen-{generation}-{nonce}", ns.name);
+    let ttr = std::time::Instant::now();
     let k = mlake_ivf::centroid_count(n);
     let mut centroids = mlake_ivf::train_centroids_k(&sample, k, seed);
     drop(sample);
     let kk = centroids.len().max(1);
+    phase_log("train", ttr);
+    let tas = std::time::Instant::now();
 
     // One big sort carries full item bytes grouped by cluster (avoids √N open cluster files);
     // the rest carry small SSTable fragments. Budget split: the item + payload sorts hold the
@@ -315,43 +331,73 @@ async fn build_type_streaming(
     let mut sizes = vec![0usize; kk];
     let mut cluster_tags: Vec<(BTreeSet<String>, bool)> = vec![(BTreeSet::new(), false); kk];
 
-    // Single assignment pass over the spill.
-    for item in spill.into_reader()? {
-        let c = if centroids.is_empty() { 0 } else { centroids.assign(&item.vector) };
-        sizes[c] += 1;
-        cluster_sort.add(cluster_key(c), item.to_rkyv_bytes())?;
-        pk_sort.add(item.id.0, (c as u32).to_le_bytes().to_vec())?;
-        payload_sort.add(item.id.0, item.to_payload_bytes())?;
-        for e in &item.entity_ids {
-            entity_sort.add(e.0, item.id.0.to_vec())?;
+    // Single assignment pass over the spill, in batches: the per-item centroid assignment and
+    // the two rkyv serializations (full item for the cluster file, payload for the store) are
+    // the CPU-heavy work and are independent, so a batch does them across cores (like the in-RAM
+    // fold's parallel assign). Feeding the external sorts / FTS stays serial (shared state), but
+    // that part is cheap.
+    use rayon::prelude::*;
+    const ASSIGN_BATCH: usize = 8_192;
+    let mut batch: Vec<StoredMemory> = Vec::with_capacity(ASSIGN_BATCH);
+    let mut reader = spill.into_reader()?;
+    loop {
+        batch.clear();
+        while batch.len() < ASSIGN_BATCH {
+            match reader.next() {
+                Some(item) => batch.push(item),
+                None => break,
+            }
         }
-        let t = &item.timestamps;
-        if let Some(ts) = t.occurred_start.or(t.mentioned_at).or(t.occurred_end) {
-            time_sort.add(ts_key(ts), item.id.0.to_vec())?;
+        if batch.is_empty() {
+            break;
         }
-        fts.add(item.id, &item.text, &item.tags).map_err(|e| crate::Error::Fts(e.to_string()))?;
-        for edge in &item.causal_out {
-            radj_pairs.push((
-                edge.target,
-                InEdge {
-                    source: item.id,
-                    kind: EdgeKind::Causal(LinkTypeTag::from(edge.link_type)),
-                    weight: edge.weight.to_f32(),
-                },
-            ));
-        }
-        let (tset, unt) = &mut cluster_tags[c];
-        if item.tags.is_empty() {
-            *unt = true;
-        } else {
-            for tag in &item.tags {
-                tset.insert(tag.clone());
+        // Parallel: nearest centroid + both serializations per item.
+        let prepared: Vec<(usize, Vec<u8>, Vec<u8>)> = batch
+            .par_iter()
+            .map(|item| {
+                let c = if centroids.is_empty() { 0 } else { centroids.assign(&item.vector) };
+                (c, item.to_rkyv_bytes(), item.to_payload_bytes())
+            })
+            .collect();
+        // Serial: feed the sorts / FTS / summaries.
+        for (item, (c, full, payload)) in batch.drain(..).zip(prepared) {
+            sizes[c] += 1;
+            cluster_sort.add(cluster_key(c), full)?;
+            pk_sort.add(item.id.0, (c as u32).to_le_bytes().to_vec())?;
+            payload_sort.add(item.id.0, payload)?;
+            for e in &item.entity_ids {
+                entity_sort.add(e.0, item.id.0.to_vec())?;
+            }
+            let t = &item.timestamps;
+            if let Some(ts) = t.occurred_start.or(t.mentioned_at).or(t.occurred_end) {
+                time_sort.add(ts_key(ts), item.id.0.to_vec())?;
+            }
+            fts.add(item.id, &item.text, &item.tags).map_err(|e| crate::Error::Fts(e.to_string()))?;
+            for edge in &item.causal_out {
+                radj_pairs.push((
+                    edge.target,
+                    InEdge {
+                        source: item.id,
+                        kind: EdgeKind::Causal(LinkTypeTag::from(edge.link_type)),
+                        weight: edge.weight.to_f32(),
+                    },
+                ));
+            }
+            let (tset, unt) = &mut cluster_tags[c];
+            if item.tags.is_empty() {
+                *unt = true;
+            } else {
+                for tag in &item.tags {
+                    tset.insert(tag.clone());
+                }
             }
         }
     }
     centroids.sizes = sizes;
+    phase_log("assign", tas);
 
     // Write cluster files from the cluster-grouped stream.
+    let tcw = std::time::Instant::now();
     let mut cluster_paths: Vec<String> = vec![String::new(); kk];
     let mut merge = cluster_sort.finish()?;
     let mut cur_c: Option<usize> = None;
@@ -391,7 +437,10 @@ async fn build_type_streaming(
         }
     }
 
+    phase_log("cluster_write", tcw);
+
     // Build the SSTables from the sorted merges, and the sparse radj in RAM.
+    let tsst = std::time::Instant::now();
     let pk = build_sstable_from_merge(pk_sort.finish()?)?;
     let payload = build_sstable_from_merge(payload_sort.finish()?)?;
     let entity = build_sstable_from_merge(entity_sort.finish()?)?;
@@ -402,7 +451,9 @@ async fn build_type_streaming(
         .into_iter()
         .map(|(tags, has_untagged)| ClusterTagSummary { tags: tags.into_iter().collect(), has_untagged })
         .collect();
+    phase_log("sstable_finalize", tsst);
 
+    let twg = std::time::Instant::now();
     let files = write_generation(
         &ns.store,
         &prefix,
@@ -418,6 +469,7 @@ async fn build_type_streaming(
         n,
     )
     .await?;
+    phase_log("write_gen", twg);
 
     Ok(mlake_core::manifest::FactTypeIndex { prev_files: None, train_count: n as u64, files })
 }
