@@ -532,16 +532,36 @@ green; what follows is what is left.
 
 ## Read path: the zero-copy claim, and the cache
 
-- [ ] **We deserialize; we do not read zero-copy.** `rkyv_read` validates with
-      `check_archived_root` — which yields a perfectly usable `&Archived<T>` —
-      and then throws it away by calling `Deserialize` into an owned graph: a
-      fresh `String` per text, a `Vec` per tag list, per member. Three copies on
-      a cold read (S3 body, realignment when the buffer is not 8-byte aligned,
-      then the item graph) and an allocation storm on every hydrate. SPEC used to
-      assert this was zero-copy; that line is now corrected rather than aspirational.
-      The fix is to operate on `&Archived<StoredMemory>` at the call sites — the
-      accessors already exist. Lower value than it looks: after the vector/payload
-      split this cost falls only on hydrated winners, not on every probed member.
+- [ ] **We deserialize; we do not read zero-copy — but the value is now small,
+      and the invasive fix should wait for the segmented index to settle.**
+      `rkyv_read` validates with `check_archived_root` (yielding a usable
+      `&Archived<T>`) and then throws it away by `Deserialize`ing into an owned
+      graph. Two things learned while scoping this:
+
+      1. **The 6-byte envelope header makes the aligned fast path DEAD.** Every
+         format wraps its payload behind `envelope::HEADER_LEN = 6`, so
+         `&bytes[6..]` is never 8-aligned and *every* rkyv read takes the copy
+         branch, unconditionally — the in-place branch in `rkyv_read` never runs
+         for an enveloped object. Padding the header 6->8 makes a cold read from
+         mmap (page-aligned, so 8-aligned) skip that copy. It is a format change
+         (version bump + re-ingest) and removes only one of three copies; the
+         deserialize allocations, the dominant cost, remain.
+      2. **After the vector/payload split the deserialize is off the hot path.**
+         The scan reads flat `VectorBlock` bytes and never deserializes. A whole
+         `ClusterFile::from_bytes` now happens only in the fold (`read_generation`,
+         not latency-critical) and winner-hydration is bounded by arm depth through
+         the payload store. So the allocation storm that motivated this is already
+         mostly gone.
+
+      The real prize (operating on `&Archived<StoredMemory>` at the call sites,
+      the accessors already exist) threads borrow lifetimes through the query and
+      fold path — which is exactly the code the segmented/LSM refactor is
+      restructuring. Doing a large lifetime refactor concurrently with a
+      structural one is high-risk for low post-split payoff; sequence it *after*
+      the segmented work lands, and gate it on a measured allocation/latency
+      number rather than the principle. The header-alignment sub-fix is
+      independent and smaller, but is still a core format break and should ride
+      the next deliberate format bump, not a solo one.
 - [x] **The disk cache now mmaps instead of `fs::read`** (`cache.rs`). A warm hit
       maps the blob and hands the mapping to `Bytes::from_owner`, so the blob is
       never copied onto the heap and a re-read of a resident file does no I/O at
