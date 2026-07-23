@@ -115,6 +115,11 @@ CONSOLIDATED_FAILED = "2"
 #: per-document counts; the consolidated flag backs get_bank_freshness's pending/failed.
 _INDEXED_METADATA_KEYS = [META_DOCUMENT_ID, META_CONSOLIDATED_FLAG]
 
+#: Per-entity cap when deriving the entity-link count, mirroring Postgres's writer cap
+#: (each memory bidirectionally linked to at most this many others sharing an entity). Keeps
+#: `link_counts`'s entity total identical to the SQL path's `SUM(LEAST(n-1, cap))`.
+_MAX_LINKS_PER_ENTITY = 10
+
 #: Reserved key inside an archived row's `metadata` holding the full memlake
 #: memory (vector, memory_type, causal edges, the raw metadata bag) — everything
 #: the archive's memory_units-shaped columns cannot hold — so restore rebuilds it
@@ -820,21 +825,34 @@ class MemlakeMemories(MemoriesExtension):
     async def link_counts(self, *, conn, fq_table, bank_id: str) -> dict[str, int]:
         """Live link totals for the bank stats page, keyed by link type.
 
-        In memlake the links live inside the memory — derived semantic (pure vector kNN)
-        edges and intrinsic causal edges — so this is a metadata read of the fold-time
-        per-segment tally plus the WAL tail (LinkStats), never a corpus walk. memlake does
-        not model Postgres's "temporal" or "entity" link types as stored edges: link
-        derivation is vector-only (top-k nearest neighbours), and entities drive graph
-        *expansion at query time* rather than standing links. So those buckets are
-        structurally 0 here. Zero-valued types are omitted; an un-written bank has no links.
+        - ``semantic`` / ``causal``: stored inside the memory (derived vector-kNN edges and
+          intrinsic causal edges), read from the fold-time per-segment tally plus the WAL
+          tail via LinkStats — a metadata read, not a corpus walk.
+        - ``entity``: *derived*, not stored — exactly as Postgres does it. Postgres dropped
+          the entity edge table and now counts ``SUM(LEAST(n-1, cap))`` over ``unit_entities``;
+          memlake computes the same from its entity posting index (EntityStats), so the two
+          agree. Entity co-occurrence still drives graph expansion at query time in both.
+
+        memlake has no ``temporal`` link type: it never derives time-proximity edges and its
+        graph arm has no temporal expansion, so that bucket is genuinely 0 (a real gap versus
+        Postgres, not just a missing count). Zero-valued types are omitted; an un-written
+        bank has no links.
         """
+        ns = self._namespace(bank_id)
         try:
-            stats = await asyncio.to_thread(self._client.link_stats, self._namespace(bank_id))
+            stats = await asyncio.to_thread(self._client.link_stats, ns)
+            entity_counts = await asyncio.to_thread(self._client.entity_stats, ns)
         except Exception as e:
             if _is_missing_namespace(e):
                 return {}
             raise
-        return {k: v for k, v in stats.items() if v}
+        out = {k: v for k, v in stats.items() if v}
+        # Entity links, derived the same way Postgres does: each memory bidirectionally
+        # linked to up to _MAX_LINKS_PER_ENTITY others sharing each entity.
+        entity_total = sum(min(n - 1, _MAX_LINKS_PER_ENTITY) for n in entity_counts.values() if n > 1)
+        if entity_total:
+            out["entity"] = entity_total
+        return out
 
     async def list_tags(self, *, conn, fq_table, bank_id: str) -> dict[str, int]:
         return await reads.list_tags(self, conn=conn, fq_table=fq_table, bank_id=bank_id)

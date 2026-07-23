@@ -262,19 +262,25 @@ async def test_link_counts_report_derived_edges(store, bank_id, index_pass):
     # A bank with no writes has no namespace yet — no links, not an error.
     assert await store.link_counts(conn=None, fq_table=_fq_table, bank_id=bank_id) == {}
 
-    # Identical vectors are mutual nearest neighbours, so each memory gets derived links.
+    # Identical vectors are mutual nearest neighbours (→ derived semantic links), and all four
+    # share one entity (→ derived entity links, counted the way Postgres does).
+    shared = _entity("22222222-2222-2222-2222-222222222222", "Shared")
     await store.insert_facts(
         conn=None,
         ops=None,
         bank_id=bank_id,
-        facts=[make_fact(f"fact {i}", seed=0.5) for i in range(4)],
+        facts=[make_fact(f"fact {i}", seed=0.5, entities=[shared]) for i in range(4)],
     )
     index_pass(store._namespace(bank_id))
 
     counts = await store.link_counts(conn=None, fq_table=_fq_table, bank_id=bank_id)
     assert counts.get("semantic", 0) > 0, counts
-    # There are no client-supplied causal edges here, so only semantic links exist.
+    # Entity links are derived, not stored: SUM(LEAST(n-1, cap)) over entities — here one
+    # entity carried by 4 memories → min(4-1, 10) = 3, matching the SQL path.
+    assert counts.get("entity") == 3, counts
+    # No client-supplied causal edges, and memlake derives no temporal links.
     assert "causal" not in counts
+    assert "temporal" not in counts
 
 
 # --------------------------------------------------------------------------- curation archive
