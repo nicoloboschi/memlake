@@ -1,0 +1,139 @@
+{{- if .Values.proxy.enabled }}
+{{- $ns := .Release.Namespace -}}
+{{- $serve := printf "%s.%s.svc.cluster.local" (include "memlake.serveHeadless" .) $ns -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "memlake.fullname" . }}-proxy
+  labels:
+    {{- include "memlake.labels" . | nindent 4 }}
+    app.kubernetes.io/component: proxy
+data:
+  envoy.yaml: |
+    admin:
+      address: { socket_address: { address: 0.0.0.0, port_value: 9901 } }
+    static_resources:
+      listeners:
+      - name: grpc
+        address: { socket_address: { address: 0.0.0.0, port_value: {{ .Values.proxy.service.port }} } }
+        filter_chains:
+        - filters:
+          - name: envoy.filters.network.http_connection_manager
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+              stat_prefix: grpc
+              codec_type: AUTO
+              route_config:
+                name: memlake
+                virtual_hosts:
+                - name: memlake
+                  domains: ["*"]
+                  routes:
+                  {{- range .Values.proxy.pins }}
+                  # Pin: {{ .namespace }} -> dedicated pods ({{ .service }}).
+                  - match:
+                      prefix: "/"
+                      headers:
+                      - name: x-memlake-namespace
+                        string_match: { exact: {{ .namespace | quote }} }
+                    route: { cluster: memlake_pin_{{ .namespace | replace "-" "_" }} }
+                  {{- end }}
+                  # Default: consistent-hash on the namespace across the serve pool.
+                  - match: { prefix: "/" }
+                    route:
+                      cluster: memlake_hash
+                      hash_policy:
+                      - header: { header_name: x-memlake-namespace }
+              http_filters:
+              - name: envoy.filters.http.router
+                typed_config:
+                  "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+      clusters:
+      - name: memlake_hash
+        connect_timeout: 2s
+        type: STRICT_DNS
+        lb_policy: {{ .Values.proxy.lbPolicy }}
+        typed_extension_protocol_options:
+          envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+            "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+            explicit_http_config: { http2_protocol_options: {} }
+        load_assignment:
+          cluster_name: memlake_hash
+          endpoints:
+          - lb_endpoints:
+            - endpoint: { address: { socket_address: { address: {{ $serve }}, port_value: 50051 } } }
+        outlier_detection: { consecutive_5xx: 3, interval: 10s, base_ejection_time: 30s }
+      {{- range .Values.proxy.pins }}
+      - name: memlake_pin_{{ .namespace | replace "-" "_" }}
+        connect_timeout: 2s
+        type: STRICT_DNS
+        lb_policy: ROUND_ROBIN
+        typed_extension_protocol_options:
+          envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+            "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+            explicit_http_config: { http2_protocol_options: {} }
+        load_assignment:
+          cluster_name: memlake_pin_{{ .namespace | replace "-" "_" }}
+          endpoints:
+          - lb_endpoints:
+            - endpoint: { address: { socket_address: { address: {{ .service }}.{{ $ns }}.svc.cluster.local, port_value: 50051 } } }
+      {{- end }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "memlake.fullname" . }}-proxy
+  labels:
+    {{- include "memlake.labels" . | nindent 4 }}
+    app.kubernetes.io/component: proxy
+spec:
+  replicas: {{ .Values.proxy.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: proxy
+  template:
+    metadata:
+      annotations:
+        checksum/config: {{ .Values.proxy | toYaml | sha256sum }}
+      labels:
+        {{- include "memlake.labels" . | nindent 8 }}
+        app.kubernetes.io/component: proxy
+    spec:
+      containers:
+        - name: envoy
+          image: {{ .Values.proxy.image }}
+          args: ["envoy", "-c", "/etc/envoy/envoy.yaml", "--service-cluster", "memlake-proxy"]
+          ports:
+            - { name: grpc, containerPort: {{ .Values.proxy.service.port }} }
+            - { name: admin, containerPort: 9901 }
+          readinessProbe:
+            httpGet: { path: /ready, port: 9901 }
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          volumeMounts:
+            - { name: config, mountPath: /etc/envoy }
+          resources:
+            {{- toYaml .Values.proxy.resources | nindent 12 }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "memlake.fullname" . }}-proxy
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "memlake.fullname" . }}-proxy
+  labels:
+    {{- include "memlake.labels" . | nindent 4 }}
+    app.kubernetes.io/component: proxy
+spec:
+  type: {{ .Values.proxy.service.type }}
+  selector:
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: proxy
+  ports:
+    - name: grpc
+      port: {{ .Values.proxy.service.port }}
+      targetPort: {{ .Values.proxy.service.port }}
+{{- end }}

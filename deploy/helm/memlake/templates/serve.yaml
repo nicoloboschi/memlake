@@ -1,0 +1,77 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "memlake.fullname" . }}-serve
+  labels:
+    {{- include "memlake.labels" . | nindent 4 }}
+    app.kubernetes.io/component: serve
+spec:
+  replicas: {{ .Values.serve.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: serve
+  template:
+    metadata:
+      labels:
+        {{- include "memlake.labels" . | nindent 8 }}
+        app.kubernetes.io/component: serve
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: serve
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - serve
+            - --addr
+            - 0.0.0.0:50051
+            - --max-concurrent-queries
+            - {{ .Values.serve.maxConcurrentQueries | quote }}
+          envFrom:
+            # Real AWS S3 creds (MEMLAKE_QUERY_S3_*). No endpoint key => talks to AWS, not MinIO.
+            - secretRef:
+                name: {{ .Values.s3.existingSecret }}
+          env:
+            - name: MEMLAKE_NODE_ID
+              valueFrom:
+                fieldRef: { fieldPath: metadata.name }
+            {{- range $k, $v := .Values.serve.env }}
+            - name: {{ $k }}
+              value: {{ $v | quote }}
+            {{- end }}
+          ports:
+            - name: grpc
+              containerPort: 50051
+          readinessProbe:
+            tcpSocket: { port: 50051 }
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket: { port: 50051 }
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.serve.resources | nindent 12 }}
+---
+# Headless: Envoy resolves this to individual pod IPs so it can consistent-hash across pods.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "memlake.serveHeadless" . }}
+  labels:
+    {{- include "memlake.labels" . | nindent 4 }}
+    app.kubernetes.io/component: serve
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: false
+  selector:
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: serve
+  ports:
+    - name: grpc
+      port: 50051
+      targetPort: 50051

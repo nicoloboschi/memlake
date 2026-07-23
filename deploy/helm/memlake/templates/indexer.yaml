@@ -1,0 +1,49 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "memlake.fullname" . }}-indexer
+  labels:
+    {{- include "memlake.labels" . | nindent 4 }}
+    app.kubernetes.io/component: indexer
+spec:
+  replicas: {{ .Values.indexer.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: indexer
+  template:
+    metadata:
+      labels:
+        {{- include "memlake.labels" . | nindent 8 }}
+        app.kubernetes.io/component: indexer
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: indexer
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - index
+            - --interval-secs
+            - {{ .Values.indexer.intervalSecs | quote }}
+          envFrom:
+            # Real AWS S3 creds (MEMLAKE_INDEXER_S3_*).
+            - secretRef:
+                name: {{ .Values.s3.existingSecret }}
+          env:
+            - name: MEMLAKE_NODE_ID
+              valueFrom:
+                fieldRef: { fieldPath: metadata.name }
+            - name: MEMLAKE_INDEXER_GC_INTERVAL_SECS
+              value: {{ .Values.indexer.gcIntervalSecs | quote }}
+            - name: MEMLAKE_INDEXER_GC_MIN_AGE_SECS
+              value: {{ .Values.indexer.gcMinAgeSecs | quote }}
+            {{- range $k, $v := .Values.indexer.env }}
+            - name: {{ $k }}
+              value: {{ $v | quote }}
+            {{- end }}
+          resources:
+            {{- toYaml .Values.indexer.resources | nindent 12 }}

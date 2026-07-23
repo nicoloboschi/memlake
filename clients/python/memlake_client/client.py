@@ -241,10 +241,16 @@ class MemlakeClient:
         considered answer and is raised as-is."""
         namespace = getattr(request, "namespace", "") or ""
         ordered = self._ordered_nodes(namespace)
+        # Carry the namespace as a gRPC metadata header so an L7 proxy (Envoy/Gateway API) can
+        # consistent-hash on it — one serve pod per namespace, for cache + commit affinity — and
+        # route pinned namespaces to dedicated pods. Harmless when talking directly to a serve pod,
+        # which ignores it. The client's own rendezvous ordering below still applies when it is
+        # given the pod set directly (no proxy); behind a proxy, point it at the single proxy VIP.
+        metadata = (("x-memlake-namespace", namespace),) if namespace else None
         last_err: Optional[grpc.RpcError] = None
         for node in ordered:
             try:
-                result = getattr(self._stubs[node], method)(request)
+                result = getattr(self._stubs[node], method)(request, metadata=metadata)
                 self.last_node = node
                 return result
             except grpc.RpcError as e:

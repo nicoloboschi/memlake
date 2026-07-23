@@ -97,6 +97,21 @@ services:
       MEMLAKE_INDEXER_GC_MIN_AGE_SECS: ${MEMLAKE_INDEXER_GC_MIN_AGE_SECS:-60}
       RUST_LOG: ${RUST_LOG:-info}
 
+  # The L7 proxy: clients hit this instead of `serve` directly. It consistent-hashes on the
+  # `x-memlake-namespace` header so one serve pod owns a namespace (cache + commit affinity), and
+  # peels pinned namespaces off to a dedicated cluster. See deploy/envoy/envoy.demo.yaml.
+  proxy:
+    image: envoyproxy/envoy:v1.31-latest
+    depends_on:
+      serve:
+        condition: service_healthy
+    ports:
+      - "50050:50050"   # gRPC entrypoint for clients
+      - "9901:9901"     # Envoy admin/stats
+    volumes:
+      - ./deploy/envoy/envoy.demo.yaml:/etc/envoy/envoy.yaml:ro
+    command: ["envoy", "-c", "/etc/envoy/envoy.yaml", "--service-cluster", "memlake-proxy"]
+
   # The read-only inspection console. Talks gRPC to `serve` server-side; the browser only ever
   # sees this app's own JSON endpoints.
   admin:
@@ -123,10 +138,14 @@ services:
       dockerfile: demo/Dockerfile
     image: memlake-demo-writer:demo
     depends_on:
+      proxy:
+        condition: service_started
       serve:
         condition: service_healthy
     environment:
-      MEMLAKE_ADDR: serve:50051
+      # Through the L7 proxy (consistent-hash by namespace), not straight to serve — the client
+      # sends the x-memlake-namespace header the proxy routes on.
+      MEMLAKE_ADDR: proxy:50050
       MEMLAKE_DEMO_NAMESPACE: demo
       MEMLAKE_DEMO_INTERVAL: "2"
       MEMLAKE_DEMO_BATCH: "5"

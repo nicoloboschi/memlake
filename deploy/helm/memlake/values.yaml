@@ -1,0 +1,72 @@
+# memlake Helm values. Defaults target a dev cluster over REAL AWS S3 (no MinIO).
+
+image:
+  repository: ghcr.io/nicoloboschi/memlake-server
+  tag: dev
+  pullPolicy: IfNotPresent
+# For a private ghcr package, the namespace needs a pull secret with the package read scope.
+# Create it out-of-band and name it here (see deploy/README.md).
+imagePullSecrets:
+  - name: ghcr
+
+# Object storage. memlake is service-scoped: serve reads MEMLAKE_QUERY_S3_*, indexer reads
+# MEMLAKE_INDEXER_S3_*. Both are supplied by ONE existing Secret (all keys), created from the repo
+# .env at deploy time — never templated into the chart. With no S3 endpoint set, the client talks to
+# real AWS S3.
+s3:
+  existingSecret: memlake-s3
+
+serve:
+  replicas: 3
+  # The cap that bounds a pod's peak query memory (permits x per-query working set).
+  maxConcurrentQueries: 32
+  resources:
+    requests: { cpu: "500m", memory: "1Gi" }
+    limits: { cpu: "2", memory: "2Gi" }
+  env: {}   # extra env, e.g. RUST_LOG: debug
+
+indexer:
+  replicas: 1
+  intervalSecs: 5
+  gcIntervalSecs: 300
+  gcMinAgeSecs: 900
+  resources:
+    requests: { cpu: "500m", memory: "1Gi" }
+    limits: { cpu: "2", memory: "4Gi" }
+  env: {}
+
+# The Envoy L7 proxy — the client entrypoint. Consistent-hashes gRPC by the x-memlake-namespace
+# header across the serve pods (discovered via the headless serve Service).
+proxy:
+  enabled: true
+  replicas: 2
+  image: envoyproxy/envoy:v1.31-latest
+  # RING_HASH or MAGLEV (Maglev = less reshuffle when serve pods scale).
+  lbPolicy: MAGLEV
+  service:
+    # ClusterIP (in-cluster clients) or LoadBalancer (external). Port 50050 is the gRPC entrypoint.
+    type: ClusterIP
+    port: 50050
+  resources:
+    requests: { cpu: "250m", memory: "256Mi" }
+    limits: { cpu: "1", memory: "512Mi" }
+  # Namespace pinning: each entry peels a namespace off the hash pool to a dedicated serve
+  # Deployment (compute isolation). `service` must be a headless Service selecting those pods.
+  # Example:
+  #   pins:
+  #     - namespace: acme-corp
+  #       service: memlake-serve-acme
+  pins: []
+
+# The read-only inspection console (optional). Port-forward to view; not the data path.
+admin:
+  enabled: true
+  replicas: 1
+  repository: ghcr.io/nicoloboschi/memlake-admin
+  tag: dev
+  service:
+    type: ClusterIP
+    port: 3000
+  resources:
+    requests: { cpu: "100m", memory: "256Mi" }
+    limits: { cpu: "500m", memory: "1Gi" }

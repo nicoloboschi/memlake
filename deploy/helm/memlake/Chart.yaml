@@ -1,0 +1,9 @@
+apiVersion: v2
+name: memlake
+description: >-
+  memlake — an S3-native retrieval engine. Stateless serve pods + an async indexer over object
+  storage, behind an Envoy L7 proxy that consistent-hashes by namespace (cache + commit affinity)
+  and can pin namespaces to dedicated pods.
+type: application
+version: 0.1.0
+appVersion: "dev"

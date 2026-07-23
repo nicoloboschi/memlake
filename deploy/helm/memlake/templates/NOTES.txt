@@ -1,0 +1,29 @@
+memlake is installed in namespace {{ .Release.Namespace }} (release {{ .Release.Name }}).
+
+Components:
+  serve    x{{ .Values.serve.replicas }}   stateless gRPC API over AWS S3
+  indexer  x{{ .Values.indexer.replicas }}   async fold + GC loop
+{{- if .Values.proxy.enabled }}
+  proxy    x{{ .Values.proxy.replicas }}   Envoy, consistent-hash by x-memlake-namespace ({{ .Values.proxy.lbPolicy }})
+{{- end }}
+{{- if .Values.admin.enabled }}
+  admin    x{{ .Values.admin.replicas }}   inspection console
+{{- end }}
+
+Reach the gRPC entrypoint (clients send the x-memlake-namespace header; the memlake client does
+this automatically):
+
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "memlake.fullname" . }}-proxy {{ .Values.proxy.service.port }}:{{ .Values.proxy.service.port }}
+  # then point a client at localhost:{{ .Values.proxy.service.port }}
+
+{{- if .Values.admin.enabled }}
+
+Open the admin UI:
+
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "memlake.fullname" . }}-admin {{ .Values.admin.service.port }}:{{ .Values.admin.service.port }}
+  # then browse http://localhost:{{ .Values.admin.service.port }}
+{{- end }}
+
+Cleanup (drops everything; S3 data is untouched):
+
+  kubectl delete namespace {{ .Release.Namespace }}

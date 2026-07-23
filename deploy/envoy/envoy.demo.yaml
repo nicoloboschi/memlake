@@ -1,0 +1,80 @@
+# Envoy L7 proxy for the demo: consistent-hash routing by namespace, with a per-namespace pin.
+#
+# Clients send the namespace as the `x-memlake-namespace` gRPC metadata header (the memlake client
+# does this automatically). Envoy hashes that header across the serve pool (RING_HASH) so one pod
+# serves a given namespace — cache + commit affinity — while any pod can still serve any namespace.
+# A header-match route in front of the default peels specific namespaces off to a dedicated cluster,
+# which is how a namespace is pinned to isolated compute (here both clusters point at the same demo
+# serve; on k8s the pinned cluster is a separate Deployment).
+admin:
+  address:
+    socket_address: { address: 0.0.0.0, port_value: 9901 }
+
+static_resources:
+  listeners:
+  - name: grpc
+    address:
+      socket_address: { address: 0.0.0.0, port_value: 50050 }
+    filter_chains:
+    - filters:
+      - name: envoy.filters.network.http_connection_manager
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+          stat_prefix: grpc
+          codec_type: AUTO
+          route_config:
+            name: memlake
+            virtual_hosts:
+            - name: memlake
+              domains: ["*"]
+              routes:
+              # ---- Pinning example: route one namespace to its own (isolated) cluster. ----
+              - match:
+                  prefix: "/"
+                  headers:
+                  - name: x-memlake-namespace
+                    string_match: { exact: "pinned-example" }
+                route: { cluster: memlake_pinned }
+              # ---- Default: consistent-hash on the namespace across the serve pool. ----
+              - match: { prefix: "/" }
+                route:
+                  cluster: memlake_hash
+                  hash_policy:
+                  - header: { header_name: x-memlake-namespace }
+          http_filters:
+          - name: envoy.filters.http.router
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+
+  clusters:
+  - name: memlake_hash
+    connect_timeout: 2s
+    type: STRICT_DNS          # resolves the compose `serve` service (all replicas if scaled)
+    lb_policy: RING_HASH      # consistent hashing; the k8s chart uses MAGLEV
+    typed_extension_protocol_options:
+      envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+        "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+        explicit_http_config: { http2_protocol_options: {} }   # gRPC upstream speaks HTTP/2
+    load_assignment:
+      cluster_name: memlake_hash
+      endpoints:
+      - lb_endpoints:
+        - endpoint: { address: { socket_address: { address: serve, port_value: 50051 } } }
+    outlier_detection:        # eject a bad pod → ring re-routes that namespace to the next host
+      consecutive_5xx: 3
+      interval: 10s
+      base_ejection_time: 30s
+
+  - name: memlake_pinned
+    connect_timeout: 2s
+    type: STRICT_DNS
+    lb_policy: ROUND_ROBIN
+    typed_extension_protocol_options:
+      envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+        "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+        explicit_http_config: { http2_protocol_options: {} }
+    load_assignment:
+      cluster_name: memlake_pinned
+      endpoints:
+      - lb_endpoints:
+        - endpoint: { address: { socket_address: { address: serve, port_value: 50051 } } }
