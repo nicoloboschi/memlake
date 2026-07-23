@@ -262,6 +262,27 @@ impl GraphSource for Engine {
     fn incoming(&self, target: &MemoryId) -> Vec<InEdge> {
         self.radj.incoming(target).to_vec()
     }
+
+    fn temporal_candidates(&self, seed_id: MemoryId, cap: usize) -> Vec<MemoryId> {
+        use mlake_core::memory::{effective_ts, TEMPORAL_SPREAD_WINDOW_MS};
+        let Some(seed) = self.items.get(&seed_id) else {
+            return Vec::new();
+        };
+        let Some(seed_ts) = effective_ts(&seed.timestamps) else {
+            return Vec::new();
+        };
+        let mt = seed.memory_type;
+        let mut out: Vec<MemoryId> = self
+            .items
+            .values()
+            .filter(|m| m.id != seed_id && m.memory_type == mt)
+            .filter(|m| effective_ts(&m.timestamps).is_some_and(|ts| (ts - seed_ts).abs() <= TEMPORAL_SPREAD_WINDOW_MS))
+            .map(|m| m.id)
+            .collect();
+        out.sort();
+        out.truncate(cap);
+        out
+    }
 }
 
 #[cfg(test)]

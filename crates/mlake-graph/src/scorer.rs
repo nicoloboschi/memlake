@@ -18,6 +18,17 @@ pub fn entity_score(shared_count: u32) -> f32 {
     (shared_count as f32 * 0.5).tanh()
 }
 
+/// Temporal arm: how many seeds a candidate is a time-neighbour of maps to [0, 0.5) via
+/// `0.5 * tanh(count * 0.5)`.
+///
+/// Same saturating shape as the entity arm — being written near many seeds matters less
+/// per extra seed — but scaled to half, because "written around the same time" is weaker
+/// evidence of relevance than a shared entity or an explicit link, and the arm draws from a
+/// coarse ±window rather than a precise relation. Reference: 1 → 0.23, 2 → 0.38, 3 → 0.46.
+pub fn temporal_score(neighbour_count: u32) -> f32 {
+    0.5 * (neighbour_count as f32 * 0.5).tanh()
+}
+
 /// Semantic and causal arms both score a candidate by the *maximum* edge weight reaching
 /// it, not a sum: two weak links are not evidence as strong as one strong link.
 pub fn max_weight(current: f32, candidate: f32) -> f32 {
@@ -31,6 +42,7 @@ pub struct ScoreAccumulator {
     entity: HashMap<MemoryId, f32>,
     semantic: HashMap<MemoryId, f32>,
     causal: HashMap<MemoryId, f32>,
+    temporal: HashMap<MemoryId, f32>,
 }
 
 impl ScoreAccumulator {
@@ -58,7 +70,14 @@ impl ScoreAccumulator {
         *e = max_weight(*e, weight);
     }
 
-    /// Final additive score per candidate, in [0, 3].
+    /// Record the temporal arm's contribution: `0.5 * tanh(count * 0.5)` for a candidate that
+    /// is a time-neighbour of `neighbour_count` seeds. Like the entity arm, the count is
+    /// authoritative (a single insert), not accumulated across calls.
+    pub fn add_temporal(&mut self, id: MemoryId, neighbour_count: u32) {
+        self.temporal.insert(id, temporal_score(neighbour_count));
+    }
+
+    /// Final additive score per candidate, in [0, 3.5].
     pub fn merged(&self) -> HashMap<MemoryId, f32> {
         let mut all: HashMap<MemoryId, f32> = HashMap::new();
         for (id, s) in &self.entity {
@@ -68,6 +87,9 @@ impl ScoreAccumulator {
             *all.entry(*id).or_insert(0.0) += s;
         }
         for (id, s) in &self.causal {
+            *all.entry(*id).or_insert(0.0) += s;
+        }
+        for (id, s) in &self.temporal {
             *all.entry(*id).or_insert(0.0) += s;
         }
         all

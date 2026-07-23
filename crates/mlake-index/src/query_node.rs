@@ -1798,18 +1798,62 @@ impl QueryNode {
         }
         metrics.record_phase(Phase::GraphRadj, tr.elapsed());
 
+        // Temporal neighbours per seed: a ranged time-index scan over `[t ± window]` for each
+        // seed with an effective time, issued concurrently across seeds (each walks its
+        // segments in turn), plus in-window tail items. Pre-fetched here — like the entity
+        // postings — so the temporal arm scores synchronously without hydrating candidates.
+        let tt = Instant::now();
+        let per_temporal_cap = GraphParams::default().per_temporal_cap;
+        let seed_windows: Vec<(MemoryId, i64, i64)> = seeds
+            .iter()
+            .filter_map(|s| {
+                mlake_core::memory::effective_ts(&s.timestamps).map(|ts| {
+                    (s.id, ts - mlake_core::memory::TEMPORAL_SPREAD_WINDOW_MS, ts + mlake_core::memory::TEMPORAL_SPREAD_WINDOW_MS)
+                })
+            })
+            .collect();
+        let mut temporal: HashMap<MemoryId, Vec<MemoryId>> = HashMap::new();
+        if !seed_windows.is_empty() {
+            let scans = seed_windows.iter().map(|&(sid, from, to)| async move {
+                let mut ids: Vec<MemoryId> = Vec::new();
+                for seg in state.segments.iter() {
+                    if !seg.time.is_empty() {
+                        ids.extend(
+                            seg.time.in_window(&self.ns.store, from, to, per_temporal_cap, Some((metrics, 4))).await?,
+                        );
+                    }
+                }
+                Ok::<(MemoryId, Vec<MemoryId>), crate::Error>((sid, ids))
+            });
+            for (sid, mut ids) in futures::future::try_join_all(scans).await? {
+                let (from, to) = seed_windows.iter().find(|w| w.0 == sid).map(|w| (w.1, w.2)).unwrap();
+                for m in &state.tail_items {
+                    if mlake_core::memory::effective_ts(&m.timestamps).is_some_and(|ts| ts >= from && ts <= to) {
+                        ids.push(m.id);
+                    }
+                }
+                ids.retain(|id| *id != sid);
+                ids.sort();
+                ids.dedup();
+                temporal.insert(sid, ids);
+            }
+        }
+        metrics.record_phase(Phase::GraphRadj, tt.elapsed());
+
         // Score structurally — NO candidate hydration. Activation comes entirely from the
-        // graph structure already in hand: seed edges, incoming edges (radj), and how many
-        // seed-entity postings each candidate appears in (its shared-entity count). Existence
-        // is just "not tombstoned": semantic/causal targets were liveness-filtered at fold
-        // time, so an edge only dangles if its target was deleted since. This is the change
-        // that removed the whole-corpus hydration: previously every candidate (thousands, via
-        // `per_entity_cap`) was read from its cluster just to be scored and then truncated.
+        // graph structure already in hand: seed edges, incoming edges (radj), how many
+        // seed-entity postings each candidate appears in (its shared-entity count), and how
+        // many seeds each candidate is a time-neighbour of. Existence is just "not
+        // tombstoned": semantic/causal targets were liveness-filtered at fold time, so an edge
+        // only dangles if its target was deleted since. This is the change that removed the
+        // whole-corpus hydration: previously every candidate (thousands, via `per_entity_cap`)
+        // was read from its cluster just to be scored and then truncated.
         let te = Instant::now();
         let source = LazyGraphSource {
             entity_index: &entity_candidates,
             incoming: &incoming,
             tombstones: &self.tombstones,
+            temporal: &temporal,
         };
         let ranked = mlake_graph::retrieve(
             &source,
@@ -1898,6 +1942,9 @@ struct LazyGraphSource<'a> {
     entity_index: &'a HashMap<EntityId, Vec<MemoryId>>,
     incoming: &'a HashMap<MemoryId, Vec<InEdge>>,
     tombstones: &'a HashSet<MemoryId>,
+    /// Per-seed time-neighbours, pre-fetched (one ranged time-index scan per seed) so the
+    /// temporal arm serves them synchronously like the entity postings.
+    temporal: &'a HashMap<MemoryId, Vec<MemoryId>>,
 }
 
 impl GraphSource for LazyGraphSource<'_> {
@@ -1919,5 +1966,16 @@ impl GraphSource for LazyGraphSource<'_> {
 
     fn incoming(&self, target: &MemoryId) -> Vec<InEdge> {
         self.incoming.get(target).cloned().unwrap_or_default()
+    }
+
+    fn temporal_candidates(&self, seed_id: MemoryId, cap: usize) -> Vec<MemoryId> {
+        self.temporal
+            .get(&seed_id)
+            .into_iter()
+            .flatten()
+            .filter(|id| !self.tombstones.contains(id))
+            .take(cap)
+            .copied()
+            .collect()
     }
 }

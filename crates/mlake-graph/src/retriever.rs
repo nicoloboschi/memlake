@@ -38,6 +38,14 @@ pub trait GraphSource {
 
     /// Incoming edges for a target, from reverse adjacency.
     fn incoming(&self, target: &MemoryId) -> Vec<crate::radj::InEdge>;
+
+    /// Memory ids written within the temporal-spread window of `seed_id` — its time-neighbours
+    /// — filtered to the seed's `memory_type`, capped at `cap`. The window is the source's to
+    /// define (it owns the time index); the graph arm only tallies how many seeds each
+    /// candidate neighbours. Empty when the seed has no effective timestamp or the source has
+    /// no time index. Like `entity_candidates`, this is a bounded posting-style read, never a
+    /// hydration.
+    fn temporal_candidates(&self, seed_id: MemoryId, cap: usize) -> Vec<MemoryId>;
 }
 
 /// Retrieval parameters. Defaults match SPEC §7.
@@ -50,6 +58,11 @@ pub struct GraphParams {
     /// Whether to run the entity arm. Set false to model the timeout fallback, which
     /// serves semantic + causal only (SPEC §7.6).
     pub include_entity_arm: bool,
+    /// Whether to run the temporal arm (time-neighbour spread). Off keeps the arm out of a
+    /// timeout fallback or a corpus without timestamps.
+    pub include_temporal_arm: bool,
+    /// Time-neighbours read per seed before the cap applies.
+    pub per_temporal_cap: usize,
 }
 
 impl Default for GraphParams {
@@ -58,6 +71,8 @@ impl Default for GraphParams {
             per_entity_cap: 200,
             budget: 50,
             include_entity_arm: true,
+            include_temporal_arm: true,
+            per_temporal_cap: 200,
         }
     }
 }
@@ -91,6 +106,9 @@ pub fn retrieve(
     }
     expand_semantic(source, seeds, &mut acc);
     expand_causal(source, seeds, &mut acc);
+    if params.include_temporal_arm {
+        expand_temporal(source, seeds, params.per_temporal_cap, &mut acc);
+    }
 
     acc.ranked(&seed_ids, params.budget)
         .into_iter()
@@ -132,6 +150,25 @@ fn expand_entities(
     }
     for (cand_id, count) in shared {
         acc.add_entity(cand_id, count);
+    }
+}
+
+/// Temporal arm: candidates written near a seed in time, scored by how many seeds each one
+/// neighbours — the time analogue of the entity arm. A memory close in time to several seeds
+/// is more likely part of the same episode, so it accumulates the way a shared entity does.
+/// The window and effective-time cascade live in the source; here it is a pure tally.
+fn expand_temporal(source: &dyn GraphSource, seeds: &[StoredMemory], cap: usize, acc: &mut ScoreAccumulator) {
+    let seed_set: BTreeSet<MemoryId> = seeds.iter().map(|s| s.id).collect();
+    let mut near: HashMap<MemoryId, u32> = HashMap::new();
+    for seed in seeds {
+        for id in source.temporal_candidates(seed.id, cap) {
+            if !seed_set.contains(&id) {
+                *near.entry(id).or_insert(0) += 1;
+            }
+        }
+    }
+    for (cand_id, count) in near {
+        acc.add_temporal(cand_id, count);
     }
 }
 
@@ -238,6 +275,23 @@ mod tests {
         fn incoming(&self, target: &MemoryId) -> Vec<InEdge> {
             self.radj.incoming(target).to_vec()
         }
+
+        fn temporal_candidates(&self, seed_id: MemoryId, cap: usize) -> Vec<MemoryId> {
+            use mlake_core::memory::{effective_ts, TEMPORAL_SPREAD_WINDOW_MS};
+            let Some(seed_ts) = self.items.get(&seed_id).and_then(|m| effective_ts(&m.timestamps)) else {
+                return Vec::new();
+            };
+            let mut out: Vec<MemoryId> = self
+                .items
+                .values()
+                .filter(|m| m.id != seed_id && !self.tombstoned.contains(&m.id))
+                .filter(|m| effective_ts(&m.timestamps).is_some_and(|ts| (ts - seed_ts).abs() <= TEMPORAL_SPREAD_WINDOW_MS))
+                .map(|m| m.id)
+                .collect();
+            out.sort();
+            out.truncate(cap);
+            out
+        }
     }
 
     fn item(key: &str, entities: Vec<u64>) -> StoredMemory {
@@ -281,6 +335,41 @@ mod tests {
         // Scores match the tanh table.
         assert!((by_id[&MemoryId::from_key("a")] - 0.762).abs() < 0.01);
         assert!((by_id[&MemoryId::from_key("b")] - 0.462).abs() < 0.01);
+    }
+
+    fn item_at(key: &str, ts_ms: i64) -> StoredMemory {
+        let mut m = item(key, vec![]);
+        m.timestamps.occurred_start = Some(ts_ms);
+        m
+    }
+
+    #[test]
+    fn temporal_arm_scores_time_neighbours() {
+        let day = 24 * 60 * 60 * 1000i64;
+        // Seed at t=0: `near` is inside the ±24h window, `far` well outside it.
+        let seed = item_at("seed", 0);
+        let near = item_at("near", day / 2); // 12h away → neighbour
+        let far = item_at("far", 5 * day); // 5 days away → not a neighbour
+        let graph = MemGraph::new(vec![seed.clone(), near, far], vec![]);
+
+        let results = retrieve(&graph, &[seed], GraphParams::default());
+        let by_id: HashMap<MemoryId, f32> = results.iter().map(|r| (r.id, r.activation)).collect();
+
+        assert!(by_id.contains_key(&MemoryId::from_key("near")), "time-neighbour surfaces");
+        assert!(!by_id.contains_key(&MemoryId::from_key("far")), "out-of-window item absent");
+        // One neighbouring seed → temporal_score(1) = 0.5 * tanh(0.5) ≈ 0.231.
+        assert!((by_id[&MemoryId::from_key("near")] - 0.231).abs() < 0.01, "{by_id:?}");
+    }
+
+    #[test]
+    fn temporal_arm_can_be_disabled() {
+        let day = 24 * 60 * 60 * 1000i64;
+        let seed = item_at("seed", 0);
+        let near = item_at("near", day / 2);
+        let graph = MemGraph::new(vec![seed.clone(), near], vec![]);
+        // No entities, no edges, temporal off → the arm contributes nothing and nothing ranks.
+        let params = GraphParams { include_temporal_arm: false, ..GraphParams::default() };
+        assert!(retrieve(&graph, &[seed], params).is_empty());
     }
 
     #[test]

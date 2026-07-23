@@ -64,6 +64,18 @@ pub struct Timestamps {
 /// Maximum inline semantic (kNN) links per item, per SPEC §3.3.
 pub const MAX_SEMANTIC_OUT: usize = 5;
 
+/// Half-width of the graph's temporal-spread window, in epoch milliseconds. A memory whose
+/// effective time is within this of a seed's is a temporal neighbour, mirroring Hindsight's
+/// ~24h temporal linking. The graph's temporal arm reads neighbours in `[t - W, t + W]`.
+pub const TEMPORAL_SPREAD_WINDOW_MS: i64 = 24 * 60 * 60 * 1000;
+
+/// The time used to *window* a memory for temporal neighbouring: occurred-start, else the
+/// mention time, else occurred-end. Matches the `effective_ts` the time index is keyed on and
+/// the temporal arm's `eff` cascade. `None` means the memory carries no usable timestamp.
+pub fn effective_ts(ts: &Timestamps) -> Option<i64> {
+    ts.occurred_start.or(ts.mentioned_at).or(ts.occurred_end)
+}
+
 /// Minimum cosine similarity for a derived semantic link, per SPEC §5.2.
 pub const SEMANTIC_LINK_THRESHOLD: f32 = 0.7;
 
