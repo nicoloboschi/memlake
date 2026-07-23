@@ -1,9 +1,10 @@
 # TODOS — what memlake still needs to back Hindsight's memories
 
-Scope: **memlake-side work only.** Hindsight-side integration work is tracked in
-the `hindsight-wt8` worktree (branch `feat/memlake-provider`) and is deliberately
-not repeated here. Everything below is something memlake has to provide before
-Hindsight can stop falling back or degrading.
+Scope: mostly **memlake-side work**, but §0 also tracks the Hindsight-side and
+operational pieces that stand between "verified end to end in dev" and "running
+against real banks". The integration itself now lives in this repo,
+`integrations/hindsight` (`hindsight_memlake`), tested against a live server; the
+OSS seam it implements is Hindsight PR #2917 (`feat/pluggable-memories-provider`).
 
 Current state: in memlake mode Hindsight writes **nothing** memory-shaped to
 Postgres — no `memory_units`, no `memory_links`, no `unit_entities`. Running
@@ -25,6 +26,77 @@ LoComo scores identically to the Postgres path (14/15 on conv-26) with
 `nprobe=32`.
 
 Ordered by what blocks the most.
+
+---
+
+## 0. Path to a real Hindsight deployment
+
+The functional surface is done and verified at LoComo parity; what is left is
+mostly **operational and packaging**, not features. Grouped by how hard it blocks.
+
+### 0a. Hard blockers — the extension cannot even load / run in a real deployment
+
+- [ ] **The OSS seam is unreleased.** `hindsight_memlake` imports
+      `hindsight_api.engine.memories.base`, which exists only on Hindsight PR #2917.
+      Until that merges and ships in a `hindsight-api-slim` release, the extension
+      installs only from a source checkout (which is why the integration tests wire
+      it in through `HINDSIGHT_API_SLIM_PATH`).
+- [ ] **protobuf runtime conflict.** `memlake_client`'s generated stubs call
+      `ValidateProtobufRuntimeVersion(...)` against protobuf-7 gencode; Hindsight
+      pins `protobuf>=6.33.5`. It is a floor, so 7.x *may* resolve, but OTel deps
+      have historically capped it — verify against the real Hindsight lockfile, and
+      if it does not resolve, regenerate the stubs against 6.x gencode. Otherwise
+      `import memlake_client` raises `VersionError` and the extension never loads.
+- [ ] **No deployment wiring, and the indexer is mandatory.** memlake needs two
+      processes against S3 — the `serve` gRPC API *and* a continuous
+      `mlake-server index` loop. Search returns nothing until a fold runs (the tests
+      call `index --once` by hand). There is no docker-compose/helm standing up
+      server + indexer + bucket next to Hindsight, and no operator config doc.
+
+### 0b. Correctness gaps that fail *silently* in production
+
+- [ ] **No cross-store atomicity.** Facts are written inside Hindsight's retain
+      Postgres transaction; if it rolls back, memlake keeps entries whose document
+      rows never existed. Recall skips ids it cannot resolve (wasted slots, not
+      wrong answers) but they accumulate — no reconciliation or drift detection.
+- [ ] **Format-version bumps silently invalidate namespaces.** A v1→v2 bump left
+      existing namespaces unreadable with no migration path. Fine pre-release; needs
+      a story before real data lands. (See also §7.)
+
+### 0c. Migration prerequisites for real data
+
+- [ ] **No backfill path** from an existing Postgres bank into a namespace. This
+      can only be switched on for *new* banks until it exists, and it is also how a
+      like-for-like A/B benchmark would be set up. (See also §7.)
+- [ ] **Multi-tenancy undecided.** Hindsight isolates tenants by Postgres schema;
+      the provider maps a bank to a flat namespace with a prefix, one shared bucket.
+      Decide whether the namespace *is* the tenancy boundary and what isolation it
+      guarantees. (See also §7.)
+- [ ] **`DeleteNamespace` hazards** — not safe against a running indexer, and
+      returns `INTERNAL: no manifest` rather than `NOT_FOUND` on a missing namespace.
+      (See §7.)
+
+### 0d. Feature-parity gaps — runs, but degraded UX
+
+- [ ] **Curation invalidate/revert unsupported → §6.** `update_memory_unit` (edit
+      *and* the state changes) reads/writes `memory_units` directly, so in memlake
+      mode it finds nothing and silently returns "not found": you cannot edit,
+      invalidate or revert a memory. **This is where we start.**
+- [ ] **Count surfaces return zero/degraded → §5b.** bank-stats link counts,
+      `get_memories_timeseries`, `list_observation_scopes`, `list_documents`
+      per-doc counts, `get_bank_freshness` pending/failed.
+- [ ] **`list_tags` is O(corpus) per call → §5.** No `ListTags` RPC / tag-count
+      histogram yet.
+- [ ] **Smaller parity gaps:** no scan ordering (curation list comes back in
+      storage order, not `mentioned_at DESC` → §5); no key-*absence* predicate
+      (worked around with a positive `consolidated` flag → §5); nested tag groups
+      applied in Python, so they can trim below the limit → §4.
+
+### 0e. Performance / polish
+
+- [ ] **No `grpc.aio` client → §8.** Every call is wrapped in `asyncio.to_thread`,
+      a thread hop per retain batch and per recall.
+- [ ] **Residual stale co-occurrences accumulate → §6b.** Inert hygiene.
 
 ---
 
@@ -94,13 +166,13 @@ What is still missing is only the *stored* edge types:
       would otherwise pay ~18 bytes per edge across every candidate (~27 KB on a
       300-candidate recall). The graph reads through `Scan`/`Get`, where it is free.
 
-- [ ] **The streaming indexer derives no semantic links.**
-      `streaming.rs:238` — `item.semantic_out.clear(); // bulk build derives no
-      semantic links`. Above `MEMLAKE_INDEXER_STREAMING_THRESHOLD` docs a namespace
-      takes that path and has **no semantic edges at all**, so the graph silently
-      shows entity and observation structure only. Since the graph is core UI and
-      this flips at a size threshold, the failure mode is "works in dev, empty in
-      production" with no error. (Noted as being removed.)
+- [x] **The streaming indexer derives semantic links — DONE.** It used to clear
+      `semantic_out` on the bulk path (`streaming.rs:238`), so a namespace over
+      `MEMLAKE_INDEXER_STREAMING_THRESHOLD` docs had no semantic edges at all — the
+      graph silently showed entity/observation structure only, a "works in dev,
+      empty in production" failure with no error. The streaming fold now re-derives
+      semantic links per cluster in `build_type_streaming`, so both index paths
+      produce the same edges and the size threshold no longer changes the graph.
 
 - [ ] **Temporal and causal edge types.** Temporal links are not edges — derive
       adjacency from the timestamps already on the payload. `causal_out` is already
