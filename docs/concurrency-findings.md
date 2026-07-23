@@ -232,6 +232,53 @@ lever for the indexer bottleneck is the queue-based indexer being built (`index_
 the `mix` namespaces are degraded from dozens of runs — docs 6k→13k+ — so late absolute numbers
 aren't comparable to earlier ones.)
 
+## The latency TAIL: cold cluster fetches after a fold (fixes #5, #6)
+
+Tracing the slow ops (both reads and the write-path derive) pinned the tail precisely: it is a
+**cold `fetch_clusters`**. The slowest write showed `link_ms=14454ms` but `link_snapshot_ms=0.98ms`
+— the snapshot reopen was instant; the whole 14.5s was the derive's corpus queries. The slowest
+query showed `fetch_clusters=13.6s`, `tier:cold`. So the "sometimes instant, sometimes 18s" is:
+**a fold publishes a new generation whose freshly-built segment is not in any serve-node cache, and
+the first query/derive to probe it pays a multi-second object-store GET on the request path.** Warm
+steady-state reads are ~20ms; each fold makes one generation's clusters cold again.
+
+**Fix #5 — parallelize the derive corpus queries.** `derive_links_for_write` ran its per-item vector
+queries one `await` at a time (n sequential queries per batch — the dominant write cost). They're
+independent, so they now run with bounded concurrency (buffered, 8) sharing the lock-free QueryNode
+snapshot + atomic QueryMetrics. Correctness identical (e2e link tests). Also reverted the size-tiered
+compaction auto-fire (it over-worked the single indexer; fan-out isn't the bottleneck, the indexer
+is — `minor_compact` stays available but dormant).
+
+**Fix #6 — warm the new generation's clusters on fold, off the request path.** `QueryNode::warm()`
+pulls a generation's cluster+vector blobs into the read cache, warming **only the segments this open
+freshly decoded** (`newly_loaded`) — after a fold that's just the new segment(s); persisted ones are
+already cached — so warming never re-pulls warm blobs (warming *everything* thrashed the 512MB mem
+tier and raised the median). The serve node kicks it as a detached task the moment it adopts a new
+generation (`reopen_fold`/`full_open`). Toggle `MEMLAKE_WARM_ON_FOLD=off`.
+
+Clean A/B on a fresh bucket (only variable = warm on/off):
+
+| metric | warm OFF | warm ON |
+|---|---|---|
+| READ QPS | 100 | **122** |
+| READ p99 | 3464ms | **2435ms** (−30%) |
+| WRITE p99 | 7898ms | **5944ms** (−25%) |
+| p50 (read/write) | 21 / 235ms | 20 / 225ms (flat) |
+
+**Deferred adoption (`reopen_defer`) — correct, tested, but OPT-IN (default off).** The GC grace
+window (gc.rs keeps WAL + previous-generation segment objects above `prev_wal_index_cursor`) makes it
+provably safe for a serve node to keep serving from its *already-warm* old segments + an extended
+tail after a fold, instead of adopting the cold new generation on the request path — as long as
+`new_manifest.prev_wal_index_cursor <= node.wal_index_cursor()` (exactly one generation of lag).
+Proven identical to a fresh open by `deferred_reopen_across_a_fold_matches_a_fresh_open`. **But** it
+keeps the WAL tail growing (each reopen re-scans a longer `(cursor, head]`), and under the write-heavy
+mixed load the A/B was neutral-to-slightly-worse — the growing tail-scan offset the cold-fold savings,
+and warm-on-fold already removes most of the cold tail. So it ships **off by default**
+(`MEMLAKE_DEFER_FOLD=on` to enable) — a real win for read-heavy / low-fold namespaces, not for
+write-heavy ones. **Caveat: the mixed benchmark has high run-to-run variance** (READ p99 ranged
+251ms–2.4s across near-identical configs), so treat single-run deltas skeptically; the warm-on-fold
+number above is the one clean, order-controlled signal.
+
 ## Open / to try next (the loop) — priority order
 
 1. ❓ **Indexer throughput/fairness** — now the top bottleneck under write load (the queue-based

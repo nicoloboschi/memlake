@@ -39,8 +39,9 @@ struct Snapshot {
 
 /// What `snapshot_traced` did, for the per-call trace.
 struct SnapshotOutcome {
-    /// `reuse` (cached, head unchanged), `reopen_tail` (a write; segments reused), or `full_open`
-    /// (a fold, or no cache).
+    /// `reuse` (cached, head unchanged), `reopen_tail` (a write; segments reused), `reopen_defer`
+    /// (a fold, but still in the grace window — serve warm segments + extended tail), `reopen_fold`
+    /// (adopt a new generation, ≥2 folds behind), or `full_open` (no cache).
     action: &'static str,
     /// Time spent in the snapshot step (head check + any reopen/open).
     open_ms: f64,
@@ -180,10 +181,47 @@ impl MemlakeService {
                         let out = SnapshotOutcome::new("reopen_tail", started, node.tail_len());
                         return Ok((self.install_snapshot(&ns.name, node), out));
                     }
-                    Ok(Some(_)) => {
-                        // A fold changed the manifest. Reopen reusing the segments whose id
-                        // persisted across the fold (a flush adds one L0, a compaction replaces a
-                        // few with one — most persist) and reloading only the new ones.
+                    Ok(Some(versioned)) => {
+                        // A fold changed the manifest. If the new generation's grace window still
+                        // covers our snapshot's WAL cursor — GC keeps WAL entries (and the previous
+                        // generation's segment objects) above `prev_wal_index_cursor`, so
+                        // `prev_wal_index_cursor <= our cursor` means everything our segments+tail
+                        // read is still present — we can keep serving from the ALREADY-WARM segments
+                        // plus an extended tail instead of adopting the fold's cold new generation on
+                        // the request path. Correctness is identical (old segments + tail(cursor,
+                        // head] = the live set); manifest.rs documents this previous-generation
+                        // reopen. We adopt the new generation (and warm it) only once a further fold
+                        // pushes the watermark past our cursor — the grace window is one generation.
+                        // Deferred adoption is OPT-IN (`MEMLAKE_DEFER_FOLD=on`). It is provably
+                        // correct (old segments + retained tail = the live set; see the e2e test
+                        // `deferred_reopen_across_a_fold_matches_a_fresh_open`) and avoids the cold
+                        // new-generation fetch on the request path — a clear win for read-heavy /
+                        // low-fold namespaces. But under write-heavy load it keeps the WAL tail
+                        // growing (each reopen re-scans a longer `(cursor, head]`), which offset the
+                        // cold-fold savings in A/B, so it is not on by default. warm-on-fold (always
+                        // on) already removes most of the cold tail. See docs/concurrency-findings.md.
+                        let defer_enabled =
+                            std::env::var("MEMLAKE_DEFER_FOLD").as_deref() == Ok("on");
+                        let can_defer = defer_enabled
+                            && mlake_core::manifest::Manifest::from_bytes(&versioned.bytes)
+                                .map(|m| m.prev_wal_index_cursor <= cached.node.wal_index_cursor())
+                                .unwrap_or(false);
+                        if can_defer {
+                            let node = Arc::new(
+                                cached
+                                    .node
+                                    .reopen_extending_tail(head, self.tokenizer.clone())
+                                    .await
+                                    .map_err(internal)?,
+                            );
+                            let out =
+                                SnapshotOutcome::new("reopen_defer", started, node.tail_len());
+                            return Ok((self.install_snapshot(&ns.name, node), out));
+                        }
+                        // Grace window exhausted (≥ 2 generations behind) — adopt now. Reopen
+                        // reusing the segments whose id persisted across the fold (a flush adds one
+                        // L0, a compaction replaces a few with one — most persist), reloading only
+                        // the new ones, and warm those cold clusters off the request path.
                         let node = Arc::new(
                             cached
                                 .node
@@ -1408,6 +1446,7 @@ pub async fn run_indexer(
 
         // Drain: keep folding until the tail is empty (a fold that consumed nothing) or the per-claim
         // ceiling is hit, so a bulk load folds promptly instead of accumulating an unbounded tail.
+        let mut fold_errored = false;
         for _ in 0..MAX_DRAIN_ITERS {
             match fold(&ns, &tokenizer, IndexOptions::default(), budget, streaming_threshold).await {
                 Ok(outcome) => {
@@ -1426,6 +1465,7 @@ pub async fn run_indexer(
                 }
                 Err(e) => {
                     tracing::warn!(namespace = name, error = %e, "index failed");
+                    fold_errored = true;
                     break;
                 }
             }
@@ -1436,7 +1476,7 @@ pub async fn run_indexer(
         // anything a slow reader on the previous manifest might still be scanning. GC reads the
         // manifest fresh and only deletes what the CURRENT manifest doesn't reference, so it is safe
         // alongside a peer that just published a new generation.
-        let gc_due = last_gc.get(&name).map(|t| t.elapsed() >= gc_interval).unwrap_or(true);
+        let gc_due = !fold_errored && last_gc.get(&name).map(|t| t.elapsed() >= gc_interval).unwrap_or(true);
         if gc_due {
             match mlake_index::gc_with_min_age(&ns, gc_min_age).await {
                 Ok(out) if out.generation_files_deleted + out.wal_entries_deleted > 0 => {
@@ -1455,10 +1495,13 @@ pub async fn run_indexer(
 
         hb.abort();
 
-        // Complete: if more WAL arrived during the fold (head past the indexed cursor), keep the job
-        // pending for another pass; otherwise remove it. This closes the completion/write race — the
-        // job is only removed when the namespace is genuinely drained.
-        let still_dirty = namespace_is_dirty(&ns).await;
+        // Complete. On a fold ERROR, drop the job rather than re-queue it: re-queueing an
+        // unfoldable namespace (e.g. a corrupt/old-format manifest) means it is claimed again
+        // immediately and fails again — a tight loop that starves every other namespace. Dropping it
+        // lets the reconciliation sweep re-enqueue it on its slow cadence instead (bounded retry).
+        // On success, re-queue iff more WAL arrived during the fold (head past the indexed cursor) —
+        // this closes the completion/write race so the job is only removed when genuinely drained.
+        let still_dirty = !fold_errored && namespace_is_dirty(&ns).await;
         if let Err(e) = queue.complete(&name, &worker_id, still_dirty).await {
             tracing::warn!(namespace = name, error = %e, "index queue complete failed");
         }

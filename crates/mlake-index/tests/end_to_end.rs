@@ -187,6 +187,76 @@ async fn reopen_extending_tail_matches_a_fresh_open() {
     assert_eq!(via_reopen, vec![MemoryId::from_key("b")], "only the live tail item `b` survives");
 }
 
+/// The deferred-adoption path: a snapshot opened on generation N keeps serving from its (warm)
+/// segments + an extended tail even after a fold published generation N+1, as long as the new
+/// manifest's `prev_wal_index_cursor` still sits at or below the snapshot's cursor (the one-
+/// generation GC grace window). The extended-tail reopen must produce results IDENTICAL to a fresh
+/// open of N+1 — the writes the fold baked into N+1's segments are still replayed from the retained
+/// WAL over N's segments, so the live set is the same. This is what makes the serve node's
+/// `reopen_defer` branch safe (see service.rs `snapshot_traced`).
+#[tokio::test]
+async fn deferred_reopen_across_a_fold_matches_a_fresh_open() {
+    let store = Store::in_memory();
+    let ns = namespace(store, "ns").await;
+    let mut writer = Writer::new(ns.clone());
+
+    // Generation 1: `a` and `c` folded into a segment.
+    writer.commit(vec![Op::Upsert(item("a", vec![1.0, 0.0], "first"))]).await.unwrap();
+    writer.commit(vec![Op::Upsert(item("c", vec![0.5, 0.5], "third"))]).await.unwrap();
+    index(&ns, &Tokenizer::default(), IndexOptions::default()).await.unwrap();
+
+    // Open a snapshot on generation 1, capturing its cursor.
+    let node = QueryNode::open(&ns, Tokenizer::default()).await.unwrap();
+    let node_cursor = node.wal_index_cursor();
+
+    // More writes, then a SECOND fold → generation 2 bakes `b` and the delete of `a` into its
+    // segments and advances the cursor. `node` is now exactly one generation behind.
+    writer.commit(vec![Op::Upsert(item("b", vec![0.0, 1.0], "second"))]).await.unwrap();
+    writer.commit(vec![Op::Tombstone { id: MemoryId::from_key("a") }]).await.unwrap();
+    index(&ns, &Tokenizer::default(), IndexOptions::default()).await.unwrap();
+
+    // The grace-window guard the serve node evaluates: the new manifest must still cover our cursor.
+    let (manifest, _etag) = ns.read_manifest().await.unwrap();
+    assert!(
+        manifest.prev_wal_index_cursor <= node_cursor,
+        "precondition: still inside the one-generation grace window (deferred path is valid)"
+    );
+
+    let head = ns.resolve_head().await.unwrap();
+    let reopened = node.reopen_extending_tail(head, Tokenizer::default()).await.unwrap();
+    let fresh = QueryNode::open(&ns, Tokenizer::default()).await.unwrap();
+
+    assert_eq!(
+        reopened.doc_count(),
+        fresh.doc_count(),
+        "deferred reopen doc_count must match a fresh open of the new generation"
+    );
+    assert_eq!(reopened.doc_count(), 2, "`a` deleted; `b`, `c` live");
+
+    // Query every direction and confirm the deferred snapshot and a fresh open agree exactly.
+    for q in [vec![1.0, 0.0], vec![0.0, 1.0], vec![0.5, 0.5]] {
+        let via_reopen: Vec<_> = reopened
+            .query(1, Some(&q), None, &tf(), 10, QueryConfig::default())
+            .await
+            .unwrap()
+            .iter()
+            .map(|h| h.id)
+            .collect();
+        let via_fresh: Vec<_> = fresh
+            .query(1, Some(&q), None, &tf(), 10, QueryConfig::default())
+            .await
+            .unwrap()
+            .iter()
+            .map(|h| h.id)
+            .collect();
+        assert_eq!(via_reopen, via_fresh, "deferred reopen must match a fresh open for q={q:?}");
+        assert!(
+            !via_reopen.contains(&MemoryId::from_key("a")),
+            "the deleted `a` must not resurface via the deferred path"
+        );
+    }
+}
+
 /// Reopen after a FOLD, reusing the segments whose id persisted and reloading only the new one,
 /// must produce a snapshot identical to a full fresh open — including a query across both segments
 /// and a delete of an item in the reused (old) segment.
