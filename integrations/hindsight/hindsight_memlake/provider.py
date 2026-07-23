@@ -707,27 +707,35 @@ class MemlakeMemories(MemoriesExtension):
 
         memlake runs each type's arms concurrently over a single snapshot, so the
         storage reads coalesce into shared roundtrip waves — one call for N types
-        costs the waves of one, not N.
+        costs the waves of one, not N. A recall against a bank that has never been
+        written to (no namespace/manifest yet) is empty, not an error — the same
+        way the addressed reads treat it.
         """
-        return await asyncio.to_thread(
-            partial(
-                self._client.query,
-                self._namespace(bank_id),
-                vector=vector,
-                text=text or None,
-                memory_types=memory_types,
-                tags=tags,
-                tags_mode=_tags_mode(tags_match),
-                vector_top_k=vector_top_k,
-                text_top_k=text_top_k,
-                graph_top_k=graph_top_k,
-                nprobe=self._nprobe,
-                temporal_from=temporal_from,
-                temporal_to=temporal_to,
-                updated_from=updated_from,
-                updated_to=updated_to,
+        try:
+            response = await asyncio.to_thread(
+                partial(
+                    self._client.query,
+                    self._namespace(bank_id),
+                    vector=vector,
+                    text=text or None,
+                    memory_types=memory_types,
+                    tags=tags,
+                    tags_mode=_tags_mode(tags_match),
+                    vector_top_k=vector_top_k,
+                    text_top_k=text_top_k,
+                    graph_top_k=graph_top_k,
+                    nprobe=self._nprobe,
+                    temporal_from=temporal_from,
+                    temporal_to=temporal_to,
+                    updated_from=updated_from,
+                    updated_to=updated_to,
+                )
             )
-        )
+        except Exception as e:
+            if _is_missing_namespace(e):
+                return []
+            raise
+        return response
 
     # -- addressed reads -----------------------------------------------------
     #
