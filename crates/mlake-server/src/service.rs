@@ -11,7 +11,7 @@ use mlake_fts::Tokenizer;
 use mlake_index::streaming::FoldBudget;
 use mlake_index::{fold, IndexOptions, QueryNode, ScanCursor};
 use mlake_store::{QueryMetrics, Store};
-use mlake_wal::{Namespace, Writer};
+use mlake_wal::{IndexQueue, Namespace, Writer};
 use tokio::sync::Mutex as AsyncMutex;
 use tonic::{Request, Response, Status};
 
@@ -378,6 +378,26 @@ impl Memlake for MemlakeService {
             w.commit(ops).await.map_err(internal)?
         };
         let commit_ms = ms(commit_t);
+
+        // Notify the indexer via the object-storage queue that this namespace has un-indexed WAL —
+        // this is what replaces poll-every-namespace: an indexer only ever folds namespaces with a
+        // job. Enqueue is idempotent (a namespace already queued or being folded is skipped, and
+        // the fold re-checks the WAL head at completion, so a write mid-fold is never lost). A
+        // `wait_for_index` caller enqueues inline, so the fold it waits on is actually scheduled;
+        // otherwise it is best-effort and off the ack path, with the indexer's reconciliation sweep
+        // as the backstop if this pod dies before the spawned task runs.
+        let queue = mlake_wal::IndexQueue::new(self.store.clone());
+        if req.wait_for_index {
+            queue.enqueue(&req.namespace).await.map_err(internal)?;
+        } else {
+            let ns = req.namespace.clone();
+            tokio::spawn(async move {
+                if let Err(e) = queue.enqueue(&ns).await {
+                    tracing::debug!(namespace = %ns, error = %e, "index enqueue failed (sweep is the backstop)");
+                }
+            });
+        }
+
         // Do NOT drop the cached snapshot here. The next read's head-check (`snapshot_traced`)
         // sees the advanced head (via the head pointer this write bumped) and reopens the stale
         // snapshot cheaply — `reopen_tail` (write) or `reopen_fold` (a fold) reusing the loaded
@@ -1267,114 +1287,166 @@ fn parse_page_token(token: &str, generation: u64) -> Result<Option<(u8, ScanCurs
     )))
 }
 
-/// Run the indexer over the given namespaces (or all discovered ones) on a fixed interval.
-/// Idempotent by construction, so running more than one replica is safe.
-/// TTL for the index lease. A fold is normally seconds; this leaves comfortable headroom, and
-/// a crashed holder's lease becomes stealable this long after its last acquire.
-const INDEX_LEASE_TTL_SECS: u64 = 60;
-
-#[allow(clippy::too_many_arguments)]
-/// Per-namespace drain iterations in one pass. One fold folds the whole tail up to the head, so a
+/// Per-namespace drain iterations per claim. One fold folds the whole tail up to the head, so a
 /// second only catches writes that arrived *during* the fold; a small ceiling drains a burst
-/// promptly while still yielding to other namespaces under a continuous write stream.
+/// promptly, then the completion re-check re-queues the namespace if it is still dirty.
 const MAX_DRAIN_ITERS: usize = 8;
-/// Short sleep between passes while actively draining a large tail, so the indexer keeps the tail
-/// bounded under load instead of letting it grow for a full `interval` between passes.
-const BUSY_TICK: std::time::Duration = std::time::Duration::from_millis(500);
+/// How long a claimed job may go without a heartbeat before another indexer may steal it (its
+/// worker is presumed crashed). Generous versus a normal fold; a long compaction is kept alive by
+/// the background heartbeat below, so this only fires on an actual death.
+const CLAIM_STALE_MS: u64 = 120_000;
+/// How often the background task refreshes a held claim's heartbeat during a fold.
+const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+/// How often the reconciliation sweep runs — the backstop that enqueues any dirty namespace the
+/// queue may have missed (e.g. a serve pod that died before its async enqueue ran). Rare on
+/// purpose: the queue is the hot path, this is a slow safety net, and it is the only LIST-all.
+const RECONCILE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
 
+/// True when the namespace has WAL past the indexed cursor — i.e. there is work to fold.
+async fn namespace_is_dirty(ns: &Namespace) -> bool {
+    let Ok(head) = ns.wal_head().await else { return false };
+    match ns.read_manifest().await {
+        Ok((m, _)) => head > m.wal_index_cursor,
+        Err(_) => true, // can't tell → assume dirty; a needless fold is cheap and safe
+    }
+}
+
+/// Backstop sweep: enqueue every dirty namespace so nothing is stranded if an enqueue was lost.
+async fn reconcile_queue(store: &Store, queue: &IndexQueue, namespaces: &[String]) {
+    let targets = if namespaces.is_empty() {
+        discover_namespaces(store).await.unwrap_or_default()
+    } else {
+        namespaces.to_vec()
+    };
+    for name in &targets {
+        let ns = Namespace::new(name, store.clone());
+        if namespace_is_dirty(&ns).await {
+            if let Err(e) = queue.enqueue(name).await {
+                tracing::debug!(namespace = name, error = %e, "reconcile enqueue failed");
+            }
+        }
+    }
+}
+
+/// Run the indexer, pulling namespaces to fold from the object-storage queue instead of polling
+/// every namespace. Serve pods enqueue on write; each indexer claims a job (CAS, exclusive), drains
+/// its tail, GCs, and completes it — re-queueing if more WAL arrived. A rare reconciliation sweep is
+/// the backstop. Idempotent and coordination-free, so N indexer replicas share the one queue safely.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_indexer(
     store: Store,
     tokenizer: Tokenizer,
     namespaces: Vec<String>,
     interval: std::time::Duration,
-    lease_holder: String,
+    worker_id: String,
     budget: FoldBudget,
     streaming_threshold: usize,
-    tail_flush_docs: usize,
+    _tail_flush_docs: usize,
     gc_interval: std::time::Duration,
     gc_min_age: std::time::Duration,
 ) -> anyhow::Result<()> {
+    let queue = IndexQueue::new(store.clone());
     // Per-namespace GC throttle: reclaiming runs on a slower cadence than folding (dead objects are
-    // min-age-gated inside `gc`, so more-frequent passes would mostly be no-op LISTs). `None` in the
-    // map means "never GC'd this process" → due immediately.
+    // min-age-gated inside `gc`, so more-frequent passes would mostly be no-op LISTs).
     let mut last_gc: HashMap<String, std::time::Instant> = HashMap::new();
+    // Due immediately, so startup populates the queue from any already-dirty namespaces (including
+    // work that predates the queue).
+    let mut last_reconcile = std::time::Instant::now()
+        .checked_sub(RECONCILE_INTERVAL)
+        .unwrap_or_else(std::time::Instant::now);
+
     loop {
-        let targets = if namespaces.is_empty() {
-            discover_namespaces(&store).await.unwrap_or_default()
-        } else {
-            namespaces.clone()
-        };
-        // Whether any namespace still had a large tail this pass. Under load we come back on a short
-        // tick to keep draining (size-triggered flush); when idle we wait the full interval.
-        let mut busy = false;
-        for name in &targets {
-            let ns = Namespace::new(name, store.clone());
-            // Soft lease: skip a namespace a peer is actively folding, so N indexers don't all
-            // fold every namespace (doubled compute + doubled S3 PUTs). Best-effort — it fails
-            // open, so at worst two nodes fold once and one wins the manifest CAS (safe).
-            if !ns.acquire_index_lease(&lease_holder, INDEX_LEASE_TTL_SECS).await {
-                tracing::debug!(namespace = name, "index skipped (peer holds lease)");
+        if last_reconcile.elapsed() >= RECONCILE_INTERVAL {
+            reconcile_queue(&store, &queue, &namespaces).await;
+            last_reconcile = std::time::Instant::now();
+        }
+
+        // Claim the next namespace with work. `None` ⇒ queue empty; idle briefly and re-check.
+        let name = match queue.claim(&worker_id, CLAIM_STALE_MS).await {
+            Ok(Some(n)) => n,
+            Ok(None) => {
+                tokio::time::sleep(interval).await;
                 continue;
             }
-            // Drain: keep folding until the tail is empty (a fold that consumed nothing) or the
-            // per-pass ceiling is hit, so a bulk load is folded promptly rather than accumulating
-            // an unbounded, memory-heavy un-indexed tail (see docs/ARCHITECTURE.md §6).
-            let mut folded = 0usize;
-            for _ in 0..MAX_DRAIN_ITERS {
-                match fold(&ns, &tokenizer, IndexOptions::default(), budget, streaming_threshold).await
-                {
-                    Ok(outcome) => {
-                        if outcome.doc_count > 0 {
-                            tracing::info!(
-                                namespace = name,
-                                generation = outcome.generation,
-                                docs = outcome.doc_count,
-                                published = outcome.published,
-                                "indexed"
-                            );
-                        }
-                        folded += outcome.doc_count;
-                        if outcome.doc_count == 0 {
-                            break; // tail fully drained
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(namespace = name, error = %e, "index failed");
+            Err(e) => {
+                tracing::warn!(error = %e, "index queue claim failed");
+                tokio::time::sleep(interval).await;
+                continue;
+            }
+        };
+        let ns = Namespace::new(&name, store.clone());
+
+        // Keep the claim alive across a long fold/compaction with a background heartbeat; it stops
+        // itself once the job is no longer ours (reclaimed or completed).
+        let hb = {
+            let (q, n, w) = (queue.clone(), name.clone(), worker_id.clone());
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(HEARTBEAT_INTERVAL).await;
+                    if !q.heartbeat(&n, &w).await.unwrap_or(false) {
                         break;
                     }
                 }
-            }
-            if folded >= tail_flush_docs {
-                busy = true;
-            }
+            })
+        };
 
-            // Reclaim unreferenced objects (folded WAL entries, compacted-away segments, CAS-race
-            // losers). Run under the fold lease so peers don't GC the same namespace concurrently,
-            // and throttled to `gc_interval` — well below `gc`'s own min-age guard, which keeps
-            // anything a slow reader on the previous manifest might still be scanning. GC reads the
-            // manifest fresh and only deletes what the CURRENT manifest doesn't reference, so it is
-            // safe to run alongside a peer that just published a new generation.
-            let gc_due = last_gc.get(name).map(|t| t.elapsed() >= gc_interval).unwrap_or(true);
-            if gc_due {
-                match mlake_index::gc_with_min_age(&ns, gc_min_age).await {
-                    Ok(out) if out.generation_files_deleted + out.wal_entries_deleted > 0 => {
+        // Drain: keep folding until the tail is empty (a fold that consumed nothing) or the per-claim
+        // ceiling is hit, so a bulk load folds promptly instead of accumulating an unbounded tail.
+        for _ in 0..MAX_DRAIN_ITERS {
+            match fold(&ns, &tokenizer, IndexOptions::default(), budget, streaming_threshold).await {
+                Ok(outcome) => {
+                    if outcome.doc_count > 0 {
                         tracing::info!(
                             namespace = name,
-                            generation_files = out.generation_files_deleted,
-                            wal_entries = out.wal_entries_deleted,
-                            "gc reclaimed"
+                            generation = outcome.generation,
+                            docs = outcome.doc_count,
+                            published = outcome.published,
+                            "indexed"
                         );
                     }
-                    Ok(_) => {}
-                    Err(e) => tracing::warn!(namespace = name, error = %e, "gc failed"),
+                    if outcome.doc_count == 0 {
+                        break; // tail fully drained
+                    }
                 }
-                last_gc.insert(name.clone(), std::time::Instant::now());
+                Err(e) => {
+                    tracing::warn!(namespace = name, error = %e, "index failed");
+                    break;
+                }
             }
-
-            ns.release_index_lease(&lease_holder).await;
         }
-        tokio::time::sleep(if busy { BUSY_TICK.min(interval) } else { interval }).await;
+
+        // Reclaim unreferenced objects (folded WAL entries, compacted-away segments, CAS-race
+        // losers), throttled to `gc_interval` — well below `gc`'s own min-age guard, which keeps
+        // anything a slow reader on the previous manifest might still be scanning. GC reads the
+        // manifest fresh and only deletes what the CURRENT manifest doesn't reference, so it is safe
+        // alongside a peer that just published a new generation.
+        let gc_due = last_gc.get(&name).map(|t| t.elapsed() >= gc_interval).unwrap_or(true);
+        if gc_due {
+            match mlake_index::gc_with_min_age(&ns, gc_min_age).await {
+                Ok(out) if out.generation_files_deleted + out.wal_entries_deleted > 0 => {
+                    tracing::info!(
+                        namespace = name,
+                        generation_files = out.generation_files_deleted,
+                        wal_entries = out.wal_entries_deleted,
+                        "gc reclaimed"
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!(namespace = name, error = %e, "gc failed"),
+            }
+            last_gc.insert(name.clone(), std::time::Instant::now());
+        }
+
+        hb.abort();
+
+        // Complete: if more WAL arrived during the fold (head past the indexed cursor), keep the job
+        // pending for another pass; otherwise remove it. This closes the completion/write race — the
+        // job is only removed when the namespace is genuinely drained.
+        let still_dirty = namespace_is_dirty(&ns).await;
+        if let Err(e) = queue.complete(&name, &worker_id, still_dirty).await {
+            tracing::warn!(namespace = name, error = %e, "index queue complete failed");
+        }
+        // Loop straight back to claim the next job — the queue's empty path is where we idle.
     }
 }
 

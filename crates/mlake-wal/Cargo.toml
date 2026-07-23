@@ -9,6 +9,7 @@ mlake-core.workspace = true
 mlake-store.workspace = true
 anyhow.workspace = true
 futures.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

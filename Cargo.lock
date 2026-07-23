@@ -1662,6 +1662,7 @@ dependencies = [
  "mlake-core",
  "mlake-store",
  "object_store",
+ "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.19",

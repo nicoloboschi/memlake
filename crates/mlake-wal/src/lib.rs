@@ -10,9 +10,11 @@
 //! which is what makes an acked write immediately visible (INV-5).
 
 pub mod commit;
+pub mod index_queue;
 pub mod tail;
 
 pub use commit::{CommitResult, Writer};
+pub use index_queue::{IndexQueue, Job, JobState, QueueState, QUEUE_PATH};
 pub use tail::{TailScan, WalTail};
 
 use mlake_core::manifest::{
