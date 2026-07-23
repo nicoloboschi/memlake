@@ -308,16 +308,27 @@ async fn gc_reclaims_folded_wal_and_old_generations_without_changing_results() {
 
     let before = QueryNode::open(&ns, Tokenizer::default()).await.unwrap();
     assert_eq!(before.doc_count(), 3);
+    // Snapshot the ranked result BEFORE gc (while every file is still present).
+    let hits_before = before
+        .query(1, Some(&[0.0, 1.0]), None, &tf(), 10, QueryConfig::default())
+        .await
+        .unwrap();
+    let ids_before: Vec<MemoryId> = hits_before.iter().map(|h| h.id).collect();
 
     let outcome = gc_with_min_age(&ns, GcDuration::ZERO).await.unwrap();
     assert!(outcome.wal_entries_deleted > 0, "folded WAL entries should be reclaimed");
     assert!(outcome.generation_files_deleted > 0, "an old generation should be reclaimed");
 
-    // Results are unchanged: GC only removed files nothing references.
+    // Results are unchanged: GC only removed files nothing references, so the same query returns
+    // the identical ranking (whatever it is) — the actual "without changing results" invariant.
     let after = QueryNode::open(&ns, Tokenizer::default()).await.unwrap();
     assert_eq!(after.doc_count(), 3);
-    let hits = after.query(1, Some(&[0.0, 1.0]), None, &tf(), 10, QueryConfig::default()).await.unwrap();
-    assert_eq!(hits[0].id, MemoryId::from_key("b"));
+    let hits_after = after
+        .query(1, Some(&[0.0, 1.0]), None, &tf(), 10, QueryConfig::default())
+        .await
+        .unwrap();
+    let ids_after: Vec<MemoryId> = hits_after.iter().map(|h| h.id).collect();
+    assert_eq!(ids_before, ids_after, "GC must not change query results");
 }
 
 /// GC keeps the current and previous generations, so a query still works immediately after

@@ -36,11 +36,14 @@ def build_binary() -> Path:
 
 def _env(extra: dict | None = None) -> dict:
     env = dict(os.environ)
-    env.setdefault("MEMLAKE_S3_ENDPOINT", "http://localhost:9000")
-    env.setdefault("MEMLAKE_S3_BUCKET", "memlake")
-    env.setdefault("MEMLAKE_S3_ACCESS_KEY", "memlake")
-    env.setdefault("MEMLAKE_S3_SECRET_KEY", "memlake123")
-    env.setdefault("MEMLAKE_S3_REGION", "us-east-1")
+    # The server reads service-scoped S3 config: the query service from MEMLAKE_QUERY_S3_* and the
+    # indexer from MEMLAKE_INDEXER_S3_* (no unprefixed fallback). Point both at the local MinIO.
+    for prefix in ("MEMLAKE_QUERY", "MEMLAKE_INDEXER"):
+        env.setdefault(f"{prefix}_S3_ENDPOINT", "http://localhost:9000")
+        env.setdefault(f"{prefix}_S3_BUCKET", "memlake")
+        env.setdefault(f"{prefix}_S3_ACCESS_KEY", "memlake")
+        env.setdefault(f"{prefix}_S3_SECRET_KEY", "memlake123")
+        env.setdefault(f"{prefix}_S3_REGION", "us-east-1")
     env.setdefault("RUST_LOG", "warn")
     if extra:
         env.update({k: str(v) for k, v in extra.items()})

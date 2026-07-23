@@ -27,6 +27,12 @@ use crate::generation::{read_fts_split, TagSummary};
 use crate::sstable::{EntityTable, PayloadTable, PkTable, RadjTable, RerankTable, TimeTable};
 use crate::{QueryConfig, Result};
 
+/// Minimum query-similarity (exact cosine) a vector hit must reach to seed the graph arm's link
+/// expansion. Matches Hindsight's `_find_semantic_seeds(threshold=0.3)`: expanding from a
+/// barely-relevant seed only pulls its (equally off-query) neighbours into fusion, so weak seeds
+/// are dropped before the one-hop spread.
+const GRAPH_SEED_MIN_SIMILARITY: f32 = 0.3;
+
 /// One arm's contribution to a hit: its 0-based rank within that arm and its raw score
 /// (dense cosine similarity, BM25 score, or graph activation).
 #[derive(Clone, Copy, Debug)]
@@ -969,11 +975,21 @@ impl QueryNode {
         metrics.record_phase(Phase::Fts, tf.elapsed());
 
         // The graph arm needs dense seeds; it does ranged pk/radj reads, so it is skipped
-        // when disabled (top_k 0) or when there is nothing to seed from.
+        // when disabled (top_k 0) or when there is nothing to seed from. Only vector hits at or
+        // above the seed-similarity floor seed the expansion — a barely-relevant seed only pulls
+        // its (equally off-query) neighbours into fusion. Matches Hindsight's
+        // `_find_semantic_seeds(threshold=0.3)`. `vector_scored` is exact cosine, sorted desc.
         let graph_scored = if depths.graph > 0 && !vector_scored.is_empty() {
-            let seed_ids: Vec<MemoryId> = vector_scored.iter().map(|(id, _)| *id).collect();
-            self.graph_arm(state, &seed_ids, &probed_items, depths.graph, tags, metrics)
-                .await?
+            let seed_ids: Vec<MemoryId> = vector_scored
+                .iter()
+                .filter(|(_, score)| *score >= GRAPH_SEED_MIN_SIMILARITY)
+                .map(|(id, _)| *id)
+                .collect();
+            if seed_ids.is_empty() {
+                Vec::new()
+            } else {
+                self.graph_arm(state, &seed_ids, &probed_items, depths.graph, tags, metrics).await?
+            }
         } else {
             Vec::new()
         };
