@@ -642,11 +642,12 @@ class MemlakeClient:
         *,
         memory_types: Optional[Sequence[int]] = None,
     ) -> dict:
-        """Live edge totals for a namespace, as `{"semantic": n, "causal": m}`.
+        """Live edge totals for a namespace, as `{"semantic", "causal", "temporal"}`.
 
-        The primitive behind the bank stats page's link count: read from the per-segment tally
-        the fold builds plus the WAL tail, so it is a metadata read, not a corpus scan.
-        `semantic` is the derived kNN links; `causal` the intrinsic causal links."""
+        The primitive behind the bank stats page's link count. `semantic`/`causal` are read from
+        the per-segment tally the fold builds plus the WAL tail (a metadata read). `temporal` is
+        derived server-side from the time index — each memory's ±24h neighbours, capped — so it
+        never scans memory records."""
         resp = self._call(
             "LinkStats",
             pb.LinkStatsRequest(
@@ -654,7 +655,11 @@ class MemlakeClient:
                 memory_types=list(memory_types or []),
             ),
         )
-        return {"semantic": resp.semantic_edge_count, "causal": resp.causal_edge_count}
+        return {
+            "semantic": resp.semantic_edge_count,
+            "causal": resp.causal_edge_count,
+            "temporal": resp.temporal_edge_count,
+        }
 
     def list_namespaces(self) -> list:
         """Every namespace in the bucket (one LIST). Not routed to a preferred node — any node

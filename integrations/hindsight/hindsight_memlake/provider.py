@@ -879,10 +879,10 @@ class MemlakeMemories(MemoriesExtension):
           agree. Entity co-occurrence still drives graph expansion at query time in both.
 
         - ``temporal``: also *derived*, not stored. memlake's temporal support is a query-time
-          graph arm (time-neighbour spread), so it keeps no temporal edges — but Postgres's
-          temporal links are a pure function of the effective times, which memlake has, so the
-          count is derived by walking the corpus and counting windowed neighbours. This one is
-          an O(n) scan rather than a metadata read; the others are cheap.
+          graph arm (time-neighbour spread), so it keeps no temporal edges — but the count is a
+          pure function of the effective times, so the server derives it by sweeping the time
+          index (each memory's ±24h neighbours, capped). Comes back on the same ``LinkStats``
+          call, no memory-record scan.
 
         Zero-valued types are omitted; an un-written bank has no links.
         """
@@ -900,10 +900,6 @@ class MemlakeMemories(MemoriesExtension):
         entity_total = sum(min(n - 1, _MAX_LINKS_PER_ENTITY) for n in entity_counts.values() if n > 1)
         if entity_total:
             out["entity"] = entity_total
-        # Temporal links, derived from the effective times (memlake stores none).
-        temporal_total = await reads.temporal_link_count(self, conn=conn, fq_table=fq_table, bank_id=bank_id)
-        if temporal_total:
-            out["temporal"] = temporal_total
         return out
 
     async def list_tags(self, *, conn, fq_table, bank_id: str) -> dict[str, int]:
