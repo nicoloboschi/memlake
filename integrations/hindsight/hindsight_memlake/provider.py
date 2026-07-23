@@ -144,6 +144,19 @@ def _from_epoch_ms(ms: int | None) -> datetime | None:
     return datetime.fromtimestamp(ms / 1000, tz=timezone.utc)
 
 
+def _is_missing_namespace(err: Exception) -> bool:
+    """Whether an error is memlake's "namespace has no manifest".
+
+    A namespace is created lazily on a bank's first write, so a bank that exists
+    (in Postgres) but has never been written to has no manifest yet. A *read*
+    against it — a list, a count, a facet on a freshly-created bank — is "nothing
+    there yet", not a failure, so the read paths map this to an empty result
+    instead of propagating it. memlake surfaces it as an INTERNAL rpc whose
+    message carries this text.
+    """
+    return "no manifest" in str(err)
+
+
 def _parse_embedding(query_embedding: str | list[float]) -> list[float]:
     """Recall passes embeddings around as the pgvector literal '[0.1,0.2,...]'."""
     if isinstance(query_embedding, list):
@@ -207,13 +220,19 @@ class MemlakeMemories(MemoriesExtension):
         self._ensured.add(ns)
 
     async def _metadata_stats(self, bank_id: str, key: str) -> dict:
-        """`{value: count}` for a declared key, or empty for one that was never declared.
+        """`{value: count}` for a declared key: the per-value tally memlake keeps for
+        each key named in ``indexed_metadata_keys`` at namespace creation.
 
-        Empty is the signal to fall back to a scan: a namespace created before the keys were
-        declared has no tally, and its counts have to be walked. A genuinely empty bank also
-        returns empty, but its scan is just as cheap — so the fallback is safe either way.
+        Empty for a bank that has never been written to (no namespace yet) or a key
+        that carries no value on any live memory — both mean "no counts", so the
+        callers read it the same way.
         """
-        return await asyncio.to_thread(partial(self._client.metadata_stats, self._namespace(bank_id), key))
+        try:
+            return await asyncio.to_thread(partial(self._client.metadata_stats, self._namespace(bank_id), key))
+        except Exception as e:
+            if _is_missing_namespace(e):
+                return {}
+            raise
 
     # -- writes --------------------------------------------------------------
 
@@ -370,7 +389,7 @@ class MemlakeMemories(MemoriesExtension):
             # Callers delete defensively — `delete_bank` runs before ingest to clear
             # a previous run — so dropping a namespace that was never created has to
             # be a no-op, not an error.
-            if "no manifest" in str(e):
+            if _is_missing_namespace(e):
                 self._ensured.discard(namespace)
                 logger.debug("[memories] memlake namespace %s does not exist; nothing to drop", namespace)
                 return
@@ -670,9 +689,14 @@ class MemlakeMemories(MemoriesExtension):
     async def get_memories(self, *, conn, fq_table, bank_id: str, unit_ids: list[str]) -> list[StoredMemory]:
         if not unit_ids:
             return []
-        records = await asyncio.to_thread(
-            self._client.get, self._namespace(bank_id), [uuid.UUID(u).bytes for u in unit_ids]
-        )
+        try:
+            records = await asyncio.to_thread(
+                self._client.get, self._namespace(bank_id), [uuid.UUID(u).bytes for u in unit_ids]
+            )
+        except Exception as e:
+            if _is_missing_namespace(e):
+                return []
+            raise
         return [_stored_from_record(r) for r in records]
 
     async def get_memories_with_edges(self, *, conn, fq_table, bank_id: str, unit_ids: list[str]) -> list[StoredMemory]:
@@ -703,10 +727,16 @@ class MemlakeMemories(MemoriesExtension):
         page_token: str = "",
         tags: list[str] | None = None,
         tags_match: str = "any",
+        document_id: str | None = None,
         metadata_equals: dict[str, str] | None = None,
         skip: int = 0,
         include_edges: bool = False,
     ) -> ScanPage:
+        # `document_id` is a real column in Postgres; here it lives in the opaque
+        # bag under META_DOCUMENT_ID (a declared indexed key), so the filter is
+        # just one more metadata equality folded in alongside any the caller gave.
+        if document_id is not None:
+            metadata_equals = {**(metadata_equals or {}), META_DOCUMENT_ID: document_id}
         return await self.scan_raw(
             bank_id,
             fact_types=fact_types,
@@ -745,29 +775,39 @@ class MemlakeMemories(MemoriesExtension):
         empty result with no cursor means "nothing matches", not "keep going".
         """
         memory_types = [FACT_TYPE_TO_MEMORY_TYPE[ft] for ft in (fact_types or []) if ft in FACT_TYPE_TO_MEMORY_TYPE]
-        response = await asyncio.to_thread(
-            partial(
-                self._client.scan,
-                self._namespace(bank_id),
-                memory_types=sorted(memory_types),
-                page_token=page_token,
-                limit=limit,
-                metadata_equals=metadata_equals,
-                tags=tags,
-                tags_mode=_tags_mode(tags_match),
-                skip=skip,
-                include_edges=include_edges,
-                updated_from=updated_from,
-                updated_to=updated_to,
+        try:
+            response = await asyncio.to_thread(
+                partial(
+                    self._client.scan,
+                    self._namespace(bank_id),
+                    memory_types=sorted(memory_types),
+                    page_token=page_token,
+                    limit=limit,
+                    metadata_equals=metadata_equals,
+                    tags=tags,
+                    tags_mode=_tags_mode(tags_match),
+                    skip=skip,
+                    include_edges=include_edges,
+                    updated_from=updated_from,
+                    updated_to=updated_to,
+                )
             )
-        )
+        except Exception as e:
+            if _is_missing_namespace(e):
+                return ScanPage(memories=[], next_page_token="")
+            raise
         return ScanPage(
             memories=[_stored_from_record(r) for r in response.memories],
             next_page_token=response.next_page_token,
         )
 
     async def count_memories(self, *, conn, fq_table, bank_id: str) -> dict[str, int]:
-        response = await asyncio.to_thread(self._client.stats, self._namespace(bank_id))
+        try:
+            response = await asyncio.to_thread(self._client.stats, self._namespace(bank_id))
+        except Exception as e:
+            if _is_missing_namespace(e):
+                return {}
+            raise
         counts: dict[str, int] = {}
         for type_stats in response.types:
             fact_type = MEMORY_TYPE_TO_FACT_TYPE.get(type_stats.memory_type)
@@ -838,7 +878,7 @@ class MemlakeMemories(MemoriesExtension):
             # A namespace with no writes yet has no manifest; a get against it is
             # "nothing there", not an error — invalidating a memory that isn't in
             # the bank returns False rather than raising.
-            if "no manifest" in str(e):
+            if _is_missing_namespace(e):
                 return None
             raise
         return recs[0] if recs else None

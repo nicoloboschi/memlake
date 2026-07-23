@@ -4,8 +4,11 @@
 #   * MinIO           object store (real S3 conditional-write semantics)
 #   * serve           memlake's stateless gRPC query/write API  (localhost:50051)
 #   * indexer         memlake's compaction loop — folds the WAL tail into segments
-#   * db              Postgres+pgvector — Hindsight still keeps documents, chunks,
-#                     banks, operations and the entity-name registry here
+#
+# Hindsight still keeps its non-memory metadata (documents, chunks, banks,
+# operations, the entity-name registry) in Postgres, but that does NOT need a
+# service here: run on the host with the default `pg0` database url and Hindsight
+# starts its own embedded Postgres. See README.md.
 #
 # Hindsight's API process itself runs on the HOST (see README.md), not here: the
 # `MEMORIES` extension seam it needs is still unreleased, so it has to run from a
@@ -105,27 +108,5 @@ services:
       MEMLAKE_NODE_ID: indexer-1
       RUST_LOG: ${RUST_LOG:-info}
 
-  # Postgres for the metadata Hindsight keeps outside the memories store
-  # (documents, chunks, banks, operations, entity-name registry). pgvector is
-  # pre-installed because Hindsight's migrations declare the extension even when
-  # the vectors themselves live in memlake.
-  db:
-    image: pgvector/pgvector:pg${HINDSIGHT_DB_VERSION:-18}
-    restart: unless-stopped
-    ports:
-      - "${HINDSIGHT_DB_PORT:-5432}:5432"
-    environment:
-      POSTGRES_USER: ${HINDSIGHT_DB_USER:-hindsight_user}
-      POSTGRES_PASSWORD: ${HINDSIGHT_DB_PASSWORD:-hindsight_password}
-      POSTGRES_DB: ${HINDSIGHT_DB_NAME:-hindsight_db}
-    volumes:
-      - pg-data:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${HINDSIGHT_DB_USER:-hindsight_user} -d ${HINDSIGHT_DB_NAME:-hindsight_db}"]
-      interval: 5s
-      timeout: 3s
-      retries: 20
-
 volumes:
   minio-data:
-  pg-data:
