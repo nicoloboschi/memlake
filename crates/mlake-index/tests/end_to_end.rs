@@ -187,6 +187,51 @@ async fn reopen_extending_tail_matches_a_fresh_open() {
     assert_eq!(via_reopen, vec![MemoryId::from_key("b")], "only the live tail item `b` survives");
 }
 
+/// Reopen after a FOLD, reusing the segments whose id persisted and reloading only the new one,
+/// must produce a snapshot identical to a full fresh open — including a query across both segments
+/// and a delete of an item in the reused (old) segment.
+#[tokio::test]
+async fn reopen_after_fold_matches_a_fresh_open() {
+    let store = Store::in_memory();
+    let ns = namespace(store, "ns").await;
+    let mut writer = Writer::new(ns.clone());
+
+    // Fold 1: segment A holds `a`.
+    writer.commit(vec![Op::Upsert(item("a", vec![1.0, 0.0], "first"))]).await.unwrap();
+    index(&ns, &Tokenizer::default(), IndexOptions::default()).await.unwrap();
+    let node = QueryNode::open(&ns, Tokenizer::default()).await.unwrap();
+
+    // Fold 2: adds segment B (`b`) — segment A persists — and tombstones `a` (in the reused segment).
+    writer.commit(vec![Op::Upsert(item("b", vec![0.0, 1.0], "second"))]).await.unwrap();
+    writer.commit(vec![Op::Tombstone { id: MemoryId::from_key("a") }]).await.unwrap();
+    index(&ns, &Tokenizer::default(), IndexOptions::default()).await.unwrap();
+
+    let reopened = node.reopen_after_fold(Tokenizer::default()).await.unwrap();
+    let fresh = QueryNode::open(&ns, Tokenizer::default()).await.unwrap();
+
+    assert_eq!(reopened.doc_count(), fresh.doc_count(), "doc_count must match a fresh open");
+    assert_eq!(reopened.doc_count(), 1, "`a` deleted, `b` folded => 1 live");
+
+    // Query both arms across the reused segment A + new segment B; results must be identical.
+    for q in [vec![1.0, 0.0], vec![0.0, 1.0]] {
+        let via_reopen: Vec<_> = reopened
+            .query(1, Some(&q), None, &tf(), 10, QueryConfig::default())
+            .await
+            .unwrap()
+            .iter()
+            .map(|h| h.id)
+            .collect();
+        let via_fresh: Vec<_> = fresh
+            .query(1, Some(&q), None, &tf(), 10, QueryConfig::default())
+            .await
+            .unwrap()
+            .iter()
+            .map(|h| h.id)
+            .collect();
+        assert_eq!(via_reopen, via_fresh, "reopen-after-fold must match a fresh open for q={q:?}");
+    }
+}
+
 /// A delete committed after indexing removes the item from strongly-consistent results,
 /// even though the generation still physically contains it.
 #[tokio::test]

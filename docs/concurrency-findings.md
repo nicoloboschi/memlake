@@ -120,7 +120,47 @@ end-to-end tests pass (text arm still correct).
 Remaining tail: p99 still ~6s (reads) / ~7s (writes); max reopen 5.9s — a few outliers, likely
 `full_open` on a fold (segments changed → can't reuse) or heavy-contention moments. Next.
 
-## 🔬 THE remaining tail — `full_open` after a fold (p99, reads AND writes)
+## ✅ FIX #3 — segment reuse across a fold + stop invalidating the snapshot on write
+
+Two changes that together **eliminated `full_open` on the hot path** and collapsed the p99.
+
+**3a — reuse persisting segments across a fold.** `FactType.segments` is now `Vec<Arc<SegmentState>>`
+(per-segment sharing) and `SegmentState` carries its `seg-<uuid>` id. A new `reopen_after_fold`
+reuses the `Arc` of every segment whose id survived the fold and reloads only the genuinely-new
+ones (a flush adds one L0; a compaction replaces a few). `snapshot_traced`'s fold (200) branch now
+calls it instead of `QueryNode::open`. Fold reopen dropped from 200–1200ms (`full_open`) to a median
+**131ms** (`reopen_fold`). Proven identical to a fresh open by `reopen_after_fold_matches_a_fresh_open`.
+
+**3b — don't drop the cached snapshot on write.** The write handler used to `invalidate` (remove)
+the namespace's cached snapshot, so the *next read had nothing to reopen from and `full_open`ed*.
+But `snapshot_traced` already re-validates the head every read (via the head pointer the write
+bumped) and reopens the stale snapshot cheaply — `reopen_tail` (write) or `reopen_fold` (fold).
+Removing the invalidate is safe (the reopen re-scans the tail to the new head, so the write is
+always seen — visibility tests green) and turns the post-write read from `full_open` into
+`reopen_tail`. **`full_open` count over a full mixed run: 229 → 0.**
+
+**Result (full mixed, 12 readers + 4 writers, warm):**
+
+| | before fix #3 | after fix #3 |
+|---|---|---|
+| READ QPS | 254 | **315** |
+| READ p50 / p90 / p99 | 22 / 94 / 455 ms | **22 / 55 / 280 ms** |
+| WRITE p50 / p99 | 287ms / 3.26s | **190ms / 1.15s** |
+| snapshot actions | 229 full_open | **0 full_open** (reopen_tail/fold/reuse) |
+
+### Cumulative (session start → now, full mixed 12r+4w warm)
+
+| | start | now | factor |
+|---|---|---|---|
+| READ QPS | 2.1 | **315** | **~150×** |
+| READ p50 | 7.4 s | **22 ms** | **~330×** |
+| READ p99 | ~24 s | **280 ms** | **~85×** |
+| WRITE p50 | 3.0 s | **190 ms** | **~16×** |
+
+Three fixes: cache promotion, lazy tail FTS, segment-reuse + no-write-invalidate. All committed, all
+tests green (cache, visibility, 53 end-to-end incl. two new reopen-equivalence tests).
+
+## 🔬 (Resolved) `full_open` after a fold — kept for history
 
 After fixes #1 and #2 the p50/p90 are excellent (26ms / 240ms), but **p99 ~6s (reads) / ~7s
 (writes)** remains. The trace pins it: of reads > 1s, **23/25 are `full_open`** with `open_ms`

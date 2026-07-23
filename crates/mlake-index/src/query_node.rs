@@ -124,6 +124,11 @@ impl UpdatedWindow {
 /// One fact type's loaded state within ONE segment — the indexed metadata for that segment. A
 /// query fans out across a fact type's segments (newest-first) and merges (see [`FactType`]).
 struct SegmentState {
+    /// The segment's content-nonce id (`seg-<uuid>`), stable for the life of the segment. A fold
+    /// that adds an L0 segment or compacts a few into one leaves most segments' ids unchanged, so
+    /// a reopen-after-fold reuses their loaded `SegmentState` (this whole struct) by id instead of
+    /// re-decoding centroids/tables/FTS.
+    id: String,
     /// This segment's highest WAL seq — the ordering key for the supersede overlay (a newer
     /// segment has a higher `seq_hi`). An item here is hidden if a segment with a higher `seq_hi`
     /// supersedes its id.
@@ -150,10 +155,11 @@ struct SegmentState {
 /// un-indexed WAL-tail overlay. Every arm reads across `segments` + the tail and merges, with a
 /// newer segment (or the tail) shadowing an older copy of the same id.
 struct FactType {
-    /// The fold-produced segment metadata for this fact type. `Arc`-shared so a reopen that only
-    /// extends the WAL tail (a write, not a fold — detected by an unchanged manifest etag) can
-    /// reuse it without re-decoding centroids, tables and the FTS split.
-    segments: Arc<Vec<SegmentState>>,
+    /// The fold-produced segment metadata for this fact type, one `Arc` per segment. Per-segment
+    /// sharing lets a write-only reopen reuse the whole list AND a fold-triggered reopen reuse the
+    /// individual segments whose id persisted across the fold (see `reopen_after_fold`) — without
+    /// re-decoding centroids, tables and the FTS split.
+    segments: Vec<Arc<SegmentState>>,
     tail_items: Vec<StoredMemory>,
     /// The tail's BM25 index, built **lazily** on first text-arm use and cached — a tantivy build
     /// has fixed per-index overhead (schema + writer + commit), and a snapshot reopen (every write)
@@ -228,6 +234,30 @@ impl QueryNode {
     /// tail past the manifest cursor, so every acked write is reflected even before the
     /// indexer folds it.
     pub async fn open(ns: &Namespace, tokenizer: Tokenizer) -> Result<Self> {
+        Self::open_with_reuse(ns, tokenizer, &HashMap::new()).await
+    }
+
+    /// Reopen after a **fold** (the manifest changed, so the etag fast-path cannot reuse). A fold
+    /// leaves most segments' ids unchanged — a flush adds one L0, a compaction replaces a few with
+    /// one — so this reuses their already-loaded `SegmentState` (centroids, tables, FTS split) by
+    /// `(fact type, seg id)` and reloads only the genuinely-new segments, turning a `full_open`
+    /// (reload everything) into a targeted one. Correctness is identical to a fresh open: it reads
+    /// the current manifest and re-derives all tombstone/tail state; only decode work is skipped.
+    pub async fn reopen_after_fold(&self, tokenizer: Tokenizer) -> Result<Self> {
+        let mut reuse: HashMap<(u8, String), Arc<SegmentState>> = HashMap::new();
+        for (ft, f) in &self.per_type {
+            for s in f.segments.iter() {
+                reuse.insert((*ft, s.id.clone()), Arc::clone(s));
+            }
+        }
+        Self::open_with_reuse(&self.ns, tokenizer, &reuse).await
+    }
+
+    async fn open_with_reuse(
+        ns: &Namespace,
+        tokenizer: Tokenizer,
+        reuse: &HashMap<(u8, String), Arc<SegmentState>>,
+    ) -> Result<Self> {
         let metrics = QueryMetrics::new();
 
         // RT1: manifest, then the live WAL head (the read's consistency point). The head comes
@@ -279,9 +309,15 @@ impl QueryNode {
 
             // Load every segment that indexes this fact type, newest-first; the query fans each
             // arm out across them and merges. A fact type present only in the tail has no segments.
-            let mut segments: Vec<SegmentState> = Vec::new();
+            let mut segments: Vec<Arc<SegmentState>> = Vec::new();
             for seg in &manifest.segments {
                 let Some(fti) = seg.index(ft) else { continue };
+                // Reuse an already-loaded segment (same id) across a fold instead of re-decoding
+                // its centroids/tables/FTS split — the whole point of the fold fast-path.
+                if let Some(reused) = reuse.get(&(ft, seg.id.clone())) {
+                    segments.push(Arc::clone(reused));
+                    continue;
+                }
                 {
                     let files = &fti.files;
                     // The metadata objects (centroids, tag summary, radj/pk sparse indexes, FTS
@@ -384,7 +420,8 @@ impl QueryNode {
                         PayloadTable::open(&payload_idx, files.payload_data.clone())?
                     };
 
-                    segments.push(SegmentState {
+                    segments.push(Arc::new(SegmentState {
+                        id: seg.id.clone(),
                         seq_hi: seg.seq_hi,
                         doc_count: pk.record_count() as usize,
                         stats_path: files.stats.clone(),
@@ -399,7 +436,7 @@ impl QueryNode {
                         time,
                         payload,
                         rerank,
-                    });
+                    }));
                 }
             }
 
@@ -430,7 +467,7 @@ impl QueryNode {
             per_type.insert(
                 ft,
                 FactType {
-                    segments: Arc::new(segments),
+                    segments,
                     tail_items,
                     tail_fts: std::sync::OnceLock::new(),
                     doc_count,
@@ -493,11 +530,8 @@ impl QueryNode {
             // whole point of a cheap reopen is not paying a tantivy build a vector-only query
             // never uses.
             // Reuse the fold-produced segments for this fact type (empty for a tail-only type).
-            let segments = self
-                .per_type
-                .get(&ft)
-                .map(|f| Arc::clone(&f.segments))
-                .unwrap_or_else(|| Arc::new(Vec::new()));
+            let segments: Vec<Arc<SegmentState>> =
+                self.per_type.get(&ft).map(|f| f.segments.clone()).unwrap_or_default();
 
             // Live doc count: indexed records + genuinely-new tail items, minus tombstoned ones —
             // same accounting as `open`, over the reused segments.

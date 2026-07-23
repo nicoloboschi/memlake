@@ -180,8 +180,21 @@ impl MemlakeService {
                         let out = SnapshotOutcome::new("reopen_tail", started, node.tail_len());
                         return Ok((self.install_snapshot(&ns.name, node), out));
                     }
-                    Ok(Some(_)) => {} // manifest changed (a fold) — fall through to full reopen
-                    Err(_) => {}      // conditional GET failed — fall through to the safe full path
+                    Ok(Some(_)) => {
+                        // A fold changed the manifest. Reopen reusing the segments whose id
+                        // persisted across the fold (a flush adds one L0, a compaction replaces a
+                        // few with one — most persist) and reloading only the new ones.
+                        let node = Arc::new(
+                            cached
+                                .node
+                                .reopen_after_fold(self.tokenizer.clone())
+                                .await
+                                .map_err(internal)?,
+                        );
+                        let out = SnapshotOutcome::new("reopen_fold", started, node.tail_len());
+                        return Ok((self.install_snapshot(&ns.name, node), out));
+                    }
+                    Err(_) => {} // conditional GET failed — fall through to the safe full path
                 }
             }
         }
@@ -365,9 +378,11 @@ impl Memlake for MemlakeService {
             w.commit(ops).await.map_err(internal)?
         };
         let commit_ms = ms(commit_t);
-        // A new write means any cached snapshot is stale; drop it so the next read re-opens
-        // and sees this write (via the WAL tail, even before it is indexed).
-        self.invalidate(&req.namespace);
+        // Do NOT drop the cached snapshot here. The next read's head-check (`snapshot_traced`)
+        // sees the advanced head (via the head pointer this write bumped) and reopens the stale
+        // snapshot cheaply — `reopen_tail` (write) or `reopen_fold` (a fold) reusing the loaded
+        // segments — instead of the `full_open` that dropping it would force. Correctness is
+        // unchanged: the reopen re-scans the tail to the new head, so the write is always seen.
 
         // Optionally fold the write into the indexed generation before returning. Done after
         // the commit so the ack still reflects durability; the extra latency is only paid by
@@ -928,7 +943,7 @@ impl Memlake for MemlakeService {
                     .map_err(internal)?
                     .seq
             };
-            self.invalidate(&req.namespace);
+            // snapshot left cached: the next read re-validates its head and reopens cheaply (see write()).
             return Ok(Response::new(pb::DeleteByPredicateResponse { deleted: 0, seq }));
         }
 
@@ -952,7 +967,7 @@ impl Memlake for MemlakeService {
                 last_seq = w.commit(ops).await.map_err(internal)?.seq;
             }
         }
-        self.invalidate(&req.namespace);
+        // snapshot left cached: the next read re-validates its head and reopens cheaply (see write()).
         Ok(Response::new(pb::DeleteByPredicateResponse { deleted, seq: last_seq }))
     }
 
