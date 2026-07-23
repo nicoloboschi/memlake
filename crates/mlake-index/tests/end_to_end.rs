@@ -11,7 +11,7 @@ use std::sync::Arc;
 use mlake_core::memory::Timestamps;
 use mlake_core::{Memory, MemoryId, Op};
 use mlake_fts::Tokenizer;
-use mlake_index::{index, ArmDepths, IndexOptions, QueryConfig, QueryNode};
+use mlake_index::{flush, index, ArmDepths, IndexOptions, QueryConfig, QueryNode};
 use mlake_store::Store;
 use mlake_wal::{Namespace, Writer};
 
@@ -230,6 +230,68 @@ async fn reopen_after_fold_matches_a_fresh_open() {
             .collect();
         assert_eq!(via_reopen, via_fresh, "reopen-after-fold must match a fresh open for q={q:?}");
     }
+}
+
+/// A minor compaction (merge the newest small-segment run + tail, keep older segments) must
+/// preserve every guarantee: deletes and re-upserts land correctly whether the target lived in a
+/// MERGED segment or a KEPT one (the supersede-overlay edge cases), and no live item is lost.
+#[tokio::test]
+async fn minor_compaction_preserves_correctness() {
+    let store = Store::in_memory();
+    let ns = namespace(store, "ns").await;
+    let mut w = Writer::new(ns.clone());
+    let vecf = |i: usize| {
+        let mut v = vec![0.0f32; 16];
+        v[i % 16] = 1.0;
+        v[(i * 3 + 1) % 16] += 0.7;
+        v
+    };
+    let up = |i: usize, text: &str| Op::Upsert(item(&format!("m{i}"), vecf(i), text));
+
+    // seg1 (KEPT): m0..m9.
+    for i in 0..10 {
+        w.commit(vec![up(i, &format!("t{i}"))]).await.unwrap();
+    }
+    index(&ns, &Tokenizer::default(), IndexOptions::default()).await.unwrap();
+    // seg2 (MERGED): m10..m14.
+    for i in 10..15 {
+        w.commit(vec![up(i, &format!("t{i}"))]).await.unwrap();
+    }
+    flush(&ns, &Tokenizer::default(), IndexOptions::default()).await.unwrap();
+    // seg3 (MERGED): m15..m19.
+    for i in 15..20 {
+        w.commit(vec![up(i, &format!("t{i}"))]).await.unwrap();
+    }
+    flush(&ns, &Tokenizer::default(), IndexOptions::default()).await.unwrap();
+    // Tail: delete m0 (KEPT) + m12 (MERGED); re-upsert m5 (KEPT) + m17 (MERGED) with new text; add m20.
+    w.commit(vec![Op::Tombstone { id: MemoryId::from_key("m0") }]).await.unwrap();
+    w.commit(vec![Op::Tombstone { id: MemoryId::from_key("m12") }]).await.unwrap();
+    w.commit(vec![up(5, "REUP5")]).await.unwrap();
+    w.commit(vec![up(17, "REUP17")]).await.unwrap();
+    w.commit(vec![up(20, "t20")]).await.unwrap();
+
+    // 3 small segments; merge the newest 2 (seg3, seg2) + tail, KEEP seg1.
+    mlake_index::minor_compact(&ns, &Tokenizer::default(), IndexOptions::default(), 2).await.unwrap();
+
+    let node = QueryNode::open(&ns, Tokenizer::default()).await.unwrap();
+    // NB: `doc_count` is deliberately approximate across segments (cross-segment supersede is
+    // resolved at query time, not counted — same as any flush that leaves >1 segment). The
+    // *retrieval* results below are the exact correctness check.
+
+    let ids = |ks: &[&str]| ks.iter().map(|k| MemoryId::from_key(k)).collect::<Vec<_>>();
+    // Deletes: gone whether the target lived in a KEPT segment (m0) or a MERGED one (m12).
+    assert!(node.get_many(&ids(&["m0"]), false).await.unwrap().is_empty(), "m0 (kept) deleted");
+    assert!(node.get_many(&ids(&["m12"]), false).await.unwrap().is_empty(), "m12 (merged) deleted");
+    // Re-upserts: the NEW version wins, whether the old copy was in a KEPT (m5) or MERGED (m17) segment.
+    let m5 = node.get_many(&ids(&["m5"]), false).await.unwrap();
+    assert_eq!(m5.len(), 1);
+    assert_eq!(m5[0].text, "REUP5", "m5 re-upsert (old copy in kept seg) resolves to the new version");
+    let m17 = node.get_many(&ids(&["m17"]), false).await.unwrap();
+    assert_eq!(m17.len(), 1);
+    assert_eq!(m17[0].text, "REUP17", "m17 re-upsert (old copy in merged seg) resolves to the new version");
+    // Untouched live items across kept / merged / new are all retrievable.
+    let live = node.get_many(&ids(&["m1", "m9", "m10", "m14", "m19", "m20"]), false).await.unwrap();
+    assert_eq!(live.len(), 6, "kept + merged + new live items all present");
 }
 
 /// A delete committed after indexing removes the item from strongly-consistent results,

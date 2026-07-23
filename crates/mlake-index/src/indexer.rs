@@ -80,9 +80,13 @@ pub async fn fold(
     streaming_threshold_docs: usize,
 ) -> Result<IndexOutcome> {
     let (manifest, _etag) = ns.read_manifest().await?;
-    // A full rebuild happens on the first build (no segments) and on compaction (too many
-    // segments): `index`/`index_streaming` merge ALL segments + the tail into one fresh segment.
-    // In between, a fold just flushes the tail into a new L0 segment (O(tail)).
+    // A full rebuild happens on the first build (no segments) and at the hard count cap
+    // (`COMPACT_FANOUT`): `index`/`index_streaming` merge ALL segments + the tail into one fresh
+    // segment (O(corpus)). In between, a fold flushes the tail into a new L0 segment (O(tail)) —
+    // EXCEPT when small segments have accumulated: then a *minor* compaction merges just the
+    // newest small-segment run + the tail (O(small), not O(corpus)), so read-time fan-out stays
+    // bounded without the indexer paying a full rebuild every few small writes. See
+    // docs/concurrency-findings.md.
     if manifest.segments.is_empty() || manifest.segments.len() >= COMPACT_FANOUT {
         // Auto-select in-RAM vs streaming by size — the in-RAM merge is O(N) RAM, so a corpus too
         // big for memory uses the external-memory fold.
@@ -92,6 +96,9 @@ pub async fn fold(
         } else {
             index(ns, tokenizer, opts).await
         }
+    } else if let Some(merge_len) = minor_compact_prefix(&manifest.segments) {
+        // Fold the tail AND merge the newest run of small segments into one — O(small).
+        minor_compact(ns, tokenizer, opts, merge_len).await
     } else {
         // Steady state: flush the WAL tail into a new L0 segment and append it — O(tail).
         flush(ns, tokenizer, opts).await
@@ -101,6 +108,17 @@ pub async fn fold(
 /// Segment count at which a fold compacts (merges all segments into one) instead of flushing. Keeps
 /// the per-query segment fan-out — and the roundtrip budget — a small constant (see INV-7).
 pub const COMPACT_FANOUT: usize = 8;
+
+/// A segment with fewer than this many docs is "small" — a fold slice from a low-write interval.
+pub const SMALL_SEGMENT_DOCS: u64 = 1000;
+
+/// Compact once this many *small* segments have accumulated, just below the hard `COMPACT_FANOUT`
+/// count cap. Firing here replaces the O(corpus) full rebuild the cap would otherwise do with a
+/// cheap O(small) *minor* merge of only the small segments — a strict win. Deliberately close to
+/// the cap (not aggressive): each minor compaction still opens a snapshot and rebuilds the merged
+/// index, so firing every few folds over-works a busy single indexer (measured — it inflates the
+/// WAL tail and slows reads more than the extra fan-out costs). See docs/concurrency-findings.md.
+pub const SMALL_SEGMENT_FANOUT: usize = 7;
 
 /// Flush the un-indexed WAL tail into a NEW L0 segment and append it (the LSM flush — O(tail), not
 /// O(corpus)). Deletes and re-upserts in the slice become the segment's supersede overlay, hiding
@@ -201,6 +219,186 @@ pub async fn flush(ns: &Namespace, tokenizer: &Tokenizer, opts: IndexOptions) ->
     next.prev_wal_index_cursor = manifest.wal_index_cursor;
     next.prev_segments = Vec::new(); // a flush drops no segment, so there is no grace window
     next.segments = std::iter::once(segment).chain(manifest.segments).collect();
+
+    let published = match etag {
+        Some(etag) => ns
+            .swap_manifest(&etag, &next)
+            .await
+            .map(|_| true)
+            .or_else(|e| if e.is_conflict() { Ok(false) } else { Err(e) })?,
+        None => false,
+    };
+    Ok(IndexOutcome { generation: version, doc_count, published })
+}
+
+/// How many of the newest (front-of-list) segments a minor compaction should merge, or `None` if
+/// one is not warranted. Merges the newest contiguous run of SMALL segments (older/larger segments
+/// stay put — that is what keeps it O(small), not O(corpus)).
+fn minor_compact_prefix(segments: &[mlake_core::Segment]) -> Option<usize> {
+    let run = segments.iter().take_while(|s| s.doc_count < SMALL_SEGMENT_DOCS).count();
+    (run >= SMALL_SEGMENT_FANOUT).then_some(run)
+}
+
+/// Merge the newest `merge_len` segments together with the WAL tail into ONE new L0 segment,
+/// dropping those segments and leaving the older ones — a size-tiered *minor* compaction. It reads
+/// only the merged segments (O(small)); the kept segments are untouched, so the new segment carries
+/// a supersede overlay to keep hiding their now-shadowed copies, exactly as a flush does. Its result
+/// is identical to a fresh open over the equivalent full rebuild (covered by
+/// `minor_compaction_matches_a_full_rebuild`).
+pub async fn minor_compact(
+    ns: &Namespace,
+    tokenizer: &Tokenizer,
+    opts: IndexOptions,
+    merge_len: usize,
+) -> Result<IndexOutcome> {
+    use std::collections::{BTreeMap, HashMap, HashSet};
+
+    let (manifest, etag) = ns.read_manifest().await?;
+    let head = ns.wal_head().await?;
+    let cursor = manifest.wal_index_cursor;
+    // The segment list may have changed since the trigger read it; fall back to a plain flush if the
+    // requested prefix no longer holds.
+    if merge_len < 2 || merge_len > manifest.segments.len() {
+        return flush(ns, tokenizer, opts).await;
+    }
+    let build_opts = IndexOptions {
+        indexed_metadata_keys: manifest.indexed_metadata_keys.clone(),
+        ..opts
+    };
+    let merged_segs = &manifest.segments[..merge_len];
+    let kept_segs = manifest.segments[merge_len..].to_vec();
+
+    // (1) Materialize the merged segments' live items (newest-first, honoring their internal
+    // supersede overlays), and collect those overlays to carry forward — they may hide copies that
+    // live in the KEPT segments, which must keep being hidden.
+    let mut kill: HashMap<[u8; 16], u64> = HashMap::new();
+    let mut carry_superseded: Vec<MemoryId> = Vec::new();
+    let mut carry_predicates: Vec<(u64, mlake_core::Predicate)> = Vec::new();
+    for seg in merged_segs {
+        let tomb = crate::generation::read_tombstones(&ns.store, &seg.tombstones, None).await?;
+        for id in &tomb.superseded {
+            let e = kill.entry(id.0).or_insert(0);
+            *e = (*e).max(seg.seq_hi);
+        }
+        carry_superseded.extend(tomb.superseded);
+        carry_predicates.extend(tomb.predicates);
+    }
+    let mut by_id: BTreeMap<[u8; 16], StoredMemory> = BTreeMap::new();
+    for seg in merged_segs {
+        for ft in seg.memory_types() {
+            let fti = seg.index(ft).unwrap();
+            let gen =
+                crate::generation::read_generation(&ns.store, &fti.files, manifest.version, None)
+                    .await?;
+            for cluster in &gen.clusters {
+                for item in cluster {
+                    if by_id.contains_key(&item.id.0)
+                        || kill.get(&item.id.0).is_some_and(|&s| s > seg.seq_hi)
+                    {
+                        continue;
+                    }
+                    by_id.insert(item.id.0, item.clone());
+                }
+            }
+        }
+    }
+    if !carry_predicates.is_empty() {
+        by_id.retain(|_, m| !carry_predicates.iter().any(|(seq, p)| m.write_seq < *seq && p.matches(m)));
+    }
+
+    // (2) Fold the WAL tail into the merged set (identical to `index`/`flush`).
+    let scan = WalTail::new(ns).scan(cursor, Some(head)).await?;
+    let mut touched: HashSet<[u8; 16]> = HashSet::new();
+    for id in &scan.tombstones {
+        by_id.remove(&id.0);
+        touched.insert(id.0);
+    }
+    for (id, mut item) in scan.upserts {
+        if let Some(deltas) = scan.pending_patches.get(&id) {
+            mlake_core::wal::apply_deltas(&mut item, deltas);
+        }
+        touched.insert(id.0);
+        by_id.insert(id.0, item);
+    }
+    if !scan.predicate_tombstones.is_empty() {
+        by_id.retain(|_, m| {
+            !scan.predicate_tombstones.iter().any(|(seq, p)| m.write_seq < *seq && p.matches(m))
+        });
+    }
+
+    // A pre-fold snapshot: for re-materializing tail patches that target an id living only in a KEPT
+    // segment, and for the supersede membership check below.
+    let node = crate::QueryNode::open(ns, tokenizer.clone()).await?;
+    let patch_only: Vec<MemoryId> = scan
+        .pending_patches
+        .keys()
+        .filter(|id| !touched.contains(&id.0) && !by_id.contains_key(&id.0))
+        .copied()
+        .collect();
+    if !patch_only.is_empty() {
+        for mut item in node.get_many(&patch_only, true).await? {
+            if let Some(deltas) = scan.pending_patches.get(&item.id) {
+                mlake_core::wal::apply_deltas(&mut item, deltas);
+            }
+            touched.insert(item.id.0);
+            by_id.insert(item.id.0, item);
+        }
+    }
+
+    // (3) The new segment's supersede overlay: the merged segments' overlays carried forward, plus
+    // every tail delete, plus tail-touched ids that also exist in a segment (a re-upsert whose older
+    // copy — possibly in a KEPT segment — must be shadowed). Over-inclusive is safe: an entry for an
+    // id in no kept segment hides nothing, and the new segment's OWN items (seq_hi = head) are not
+    // hidden by an equal seq_hi.
+    let touched_ids: Vec<MemoryId> = touched.iter().map(|id| MemoryId(*id)).collect();
+    let mut superseded: Vec<MemoryId> = carry_superseded;
+    superseded.extend(scan.tombstones.iter().copied());
+    superseded.extend(node.segment_ids(&touched_ids).await?);
+    superseded.sort_unstable();
+    superseded.dedup();
+    let mut predicates = carry_predicates;
+    predicates.extend(scan.predicate_tombstones.iter().cloned());
+
+    // (4) Build the merged segment. Semantic links are left as-is (dangling targets are filtered at
+    // read time, and a target may live in a kept segment — pruning to only the merged live set would
+    // wrongly drop valid cross-segment links).
+    let seg_id = mlake_core::MemoryId::new_v4().as_uuid().simple().to_string();
+    let items: Vec<StoredMemory> = by_id.into_values().collect();
+    let doc_count = items.len();
+    let mut items_by_ft: BTreeMap<u8, Vec<StoredMemory>> = BTreeMap::new();
+    for item in items {
+        items_by_ft.entry(item.memory_type).or_default().push(item);
+    }
+    let mut indexes: BTreeMap<u8, mlake_core::manifest::FactTypeIndex> = BTreeMap::new();
+    for (ft, ft_items) in items_by_ft {
+        let fti = build_memory_type_index(ns, &seg_id, ft, ft_items, build_opts.clone()).await?;
+        indexes.insert(ft, fti);
+    }
+
+    let seg_prefix = mlake_core::manifest::segment_prefix(&ns.name, &seg_id);
+    let tomb = mlake_core::SegmentTombstones { superseded, predicates };
+    let tomb_path = crate::generation::write_tombstones(&ns.store, &seg_prefix, &tomb).await?;
+
+    let merged_seq_lo = merged_segs.iter().map(|s| s.seq_lo).min().unwrap_or(cursor + 1);
+    let segment = mlake_core::Segment {
+        id: seg_id,
+        level: 0,
+        seq_lo: merged_seq_lo,
+        seq_hi: head, // includes the freshly folded tail, so it shadows the kept (older) segments
+        doc_count: doc_count as u64,
+        indexes,
+        tombstones: tomb_path,
+    };
+
+    // (5) Publish: merged segment at the front, kept segments behind. Advance the cursor.
+    let version = manifest.version + 1;
+    let mut next = manifest.clone();
+    next.version = version;
+    next.wal_index_cursor = head;
+    next.wal_head = head;
+    next.prev_wal_index_cursor = manifest.wal_index_cursor;
+    next.prev_segments = manifest.segments.clone();
+    next.segments = std::iter::once(segment).chain(kept_segs).collect();
 
     let published = match etag {
         Some(etag) => ns

@@ -753,7 +753,11 @@ impl QueryNode {
                     for (id, item) in
                         seg.payload.lookup_batch(&self.ns.store, &missing, Some((&metrics, 1))).await?
                     {
-                        if wanted.contains(&id) {
+                        // A newer segment may supersede this id (a re-upsert or a folded delete).
+                        // The query path hides such copies via `superseded`; `get` must match, or a
+                        // deleted/re-upserted id whose delete has been folded into an overlay would
+                        // leak through `get` while `query`/`scan` correctly hide it.
+                        if wanted.contains(&id) && !self.superseded(&id, seg.seq_hi) {
                             found.entry(id).or_insert(item);
                         }
                     }
@@ -768,7 +772,7 @@ impl QueryNode {
                 clusters.sort_unstable();
                 clusters.dedup();
                 for item in self.fetch_clusters(seg, &clusters, &metrics, 2).await? {
-                    if wanted.contains(&item.id) {
+                    if wanted.contains(&item.id) && !self.superseded(&item.id, seg.seq_hi) {
                         found.entry(item.id).or_insert(item);
                     }
                 }

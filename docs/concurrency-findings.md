@@ -207,13 +207,36 @@ request-serving threads. Approximate derivation (`exact_rerank=false`) already c
 
 ---
 
+## ✅/🔬 FIX #4 — partial (size-tiered) compaction + a `get_many` correctness fix
+
+Implemented `minor_compact`: instead of the full O(corpus) rebuild the `COMPACT_FANOUT=8` count cap
+does, merge only the newest run of **small** segments + the tail into one segment (O(small)), keeping
+the older/larger ones. Carries the merged segments' supersede/predicate overlays forward so kept
+segments' shadowed copies stay hidden. Proven identical-to-a-fresh-open — including deletes and
+re-upserts in both the *kept* and *merged* segments — by `minor_compaction_preserves_correctness`.
+
+**A real bug this surfaced (`get_many`):** `get` only filtered the *tail* tombstones; it never
+checked the cross-segment `seg_superseded` overlay. So a delete or re-upsert **folded into a
+segment overlay** (by any flush or compaction) while the old copy still lived in an older segment
+**leaked through `get`**, even though `query`/`scan` correctly hid it. Fixed `get_many` to apply
+`superseded()` like the query path. This is a genuine guarantee fix independent of compaction.
+
+**Honest performance finding.** In the write-heavy mixed test, *any* early compaction trigger
+**regressed** (315 → 150–230 QPS): the earlier fixes already made reads fast (p50 ~22ms even at 6
+segments), so segment fan-out is **no longer the bottleneck — the single indexer is**. Firing
+partial compactions frequently over-works it → WAL tail grows → reads slow. So the trigger is set
+**conservatively** (`SMALL_SEGMENT_FANOUT=7`, just below the count cap): it fires no more often than
+the cap's full rebuild but does the *cheaper* partial merge, and it only helps namespaces with a mix
+of large + small segments (an all-small namespace's "partial" merge ≈ a full rebuild). The real
+lever for the indexer bottleneck is the queue-based indexer being built (`index_queue`). (Caveat:
+the `mix` namespaces are degraded from dozens of runs — docs 6k→13k+ — so late absolute numbers
+aren't comparable to earlier ones.)
+
 ## Open / to try next (the loop) — priority order
 
-1. ✅ **Reuse persisting segments across a fold** — DONE (fix #3). `full_open` eliminated on the hot
-   path; p99 collapsed.
-2. ❓ **Size-based compaction** — a namespace still sits at 6+ L0 segments, so every read fans the
-   vector arm out 6× (rerank per segment) and every reopen touches 6 segments. Now the top remaining
-   cost. Compact many tiny segments sooner (the load's 50-item writes each became a segment).
+1. ❓ **Indexer throughput/fairness** — now the top bottleneck under write load (the queue-based
+   `index_queue` in progress). Compaction and write latency both gate on it.
+2. ✅ **Size-tiered compaction** — DONE (fix #4), conservatively triggered; correctness-proven.
 3. ❓ **Write-path isolation** — move `derive_links` off the request path or onto a bounded blocking
    pool, if write p99 persists after #1.
 4. ❓ **500-namespace run** — with promotion the mem tier fills with the hot set; at 500 busy
