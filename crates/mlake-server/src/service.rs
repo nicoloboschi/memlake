@@ -74,6 +74,18 @@ pub struct MemlakeService {
     query_limiter: QueryLimiter,
     /// Per-call JSONL audit log, on only when `MEMLAKE_TRACE_LOG` is set (see `crate::trace`).
     tracer: Tracer,
+    /// Live count of executing retrieval requests, recorded per trace. High in-flight + high
+    /// latency is the signature of CPU contention (per-query rerank parallelism oversubscribing
+    /// the cores under concurrent load) rather than a slow snapshot or cold cache.
+    in_flight: std::sync::atomic::AtomicUsize,
+}
+
+/// Decrements the in-flight gauge on drop, so it is correct across every return path.
+struct InFlightGuard<'a>(&'a std::sync::atomic::AtomicUsize);
+impl Drop for InFlightGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 impl MemlakeService {
@@ -85,6 +97,7 @@ impl MemlakeService {
             snapshots: Mutex::new(HashMap::new()),
             query_limiter: QueryLimiter::new(DEFAULT_MAX_CONCURRENT_QUERIES),
             tracer: Tracer::from_env(),
+            in_flight: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -428,6 +441,11 @@ impl Memlake for MemlakeService {
         let _permit = self.query_limiter.acquire().await;
         let permit_wait_ms = ms(permit_t);
 
+        // Concurrency at the moment this query begins executing — a high value alongside high
+        // latency points at CPU contention, not a slow snapshot.
+        let in_flight = self.in_flight.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        let _in_flight_guard = InFlightGuard(&self.in_flight);
+
         let ns = self.namespace(&req.namespace);
         // Reuse the cached open snapshot when still current (see `snapshot`): a warm read is
         // pure in-memory arm evaluation over the shared Store cache, 0 fresh roundtrips.
@@ -508,6 +526,7 @@ impl Memlake for MemlakeService {
                 "namespace": req.namespace,
                 "total_ms": ms(t0),
                 "permit_wait_ms": permit_wait_ms,
+                "in_flight": in_flight,
                 "snapshot": {
                     "action": snap_out.action,
                     "open_ms": snap_out.open_ms,
@@ -742,8 +761,13 @@ impl Memlake for MemlakeService {
 
         let ns = self.namespace(&req.namespace);
         let snap = self.snapshot(&ns).await?;
-        let (semantic_edge_count, causal_edge_count) = snap.node.link_counts(&types).await.map_err(internal)?;
-        Ok(Response::new(pb::LinkStatsResponse { semantic_edge_count, causal_edge_count }))
+        let (semantic_edge_count, causal_edge_count, temporal_edge_count) =
+            snap.node.link_counts(&types).await.map_err(internal)?;
+        Ok(Response::new(pb::LinkStatsResponse {
+            semantic_edge_count,
+            causal_edge_count,
+            temporal_edge_count,
+        }))
     }
 
     async fn scan(
