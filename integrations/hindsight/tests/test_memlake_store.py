@@ -246,6 +246,54 @@ async def test_invalidate_then_restore(store, bank_id, index_pass, pg_conn):
     assert detail["state"] == "valid"
 
 
+async def test_apply_edit_rewrites_fields_and_entities(store, bank_id):
+    """A curation field edit rewrites the memory in place: new text, entities, fact_type.
+
+    This exercises the store's ``apply_edit`` directly — resolving the new entity
+    names is Hindsight's job, so the engine hands the resolved ids down, which is
+    what a test at this seam supplies. `patch` cannot change entity ids or the
+    memory_type, so an edit is a full rewrite; the fields it leaves alone (tags)
+    must survive it, and the consolidation state resets so the edit re-consolidates.
+    """
+    old_entity = "33333333-3333-3333-3333-333333333333"
+    new_entity = "44444444-4444-4444-4444-444444444444"
+    unit_ids = await store.insert_facts(
+        conn=None,
+        ops=None,
+        bank_id=bank_id,
+        facts=[make_fact("original text", seed=0.4, tags=["keep"], entities=[_entity(old_entity, "Old")])],
+    )
+    uid = unit_ids[0]
+
+    await store.apply_edit(
+        conn=None,
+        fq_table=_fq_table,
+        bank_id=bank_id,
+        unit_id=uid,
+        text="corrected text",
+        context="new context",
+        fact_type="experience",
+        occurred_start=None,
+        occurred_end=None,
+        event_date=datetime(2025, 1, 1, tzinfo=timezone.utc),
+        mentioned_at=None,
+        entity_ids=[new_entity],
+    )
+
+    got = await store.get_memories(conn=None, fq_table=_fq_table, bank_id=bank_id, unit_ids=[uid])
+    assert len(got) == 1
+    edited = got[0]
+    assert edited.text == "corrected text"
+    assert edited.context == "new context"
+    assert edited.fact_type == "experience"  # the fact_type change is a memory_type change
+    assert edited.entity_ids == [new_entity]
+    assert edited.tags == ["keep"], "fields not part of the edit must survive the rewrite"
+
+    # The re-embed writes through set_memory_embedding (the engine calls it after
+    # apply_edit); here it just has to land without error.
+    await store.set_memory_embedding(conn=None, fq_table=_fq_table, bank_id=bank_id, unit_id=uid, embedding=_vec(0.9))
+
+
 async def test_invalidate_missing_is_false(store, bank_id, pg_conn):
     """Invalidating an id that was never live reports it, rather than archiving nothing."""
     missing = store.allocate_unit_ids(1)[0]

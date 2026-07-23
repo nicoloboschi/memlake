@@ -78,10 +78,11 @@ mostly **operational and packaging**, not features. Grouped by how hard it block
 
 ### 0d. Feature-parity gaps — runs, but degraded UX
 
-- [x] **Curation invalidate/revert — DONE → §6.** Invalidate/revert now work in
-      memlake mode via an archive namespace, tested live. The remaining piece is
-      the *edit* branch of `update_memory_unit` (still raw `memory_units` SQL) —
-      tracked in §6 as the next curation item.
+- [x] **Curation edit / invalidate / revert — DONE → §6.** All three paths of
+      `update_memory_unit` now go through the store, tested live: invalidate/revert
+      via the Postgres archive table (the memory is deleted from the index), and
+      field edits (text/context/dates/fact_type/entities + re-embed) via an
+      `apply_edit` rewrite.
 - [ ] **Count surfaces return zero/degraded → §5b.** bank-stats link counts,
       `get_memories_timeseries`, `list_observation_scopes`, `list_documents`
       per-doc counts, `get_bank_freshness` pending/failed.
@@ -435,12 +436,20 @@ same shape as the per-cluster tag set.
       across the fold + query path + proto; do it once the segmented-index refactor
       settles.
 
-- [ ] **Edit (`update_memory_unit` field edits) still writes `memory_units`
-      directly.** The state changes (this item) are routed through the store; the
-      *edit* branch — correcting text/context/dates/fact_type/entities — still
-      does raw `UPDATE memory_units` + entity relink SQL, so in memlake mode a
-      field edit silently no-ops. Same shape of fix (route the field update +
-      re-embed through the store), left as the next curation item.
+- [x] **Edit (`update_memory_unit` field edits) — DONE.** Correcting a memory's
+      text/context/dates/fact_type/entities now routes through the store too, so it
+      works in memlake mode instead of silently no-op'ing. Two new interface
+      methods: `clear_unit_entities` (drop a unit's postings before re-linking — a
+      no-op for a store that carries entity ids on the memory) and `apply_edit`
+      (write the new fields, reset the consolidation markers, drop the derived
+      links; the embedding follows via `set_memory_embedding` once the caller
+      re-embeds). Postgres keeps its `UPDATE memory_units` + `DELETE memory_links`;
+      memlake rewrites the memory (an edit changes the entity set and can change
+      the memory_type, neither of which `patch` expresses, so it is a full upsert).
+      Entity *resolution* stays Hindsight's — the engine resolves names against the
+      Postgres registry and hands the ids down. Verified: the Postgres curation
+      edit suite passes unchanged, and a memlake edit rewrites text/context/
+      fact_type/entities while preserving the untouched fields.
 
 ---
 
@@ -753,3 +762,18 @@ green; what follows is what is left.
       certain-to-be-read objects (centroids, footers, `pk.idx`) and not the cluster
       or vector-block bulk, but that is untested — it could not be measured from
       inside `mlake-store`, which has no fold to run.
+
+## Cache: namespace isolation (surfaced by the SLA model)
+
+- [ ] **The read cache needs per-namespace isolation or frequency-awareness; global CLOCK
+      gives neither.** CLOCK (the current policy) is scan-resistant but not isolated: under
+      concurrent namespaces, one namespace's large `Scan` or write burst floods the single
+      shared cache and evicts a *different* busy namespace's hot working set — a noisy
+      neighbour that drops that namespace from the MEMORY tier to COLD and spikes its p99.
+      The SLA model (`docs/sla-model.md`) can only promise a *per-namespace* SLA if a busy
+      namespace's working set is protected. Two fixes, both stronger than CLOCK:
+      **per-namespace reservation** (cache divided among active namespaces, weighted by
+      traffic — simplest, makes the SLA `mem_cache / active_namespaces`), or
+      **frequency-aware admission** (TinyLFU / S3-FIFO — a one-shot scan block never
+      displaces a repeatedly-hit one, no per-namespace bookkeeping). Decide behind a
+      multi-namespace load test that reproduces the noisy-neighbour eviction first.

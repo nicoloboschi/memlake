@@ -917,6 +917,76 @@ class MemlakeMemories(MemoriesExtension):
         op = self._client.patch(uuid.UUID(unit_id).bytes, vector=_parse_embedding(embedding))
         await asyncio.to_thread(self._client.write_ops, self._namespace(bank_id), [op])
 
+    async def apply_edit(
+        self,
+        *,
+        conn,
+        fq_table,
+        bank_id: str,
+        unit_id: str,
+        text: str,
+        context: str | None,
+        fact_type: str,
+        occurred_start,
+        occurred_end,
+        event_date,
+        mentioned_at,
+        entity_ids: list[str] | None,
+    ) -> None:
+        """Apply a field edit by rewriting the memory.
+
+        `patch` cannot change the entity ids or the memory_type, and a fact-type
+        edit is exactly a memory_type change, so an edit is an upsert of the whole
+        memory rather than a partial update. The existing record supplies the
+        fields the edit leaves alone (tags, proof_count, vector — the caller
+        re-embeds and overwrites the vector next); the edit overrides the rest.
+        """
+        record = await self._get_record(self._namespace(bank_id), unit_id)
+        if record is None:
+            return
+        payload = record.memory
+
+        memory_type = FACT_TYPE_TO_MEMORY_TYPE.get(fact_type, record.memory_type)
+        eids = (
+            [uuid.UUID(e).bytes for e in entity_ids]
+            if entity_ids is not None
+            else list(payload.entity_ids)
+        )
+
+        # Rebuild the metadata bag: the edited context, and a reset consolidation
+        # state — an edit re-consolidates, so the flag goes back to "not yet".
+        meta = dict(payload.metadata or {})
+        if context:
+            meta[META_CONTEXT] = context
+        else:
+            meta.pop(META_CONTEXT, None)
+        meta[META_CONSOLIDATED_FLAG] = CONSOLIDATED_NO
+        meta[META_CONSOLIDATED_AT] = ""
+        meta[META_CONSOLIDATION_FAILED_AT] = ""
+
+        raw = record.vector.f32le if record.vector else b""
+        vector = list(struct.unpack(f"<{len(raw) // 4}f", raw)) if raw else []
+
+        memory = mc.memory(
+            text,
+            vector,
+            memory_type=memory_type,
+            id=record.id,
+            tags=list(payload.tags),
+            proof_count=payload.proof_count,
+            entity_ids=eids,
+            metadata=meta,
+            # occurred window / event date follow the edit; the write time is left
+            # to the server to stamp now, since the edit is a write.
+            event_date=_to_epoch_ms(event_date),
+            occurred_start=_to_epoch_ms(occurred_start),
+            occurred_end=_to_epoch_ms(occurred_end),
+            mentioned_at=_to_epoch_ms(mentioned_at),
+        )
+        for edge in payload.causal_out:
+            memory.causal_out.add(target=edge.target, link_type=edge.link_type, weight=edge.weight)
+        await asyncio.to_thread(self._client.write, self._namespace(bank_id), [memory])
+
     async def list_entities(
         self, *, conn, fq_table, bank_id: str, search: str | None = None, limit: int = 100, offset: int = 0
     ) -> dict[str, Any]:
