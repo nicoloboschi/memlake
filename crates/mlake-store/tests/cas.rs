@@ -284,18 +284,21 @@ async fn cache_entries_report_both_tiers_and_overlap() {
     // The demoted object is still readable — the demotion cost latency, not the bytes.
     assert!(cache.get(&a).is_some(), "the demoted object is still readable");
 
-    // But the read does NOT promote it back into memory. The tiers are CLOCK rings ordered
-    // by admission; re-admitting on every hit is the per-hit mutation the ring exists to
-    // avoid, and it would force a reader to take the write lock. The hit sets `a`'s
-    // reference bit instead, so it keeps its place in the disk ring and is served from
-    // there — earning a second chance when the hand next reaches it.
+    // A disk-tier hit PROMOTES the object back into memory — once per key (until re-evicted), not
+    // per hit — so the next read is served from RAM under the shared lock instead of re-opening +
+    // mmapping the file on every lookup. That per-lookup mmap is what serialised concurrent readers
+    // (near-zero CPU, multi-second latency); promotion is the fix (see `cache.rs::get`). With a
+    // one-blob memory budget, promoting `a` evicts `b` from memory — its bytes stay on disk.
     let after = cache.entries(None, 100).0;
     let ea2 = after.iter().find(|e| e.path.ends_with("cluster-0.bin")).unwrap();
-    assert!(!ea2.in_memory, "a hit does not re-admit into memory");
+    assert!(ea2.in_memory, "a disk-tier hit promotes the object back into memory");
     assert!(ea2.on_disk);
+    let eb2 = after.iter().find(|e| e.path.ends_with("cluster-1.bin")).unwrap();
+    assert!(!eb2.in_memory, "promoting `a` evicted `b` from the one-blob memory tier");
+    assert!(eb2.on_disk, "but `b`'s bytes remain on disk");
 
-    // Newest admission first — the listing follows the ring, and a read does not reorder it.
-    assert!(after[0].path.ends_with("cluster-1.bin"), "the newest admission leads");
+    // The just-promoted object is the newest admission, so it now leads the ring listing.
+    assert!(after[0].path.ends_with("cluster-0.bin"), "the promoted object is newest, leads");
 }
 
 /// The cache is read-through: `Store::put` writes the object and leaves it out of the
