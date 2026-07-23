@@ -192,7 +192,7 @@ impl MemlakeService {
                                 .map_err(internal)?,
                         );
                         let out = SnapshotOutcome::new("reopen_fold", started, node.tail_len());
-                        return Ok((self.install_snapshot(&ns.name, node), out));
+                        return Ok((self.install_and_warm(&ns.name, node), out));
                     }
                     Err(_) => {} // conditional GET failed — fall through to the safe full path
                 }
@@ -205,7 +205,7 @@ impl MemlakeService {
                 .map_err(internal)?,
         );
         let out = SnapshotOutcome::new("full_open", started, node.tail_len());
-        Ok((self.install_snapshot(&ns.name, node), out))
+        Ok((self.install_and_warm(&ns.name, node), out))
     }
 
     /// Cache `node` as the current snapshot for `name` and return it.
@@ -215,6 +215,22 @@ impl MemlakeService {
             node,
         });
         self.snapshots.lock().unwrap().insert(name.to_string(), snap.clone());
+        snap
+    }
+
+    /// Install `node`, then kick a detached background pass that pulls its cluster blobs into the
+    /// read cache. Used only where the node just adopted a **new** generation (`reopen_fold`,
+    /// `full_open`): the freshly folded segment is cold, so warming it off the request path keeps a
+    /// fold from spiking the next query/derive with a multi-second cold `fetch_clusters` — the
+    /// dominant latency tail. Persisted segments resolve as cache hits, so the warm fetches only the
+    /// blobs the fold actually changed.
+    fn install_and_warm(&self, name: &str, node: Arc<QueryNode>) -> Arc<Snapshot> {
+        let snap = self.install_snapshot(name, node.clone());
+        // `MEMLAKE_WARM_ON_FOLD=off` disables the prefetch (for A/B measurement / a node that would
+        // rather pay cold on demand than spend background I/O). On by default.
+        if std::env::var("MEMLAKE_WARM_ON_FOLD").as_deref() != Ok("off") {
+            tokio::spawn(async move { node.warm().await });
+        }
         snap
     }
 

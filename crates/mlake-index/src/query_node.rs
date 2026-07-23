@@ -175,6 +175,11 @@ pub struct QueryNode {
     /// Kept so a fact type's `tail_fts` can be built lazily on first text-arm use.
     tokenizer: Tokenizer,
     per_type: BTreeMap<u8, FactType>,
+    /// `(fact type, segment id)` of the segments this open freshly decoded (i.e. did NOT reuse from
+    /// a prior node). After a fold this is just the newly built segment(s); on a full open it is all
+    /// of them. `warm()` fetches only these clusters — the genuinely cold ones — so warming a fold
+    /// never re-pulls blobs the cache already holds.
+    newly_loaded: Vec<(u8, String)>,
     /// Tail deletes — newest of all, so they hide every segment's copy.
     tombstones: HashSet<MemoryId>,
     /// Cross-segment supersede overlay: `id -> highest seq_hi of a segment that kills it`. An
@@ -303,6 +308,7 @@ impl QueryNode {
         memory_types.extend(tail_by_ft.keys().copied());
 
         let mut per_type = BTreeMap::new();
+        let mut newly_loaded: Vec<(u8, String)> = Vec::new();
         for ft in memory_types {
             let tail_items = tail_by_ft.remove(&ft).unwrap_or_default();
             // `tail_fts` is built lazily on first text-arm use (see `FactType::tail_fts`).
@@ -437,6 +443,7 @@ impl QueryNode {
                         payload,
                         rerank,
                     }));
+                    newly_loaded.push((ft, seg.id.clone()));
                 }
             }
 
@@ -479,6 +486,7 @@ impl QueryNode {
             ns: ns.clone(),
             tokenizer,
             per_type,
+            newly_loaded,
             tombstones,
             seg_superseded,
             predicate_tombstones,
@@ -566,6 +574,8 @@ impl QueryNode {
             ns: ns.clone(),
             tokenizer,
             per_type,
+            // A tail-extend reuses every segment wholesale — nothing new to warm.
+            newly_loaded: Vec::new(),
             tombstones,
             seg_superseded: self.seg_superseded.clone(),
             predicate_tombstones,
@@ -1615,6 +1625,47 @@ impl QueryNode {
             .flatten()
             .filter(|item| !self.hidden(item) && !self.superseded(&item.id, state.seq_hi))
             .collect())
+    }
+
+    /// Pull every segment's cluster + vector blobs into the read cache, so a query that probes them
+    /// is served from RAM/NVMe instead of paying a cold object-store GET on the request path.
+    ///
+    /// This is the fold-tail fix: a fold publishes a new generation whose freshly built segment is
+    /// cold, and the first query/derive to touch it otherwise eats a multi-second `fetch_clusters`
+    /// (see docs/concurrency-findings.md). Warming off the request path removes that spike. Segments
+    /// that persisted across the fold resolve as cache hits here, so this fetches only what the fold
+    /// actually changed. Best-effort: fetch errors are swallowed — a failed warm just leaves the
+    /// eventual query to pay the fetch it would have paid anyway.
+    pub async fn warm(&self) {
+        use futures::stream::StreamExt;
+        /// Cold blobs pulled concurrently — matches `fetch_clusters`' fanout so a warm and a live
+        /// query place comparable peak load on the object store.
+        const WARM_FANOUT: usize = 8;
+        if self.newly_loaded.is_empty() {
+            return;
+        }
+        let fresh: HashSet<(u8, &str)> =
+            self.newly_loaded.iter().map(|(ft, id)| (*ft, id.as_str())).collect();
+        let mut paths: Vec<String> = Vec::new();
+        for (ft, state) in &self.per_type {
+            for seg in &state.segments {
+                if !fresh.contains(&(*ft, seg.id.as_str())) {
+                    continue; // a segment the cache already holds from before the fold
+                }
+                paths.extend(seg.cluster_paths.iter().cloned());
+                paths.extend(seg.vector_paths.iter().cloned());
+            }
+        }
+        let metrics = QueryMetrics::default();
+        let store = &self.ns.store;
+        futures::stream::iter(paths)
+            .for_each_concurrent(WARM_FANOUT, |p| {
+                let metrics = &metrics;
+                async move {
+                    let _ = store.get_immutable(&p, Some((metrics, 0))).await;
+                }
+            })
+            .await;
     }
 
     /// Materialize `ids` (those not already present) into `into`, searching each segment
