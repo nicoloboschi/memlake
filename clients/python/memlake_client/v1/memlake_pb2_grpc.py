@@ -79,6 +79,11 @@ class MemlakeStub:
                 request_serializer=memlake_dot_v1_dot_memlake__pb2.MetadataStatsRequest.SerializeToString,
                 response_deserializer=memlake_dot_v1_dot_memlake__pb2.MetadataStatsResponse.FromString,
                 _registered_method=True)
+        self.LinkStats = channel.unary_unary(
+                '/memlake.v1.Memlake/LinkStats',
+                request_serializer=memlake_dot_v1_dot_memlake__pb2.LinkStatsRequest.SerializeToString,
+                response_deserializer=memlake_dot_v1_dot_memlake__pb2.LinkStatsResponse.FromString,
+                _registered_method=True)
         self.Scan = channel.unary_unary(
                 '/memlake.v1.Memlake/Scan',
                 request_serializer=memlake_dot_v1_dot_memlake__pb2.ScanRequest.SerializeToString,
@@ -214,6 +219,16 @@ class MemlakeServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def LinkStats(self, request, context):
+        """Live edge totals — derived semantic (kNN) links and intrinsic causal links — across a
+        namespace. Read from the per-segment tally plus the WAL tail (the same adjustment
+        Stats.doc_count and MetadataStats make), so it is a metadata read, not a corpus scan. The
+        primitive behind the bank stats page's link count.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def Scan(self, request, context):
         """Page through a memory_type's stored memories in cluster order. This is a full scan by
         construction — the cost DOES grow with the corpus — so it exists for browsing and
@@ -330,6 +345,11 @@ def add_MemlakeServicer_to_server(servicer, server):
                     servicer.MetadataStats,
                     request_deserializer=memlake_dot_v1_dot_memlake__pb2.MetadataStatsRequest.FromString,
                     response_serializer=memlake_dot_v1_dot_memlake__pb2.MetadataStatsResponse.SerializeToString,
+            ),
+            'LinkStats': grpc.unary_unary_rpc_method_handler(
+                    servicer.LinkStats,
+                    request_deserializer=memlake_dot_v1_dot_memlake__pb2.LinkStatsRequest.FromString,
+                    response_serializer=memlake_dot_v1_dot_memlake__pb2.LinkStatsResponse.SerializeToString,
             ),
             'Scan': grpc.unary_unary_rpc_method_handler(
                     servicer.Scan,
@@ -610,6 +630,33 @@ class Memlake:
             '/memlake.v1.Memlake/MetadataStats',
             memlake_dot_v1_dot_memlake__pb2.MetadataStatsRequest.SerializeToString,
             memlake_dot_v1_dot_memlake__pb2.MetadataStatsResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def LinkStats(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/memlake.v1.Memlake/LinkStats',
+            memlake_dot_v1_dot_memlake__pb2.LinkStatsRequest.SerializeToString,
+            memlake_dot_v1_dot_memlake__pb2.LinkStatsResponse.FromString,
             options,
             channel_credentials,
             insecure,

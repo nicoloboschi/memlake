@@ -636,6 +636,26 @@ class MemlakeClient:
         )
         return {v.value: v.count for v in resp.values}
 
+    def link_stats(
+        self,
+        namespace: str,
+        *,
+        memory_types: Optional[Sequence[int]] = None,
+    ) -> dict:
+        """Live edge totals for a namespace, as `{"semantic": n, "causal": m}`.
+
+        The primitive behind the bank stats page's link count: read from the per-segment tally
+        the fold builds plus the WAL tail, so it is a metadata read, not a corpus scan.
+        `semantic` is the derived kNN links; `causal` the intrinsic causal links."""
+        resp = self._call(
+            "LinkStats",
+            pb.LinkStatsRequest(
+                namespace=namespace,
+                memory_types=list(memory_types or []),
+            ),
+        )
+        return {"semantic": resp.semantic_edge_count, "causal": resp.causal_edge_count}
+
     def list_namespaces(self) -> list:
         """Every namespace in the bucket (one LIST). Not routed to a preferred node — any node
         answers identically."""

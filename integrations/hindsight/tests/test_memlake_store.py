@@ -252,6 +252,31 @@ async def test_count_surfaces(store, bank_id, index_pass):
     assert sum(row["count"] for row in series if row["fact_type"] == "world") == 3
 
 
+async def test_link_counts_report_derived_edges(store, bank_id, index_pass):
+    """The stats page's link total comes from memlake's edge tally, not empty Postgres.
+
+    An un-written bank has no links; once several near-identical memories are written the
+    server derives semantic (kNN) links between them, and `link_counts` — the LinkStats
+    read — reports them, so the stats page agrees with the graph instead of showing 0.
+    """
+    # A bank with no writes has no namespace yet — no links, not an error.
+    assert await store.link_counts(conn=None, fq_table=_fq_table, bank_id=bank_id) == {}
+
+    # Identical vectors are mutual nearest neighbours, so each memory gets derived links.
+    await store.insert_facts(
+        conn=None,
+        ops=None,
+        bank_id=bank_id,
+        facts=[make_fact(f"fact {i}", seed=0.5) for i in range(4)],
+    )
+    index_pass(store._namespace(bank_id))
+
+    counts = await store.link_counts(conn=None, fq_table=_fq_table, bank_id=bank_id)
+    assert counts.get("semantic", 0) > 0, counts
+    # There are no client-supplied causal edges here, so only semantic links exist.
+    assert "causal" not in counts
+
+
 # --------------------------------------------------------------------------- curation archive
 
 

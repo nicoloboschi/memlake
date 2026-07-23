@@ -817,6 +817,23 @@ class MemlakeMemories(MemoriesExtension):
                 counts[fact_type] = type_stats.doc_count
         return counts
 
+    async def link_counts(self, *, conn, fq_table, bank_id: str) -> dict[str, int]:
+        """Live link totals for the bank stats page, keyed by link type.
+
+        In memlake the links live inside the memory — derived semantic (kNN) edges and
+        intrinsic causal edges — so this is a metadata read of the fold-time per-segment
+        tally plus the WAL tail (LinkStats), never a corpus walk. There is no separate
+        "entity" link type: shared-entity affinity is folded into the derived semantic
+        links. Zero-valued types are omitted; an un-written bank has no links.
+        """
+        try:
+            stats = await asyncio.to_thread(self._client.link_stats, self._namespace(bank_id))
+        except Exception as e:
+            if _is_missing_namespace(e):
+                return {}
+            raise
+        return {k: v for k, v in stats.items() if v}
+
     async def list_tags(self, *, conn, fq_table, bank_id: str) -> dict[str, int]:
         return await reads.list_tags(self, conn=conn, fq_table=fq_table, bank_id=bank_id)
 
