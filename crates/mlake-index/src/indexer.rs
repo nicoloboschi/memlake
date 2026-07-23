@@ -96,11 +96,11 @@ pub async fn fold(
         } else {
             index(ns, tokenizer, opts).await
         }
-    } else if let Some(merge_len) = minor_compact_prefix(&manifest.segments) {
-        // Fold the tail AND merge the newest run of small segments into one — O(small).
-        minor_compact(ns, tokenizer, opts, merge_len).await
     } else {
         // Steady state: flush the WAL tail into a new L0 segment and append it — O(tail).
+        // (Size-tiered `minor_compact` exists and is correctness-proven, but firing it here
+        // over-works the single indexer and regressed reads — fan-out is no longer the bottleneck,
+        // the indexer is. Left dormant for the queue-based indexer; see docs/concurrency-findings.md.)
         flush(ns, tokenizer, opts).await
     }
 }
@@ -455,29 +455,53 @@ pub async fn derive_links_for_write(
     // dot per pair instead of re-deriving `|vecs[i]|²` on every one of its `n` comparisons.
     let norms: Vec<f32> =
         vecs.iter().map(|v| if v.is_empty() { 0.0 } else { mlake_core::norm(v) }).collect();
+    use futures::stream::{StreamExt, TryStreamExt};
     let mut stats = DeriveStats::default();
+
+    // (a) For each new item, query the committed index + tail for its nearest neighbours (one
+    // exact-scored vector query each). These queries are independent and I/O+CPU bound, so run them
+    // with bounded concurrency instead of one-await-at-a-time — this is the dominant write-path cost
+    // and the batch's items don't depend on one another here. `node`/`metrics` are shared by `&`
+    // (QueryNode reads are lock-free snapshots; QueryMetrics is all atomics), so this is safe.
+    const DERIVE_QUERY_CONCURRENCY: usize = 8;
+    let qt = std::time::Instant::now();
+    let mut query_neigh: Vec<Vec<(MemoryId, f32)>> = futures::stream::iter(0..n)
+        .map(|i| {
+            let (vecs, ids, mts, tags) = (&vecs, &ids, &mts, &tags);
+            async move {
+                if vecs[i].is_empty() {
+                    return Ok::<_, crate::Error>(Vec::new());
+                }
+                let raw = node
+                    .query_raw_metered(mts[i], Some(&vecs[i]), None, tags, depths, None, Default::default(), metrics)
+                    .await?;
+                let mut neigh = Vec::new();
+                for h in raw {
+                    if let Some(d) = h.dense {
+                        if h.id != ids[i] && d.score >= SEMANTIC_LINK_THRESHOLD {
+                            neigh.push((h.id, d.score));
+                        }
+                    }
+                }
+                Ok(neigh)
+            }
+        })
+        .buffered(DERIVE_QUERY_CONCURRENCY)
+        .try_collect()
+        .await?;
+    // Wall time of the whole concurrent query phase (not the sum of per-query times).
+    stats.query_ms += qt.elapsed().as_secs_f64() * 1000.0;
+    stats.queries += vecs.iter().filter(|v| !v.is_empty()).count();
+
+    // (b) Add neighbours within this same batch (not yet committed, so invisible to `node`), then
+    // merge, truncate and assign. The batch is disjoint from the index, so these never duplicate the
+    // query hits. Pure CPU — cheap after prenorm — so it stays a sequential pass.
+    let bt = std::time::Instant::now();
     for i in 0..n {
         if vecs[i].is_empty() {
             continue;
         }
-        let mut neigh: Vec<(MemoryId, f32)> = Vec::new();
-        // (a) neighbours already in the committed index + tail (one exact-scored vector query).
-        let qt = std::time::Instant::now();
-        let raw = node
-            .query_raw_metered(mts[i], Some(&vecs[i]), None, &tags, depths, None, Default::default(), metrics)
-            .await?;
-        stats.query_ms += qt.elapsed().as_secs_f64() * 1000.0;
-        stats.queries += 1;
-        for h in raw {
-            if let Some(d) = h.dense {
-                if h.id != ids[i] && d.score >= SEMANTIC_LINK_THRESHOLD {
-                    neigh.push((h.id, d.score));
-                }
-            }
-        }
-        // (b) neighbours within this same batch (not yet committed, so invisible to `node`). The
-        // batch is disjoint from the index, so these never duplicate the query hits.
-        let bt = std::time::Instant::now();
+        let mut neigh = std::mem::take(&mut query_neigh[i]);
         for j in 0..n {
             if j == i || mts[j] != mts[i] || vecs[j].is_empty() {
                 continue;
@@ -487,7 +511,6 @@ pub async fn derive_links_for_write(
                 neigh.push((ids[j], sim));
             }
         }
-        stats.batch_ms += bt.elapsed().as_secs_f64() * 1000.0;
         neigh.sort_by(|a, b| {
             b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal).then(a.0.cmp(&b.0))
         });
@@ -495,6 +518,8 @@ pub async fn derive_links_for_write(
         memories[i].semantic_out =
             neigh.into_iter().map(|(id, sim)| SemanticEdge { target: id, weight: Weight::from_f32(sim) }).collect();
     }
+    stats.batch_ms += bt.elapsed().as_secs_f64() * 1000.0;
+
     Ok(stats)
 }
 
