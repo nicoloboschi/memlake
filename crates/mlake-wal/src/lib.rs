@@ -1,6 +1,6 @@
 //! The write-ahead log: the namespace's ordering and durability primitive.
 //!
-//! The WAL is a sequence of immutable objects at `{ns}/wal/{seq:08}.bin`. A sequence
+//! The WAL is a sequence of immutable objects at `{ns}/wal/{seq:020}.bin`. A sequence
 //! number is claimed with a conditional create, so ordering emerges from S3 itself with
 //! no lock service and no consensus (INV-1, INV-3).
 //!
@@ -319,6 +319,24 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(ns.wal_head().await.unwrap(), 12);
+    }
+
+    #[tokio::test]
+    async fn head_discovery_survives_the_1e8_boundary() {
+        let ns = Namespace::new("ns", Store::in_memory());
+        ns.create_if_absent("tok").await.unwrap();
+        // Sequences straddling 10^8, written out of order. `wal_head` is the last key in
+        // lexicographic LIST order — with an 8-wide pad `100000000.bin` sorts BEFORE `99999999.bin`
+        // (leading '1' < '9'), so the head would silently regress to 99_999_999. The 20-wide pad
+        // keeps every key the same length, so lexicographic order stays numeric order.
+        for seq in [99_999_999u64, 100_000_001, 100_000_000, 99_999_998] {
+            ns.store.put_if_absent(&seq_path("ns", seq), b"x".to_vec()).await.unwrap();
+        }
+        assert_eq!(ns.wal_head().await.unwrap(), 100_000_001, "head is the numerically highest seq");
+        // The retained-window listing is likewise ascending by sequence across the boundary.
+        let (objects, _) = ns.list_wal(0, 100).await.unwrap();
+        let seqs: Vec<u64> = objects.iter().map(|o| o.seq).collect();
+        assert_eq!(seqs, vec![99_999_998, 99_999_999, 100_000_000, 100_000_001]);
     }
 
     #[tokio::test]

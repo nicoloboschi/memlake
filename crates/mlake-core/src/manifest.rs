@@ -277,8 +277,13 @@ pub fn index_lease_path(namespace: &str) -> String {
 
 /// Object key for a WAL entry. Zero-padded so lexicographic listing is sequence order —
 /// this is what makes "find the head" a single LIST with a start-after cursor.
+///
+/// The width is 20, the digit count of `u64::MAX`, so EVERY sequence in the u64 range formats to
+/// the same length and lexicographic order equals numeric order for all of it. A narrower pad (e.g.
+/// 8) is a lexicographic time bomb: the first sequence that overflows the width grows a digit and
+/// sorts *before* all the shorter keys (`100000000` < `99999999`), silently reordering the WAL.
 pub fn wal_path(namespace: &str, seq: u64) -> String {
-    format!("{namespace}/wal/{seq:08}.bin")
+    format!("{namespace}/wal/{seq:020}.bin")
 }
 
 /// Prefix under which one segment's files live. `seg_id` is a content nonce, so the prefix is
@@ -293,13 +298,21 @@ mod tests {
 
     #[test]
     fn wal_paths_sort_in_sequence_order() {
-        let mut paths: Vec<String> = [9u64, 100, 10, 1].iter().map(|s| wal_path("ns", *s)).collect();
+        // Straddle the 10^8 boundary — where an 8-wide pad would grow a digit and sort the larger
+        // sequence *before* the smaller ones — and go up to u64::MAX, to prove lexicographic key
+        // order equals numeric sequence order across the whole u64 range.
+        let seqs = [1u64, 9, 10, 100, 99_999_999, 100_000_000, 100_000_001, u64::MAX];
+        let mut paths: Vec<String> = seqs.iter().map(|s| wal_path("ns", *s)).collect();
         paths.sort();
-        let seqs: Vec<&str> = paths.iter().map(|p| p.rsplit('/').next().unwrap()).collect();
-        assert_eq!(
-            seqs,
-            vec!["00000001.bin", "00000009.bin", "00000010.bin", "00000100.bin"]
-        );
+        let sorted: Vec<u64> = paths
+            .iter()
+            .map(|p| p.rsplit('/').next().unwrap().strip_suffix(".bin").unwrap().parse().unwrap())
+            .collect();
+        let mut expected = seqs.to_vec();
+        expected.sort_unstable();
+        assert_eq!(sorted, expected, "lexicographic key order must equal numeric sequence order");
+        // Every key is the same length, so no sequence can ever overflow the pad and reorder.
+        assert!(paths.iter().all(|p| p.len() == paths[0].len()));
     }
 
     #[test]
