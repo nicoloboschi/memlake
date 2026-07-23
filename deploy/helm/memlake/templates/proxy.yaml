@@ -36,12 +36,17 @@ data:
                       headers:
                       - name: x-memlake-namespace
                         string_match: { exact: {{ .namespace | quote }} }
-                    route: { cluster: memlake_pin_{{ .namespace | replace "-" "_" }} }
+                    route:
+                      cluster: memlake_pin_{{ .namespace | replace "-" "_" }}
+                      timeout: {{ $.Values.proxy.routeTimeout | default "120s" }}
                   {{- end }}
                   # Default: consistent-hash on the namespace across the serve pool.
                   - match: { prefix: "/" }
                     route:
                       cluster: memlake_hash
+                      # A write can be slow (write-time link derivation over S3), so allow well past
+                      # Envoy's 15s default before failing the RPC. gRPC streams honor this per-call.
+                      timeout: {{ .Values.proxy.routeTimeout | default "120s" }}
                       hash_policy:
                       - header: { header_name: x-memlake-namespace }
               http_filters:

@@ -51,6 +51,9 @@ proxy:
   image: envoyproxy/envoy:v1.31-latest
   # RING_HASH or MAGLEV (Maglev = less reshuffle when serve pods scale).
   lbPolicy: MAGLEV
+  # Per-RPC timeout at the proxy. A write can be slow (write-time derivation over S3), so this is
+  # well past Envoy's 15s default; below it a slow write fails as "upstream request timeout".
+  routeTimeout: "120s"
   service:
     # ClusterIP (in-cluster clients) or LoadBalancer (external). Port 50050 is the gRPC entrypoint.
     type: ClusterIP
