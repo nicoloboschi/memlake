@@ -537,6 +537,13 @@ impl QueryNode {
         self.per_type.values().map(|s| s.doc_count).sum()
     }
 
+    /// Number of un-indexed WAL-tail items across all fact types — a cheap "how far behind is the
+    /// indexer" signal for tracing. A large tail means every strongly-consistent read pays to scan
+    /// it, which is a prime suspect for a read that took seconds instead of milliseconds.
+    pub fn tail_len(&self) -> usize {
+        self.per_type.values().map(|f| f.tail_items.len()).sum()
+    }
+
     /// Live items of one fact type.
     pub fn doc_count_of(&self, memory_type: u8) -> usize {
         self.per_type.get(&memory_type).map(|s| s.doc_count).unwrap_or(0)

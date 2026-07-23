@@ -17,6 +17,7 @@ use tonic::{Request, Response, Status};
 
 use crate::limiter::QueryLimiter;
 use crate::pb::memlake_server::Memlake;
+use crate::trace::{ms, now_ms, Tracer};
 use crate::{convert, objects, pb};
 
 /// How long a `wait_for_index` write waits for the *background indexer* to fold its sequence into
@@ -34,6 +35,23 @@ const WAIT_FOR_INDEX_POLL: std::time::Duration = std::time::Duration::from_milli
 struct Snapshot {
     node: Arc<QueryNode>,
     through_seq: u64,
+}
+
+/// What `snapshot_traced` did, for the per-call trace.
+struct SnapshotOutcome {
+    /// `reuse` (cached, head unchanged), `reopen_tail` (a write; segments reused), or `full_open`
+    /// (a fold, or no cache).
+    action: &'static str,
+    /// Time spent in the snapshot step (head check + any reopen/open).
+    open_ms: f64,
+    /// Un-indexed WAL-tail items the resulting snapshot carries.
+    tail_entries: usize,
+}
+
+impl SnapshotOutcome {
+    fn new(action: &'static str, started: std::time::Instant, tail_entries: usize) -> Self {
+        Self { action, open_ms: ms(started), tail_entries }
+    }
 }
 
 /// Default concurrent-retrieval cap when none is configured. Sized so `permits × per-query
@@ -54,6 +72,8 @@ pub struct MemlakeService {
     /// Admission control for the memory-heavy retrieval paths (`query`, `get`), so peak working
     /// memory is bounded by the permit count instead of by request concurrency.
     query_limiter: QueryLimiter,
+    /// Per-call JSONL audit log, on only when `MEMLAKE_TRACE_LOG` is set (see `crate::trace`).
+    tracer: Tracer,
 }
 
 impl MemlakeService {
@@ -64,7 +84,13 @@ impl MemlakeService {
             writers: Mutex::new(HashMap::new()),
             snapshots: Mutex::new(HashMap::new()),
             query_limiter: QueryLimiter::new(DEFAULT_MAX_CONCURRENT_QUERIES),
+            tracer: Tracer::from_env(),
         }
+    }
+
+    /// Whether per-call tracing is enabled — for the startup log.
+    pub fn tracing_enabled(&self) -> bool {
+        self.tracer.enabled()
     }
 
     /// Set the cap on concurrently-executing retrieval requests — the knob that bounds the
@@ -105,11 +131,24 @@ impl MemlakeService {
     /// Reads stay strongly consistent: a reader re-derives the tail up to the live head every time
     /// it advances, so no acked write is ever missed.
     async fn snapshot(&self, ns: &Namespace) -> Result<Arc<Snapshot>, Status> {
+        self.snapshot_traced(ns).await.map(|(snap, _)| snap)
+    }
+
+    /// Like [`snapshot`], but also reports what it did (`reuse` / `reopen_tail` / `full_open`),
+    /// how long it took, and the resulting tail size — the inputs the tracer needs to explain a
+    /// slow read (a huge `tail_entries` means the indexer is behind; a `full_open` on a cold node
+    /// means metadata round-trips).
+    async fn snapshot_traced(
+        &self,
+        ns: &Namespace,
+    ) -> Result<(Arc<Snapshot>, SnapshotOutcome), Status> {
+        let started = std::time::Instant::now();
         if let Some(cached) = self.cached_snapshot(&ns.name) {
             // The per-query staleness check: the head from the pointer (one GET), not a LIST.
             let head = ns.resolve_head().await.map_err(internal)?;
             if head == cached.through_seq {
-                return Ok(cached);
+                let out = SnapshotOutcome::new("reuse", started, cached.node.tail_len());
+                return Ok((cached, out));
             }
 
             // Head advanced. If the manifest is unchanged, only the tail grew — reopen cheaply,
@@ -125,7 +164,8 @@ impl MemlakeService {
                                 .await
                                 .map_err(internal)?,
                         );
-                        return Ok(self.install_snapshot(&ns.name, node));
+                        let out = SnapshotOutcome::new("reopen_tail", started, node.tail_len());
+                        return Ok((self.install_snapshot(&ns.name, node), out));
                     }
                     Ok(Some(_)) => {} // manifest changed (a fold) — fall through to full reopen
                     Err(_) => {}      // conditional GET failed — fall through to the safe full path
@@ -138,7 +178,8 @@ impl MemlakeService {
                 .await
                 .map_err(internal)?,
         );
-        Ok(self.install_snapshot(&ns.name, node))
+        let out = SnapshotOutcome::new("full_open", started, node.tail_len());
+        Ok((self.install_snapshot(&ns.name, node), out))
     }
 
     /// Cache `node` as the current snapshot for `name` and return it.
@@ -249,6 +290,8 @@ impl Memlake for MemlakeService {
         if ops.is_empty() {
             return Err(Status::invalid_argument("write needs at least one op"));
         }
+        let t0 = std::time::Instant::now();
+        let op_count = ops.len();
 
         // Derive the batch's semantic kNN links HERE, before the commit, so they travel in the WAL
         // as intrinsic data — the index is then a pure speed optimization, not a correctness
@@ -262,7 +305,9 @@ impl Memlake for MemlakeService {
                 _ => None,
             })
             .collect();
-        if !upserts.is_empty() {
+        let upsert_count = upserts.len();
+        let link_ms = if !upserts.is_empty() {
+            let link_t = std::time::Instant::now();
             let snap = self.snapshot(&ns).await?;
             let metrics = QueryMetrics::new();
             mlake_index::derive_links_for_write(&snap.node, &mut upserts, &metrics)
@@ -274,14 +319,19 @@ impl Memlake for MemlakeService {
                     *m = derived.next().expect("one derived memory per upsert");
                 }
             }
-        }
+            ms(link_t)
+        } else {
+            0.0
+        };
 
         let writer = self.writer_for(&req.namespace);
         // The commit is durable (S3 conditional PUT) before this returns — that is the ack.
+        let commit_t = std::time::Instant::now();
         let result = {
             let mut w = writer.lock().await;
             w.commit(ops).await.map_err(internal)?
         };
+        let commit_ms = ms(commit_t);
         // A new write means any cached snapshot is stale; drop it so the next read re-opens
         // and sees this write (via the WAL tail, even before it is indexed).
         self.invalidate(&req.namespace);
@@ -289,11 +339,33 @@ impl Memlake for MemlakeService {
         // Optionally fold the write into the indexed generation before returning. Done after
         // the commit so the ack still reflects durability; the extra latency is only paid by
         // callers that opt in.
-        let generation = if req.wait_for_index {
-            self.index_until(&req.namespace, result.seq).await?
+        let (generation, wait_for_index_ms) = if req.wait_for_index {
+            let wait_t = std::time::Instant::now();
+            let g = self.index_until(&req.namespace, result.seq).await?;
+            (g, Some(ms(wait_t)))
         } else {
-            0
+            (0, None)
         };
+
+        if self.tracer.enabled() {
+            self.tracer.emit(serde_json::json!({
+                "ts_ms": now_ms(),
+                "op": "write",
+                "namespace": req.namespace,
+                "total_ms": ms(t0),
+                "link_ms": link_ms,
+                "commit_ms": commit_ms,
+                "wait_for_index_ms": wait_for_index_ms,
+                "params": {
+                    "ops": op_count,
+                    "upserts": upsert_count,
+                    "wait_for_index": req.wait_for_index,
+                },
+                "seq": result.seq,
+                "attempts": result.attempts,
+            }));
+        }
+
         Ok(Response::new(pb::WriteResponse {
             seq: result.seq,
             attempts: result.attempts as u32,
@@ -309,6 +381,7 @@ impl Memlake for MemlakeService {
         if req.namespace.is_empty() {
             return Err(Status::invalid_argument("namespace is required"));
         }
+        let t0 = std::time::Instant::now();
         let vector = req.vector.as_ref().map(convert::decode_vector).transpose()?;
         let tags = convert::tag_filter(req.tags);
         let depths = convert::arm_depths(
@@ -329,12 +402,14 @@ impl Memlake for MemlakeService {
         // rerank clusters at once — the server's peak query memory is bounded by the permit
         // count, not by how many requests arrive together. Under load this awaits (backpressure),
         // it does not reject.
+        let permit_t = std::time::Instant::now();
         let _permit = self.query_limiter.acquire().await;
+        let permit_wait_ms = ms(permit_t);
 
         let ns = self.namespace(&req.namespace);
         // Reuse the cached open snapshot when still current (see `snapshot`): a warm read is
         // pure in-memory arm evaluation over the shared Store cache, 0 fresh roundtrips.
-        let snap = self.snapshot(&ns).await?;
+        let (snap, snap_out) = self.snapshot_traced(&ns).await?;
         let node = &snap.node;
 
         // Which types to answer: the caller's list, or every type in the snapshot.
@@ -400,6 +475,41 @@ impl Memlake for MemlakeService {
                 req.updated_from.is_none_or(|from| updated > from)
                     && req.updated_to.is_none_or(|to| updated < to)
             });
+        }
+
+        if self.tracer.enabled() {
+            let (rt, ch, cm) = (metrics.roundtrips(), metrics.cache_hits(), metrics.cache_misses());
+            let denom = (ch + cm).max(1) as f64;
+            self.tracer.emit(serde_json::json!({
+                "ts_ms": now_ms(),
+                "op": "query",
+                "namespace": req.namespace,
+                "total_ms": ms(t0),
+                "permit_wait_ms": permit_wait_ms,
+                "snapshot": {
+                    "action": snap_out.action,
+                    "open_ms": snap_out.open_ms,
+                    "tail_entries": snap_out.tail_entries,
+                },
+                "phases_us": metrics.phase_breakdown(),
+                "io": {
+                    "roundtrips": rt,
+                    "cache_hits": ch,
+                    "cache_misses": cm,
+                    "hit_ratio": ch as f64 / denom,
+                    "bytes": metrics.bytes(),
+                    "tier": if rt == 0 { "warm" } else { "cold" },
+                },
+                "result_count": hits.len(),
+                "params": {
+                    "nprobe": req.nprobe,
+                    "vector_top_k": req.vector_top_k,
+                    "text_top_k": req.text_top_k,
+                    "graph_top_k": req.graph_top_k,
+                    "has_vector": vector.is_some(),
+                    "has_text": text.is_some(),
+                },
+            }));
         }
 
         Ok(Response::new(pb::QueryResponse {
@@ -483,21 +593,42 @@ impl Memlake for MemlakeService {
         if ids.is_empty() {
             return Ok(Response::new(pb::GetResponse { memories: Vec::new() }));
         }
+        let t0 = std::time::Instant::now();
 
         // `get` with `include_vector` fetches whole cluster files, so it shares the query
         // admission cap; the payload-only path is cheap but is gated too for a single, simple
         // memory ceiling over the retrieval paths.
+        let permit_t = std::time::Instant::now();
         let _permit = self.query_limiter.acquire().await;
+        let permit_wait_ms = ms(permit_t);
 
         let ns = self.namespace(&req.namespace);
-        let snap = self.snapshot(&ns).await?;
+        let (snap, snap_out) = self.snapshot_traced(&ns).await?;
         let found = snap.node.get_many(&ids, req.include_vector).await.map_err(internal)?;
-        Ok(Response::new(pb::GetResponse {
-            memories: found
-                .into_iter()
-                .map(|m| convert::stored_record_with_edges(m, req.include_vector, req.include_edges))
-                .collect(),
-        }))
+        let result_count = found.len();
+        let memories: Vec<_> = found
+            .into_iter()
+            .map(|m| convert::stored_record_with_edges(m, req.include_vector, req.include_edges))
+            .collect();
+
+        if self.tracer.enabled() {
+            self.tracer.emit(serde_json::json!({
+                "ts_ms": now_ms(),
+                "op": "get",
+                "namespace": req.namespace,
+                "total_ms": ms(t0),
+                "permit_wait_ms": permit_wait_ms,
+                "snapshot": {
+                    "action": snap_out.action,
+                    "open_ms": snap_out.open_ms,
+                    "tail_entries": snap_out.tail_entries,
+                },
+                "result_count": result_count,
+                "params": { "ids": ids.len(), "include_vector": req.include_vector },
+            }));
+        }
+
+        Ok(Response::new(pb::GetResponse { memories }))
     }
 
     async fn entity_stats(
@@ -601,6 +732,7 @@ impl Memlake for MemlakeService {
         if req.namespace.is_empty() {
             return Err(Status::invalid_argument("namespace is required"));
         }
+        let t0 = std::time::Instant::now();
         let limit = match req.limit {
             0 => DEFAULT_SCAN_LIMIT,
             n => (n as usize).min(MAX_SCAN_LIMIT),
@@ -619,7 +751,7 @@ impl Memlake for MemlakeService {
         let mut skip = req.skip as usize;
 
         let ns = self.namespace(&req.namespace);
-        let snap = self.snapshot(&ns).await?;
+        let (snap, snap_out) = self.snapshot_traced(&ns).await?;
         let node = &snap.node;
 
         let mut types: Vec<u8> = if req.memory_types.is_empty() {
@@ -691,6 +823,27 @@ impl Memlake for MemlakeService {
                     pending = rest;
                 }
             }
+        }
+
+        if self.tracer.enabled() {
+            self.tracer.emit(serde_json::json!({
+                "ts_ms": now_ms(),
+                "op": "scan",
+                "namespace": req.namespace,
+                "total_ms": ms(t0),
+                "snapshot": {
+                    "action": snap_out.action,
+                    "open_ms": snap_out.open_ms,
+                    "tail_entries": snap_out.tail_entries,
+                },
+                "result_count": out.len(),
+                "params": {
+                    "limit": limit,
+                    "skip": req.skip,
+                    "has_filter": !filter.metadata_equals.is_empty() || !filter.tags.is_empty(),
+                    "more": !next_token.is_empty(),
+                },
+            }));
         }
 
         Ok(Response::new(pb::ScanResponse { memories: out, next_page_token: next_token }))

@@ -12,6 +12,7 @@ mod limiter;
 mod objects;
 mod pb;
 mod service;
+mod trace;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -176,7 +177,8 @@ async fn serve(args: &[String], node: String) -> Result<()> {
     let svc = MemlakeService::new(store, Tokenizer::default()).with_max_concurrent_queries(max_queries);
 
     tracing::info!(
-        %addr, mem_mb, disk_mb, max_queries = svc.max_concurrent_queries(), node = %node,
+        %addr, mem_mb, disk_mb, max_queries = svc.max_concurrent_queries(),
+        trace_log = svc.tracing_enabled(), node = %node,
         "memlake serving gRPC"
     );
     Server::builder()

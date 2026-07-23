@@ -78,6 +78,11 @@ services:
       MEMLAKE_QUERY_S3_ENDPOINT: ${MEMLAKE_QUERY_S3_ENDPOINT-http://minio:9000}
       MEMLAKE_NODE_ID: serve-1
       RUST_LOG: ${RUST_LOG:-info}
+      # Per-call JSONL audit log (off unless set). Point it inside the mounted ./perf/traces so
+      # the file is readable on the host, e.g. SERVE_TRACE_LOG=/traces/serve.jsonl
+      MEMLAKE_TRACE_LOG: ${SERVE_TRACE_LOG:-}
+    volumes:
+      - ./perf/traces:/traces
     healthcheck:
       test: ["CMD", "nc", "-z", "localhost", "50051"]
       interval: 3s
