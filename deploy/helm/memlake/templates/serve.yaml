@@ -31,6 +31,10 @@ spec:
             - 0.0.0.0:50051
             - --max-concurrent-queries
             - {{ .Values.serve.maxConcurrentQueries | quote }}
+            - --mem-mb
+            - {{ .Values.serve.memMb | quote }}
+            - --disk-mb
+            - {{ .Values.serve.diskMb | quote }}
           envFrom:
             # Real AWS S3 creds (MEMLAKE_QUERY_S3_*). No endpoint key => talks to AWS, not MinIO.
             - secretRef:

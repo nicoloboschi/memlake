@@ -23,11 +23,12 @@ spec:
           env:
             - { name: MEMLAKE_ADDR, value: "memlake-proxy:50050" }   # the Envoy proxy Service
             - { name: MEMLAKE_LOAD_NAMESPACE, value: "perf" }
-            - { name: N_DOCS, value: "20000" }
+            - { name: N_DOCS, value: "50000" }
             - { name: BATCH, value: "512" }
-            - { name: N_QUERIES, value: "200" }
+            - { name: CONCURRENCY, value: "8" }        # concurrent writer threads (aggregate throughput)
+            - { name: N_QUERIES, value: "300" }
             - { name: DIM, value: "384" }
-            - { name: WAIT_INDEX_SECS, value: "30" }
+            - { name: FOLD_WAIT_SECS, value: "180" }   # poll stats until backlog drains, then query steady-state
           resources:
-            requests: { cpu: "500m", memory: "512Mi" }
-            limits: { cpu: "2", memory: "1Gi" }
+            requests: { cpu: "1", memory: "512Mi" }
+            limits: { cpu: "4", memory: "2Gi" }

@@ -20,10 +20,18 @@ serve:
   replicas: 3
   # The cap that bounds a pod's peak query memory (permits x per-query working set).
   maxConcurrentQueries: 32
+  # Two-tier read cache budgets. A bigger in-memory tier keeps hot clusters/blocks — and the
+  # index reads that write-time link derivation does — warm, cutting S3 roundtrips. Keep memMb a
+  # safe fraction of the memory limit so the cache can't push the process to an OOM kill.
+  memMb: 1024
+  diskMb: 8192
   resources:
-    requests: { cpu: "500m", memory: "1Gi" }
-    limits: { cpu: "2", memory: "2Gi" }
-  env: {}   # extra env, e.g. RUST_LOG: debug
+    requests: { cpu: "1", memory: "2Gi" }
+    limits: { cpu: "2", memory: "3Gi" }
+  env:
+    # Per-call JSONL audit log (write/query cost breakdown) — read it with
+    # `kubectl exec <serve-pod> -- cat /tmp/serve-trace.jsonl` during a perf investigation.
+    MEMLAKE_TRACE_LOG: /tmp/serve-trace.jsonl
 
 indexer:
   replicas: 1
