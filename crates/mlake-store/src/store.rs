@@ -302,11 +302,10 @@ impl Store {
     /// Unconditional write that also **admits the bytes to the read cache**, so the writer
     /// does not have to re-fetch what it just wrote.
     ///
-    /// This exists for the inline-fold path: since `wait_for_index`, a `serve` replica can
-    /// fold a generation itself, writing every cluster, vector block and SSTable — and then
-    /// miss the cache on all of them when the next query arrives, having had the bytes in
-    /// hand and dropped them. (The background `index` deployment is a different process, so
-    /// only the inline path is affected.)
+    /// For any writer that already holds bytes a query is certain to want: it would otherwise
+    /// write them, drop them, and miss the cache on the next read. (Serve replicas no longer fold
+    /// inline — folding is the `index` deployment's job, a separate process — so this is a
+    /// mechanism kept for a future writer that has such bytes, not the old inline-fold path.)
     ///
     /// It is opt-in on purpose, and [`Store::put`] stays read-through. A fold writes the
     /// *whole* generation, and no imminent query probes most of it, so admitting all of it

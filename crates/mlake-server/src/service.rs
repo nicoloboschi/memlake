@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 
 use mlake_fts::Tokenizer;
 use mlake_index::streaming::FoldBudget;
-use mlake_index::{fold, IndexOptions, QueryNode, ScanCursor, DEFAULT_STREAMING_THRESHOLD_DOCS};
+use mlake_index::{fold, IndexOptions, QueryNode, ScanCursor};
 use mlake_store::{QueryMetrics, Store};
 use mlake_wal::{Namespace, Writer};
 use tokio::sync::Mutex as AsyncMutex;
@@ -19,11 +19,13 @@ use crate::limiter::QueryLimiter;
 use crate::pb::memlake_server::Memlake;
 use crate::{convert, objects, pb};
 
-/// Bounded number of inline fold attempts a `wait_for_index` write makes before giving up.
-/// One fold folds the whole tail up to the current head, so a single pass normally covers the
-/// write; extra passes only absorb a lost manifest-CAS race or a head that advanced under a
-/// concurrent write. A ceiling keeps a pathological write-storm from spinning forever.
-const MAX_INDEX_ATTEMPTS: usize = 5;
+/// How long a `wait_for_index` write waits for the *background indexer* to fold its sequence into
+/// a segment, and how often it re-checks the manifest cursor while waiting. A serve replica NEVER
+/// folds itself — folding is the indexer Deployment's job, with its own memory budget and
+/// scheduling — so this just polls the cursor. If the deadline passes the write is still durable
+/// and already visible via the WAL tail; only the "it's in a segment" confirmation timed out.
+const WAIT_FOR_INDEX_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const WAIT_FOR_INDEX_POLL: std::time::Duration = std::time::Duration::from_millis(200);
 
 /// A cached open snapshot of a namespace. Opening a `QueryNode` costs a manifest read plus WAL
 /// head/tail scans (uncached, mutable) — re-doing that per query is what makes a naive server
@@ -118,35 +120,30 @@ impl MemlakeService {
         Ok(snap)
     }
 
-    /// Fold `name`'s WAL tail into the indexed generation until the manifest cursor covers
-    /// `seq`, then return the resulting generation. Runs the same fold the background indexer
-    /// runs, inline on this replica — the manifest CAS serializes it against any other folder,
-    /// so a lost race just means someone else already advanced the cursor. Bounded retries
-    /// absorb that race and a head that a concurrent write pushed past our fold.
+    /// Wait until the background indexer has folded `name`'s WAL up to `seq` into a segment, by
+    /// polling the manifest cursor. This replica does **not** fold — a fold can be an O(corpus)
+    /// rebuild or compaction, which belongs on the indexer Deployment, not on a query-serving pod.
+    /// The write is already durable and visible via the WAL tail before this is called, so a
+    /// timeout is a soft failure (the caller just didn't get the "in a segment" confirmation).
     async fn index_until(&self, name: &str, seq: u64) -> Result<u64, Status> {
         let ns = self.namespace(name);
-        for _ in 0..MAX_INDEX_ATTEMPTS {
+        let deadline = tokio::time::Instant::now() + WAIT_FOR_INDEX_TIMEOUT;
+        loop {
             let (manifest, _etag) = ns.read_manifest().await.map_err(internal)?;
             if manifest.wal_index_cursor >= seq {
-                // A fold advanced past our write; drop any snapshot opened against the older
+                // The indexer advanced past our write; drop any snapshot opened against the older
                 // generation so the next read sees the freshly-indexed one.
                 self.invalidate(name);
                 return Ok(manifest.version);
             }
-            // Inline fold on the write path: auto-select with default budget/threshold.
-            fold(
-                &ns,
-                &self.tokenizer,
-                IndexOptions::default(),
-                FoldBudget::default(),
-                DEFAULT_STREAMING_THRESHOLD_DOCS,
-            )
-            .await
-            .map_err(internal)?;
+            if tokio::time::Instant::now() >= deadline {
+                return Err(Status::deadline_exceeded(format!(
+                    "write seq {seq} not folded into a segment within {WAIT_FOR_INDEX_TIMEOUT:?}; \
+                     it is durable and visible via the WAL tail — is the indexer running?"
+                )));
+            }
+            tokio::time::sleep(WAIT_FOR_INDEX_POLL).await;
         }
-        Err(Status::deadline_exceeded(format!(
-            "write seq {seq} was not indexed after {MAX_INDEX_ATTEMPTS} fold attempts"
-        )))
     }
 
     fn invalidate(&self, name: &str) {

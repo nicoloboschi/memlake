@@ -295,7 +295,7 @@ class MemlakeClient:
         returns only once the batch is durably persisted to object storage.
 
         The write is immediately queryable without indexing (reads merge the WAL tail). Pass
-        `wait_for_index=True` to also fold the tail into the indexed generation before
+        `wait_for_index=True` to wait until the background indexer has folded this write into a segment before
         returning — a heavier, synchronous call; use it after a bulk load or when you need the
         write in the generation before proceeding (e.g. tests, benchmarks)."""
         ops = [pb.Op(upsert=m) for m in memories]

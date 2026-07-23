@@ -226,12 +226,13 @@ message Op {
 message WriteRequest {
   string namespace = 1;
   repeated Op ops = 2;          // applied atomically as one WAL entry
-  // Fold this namespace's WAL tail into the indexed generation before returning, and only
-  // return once this write's sequence is covered by the manifest cursor. The fold runs
-  // inline on the serve replica (any replica can fold — the manifest CAS serializes them),
-  // so it needs no separate indexer process. Off by default; a normal write is durable and
-  // immediately queryable via the tail without it. Use it to bound the un-indexed tail after
-  // a bulk load, or when a caller wants the write in the generation before it proceeds.
+  // Wait until the background indexer has folded this write's sequence into a segment before
+  // returning (polls the manifest cursor). The serve replica does NOT fold itself — folding is
+  // the indexer Deployment's job — so this requires the indexer to be running, and times out
+  // otherwise. Off by default, and NOT needed for consistency: a normal write is durable and
+  // immediately queryable via the WAL tail the instant it is acked. Use it only when a caller
+  // wants the write already in a segment (e.g. so its derived semantic links exist) before it
+  // proceeds. A timeout is soft: the write is still durable and visible via the tail.
   bool wait_for_index = 3;
 }
 
