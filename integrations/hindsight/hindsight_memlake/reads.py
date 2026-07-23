@@ -28,6 +28,7 @@ invalidation fields are always null.
 
 from __future__ import annotations
 
+import bisect
 import logging
 from datetime import datetime, timezone
 
@@ -50,6 +51,38 @@ _MAX_SCAN_PAGES = 50
 # Cap on memory-to-memory edges the graph view materialises, matching the SQL
 # path's `_GRAPH_MAX_EDGES`.
 _GRAPH_MAX_EDGES = 10000
+
+# Temporal-link derivation, mirroring the Postgres retain path: two facts are
+# temporally linked when their effective times fall within 24h, and each fact keeps
+# at most 20 such links (hindsight `MAX_TEMPORAL_LINKS_PER_UNIT`).
+_TEMPORAL_WINDOW_MS = 24 * 60 * 60 * 1000
+_MAX_TEMPORAL_LINKS_PER_UNIT = 20
+
+
+async def temporal_link_count(store, *, conn, fq_table, bank_id: str) -> int:
+    """Count temporal links the way Postgres *creates* them, without storing any.
+
+    memlake keeps no temporal edges — its temporal arm is query-time — so there is no tally to
+    read. But the effective times are on the memories, and Postgres's temporal links are a pure
+    function of them: each memory links to the others within a 24h window, capped per unit. So
+    walk the corpus once, sort the effective times, and for each memory count its windowed
+    neighbours (capped) — the same number the SQL ``COUNT(*)`` over temporal rows would return.
+    O(n log n) over a bank-sized index, like the other scan-based surfaces here.
+    """
+    times: list[int] = []
+    async for m in _walk(store, conn=conn, fq_table=fq_table, bank_id=bank_id):
+        eff = m.occurred_start or m.mentioned_at or m.occurred_end
+        if eff is not None:
+            times.append(int(eff.timestamp() * 1000))
+    times.sort()
+    total = 0
+    for t in times:
+        left = bisect.bisect_left(times, t - _TEMPORAL_WINDOW_MS)
+        right = bisect.bisect_right(times, t + _TEMPORAL_WINDOW_MS)
+        neighbours = (right - left) - 1  # the window includes the memory itself
+        if neighbours > 0:
+            total += min(neighbours, _MAX_TEMPORAL_LINKS_PER_UNIT)
+    return total
 
 
 def _iso(value) -> str | None:

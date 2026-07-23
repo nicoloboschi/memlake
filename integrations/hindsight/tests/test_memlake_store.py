@@ -323,6 +323,31 @@ async def test_record_unit_entities_attaches_to_written_memories(store, bank_id,
     assert counts.get("entity") == 1, counts
 
 
+async def test_link_counts_derives_temporal_from_effective_times(store, bank_id, index_pass):
+    """Temporal links are derived from the effective times, matching Postgres's 24h rule.
+
+    memlake stores no temporal edges, but they are a pure function of the timestamps it does
+    keep, so `link_counts` counts windowed neighbours the way the SQL COUNT would.
+    """
+    t0 = datetime(2020, 1, 1, 12, 0, tzinfo=timezone.utc)
+    await store.insert_facts(
+        conn=None,
+        ops=None,
+        bank_id=bank_id,
+        facts=[
+            make_fact("a", seed=0.5, occurred_start=t0),
+            make_fact("b", seed=0.6, occurred_start=t0 + timedelta(hours=1)),  # within 24h of a, c
+            make_fact("c", seed=0.7, occurred_start=t0 + timedelta(hours=2)),  # within 24h of a, b
+            make_fact("d", seed=0.8, occurred_start=t0 + timedelta(days=10)),  # isolated in time
+        ],
+    )
+    index_pass(store._namespace(bank_id))
+
+    counts = await store.link_counts(conn=None, fq_table=_fq_table, bank_id=bank_id)
+    # a, b, c are mutually within 24h → each has 2 neighbours → 3 * 2 = 6; d has none.
+    assert counts.get("temporal") == 6, counts
+
+
 # --------------------------------------------------------------------------- curation archive
 
 
