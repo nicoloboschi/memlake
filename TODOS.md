@@ -55,10 +55,12 @@ mostly **operational and packaging**, not features. Grouped by how hard it block
 
 ### 0b. Correctness gaps that fail *silently* in production
 
-- [ ] **No cross-store atomicity.** Facts are written inside Hindsight's retain
-      Postgres transaction; if it rolls back, memlake keeps entries whose document
-      rows never existed. Recall skips ids it cannot resolve (wasted slots, not
-      wrong answers) but they accumulate — no reconciliation or drift detection.
+- [ ] **Cross-store atomicity — design decided, not yet built (see §7).** Postgres
+      stays the single commit authority; memlake is a dumb idempotent target (no
+      2PC). Sync retain disabled under memlake; async retain compensates a failed op
+      by deleting the Postgres rows + a reliable `TombstoneWhere(document_id)` — which
+      memlake already supports (atomic, idempotent, `write_seq`-race-closed). Left:
+      the sync-disable flag, the compensation path, a drift-reconciliation backstop.
 - [ ] **Format-version bumps silently invalidate namespaces.** A v1→v2 bump left
       existing namespaces unreadable with no migration path. Fine pre-release; needs
       a story before real data lands. (See also §7.)
@@ -83,9 +85,13 @@ mostly **operational and packaging**, not features. Grouped by how hard it block
       via the Postgres archive table (the memory is deleted from the index), and
       field edits (text/context/dates/fact_type/entities + re-embed) via an
       `apply_edit` rewrite.
-- [ ] **Count surfaces return zero/degraded → §5b.** bank-stats link counts,
-      `get_memories_timeseries`, `list_observation_scopes`, `list_documents`
-      per-doc counts, `get_bank_freshness` pending/failed.
+- [x] **Count surfaces — DONE (scan interim) → §5b.** `get_memories_timeseries`,
+      `list_observation_scopes`, `list_documents` per-doc counts and
+      `get_bank_freshness` pending/failed now route through the store and return
+      real numbers in memlake mode instead of zero/empty — computed by a bounded
+      scan (push-down where the filter is a metadata equality). Bank-stats *link*
+      counts stay `{}` (memlake edges are not a countable relation — §2). §5b below
+      is the perf follow-up that makes these metadata-only reads.
 - [ ] **`list_tags` is O(corpus) per call → §5.** No `ListTags` RPC / tag-count
       histogram yet.
 - [ ] **Smaller parity gaps:** no scan ordering (curation list comes back in
@@ -344,8 +350,10 @@ curation UI and export:
 
 ## 5b. Declared indexed metadata keys — the counts primitive
 
-Hindsight has four "count memories grouped by X" surfaces that currently return
-zero, and a scan is the wrong answer for all of them:
+**Status: the four surfaces below now work via a bounded scan (routed through the
+store, §0d) — this item is the *optimization* that makes them metadata-only reads
+instead of O(matching) walks.** A scan is the wrong answer for a hot path like
+`get_bank_freshness` (reflect calls it often); the cheap sources are:
 
 | surface | grouped by | cheapest source |
 |---|---|---|
@@ -549,11 +557,33 @@ always-true or always-violated in provider mode, and both read as success.
       manifest`.** Callers delete defensively, so Hindsight swallows that specific
       string. A `NOT_FOUND` status or an idempotent drop would beat string-matching
       an INTERNAL message.
-- [ ] **No cross-store atomicity.** Facts are written inside Hindsight's retain
-      transaction; if that rolls back, memlake keeps entries whose Postgres
-      document rows never existed. Recall skips ids it cannot resolve, so the
-      failure mode is wasted slots rather than wrong answers — but they accumulate,
-      and there is no reconciliation or drift detection.
+- [ ] **Cross-store atomicity — design decided, not yet built.** Facts are written
+      inside Hindsight's retain transaction; if that rolls back, memlake keeps
+      entries whose Postgres document rows never existed. Recall skips ids it cannot
+      resolve (wasted slots, not wrong answers), but they accumulate with no
+      reconciliation.
+      **Decision: memlake stays a dumb, idempotent target — no transactions, no 2PC.**
+      Postgres is the single commit authority; memlake converges to it.
+      - *Sync retain:* not supported when memlake is the memory store — sync-atomic
+        across two stores needs 2PC. Disable it via config (fail/downgrade the sync
+        path); callers that require sync-atomic don't use memlake for that write.
+      - *Async retain:* doc/chunks/entities commit and are visible immediately;
+        memories go to memlake via the existing at-least-once op-level retry. On op
+        failure (retries exhausted) the op is marked failed and **compensated**: a new
+        txn deletes the Postgres doc rows AND enqueues a reliable
+        `Op::TombstoneWhere(metadata_equals=[("document_id", X)])` to memlake.
+      - *memlake already has everything* — `TombstoneWhere` is atomic (one entry),
+        idempotent, and race-closed by `write_seq` (a later valid re-retain survives an
+        earlier compensation delete; same-entry replace lets a re-ingest swap a
+        document's facts atomically). Nothing to add server-side.
+      - *Hindsight-side requirements:* stamp `document_id` into memory metadata (already
+        done); route the compensation delete through the reliable retry path, not
+        fire-and-forget; serialize same-document ops; and note that if recall joins
+        memlake hits back to Postgres, orphan memories are invisible during the
+        compensation window (the tombstone is then just physical GC).
+      - *Still to build:* the sync-retain-disable config flag, the compensation-delete
+        path in `hindsight_memlake`, and a periodic drift/reconciliation sweep as a
+        backstop for the poison-message tail.
 - [ ] **No backfill path** from an existing Postgres bank into a namespace.
       Needed before this can be switched on for real data, and it is also how a
       like-for-like benchmark would be set up.

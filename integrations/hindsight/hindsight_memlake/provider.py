@@ -1158,6 +1158,30 @@ class MemlakeMemories(MemoriesExtension):
             tag_groups=tag_groups,
         )
 
+    # -- count surfaces ------------------------------------------------------
+    #
+    # No GROUP BY, so each aggregate is a scan tallied in Python — O(matching),
+    # bounded by the scan-page cap. §5b (declared indexed metadata keys) is what
+    # turns these into metadata-only reads.
+
+    async def consolidation_freshness(self, *, conn, fq_table, bank_id: str) -> dict[str, Any]:
+        return await reads.consolidation_freshness(self, conn=conn, fq_table=fq_table, bank_id=bank_id)
+
+    async def document_memory_counts(self, *, conn, fq_table, bank_id: str, document_ids: list[str]) -> dict[str, int]:
+        return await reads.document_memory_counts(
+            self, conn=conn, fq_table=fq_table, bank_id=bank_id, document_ids=document_ids
+        )
+
+    async def memories_timeseries(
+        self, *, conn, fq_table, bank_id: str, time_field: str, trunc: str, since: datetime
+    ) -> list[dict[str, Any]]:
+        return await reads.memories_timeseries(
+            self, conn=conn, fq_table=fq_table, bank_id=bank_id, time_field=time_field, trunc=trunc, since=since
+        )
+
+    async def observation_scope_counts(self, *, conn, fq_table, bank_id: str) -> list[dict[str, Any]]:
+        return await reads.observation_scope_counts(self, conn=conn, fq_table=fq_table, bank_id=bank_id)
+
     # -- observations --------------------------------------------------------
 
     async def upsert_observation(self, *, conn, bank_id: str, record: FactRecord) -> None:

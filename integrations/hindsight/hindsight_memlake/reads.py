@@ -424,6 +424,140 @@ async def list_tags(store, *, conn, fq_table, bank_id: str) -> dict[str, int]:
     return counts
 
 
+async def _walk(store, *, conn, fq_table, bank_id, fact_types=None, metadata_equals=None):
+    """Yield every live memory in a bank (optionally filtered), bounded by the page cap.
+
+    The shared spine of the count surfaces: memlake has no GROUP BY, so an
+    aggregate is a walk that tallies in Python. `metadata_equals` is pushed to the
+    server, so a selective count (e.g. the consolidation backlog) walks only the
+    matching pages, not the whole corpus.
+    """
+    page_token = ""
+    pages = 0
+    truncated = True
+    while pages < _MAX_SCAN_PAGES:
+        page = await store.scan_memories(
+            conn=conn,
+            fq_table=fq_table,
+            bank_id=bank_id,
+            fact_types=fact_types,
+            limit=500,
+            page_token=page_token,
+            metadata_equals=metadata_equals,
+        )
+        for memory in page.memories:
+            yield memory
+        pages += 1
+        page_token = page.next_page_token
+        if not page_token:
+            truncated = False
+            break
+    if truncated:
+        logger.warning("[memories] count walk for bank %s truncated at %d scan pages", bank_id, _MAX_SCAN_PAGES)
+
+
+async def consolidation_freshness(store, *, conn, fq_table, bank_id: str) -> dict:
+    """Last consolidation time + pending/failed counts, walked from memlake.
+
+    The SQL path is one FILTER query over `memory_units`. Here each count is a
+    filtered walk — pending and failed push their flag to the server, so each is
+    O(matching), not O(corpus); `last_consolidated_at` is the max over the
+    consolidated ones, which is the one that costs a full walk of them.
+
+    §5b (declared indexed metadata keys → a MetadataStats RPC) is what makes this
+    a metadata-only read instead. Until then it is a walk, which is why
+    get_bank_freshness should not be on a hot per-request path against a huge bank.
+    """
+    from .provider import CONSOLIDATED_FAILED
+
+    facts = ["experience", "world"]
+    pending = 0
+    async for _ in _walk(
+        store, conn=conn, fq_table=fq_table, bank_id=bank_id, fact_types=facts,
+        metadata_equals={META_CONSOLIDATED_FLAG: CONSOLIDATED_NO},
+    ):
+        pending += 1
+    failed = 0
+    async for _ in _walk(
+        store, conn=conn, fq_table=fq_table, bank_id=bank_id, fact_types=facts,
+        metadata_equals={META_CONSOLIDATED_FLAG: CONSOLIDATED_FAILED},
+    ):
+        failed += 1
+
+    # The bank's last consolidation is the newest consolidated_at across its
+    # observations — an observation is written when consolidation runs, so the
+    # freshest one dates the last pass without walking every fact.
+    last = None
+    async for obs in _walk(store, conn=conn, fq_table=fq_table, bank_id=bank_id, fact_types=["observation"]):
+        when = obs.consolidated_at or obs.created_at
+        if when is not None and (last is None or when > last):
+            last = when
+    return {"last_consolidated_at": last, "pending": pending, "failed": failed}
+
+
+async def document_memory_counts(store, *, conn, fq_table, bank_id: str, document_ids: list[str]) -> dict[str, int]:
+    """Live memory count per document id — one walk of the bank, tallied by document.
+
+    Per-document push-down would be one walk *each*; a single pass grouping in
+    Python is cheaper for a page of documents. Only the requested ids are counted.
+    """
+    if not document_ids:
+        return {}
+    wanted = set(document_ids)
+    counts: dict[str, int] = {}
+    async for memory in _walk(store, conn=conn, fq_table=fq_table, bank_id=bank_id):
+        doc = memory.document_id
+        if doc in wanted:
+            counts[doc] = counts.get(doc, 0) + 1
+    return counts
+
+
+def _truncate_utc(dt, trunc: str):
+    """Truncate a datetime to the bucket boundary in UTC — the Python twin of
+    `date_trunc(trunc, ts AT TIME ZONE 'UTC')`."""
+    dt = dt.astimezone(timezone.utc) if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    if trunc == "minute":
+        return dt.replace(second=0, microsecond=0)
+    if trunc == "hour":
+        return dt.replace(minute=0, second=0, microsecond=0)
+    return dt.replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+async def memories_timeseries(store, *, conn, fq_table, bank_id: str, time_field: str, trunc: str, since) -> list[dict]:
+    """Memories bucketed by ``time_field`` (truncated to ``trunc``) and fact_type.
+
+    Event-time fields fall back to created_at per memory, matching the SQL
+    COALESCE, so a memory with no event time still lands in a bucket.
+    """
+    rollup: dict[tuple, int] = {}
+    async for memory in _walk(store, conn=conn, fq_table=fq_table, bank_id=bank_id):
+        value = getattr(memory, time_field, None)
+        if value is None and time_field != "created_at":
+            value = memory.created_at
+        if value is None:
+            continue
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        if value < since:
+            continue
+        bucket = _truncate_utc(value, trunc)
+        rollup[(bucket, memory.fact_type)] = rollup.get((bucket, memory.fact_type), 0) + 1
+    return [
+        {"bucket": bucket, "fact_type": fact_type, "count": count}
+        for (bucket, fact_type), count in sorted(rollup.items(), key=lambda kv: kv[0][0])
+    ]
+
+
+async def observation_scope_counts(store, *, conn, fq_table, bank_id: str) -> list[dict]:
+    """Observations grouped by scope — their sorted tag set — most-populous first."""
+    counts: dict[tuple, int] = {}
+    async for obs in _walk(store, conn=conn, fq_table=fq_table, bank_id=bank_id, fact_types=["observation"]):
+        scope = tuple(sorted(obs.tags or []))
+        counts[scope] = counts.get(scope, 0) + 1
+    ordered = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+    return [{"tags": list(scope), "count": count} for scope, count in ordered]
+
+
 async def list_entities(store, *, conn, fq_table, bank_id: str, search: str | None, limit: int, offset: int) -> dict:
     """The entity list: names from the registry, counts from memlake.
 

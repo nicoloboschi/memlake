@@ -188,6 +188,63 @@ async def test_delete_facts_removes_them(store, bank_id):
     assert got == []
 
 
+# --------------------------------------------------------------------------- count surfaces
+
+
+async def test_count_surfaces(store, bank_id, index_pass):
+    """The stats aggregates — per-document, freshness, timeseries, scopes — walked from memlake.
+
+    memlake has no GROUP BY, so each is a scan tallied in Python. These are what
+    report 0 / empty without the routing, so the assertions are on the counts
+    being *there*, matching what the SQL path would return.
+    """
+    ns = store._namespace(bank_id)
+    facts = await store.insert_facts(
+        conn=None,
+        ops=None,
+        bank_id=bank_id,
+        facts=[
+            make_fact("doc one fact a", seed=0.2, document_id="d1"),
+            make_fact("doc one fact b", seed=0.3, document_id="d1"),
+            make_fact("doc two fact", seed=0.7, document_id="d2"),
+        ],
+    )
+    observation = FactRecord(
+        unit_id=store.allocate_unit_ids(1)[0],
+        text="a summary under scope s",
+        embedding=_vec(0.25),
+        fact_type="observation",
+        tags=["s"],
+        source_memory_ids=[facts[0]],
+        created_at=datetime.now(timezone.utc),
+    )
+    await store.upsert_observation(conn=None, bank_id=bank_id, record=observation)
+    index_pass(ns)
+
+    # Per-document counts, for the documents named.
+    per_doc = await store.document_memory_counts(conn=None, fq_table=_fq_table, bank_id=bank_id, document_ids=["d1", "d2"])
+    assert per_doc == {"d1": 2, "d2": 1}
+
+    # Consolidation freshness: the 3 fresh facts are pending, none failed, and the
+    # observation dates the last consolidation.
+    fresh = await store.consolidation_freshness(conn=None, fq_table=_fq_table, bank_id=bank_id)
+    assert fresh["pending"] == 3
+    assert fresh["failed"] == 0
+    assert fresh["last_consolidated_at"] is not None
+
+    # Observation scopes: one scope, one observation in it.
+    scopes = await store.observation_scope_counts(conn=None, fq_table=_fq_table, bank_id=bank_id)
+    assert {"tags": ["s"], "count": 1} in scopes
+
+    # Timeseries: everything written just now lands in today's bucket.
+    since = datetime.now(timezone.utc) - timedelta(days=1)
+    series = await store.memories_timeseries(
+        conn=None, fq_table=_fq_table, bank_id=bank_id, time_field="created_at", trunc="day", since=since
+    )
+    assert sum(row["count"] for row in series) == 4  # 3 facts + 1 observation
+    assert sum(row["count"] for row in series if row["fact_type"] == "world") == 3
+
+
 # --------------------------------------------------------------------------- curation archive
 
 
