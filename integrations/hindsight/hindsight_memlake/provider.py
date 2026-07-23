@@ -767,11 +767,19 @@ class MemlakeMemories(MemoriesExtension):
         """
         if not unit_ids:
             return []
-        records = await asyncio.to_thread(
-            partial(
-                self._client.get, self._namespace(bank_id), [uuid.UUID(u).bytes for u in unit_ids], include_edges=True
+        try:
+            records = await asyncio.to_thread(
+                partial(
+                    self._client.get,
+                    self._namespace(bank_id),
+                    [uuid.UUID(u).bytes for u in unit_ids],
+                    include_edges=True,
+                )
             )
-        )
+        except Exception as e:
+            if _is_missing_namespace(e):
+                return []
+            raise
         return [_stored_from_record(r) for r in records]
 
     async def scan_memories(
@@ -1261,7 +1269,13 @@ class MemlakeMemories(MemoriesExtension):
         self, *, conn, fq_table, bank_id: str, entity_ids: list[str] | None = None
     ) -> dict[str, int]:
         ids = [uuid.UUID(e).bytes for e in entity_ids] if entity_ids else None
-        raw = await asyncio.to_thread(partial(self._client.entity_stats, self._namespace(bank_id), entity_ids=ids))
+        try:
+            raw = await asyncio.to_thread(partial(self._client.entity_stats, self._namespace(bank_id), entity_ids=ids))
+        except Exception as e:
+            # A bank with no writes yet has no namespace — no entities, not an error.
+            if _is_missing_namespace(e):
+                return {}
+            raise
         # Reads the persisted entity posting, so cost scales with the number of
         # entities rather than the corpus. An id asked about and not returned is
         # an orphan, which is exactly what the sweep needs.
