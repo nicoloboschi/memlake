@@ -10,7 +10,7 @@ use mlake_wal::Namespace;
 
 async fn namespace(name: &str) -> Namespace {
     let ns = Namespace::new(name, Store::in_memory());
-    ns.create_if_absent("tok-hash").await.unwrap();
+    ns.create_if_absent("tok-hash", &[]).await.unwrap();
     ns
 }
 
@@ -81,7 +81,7 @@ async fn fails_open_when_lease_is_unparseable() {
     // A corrupt lease object must not wedge indexing: acquisition fails open.
     let store = Store::in_memory();
     let ns = Namespace::new("ns", store.clone());
-    ns.create_if_absent("tok-hash").await.unwrap();
+    ns.create_if_absent("tok-hash", &[]).await.unwrap();
     store
         .put_if_absent("ns/index-lease.json", b"not json".to_vec())
         .await

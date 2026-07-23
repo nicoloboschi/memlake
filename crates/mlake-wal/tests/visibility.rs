@@ -29,7 +29,7 @@ fn item(key: &str, proof: u32) -> Memory {
 
 async fn namespace(store: Store, name: &str) -> Namespace {
     let ns = Namespace::new(name, store);
-    ns.create_if_absent("tok-hash").await.unwrap();
+    ns.create_if_absent("tok-hash", &[]).await.unwrap();
     ns
 }
 

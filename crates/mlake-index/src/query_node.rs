@@ -134,6 +134,10 @@ struct SegmentState {
     payload: PayloadTable,
     rerank: RerankTable,
     doc_count: usize,
+    /// This segment's stats object path. The `meta_counts` inside it are read only by
+    /// `metadata_counts` (an admin aggregate), so the path is kept but the blob is not loaded
+    /// at open — the query hot path never touches it.
+    stats_path: String,
 }
 
 /// One fact type across the whole snapshot: its segments (newest-first) plus the shared,
@@ -351,6 +355,7 @@ impl QueryNode {
                     segments.push(SegmentState {
                         seq_hi: seg.seq_hi,
                         doc_count: pk.record_count() as usize,
+                        stats_path: files.stats.clone(),
                         centroids: Centroids::from_bytes(&centroids_bytes)?,
                         cluster_paths: files.clusters.clone(),
                         vector_paths: files.vectors.clone(),
@@ -616,6 +621,45 @@ impl QueryNode {
     /// and entities carried by un-indexed tail writes are added. Entities with no live
     /// memories are omitted, so an id the caller asked about and does not get back is an
     /// orphan.
+    /// Live item count per value of one declared metadata key, across a bank's segments.
+    ///
+    /// Sums each segment's `Stats.meta_counts[key]` (built at fold from the declared keys) and
+    /// corrects for the WAL tail: a visible tail item adds its value. Like `entity_counts`, it
+    /// does not subtract items an newer segment tombstoned — the residual over-count is bounded
+    /// by re-upserts/deletes not yet compacted, which a stats surface tolerates. Empty map when
+    /// nothing was declared for `key` (its `meta_counts` never got an entry).
+    pub async fn metadata_counts(&self, key: &str, types: &[u8]) -> Result<HashMap<String, u64>> {
+        let metrics = QueryMetrics::new();
+        let mut out: HashMap<String, u64> = HashMap::new();
+        let walk: Vec<u8> = if types.is_empty() { self.memory_types() } else { types.to_vec() };
+        for ty in walk {
+            let Some(ft) = self.per_type.get(&ty) else { continue };
+            for seg in &ft.segments {
+                if seg.stats_path.is_empty() {
+                    continue;
+                }
+                let bytes = self.ns.store.get_immutable(&seg.stats_path, Some((&metrics, 2))).await?;
+                let stats: crate::generation::Stats = serde_json::from_slice(&bytes).unwrap_or_default();
+                if let Some(values) = stats.meta_counts.get(key) {
+                    for (value, count) in values {
+                        *out.entry(value.clone()).or_insert(0) += count;
+                    }
+                }
+            }
+            // The tail is not in any segment's stats yet, so add its visible items.
+            for m in &ft.tail_items {
+                if self.hidden(m) {
+                    continue;
+                }
+                if let Some((_, value)) = m.metadata.iter().find(|(k, _)| k == key) {
+                    *out.entry(value.clone()).or_insert(0) += 1;
+                }
+            }
+        }
+        out.retain(|_, n| *n > 0);
+        Ok(out)
+    }
+
     pub async fn entity_counts(
         &self,
         types: &[u8],

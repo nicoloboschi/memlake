@@ -177,12 +177,13 @@ impl Memlake for MemlakeService {
         &self,
         req: Request<pb::CreateNamespaceRequest>,
     ) -> Result<Response<pb::CreateNamespaceResponse>, Status> {
-        let name = req.into_inner().namespace;
+        let req = req.into_inner();
+        let name = req.namespace;
         if name.is_empty() {
             return Err(Status::invalid_argument("namespace is required"));
         }
         self.namespace(&name)
-            .create_if_absent(&self.tokenizer.config_hash())
+            .create_if_absent(&self.tokenizer.config_hash(), &req.indexed_metadata_keys)
             .await
             .map_err(internal)?;
         Ok(Response::new(pb::CreateNamespaceResponse {}))
@@ -482,6 +483,38 @@ impl Memlake for MemlakeService {
         // Deterministic order so a paging caller sees a stable list.
         entities.sort_by(|a, b| b.memory_count.cmp(&a.memory_count).then(a.entity_id.cmp(&b.entity_id)));
         Ok(Response::new(pb::EntityStatsResponse { entities }))
+    }
+
+    async fn metadata_stats(
+        &self,
+        req: Request<pb::MetadataStatsRequest>,
+    ) -> Result<Response<pb::MetadataStatsResponse>, Status> {
+        let req = req.into_inner();
+        if req.namespace.is_empty() {
+            return Err(Status::invalid_argument("namespace is required"));
+        }
+        if req.key.is_empty() {
+            return Err(Status::invalid_argument("key is required"));
+        }
+        let mut types: Vec<u8> = req
+            .memory_types
+            .iter()
+            .map(|&t| convert::memory_type_u8(t))
+            .collect::<Result<Vec<_>, _>>()?;
+        types.sort_unstable();
+        types.dedup();
+
+        let ns = self.namespace(&req.namespace);
+        let snap = self.snapshot(&ns).await?;
+        let counts = snap.node.metadata_counts(&req.key, &types).await.map_err(internal)?;
+
+        let mut values: Vec<pb::MetadataValueCount> = counts
+            .into_iter()
+            .map(|(value, count)| pb::MetadataValueCount { value, count })
+            .collect();
+        // Deterministic order: most-populous first, value as tie-break.
+        values.sort_by(|a, b| b.count.cmp(&a.count).then(a.value.cmp(&b.value)));
+        Ok(Response::new(pb::MetadataStatsResponse { values }))
     }
 
     async fn scan(

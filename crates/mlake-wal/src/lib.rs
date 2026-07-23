@@ -62,9 +62,13 @@ impl Namespace {
 
     /// Create the namespace if it does not exist. Safe to call concurrently from any
     /// number of nodes: the loser of the race simply finds the manifest already there.
-    pub async fn create_if_absent(&self, tokenizer_config_hash: &str) -> Result<Manifest> {
+    pub async fn create_if_absent(
+        &self,
+        tokenizer_config_hash: &str,
+        indexed_metadata_keys: &[String],
+    ) -> Result<Manifest> {
         let path = manifest_path(&self.name);
-        let manifest = Manifest::empty(tokenizer_config_hash);
+        let manifest = Manifest::empty(tokenizer_config_hash, indexed_metadata_keys.to_vec());
         match self.store.put_if_absent(&path, manifest.to_bytes()?).await {
             Ok(_) => Ok(manifest),
             Err(e) if e.is_conflict() => Ok(self.read_manifest().await?.0),
@@ -294,8 +298,8 @@ mod tests {
     #[tokio::test]
     async fn create_if_absent_is_idempotent() {
         let ns = Namespace::new("ns", Store::in_memory());
-        let first = ns.create_if_absent("tok").await.unwrap();
-        let second = ns.create_if_absent("tok").await.unwrap();
+        let first = ns.create_if_absent("tok", &[]).await.unwrap();
+        let second = ns.create_if_absent("tok", &[]).await.unwrap();
         assert_eq!(first, second);
         assert!(first.is_empty());
     }
@@ -303,14 +307,14 @@ mod tests {
     #[tokio::test]
     async fn wal_head_is_zero_for_an_empty_log() {
         let ns = Namespace::new("ns", Store::in_memory());
-        ns.create_if_absent("tok").await.unwrap();
+        ns.create_if_absent("tok", &[]).await.unwrap();
         assert_eq!(ns.wal_head().await.unwrap(), 0);
     }
 
     #[tokio::test]
     async fn wal_head_finds_the_highest_sequence_not_the_last_written() {
         let ns = Namespace::new("ns", Store::in_memory());
-        ns.create_if_absent("tok").await.unwrap();
+        ns.create_if_absent("tok", &[]).await.unwrap();
         // Write out of order; zero-padding must still order these correctly.
         for seq in [3u64, 1, 12, 2] {
             ns.store
@@ -324,7 +328,7 @@ mod tests {
     #[tokio::test]
     async fn head_discovery_survives_the_1e8_boundary() {
         let ns = Namespace::new("ns", Store::in_memory());
-        ns.create_if_absent("tok").await.unwrap();
+        ns.create_if_absent("tok", &[]).await.unwrap();
         // Sequences straddling 10^8, written out of order. `wal_head` is the last key in
         // lexicographic LIST order — with an 8-wide pad `100000000.bin` sorts BEFORE `99999999.bin`
         // (leading '1' < '9'), so the head would silently regress to 99_999_999. The 20-wide pad

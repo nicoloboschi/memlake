@@ -128,6 +128,38 @@ pub struct Stats {
     pub doc_count: usize,
     pub cluster_count: usize,
     pub edge_count: usize,
+    /// For each declared metadata key (`Manifest::indexed_metadata_keys`), the count of live
+    /// items per distinct value in *this* segment. `MetadataStats` sums these across segments
+    /// and corrects for the WAL tail, turning a "count grouped by document_id / consolidated"
+    /// query into a metadata read instead of a corpus scan. Empty when nothing is declared.
+    #[serde(default)]
+    pub meta_counts: std::collections::BTreeMap<String, std::collections::BTreeMap<String, u64>>,
+}
+
+/// Tally each item's value for the declared keys — the per-segment half of `MetadataStats`.
+///
+/// An item that carries a declared key contributes to that key's `value -> count`; one that
+/// does not is simply absent (there is no "missing" bucket). Bounded by distinct declared
+/// (key, value) pairs, so a high-cardinality key like `document_id` costs one entry per
+/// document, not per memory.
+pub fn build_meta_counts(
+    items: &[mlake_core::StoredMemory],
+    keys: &[String],
+) -> std::collections::BTreeMap<String, std::collections::BTreeMap<String, u64>> {
+    use std::collections::BTreeMap;
+    let mut out: BTreeMap<String, BTreeMap<String, u64>> = BTreeMap::new();
+    if keys.is_empty() {
+        return out;
+    }
+    let wanted: std::collections::HashSet<&str> = keys.iter().map(|s| s.as_str()).collect();
+    for item in items {
+        for (k, v) in &item.metadata {
+            if wanted.contains(k.as_str()) {
+                *out.entry(k.clone()).or_default().entry(v.clone()).or_insert(0) += 1;
+            }
+        }
+    }
+    out
 }
 
 /// One cluster's summary, for pruning it before fetch (SCALE.md Phase 4b): the union of all
@@ -235,6 +267,7 @@ pub async fn write_generation(
     rerank_tables: SsTablePair,
     tag_summary: &TagSummary,
     doc_count: usize,
+    meta_counts: std::collections::BTreeMap<String, std::collections::BTreeMap<String, u64>>,
 ) -> Result<GenerationFiles> {
     // All metadata objects are independent, immutable, and unique to this prefix, so write
     // them concurrently rather than one sequential PUT at a time.
@@ -242,6 +275,7 @@ pub async fn write_generation(
         doc_count,
         cluster_count: cluster_paths.len(),
         edge_count: 0,
+        meta_counts,
     };
     let centroids_bytes = centroids.to_bytes()?;
     let tag_bytes = serde_json::to_vec(tag_summary)?;

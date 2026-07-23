@@ -203,7 +203,7 @@ async fn write_bench(
 ) -> Result<WriteReport> {
     let metrics = store.store_metrics().unwrap().clone();
     let ns = Namespace::new(bank, store.clone());
-    ns.create_if_absent(&Tokenizer::default().config_hash()).await?;
+    ns.create_if_absent(&Tokenizer::default().config_hash(), &[]).await?;
     let gen = Generator::new(cfg);
 
     // Generate + commit in windows so RAM stays bounded regardless of scale: a single-shot

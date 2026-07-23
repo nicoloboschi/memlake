@@ -189,11 +189,18 @@ pub struct Manifest {
     /// GC grace period so in-flight readers holding the previous manifest still see their files.
     #[serde(default)]
     pub prev_segments: Vec<Segment>,
+    /// Metadata keys the namespace has declared for value-count aggregation (`MetadataStats`).
+    /// Declared once at creation and carried across every swap. The fold tallies each item's
+    /// value for exactly these keys into the per-fact-type `Stats.meta_counts`; a key not
+    /// declared here is never counted, so the cost is bounded by distinct declared
+    /// (key, value) pairs rather than by every metadata key in the corpus.
+    #[serde(default)]
+    pub indexed_metadata_keys: Vec<String>,
 }
 
 impl Manifest {
     /// The manifest for a bank namespace that has been created but never indexed.
-    pub fn empty(tokenizer_config_hash: impl Into<String>) -> Self {
+    pub fn empty(tokenizer_config_hash: impl Into<String>, indexed_metadata_keys: Vec<String>) -> Self {
         Self {
             format_version: FORMAT_VERSION,
             version: 0,
@@ -203,6 +210,7 @@ impl Manifest {
             prev_wal_index_cursor: 0,
             segments: Vec::new(),
             prev_segments: Vec::new(),
+            indexed_metadata_keys,
         }
     }
 
@@ -317,14 +325,14 @@ mod tests {
 
     #[test]
     fn roundtrip_preserves_manifest() {
-        let m = Manifest::empty("tok-hash");
+        let m = Manifest::empty("tok-hash", Vec::new());
         let bytes = m.to_bytes().unwrap();
         assert_eq!(Manifest::from_bytes(&bytes).unwrap(), m);
     }
 
     #[test]
     fn rejects_unknown_format_version() {
-        let mut v = serde_json::to_value(Manifest::empty("h")).unwrap();
+        let mut v = serde_json::to_value(Manifest::empty("h", Vec::new())).unwrap();
         v["format_version"] = serde_json::json!(999);
         let bytes = serde_json::to_vec(&v).unwrap();
         assert!(matches!(
@@ -335,7 +343,7 @@ mod tests {
 
     #[test]
     fn index_lag_is_head_minus_cursor() {
-        let mut m = Manifest::empty("h");
+        let mut m = Manifest::empty("h", Vec::new());
         m.wal_head = 141;
         m.wal_index_cursor = 137;
         assert_eq!(m.index_lag(), 4);

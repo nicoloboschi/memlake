@@ -74,6 +74,11 @@ class MemlakeStub:
                 request_serializer=memlake_dot_v1_dot_memlake__pb2.EntityStatsRequest.SerializeToString,
                 response_deserializer=memlake_dot_v1_dot_memlake__pb2.EntityStatsResponse.FromString,
                 _registered_method=True)
+        self.MetadataStats = channel.unary_unary(
+                '/memlake.v1.Memlake/MetadataStats',
+                request_serializer=memlake_dot_v1_dot_memlake__pb2.MetadataStatsRequest.SerializeToString,
+                response_deserializer=memlake_dot_v1_dot_memlake__pb2.MetadataStatsResponse.FromString,
+                _registered_method=True)
         self.Scan = channel.unary_unary(
                 '/memlake.v1.Memlake/Scan',
                 request_serializer=memlake_dot_v1_dot_memlake__pb2.ScanRequest.SerializeToString,
@@ -198,6 +203,17 @@ class MemlakeServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def MetadataStats(self, request, context):
+        """Live item count per distinct value of one declared metadata key (see
+        CreateNamespace.indexed_metadata_keys) — the primitive behind "count memories grouped by
+        document_id / consolidated". Read from the per-segment tally, so it is a metadata read,
+        not a corpus scan. Counts reflect the indexed generation plus the WAL tail, the same
+        adjustment Stats.doc_count and EntityStats make. Empty for a key that was not declared.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def Scan(self, request, context):
         """Page through a memory_type's stored memories in cluster order. This is a full scan by
         construction — the cost DOES grow with the corpus — so it exists for browsing and
@@ -309,6 +325,11 @@ def add_MemlakeServicer_to_server(servicer, server):
                     servicer.EntityStats,
                     request_deserializer=memlake_dot_v1_dot_memlake__pb2.EntityStatsRequest.FromString,
                     response_serializer=memlake_dot_v1_dot_memlake__pb2.EntityStatsResponse.SerializeToString,
+            ),
+            'MetadataStats': grpc.unary_unary_rpc_method_handler(
+                    servicer.MetadataStats,
+                    request_deserializer=memlake_dot_v1_dot_memlake__pb2.MetadataStatsRequest.FromString,
+                    response_serializer=memlake_dot_v1_dot_memlake__pb2.MetadataStatsResponse.SerializeToString,
             ),
             'Scan': grpc.unary_unary_rpc_method_handler(
                     servicer.Scan,
@@ -562,6 +583,33 @@ class Memlake:
             '/memlake.v1.Memlake/EntityStats',
             memlake_dot_v1_dot_memlake__pb2.EntityStatsRequest.SerializeToString,
             memlake_dot_v1_dot_memlake__pb2.EntityStatsResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def MetadataStats(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/memlake.v1.Memlake/MetadataStats',
+            memlake_dot_v1_dot_memlake__pb2.MetadataStatsRequest.SerializeToString,
+            memlake_dot_v1_dot_memlake__pb2.MetadataStatsResponse.FromString,
             options,
             channel_credentials,
             insecure,

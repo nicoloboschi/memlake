@@ -110,6 +110,11 @@ META_CONSOLIDATION_FAILED_AT = "consolidation_failed_at"
 #: failed memory stays out of the queue just as a succeeded one does.
 CONSOLIDATED_FAILED = "2"
 
+#: Metadata keys the namespace declares for MetadataStats value-counts, so the count
+#: surfaces read a per-segment tally instead of walking the corpus. document_id backs the
+#: per-document counts; the consolidated flag backs get_bank_freshness's pending/failed.
+_INDEXED_METADATA_KEYS = [META_DOCUMENT_ID, META_CONSOLIDATED_FLAG]
+
 #: Reserved key inside an archived row's `metadata` holding the full memlake
 #: memory (vector, memory_type, causal edges, the raw metadata bag) — everything
 #: the archive's memory_units-shaped columns cannot hold — so restore rebuilds it
@@ -196,8 +201,19 @@ class MemlakeMemories(MemoriesExtension):
         ns = self._namespace(bank_id)
         if ns in self._ensured:
             return
-        await asyncio.to_thread(self._client.create_namespace, ns)
+        await asyncio.to_thread(
+            partial(self._client.create_namespace, ns, indexed_metadata_keys=_INDEXED_METADATA_KEYS)
+        )
         self._ensured.add(ns)
+
+    async def _metadata_stats(self, bank_id: str, key: str) -> dict:
+        """`{value: count}` for a declared key, or empty for one that was never declared.
+
+        Empty is the signal to fall back to a scan: a namespace created before the keys were
+        declared has no tally, and its counts have to be walked. A genuinely empty bank also
+        returns empty, but its scan is just as cheap — so the fallback is safe either way.
+        """
+        return await asyncio.to_thread(partial(self._client.metadata_stats, self._namespace(bank_id), key))
 
     # -- writes --------------------------------------------------------------
 

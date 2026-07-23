@@ -415,7 +415,7 @@ pub async fn index_streaming_with_budget(
         doc_count += n;
         let fti = build_type_streaming(
             ns, &seg_id, ft, spill, sample, n, tokenizer, opts.seed, opts.vector_codec,
-            opts.derive_links, budget,
+            opts.derive_links, &opts.indexed_metadata_keys, budget,
         )
         .await?;
         indexes.insert(ft, fti);
@@ -466,6 +466,7 @@ async fn build_type_streaming(
     seed: u64,
     codec: VectorCodec,
     derive_links: bool,
+    indexed_metadata_keys: &[String],
     budget: FoldBudget,
 ) -> Result<mlake_core::manifest::FactTypeIndex> {
     let prefix = format!("{}/mt{memory_type}", mlake_core::manifest::segment_prefix(&ns.name, seg_id));
@@ -499,6 +500,12 @@ async fn build_type_streaming(
     // Per-cluster write-time span, accumulated in the same pass. Starts as an empty range so
     // a cluster whose members all lack an `updated_at` stays empty and prunes correctly.
     let mut cluster_updated: Vec<[i64; 2]> = vec![[i64::MAX, i64::MIN]; kk];
+    // Value-counts for the declared metadata keys, tallied in the same assign pass so the
+    // streaming fold builds them without a second walk (mirrors the in-RAM build_meta_counts).
+    let wanted_meta: std::collections::HashSet<&str> =
+        indexed_metadata_keys.iter().map(|s| s.as_str()).collect();
+    let mut meta_counts: std::collections::BTreeMap<String, std::collections::BTreeMap<String, u64>> =
+        std::collections::BTreeMap::new();
 
     // Single assignment pass over the spill, in batches: the per-item centroid assignment and the
     // two rkyv serializations (full item for the cluster file, payload for the store) are the
@@ -568,6 +575,13 @@ async fn build_type_streaming(
             } else {
                 for tag in &item.tags {
                     tset.insert(tag.clone());
+                }
+            }
+            if !wanted_meta.is_empty() {
+                for (k, v) in &item.metadata {
+                    if wanted_meta.contains(k.as_str()) {
+                        *meta_counts.entry(k.clone()).or_default().entry(v.clone()).or_insert(0) += 1;
+                    }
                 }
             }
         }
@@ -666,6 +680,7 @@ async fn build_type_streaming(
         rerank.into(),
         &tag_summary,
         n,
+        meta_counts,
     )
     .await?;
     phase_log("write_gen", twg);

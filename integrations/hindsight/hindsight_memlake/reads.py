@@ -470,19 +470,27 @@ async def consolidation_freshness(store, *, conn, fq_table, bank_id: str) -> dic
     """
     from .provider import CONSOLIDATED_FAILED
 
-    facts = ["experience", "world"]
-    pending = 0
-    async for _ in _walk(
-        store, conn=conn, fq_table=fq_table, bank_id=bank_id, fact_types=facts,
-        metadata_equals={META_CONSOLIDATED_FLAG: CONSOLIDATED_NO},
-    ):
-        pending += 1
-    failed = 0
-    async for _ in _walk(
-        store, conn=conn, fq_table=fq_table, bank_id=bank_id, fact_types=facts,
-        metadata_equals={META_CONSOLIDATED_FLAG: CONSOLIDATED_FAILED},
-    ):
-        failed += 1
+    # `consolidated` is a declared indexed key, so pending/failed are one MetadataStats read
+    # (value-counts of the flag) rather than two filtered walks. A namespace that predates the
+    # declaration returns nothing, so it falls back to the walk.
+    by_flag = await store._metadata_stats(bank_id, META_CONSOLIDATED_FLAG)
+    if by_flag:
+        pending = int(by_flag.get(CONSOLIDATED_NO, 0))
+        failed = int(by_flag.get(CONSOLIDATED_FAILED, 0))
+    else:
+        facts = ["experience", "world"]
+        pending = 0
+        async for _ in _walk(
+            store, conn=conn, fq_table=fq_table, bank_id=bank_id, fact_types=facts,
+            metadata_equals={META_CONSOLIDATED_FLAG: CONSOLIDATED_NO},
+        ):
+            pending += 1
+        failed = 0
+        async for _ in _walk(
+            store, conn=conn, fq_table=fq_table, bank_id=bank_id, fact_types=facts,
+            metadata_equals={META_CONSOLIDATED_FLAG: CONSOLIDATED_FAILED},
+        ):
+            failed += 1
 
     # The bank's last consolidation is the newest consolidated_at across its
     # observations — an observation is written when consolidation runs, so the
@@ -496,14 +504,22 @@ async def consolidation_freshness(store, *, conn, fq_table, bank_id: str) -> dic
 
 
 async def document_memory_counts(store, *, conn, fq_table, bank_id: str, document_ids: list[str]) -> dict[str, int]:
-    """Live memory count per document id — one walk of the bank, tallied by document.
+    """Live memory count per document id, for the ids given.
 
-    Per-document push-down would be one walk *each*; a single pass grouping in
-    Python is cheaper for a page of documents. Only the requested ids are counted.
+    `document_id` is a declared indexed key, so this is a MetadataStats read — a
+    per-segment tally, not a corpus walk. A namespace created before the key was
+    declared returns nothing there, so it falls back to a scan (the same walk the
+    other aggregates use).
     """
     if not document_ids:
         return {}
+    from .provider import META_DOCUMENT_ID
+
     wanted = set(document_ids)
+    by_value = await store._metadata_stats(bank_id, META_DOCUMENT_ID)
+    if by_value:
+        return {doc: count for doc, count in by_value.items() if doc in wanted}
+
     counts: dict[str, int] = {}
     async for memory in _walk(store, conn=conn, fq_table=fq_table, bank_id=bank_id):
         doc = memory.document_id

@@ -59,6 +59,13 @@ service Memlake {
   // WAL tail, the same adjustment `Stats.doc_count` makes.
   rpc EntityStats(EntityStatsRequest) returns (EntityStatsResponse);
 
+  // Live item count per distinct value of one declared metadata key (see
+  // CreateNamespace.indexed_metadata_keys) — the primitive behind "count memories grouped by
+  // document_id / consolidated". Read from the per-segment tally, so it is a metadata read,
+  // not a corpus scan. Counts reflect the indexed generation plus the WAL tail, the same
+  // adjustment Stats.doc_count and EntityStats make. Empty for a key that was not declared.
+  rpc MetadataStats(MetadataStatsRequest) returns (MetadataStatsResponse);
+
   // Page through a memory_type's stored memories in cluster order. This is a full scan by
   // construction — the cost DOES grow with the corpus — so it exists for browsing and
   // debugging, never for retrieval. Use `Query` to find things.
@@ -337,6 +344,11 @@ message QueryResponse {
 
 message CreateNamespaceRequest {
   string namespace = 1;
+  // Metadata keys to index for value-count aggregation (MetadataStats). Declared once at
+  // creation and carried across every index swap; the fold tallies each item's value for
+  // exactly these keys, so the cost is bounded by distinct declared (key, value) pairs.
+  // Ignored if the namespace already exists (create is idempotent).
+  repeated string indexed_metadata_keys = 2;
 }
 
 message CreateNamespaceResponse {}
@@ -464,6 +476,25 @@ message EntityStatsResponse {
   // Entities with no live memories are absent rather than reported as zero — an id the
   // caller asked for and does not get back is an orphan.
   repeated EntityCount entities = 1;
+}
+
+message MetadataStatsRequest {
+  string namespace = 1;
+  // The declared metadata key to count by (e.g. "document_id", "consolidated").
+  string key = 2;
+  // Restrict to these memory_types; empty means every type in the snapshot.
+  repeated uint32 memory_types = 3;
+}
+
+message MetadataValueCount {
+  string value = 1;
+  uint64 count = 2;             // live memories whose `key` equals `value`
+}
+
+message MetadataStatsResponse {
+  // A value with no live memories is absent rather than reported as zero. Empty when the key
+  // was never declared for this namespace.
+  repeated MetadataValueCount values = 1;
 }
 
 message ScanRequest {

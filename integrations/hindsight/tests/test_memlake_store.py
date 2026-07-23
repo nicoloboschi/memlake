@@ -221,8 +221,15 @@ async def test_count_surfaces(store, bank_id, index_pass):
     await store.upsert_observation(conn=None, bank_id=bank_id, record=observation)
     index_pass(ns)
 
+    # The declared-key tally is served by MetadataStats, not a scan: document_id and the
+    # consolidated flag were declared at namespace creation, so the fold counted them.
+    assert await store._metadata_stats(bank_id, "document_id") == {"d1": 2, "d2": 1}
+    assert (await store._metadata_stats(bank_id, "consolidated")).get("0") == 3
+
     # Per-document counts, for the documents named.
-    per_doc = await store.document_memory_counts(conn=None, fq_table=_fq_table, bank_id=bank_id, document_ids=["d1", "d2"])
+    per_doc = await store.document_memory_counts(
+        conn=None, fq_table=_fq_table, bank_id=bank_id, document_ids=["d1", "d2"]
+    )
     assert per_doc == {"d1": 2, "d2": 1}
 
     # Consolidation freshness: the 3 fresh facts are pending, none failed, and the

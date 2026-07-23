@@ -267,8 +267,16 @@ class MemlakeClient:
 
     # -- namespace -----------------------------------------------------------
 
-    def create_namespace(self, namespace: str) -> None:
-        self._call("CreateNamespace", pb.CreateNamespaceRequest(namespace=namespace))
+    def create_namespace(self, namespace: str, *, indexed_metadata_keys: Optional[Sequence[str]] = None) -> None:
+        """Create the namespace if absent. `indexed_metadata_keys` declares the metadata keys
+        MetadataStats can count by — fixed at creation, ignored if the namespace exists."""
+        self._call(
+            "CreateNamespace",
+            pb.CreateNamespaceRequest(
+                namespace=namespace,
+                indexed_metadata_keys=list(indexed_metadata_keys or []),
+            ),
+        )
 
     def delete_namespace(self, namespace: str) -> int:
         """Drop a whole namespace — delete every object under its prefix (manifest, WAL, all
@@ -603,6 +611,30 @@ class MemlakeClient:
             ),
         )
         return {e.entity_id: e.memory_count for e in resp.entities}
+
+    def metadata_stats(
+        self,
+        namespace: str,
+        key: str,
+        *,
+        memory_types: Optional[Sequence[int]] = None,
+    ) -> dict:
+        """Live memory count per distinct value of one declared metadata `key`, as
+        `{value: count}`.
+
+        The primitive behind "count memories grouped by document_id / consolidated": read
+        from the per-segment tally the fold builds, so it is a metadata read, not a corpus
+        scan. `key` must be one of the namespace's `indexed_metadata_keys`; an undeclared key
+        returns an empty map. Counts reflect the indexed generation plus the WAL tail."""
+        resp = self._call(
+            "MetadataStats",
+            pb.MetadataStatsRequest(
+                namespace=namespace,
+                key=key,
+                memory_types=list(memory_types or []),
+            ),
+        )
+        return {v.value: v.count for v in resp.values}
 
     def list_namespaces(self) -> list:
         """Every namespace in the bucket (one LIST). Not routed to a preferred node — any node

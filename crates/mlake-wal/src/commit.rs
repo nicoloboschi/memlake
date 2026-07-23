@@ -214,7 +214,7 @@ mod tests {
 
     async fn namespace() -> Namespace {
         let ns = Namespace::new("ns", Store::in_memory());
-        ns.create_if_absent("tok").await.unwrap();
+        ns.create_if_absent("tok", &[]).await.unwrap();
         ns
     }
 

@@ -22,7 +22,7 @@ use crate::generation::write_generation;
 use crate::Result;
 
 /// Options controlling a generation build.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct IndexOptions {
     /// Derive the semantic kNN link graph (SPEC §5.2). **On by default** — the graph arm
     /// is a first-class signal, so deriving its links is core behaviour, not opt-in.
@@ -36,6 +36,10 @@ pub struct IndexOptions {
     /// memory, so this is the single biggest lever on both stored bytes and bytes scanned
     /// per query — and the one place where storage is traded directly against recall.
     pub vector_codec: VectorCodec,
+    /// Metadata keys to tally value-counts for (`Manifest::indexed_metadata_keys`). The fold
+    /// reads these off the manifest and injects them here, so every build path picks them up
+    /// through the options it already carries. Empty for a namespace that declared none.
+    pub indexed_metadata_keys: Vec<String>,
 }
 
 impl Default for IndexOptions {
@@ -44,6 +48,7 @@ impl Default for IndexOptions {
             derive_links: true,
             seed: 42,
             vector_codec: VectorCodec::Binary,
+            indexed_metadata_keys: Vec::new(),
         }
     }
 }
@@ -168,7 +173,11 @@ pub async fn flush(ns: &Namespace, tokenizer: &Tokenizer, opts: IndexOptions) ->
     if opts.derive_links {
         derive_corpus_links(&node, &mut items, &metrics).await?;
     }
-    let build_opts = IndexOptions { derive_links: false, ..opts };
+    let build_opts = IndexOptions {
+        derive_links: false,
+        indexed_metadata_keys: manifest.indexed_metadata_keys.clone(),
+        ..opts
+    };
 
     // Build the L0 segment: a fresh per-type index over the slice's items (no copy-forward).
     let seg_id = mlake_core::MemoryId::new_v4().as_uuid().simple().to_string();
@@ -180,7 +189,7 @@ pub async fn flush(ns: &Namespace, tokenizer: &Tokenizer, opts: IndexOptions) ->
     let all: HashSet<[u8; 16]> = touched;
     let mut indexes: BTreeMap<u8, mlake_core::manifest::FactTypeIndex> = BTreeMap::new();
     for (ft, ft_items) in items_by_ft {
-        let fti = build_memory_type_index(ns, &seg_id, ft, ft_items, &all, build_opts)
+        let fti = build_memory_type_index(ns, &seg_id, ft, ft_items, &all, build_opts.clone())
             .await?;
         indexes.insert(ft, fti);
     }
@@ -304,6 +313,11 @@ async fn estimate_corpus_docs(ns: &Namespace) -> Result<usize> {
 pub async fn index(ns: &Namespace, tokenizer: &Tokenizer, opts: IndexOptions) -> Result<IndexOutcome> {
     let (manifest, etag) = ns.read_manifest().await?;
     let head = ns.wal_head().await?;
+    // The declared keys ride in the build options every build path already carries.
+    let opts = IndexOptions {
+        indexed_metadata_keys: manifest.indexed_metadata_keys.clone(),
+        ..opts
+    };
 
     // Resolve the live set across ALL segments (this is the compaction merge; on a first build the
     // list is empty). A newer segment (higher seq_hi) shadows an older copy of a re-upserted or
@@ -402,7 +416,7 @@ pub async fn index(ns: &Namespace, tokenizer: &Tokenizer, opts: IndexOptions) ->
         // A full rebuild of the merged live set — no copy-forward (that is the flush's job); prev
         // is None so this segment is fresh, retrained, with its centroids over the merged set.
         let fti =
-            build_memory_type_index(ns, &seg_id, ft, ft_items, &new_ids, opts)
+            build_memory_type_index(ns, &seg_id, ft, ft_items, &new_ids, opts.clone())
                 .await?;
         indexes.insert(ft, fti);
     }
@@ -659,6 +673,10 @@ async fn build_memory_type_index(
         })
         .collect();
 
+    // Value-counts for the declared metadata keys, for this segment's slice. Summed across
+    // segments (and corrected for the tail) by `MetadataStats`.
+    let meta_counts = crate::generation::build_meta_counts(&items, &opts.indexed_metadata_keys);
+
     let twg = std::time::Instant::now();
     let files = write_generation(
         &ns.store,
@@ -675,6 +693,7 @@ async fn build_memory_type_index(
         rerank_tables.into(),
         &tag_summary,
         doc_count,
+        meta_counts,
     )
     .await?;
     phase_log("write_meta", twg);

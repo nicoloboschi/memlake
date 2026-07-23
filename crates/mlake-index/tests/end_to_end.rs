@@ -51,7 +51,7 @@ fn tf() -> mlake_core::TagFilter {
 
 async fn namespace(store: Store, name: &str) -> Namespace {
     let ns = Namespace::new(name, store);
-    ns.create_if_absent(&Tokenizer::default().config_hash()).await.unwrap();
+    ns.create_if_absent(&Tokenizer::default().config_hash(), &[]).await.unwrap();
     ns
 }
 
@@ -223,7 +223,7 @@ async fn graph_arm_works_through_the_full_pipeline() {
         derive_links: true,
         ..IndexOptions::default()
     };
-    index(&ns, &Tokenizer::default(), opts).await.unwrap();
+    index(&ns, &Tokenizer::default(), opts.clone()).await.unwrap();
 
     let node = QueryNode::open(&ns, Tokenizer::default()).await.unwrap();
     // Query near `a`; the graph arm should also pull in its neighbour `a2`.
@@ -433,6 +433,7 @@ async fn crash_before_manifest_swap_leaves_the_old_generation_serving() {
         mlake_index::RerankTable::build(&[]).into(),
         &Vec::new(),
         0,
+        Default::default(),
     )
     .await
     .unwrap();
@@ -601,6 +602,7 @@ async fn concurrent_generation_builds_write_disjoint_files() {
         mlake_index::RerankTable::build(&[]).into(),
         &Vec::new(),
         1,
+        Default::default(),
     )
     .await
     .unwrap();
@@ -619,6 +621,7 @@ async fn concurrent_generation_builds_write_disjoint_files() {
         mlake_index::RerankTable::build(&[]).into(),
         &Vec::new(),
         1,
+        Default::default(),
     )
     .await
     .unwrap();
@@ -1578,12 +1581,12 @@ async fn streaming_fold_matches_in_ram_fold() {
     let backing_a = Arc::new(object_store::memory::InMemory::new());
     let ns_a = namespace(Store::new(Arc::clone(&backing_a) as _), "a").await;
     write_corpus(ns_a.clone()).await;
-    let out_a = index(&ns_a, &Tokenizer::default(), no_links).await.unwrap();
+    let out_a = index(&ns_a, &Tokenizer::default(), no_links.clone()).await.unwrap();
 
     let backing_b = Arc::new(object_store::memory::InMemory::new());
     let ns_b = namespace(Store::new(Arc::clone(&backing_b) as _), "b").await;
     write_corpus(ns_b.clone()).await;
-    let out_b = mlake_index::streaming::index_streaming(&ns_b, &Tokenizer::default(), no_links)
+    let out_b = mlake_index::streaming::index_streaming(&ns_b, &Tokenizer::default(), no_links.clone())
         .await
         .unwrap();
 
@@ -1687,7 +1690,7 @@ async fn streaming_fold_bounded_budget_matches_in_ram() {
 
     let ns_a = namespace(Store::in_memory(), "a").await;
     write_corpus(ns_a.clone()).await;
-    let out_a = index(&ns_a, &Tokenizer::default(), no_links).await.unwrap();
+    let out_a = index(&ns_a, &Tokenizer::default(), no_links.clone()).await.unwrap();
 
     let ns_b = namespace(Store::in_memory(), "b").await;
     write_corpus(ns_b.clone()).await;
@@ -1699,7 +1702,7 @@ async fn streaming_fold_bounded_budget_matches_in_ram() {
         radj_mb: 1,
         fts_mb: 1,
     };
-    let out_b = index_streaming_with_budget(&ns_b, &Tokenizer::default(), no_links, tiny)
+    let out_b = index_streaming_with_budget(&ns_b, &Tokenizer::default(), no_links.clone(), tiny)
         .await
         .unwrap();
 
@@ -1762,10 +1765,10 @@ async fn flush_appends_l0_and_matches_full_rebuild() {
     let ns_a = namespace(Store::in_memory(), "a").await;
     let mut wa = Writer::new(ns_a.clone());
     wa.commit(batch1.clone()).await.unwrap();
-    fold(&ns_a, &Tokenizer::default(), opts, budget, hi).await.unwrap();
+    fold(&ns_a, &Tokenizer::default(), opts.clone(), budget, hi).await.unwrap();
     assert_eq!(ns_a.read_manifest().await.unwrap().0.segments.len(), 1, "first build is one segment");
     wa.commit(batch2.clone()).await.unwrap();
-    fold(&ns_a, &Tokenizer::default(), opts, budget, hi).await.unwrap();
+    fold(&ns_a, &Tokenizer::default(), opts.clone(), budget, hi).await.unwrap();
     assert_eq!(ns_a.read_manifest().await.unwrap().0.segments.len(), 2, "flush appended an L0 segment");
 
     // B: commit both batches, fold once → a single full-rebuild segment.
@@ -1773,7 +1776,7 @@ async fn flush_appends_l0_and_matches_full_rebuild() {
     let mut wb = Writer::new(ns_b.clone());
     wb.commit(batch1).await.unwrap();
     wb.commit(batch2).await.unwrap();
-    fold(&ns_b, &Tokenizer::default(), opts, budget, hi).await.unwrap();
+    fold(&ns_b, &Tokenizer::default(), opts.clone(), budget, hi).await.unwrap();
     assert_eq!(ns_b.read_manifest().await.unwrap().0.segments.len(), 1);
 
     let node_a = QueryNode::open(&ns_a, Tokenizer::default()).await.unwrap();
@@ -1829,7 +1832,7 @@ async fn flush_links_within_a_slice_are_bidirectional() {
         .map(|i| Op::Upsert(rich_item(i)))
         .collect();
     w.commit(base).await.unwrap();
-    fold(&ns, &Tokenizer::default(), opts, budget, hi).await.unwrap();
+    fold(&ns, &Tokenizer::default(), opts.clone(), budget, hi).await.unwrap();
 
     // Flush a slice containing two fresh family-1 (identical-vector), memory_type-1 items together.
     let mut a = rich_item(1);
@@ -1837,7 +1840,7 @@ async fn flush_links_within_a_slice_are_bidirectional() {
     let mut b = rich_item(1);
     b.id = MemoryId::from_key("wb");
     w.commit(vec![Op::Upsert(a), Op::Upsert(b)]).await.unwrap();
-    fold(&ns, &Tokenizer::default(), opts, budget, hi).await.unwrap();
+    fold(&ns, &Tokenizer::default(), opts.clone(), budget, hi).await.unwrap();
 
     let node = QueryNode::open(&ns, Tokenizer::default()).await.unwrap();
     let got = node
@@ -1869,7 +1872,7 @@ async fn streaming_fold_derives_home_cluster_links() {
     let ids = [1usize, 31, 61, 91, 2, 4, 5, 7];
     w.commit(ids.iter().map(|&i| Op::Upsert(rich_item(i))).collect()).await.unwrap();
     // threshold_docs = 0 forces the streaming fold even at this tiny scale.
-    fold(&ns, &Tokenizer::default(), opts, budget, 0).await.unwrap();
+    fold(&ns, &Tokenizer::default(), opts.clone(), budget, 0).await.unwrap();
 
     let node = QueryNode::open(&ns, Tokenizer::default()).await.unwrap();
     let got = node.get_many(&[MemoryId::from_key("m1")], true).await.unwrap();
@@ -1897,14 +1900,14 @@ async fn flush_derives_links_across_segments() {
     let mut w = Writer::new(ns.clone());
     // First build: items 0..40 (family 1 = i % 10 == 1). Ids 1, 11, 31 are family 1, memory_type 1.
     w.commit((0..40).map(|i| Op::Upsert(rich_item(i))).collect()).await.unwrap();
-    fold(&ns, &Tokenizer::default(), opts, budget, hi).await.unwrap();
+    fold(&ns, &Tokenizer::default(), opts.clone(), budget, hi).await.unwrap();
 
     // Flush a NEW item with family-1's vector (a copy of item 1 under a fresh id).
     let mut newitem = rich_item(1);
     newitem.id = MemoryId::from_key("m100");
     newitem.text = "new family one".into();
     w.commit(vec![Op::Upsert(newitem)]).await.unwrap();
-    fold(&ns, &Tokenizer::default(), opts, budget, hi).await.unwrap();
+    fold(&ns, &Tokenizer::default(), opts.clone(), budget, hi).await.unwrap();
     assert_eq!(ns.read_manifest().await.unwrap().0.segments.len(), 2, "the new item flushed to an L0");
 
     // Its links reach into the OLDER segment's family-1 members.
@@ -1943,7 +1946,7 @@ async fn compaction_merges_segments_and_preserves_data() {
             batch.push(Op::Upsert(reup.clone())); // re-upsert id 2
         }
         w.commit(batch).await.unwrap();
-        fold(&ns, &Tokenizer::default(), opts, budget, hi).await.unwrap();
+        fold(&ns, &Tokenizer::default(), opts.clone(), budget, hi).await.unwrap();
     }
     // The fold at COMPACT_FANOUT segments compacted them back down.
     let segs = ns.read_manifest().await.unwrap().0.segments.len();
@@ -1979,9 +1982,9 @@ async fn streaming_fold_incremental_matches_in_ram() {
         // First batch, then fold (creates generation 1).
         w.commit((0..80).map(|i| Op::Upsert(rich_item(i))).collect()).await.unwrap();
         if streaming {
-            mlake_index::streaming::index_streaming(&ns, &Tokenizer::default(), no_links).await.unwrap();
+            mlake_index::streaming::index_streaming(&ns, &Tokenizer::default(), no_links.clone()).await.unwrap();
         } else {
-            index(&ns, &Tokenizer::default(), no_links).await.unwrap();
+            index(&ns, &Tokenizer::default(), no_links.clone()).await.unwrap();
         }
         // New tail past the cursor: delete an indexed item, add fresh ones.
         w.commit(
@@ -1993,9 +1996,9 @@ async fn streaming_fold_incremental_matches_in_ram() {
         .unwrap();
         // Fold again — reads generation 1 (prev-gen streaming) + the new tail.
         if streaming {
-            mlake_index::streaming::index_streaming(&ns, &Tokenizer::default(), no_links).await.unwrap();
+            mlake_index::streaming::index_streaming(&ns, &Tokenizer::default(), no_links.clone()).await.unwrap();
         } else {
-            index(&ns, &Tokenizer::default(), no_links).await.unwrap();
+            index(&ns, &Tokenizer::default(), no_links.clone()).await.unwrap();
         }
         let node = QueryNode::open(&ns, Tokenizer::default()).await.unwrap();
         scan_ids(&node, 1).await.union(&scan_ids(&node, 2).await).copied().collect()
@@ -2211,4 +2214,83 @@ async fn the_updated_window_reaches_past_the_arm_depth() {
 fn key_index(hit: &mlake_index::RawHit) -> usize {
     let text = &hit.memory.as_ref().expect("a hit always carries its memory").text;
     text.strip_prefix("memory ").expect("fixture text").parse().expect("fixture index")
+}
+
+/// Declared metadata keys make `metadata_counts` a metadata read, not a corpus scan: the
+/// fold tallies each item's value for the declared keys into the segment stats, and the
+/// query sums them. This is the primitive behind the count surfaces (document_id counts,
+/// consolidation-flag counts).
+#[tokio::test]
+async fn declared_metadata_keys_are_counted_by_value() {
+    let backing = std::sync::Arc::new(object_store::memory::InMemory::new());
+    let ns = Namespace::new("mc", Store::new(std::sync::Arc::clone(&backing) as _));
+    // Declare document_id and consolidated as the keys to count.
+    ns.create_if_absent(&Tokenizer::default().config_hash(), &["document_id".into(), "consolidated".into()])
+        .await
+        .unwrap();
+
+    // Two documents (2 + 1 memories), a consolidated flag on each.
+    let with_meta = |key: &str, vector: Vec<f32>, doc: &str, consolidated: &str| {
+        let mut m = item(key, vector, "text");
+        m.metadata = vec![
+            ("document_id".into(), doc.into()),
+            ("consolidated".into(), consolidated.into()),
+        ];
+        m
+    };
+    let mut writer = Writer::new(ns.clone());
+    writer
+        .commit(vec![
+            Op::Upsert(with_meta("a", vec![1.0, 0.0], "d1", "0")),
+            Op::Upsert(with_meta("b", vec![0.9, 0.1], "d1", "0")),
+            Op::Upsert(with_meta("c", vec![0.0, 1.0], "d2", "1")),
+        ])
+        .await
+        .unwrap();
+    index(&ns, &Tokenizer::default(), IndexOptions::default()).await.unwrap();
+
+    let node = QueryNode::open(&Namespace::new("mc", Store::new(backing as _)), Tokenizer::default())
+        .await
+        .unwrap();
+
+    // Per-document counts.
+    let by_doc = node.metadata_counts("document_id", &[]).await.unwrap();
+    assert_eq!(by_doc.get("d1"), Some(&2));
+    assert_eq!(by_doc.get("d2"), Some(&1));
+
+    // Consolidation-flag counts: two pending ("0"), one done ("1").
+    let by_flag = node.metadata_counts("consolidated", &[]).await.unwrap();
+    assert_eq!(by_flag.get("0"), Some(&2));
+    assert_eq!(by_flag.get("1"), Some(&1));
+
+    // A key that was not declared is never tallied.
+    assert!(node.metadata_counts("context", &[]).await.unwrap().is_empty());
+}
+
+/// The WAL tail is folded in: a memory written after the last index still counts, without a
+/// reindex — the query adds the visible tail to the segment totals.
+#[tokio::test]
+async fn metadata_counts_include_the_wal_tail() {
+    let backing = std::sync::Arc::new(object_store::memory::InMemory::new());
+    let ns = Namespace::new("mct", Store::new(std::sync::Arc::clone(&backing) as _));
+    ns.create_if_absent(&Tokenizer::default().config_hash(), &["document_id".into()])
+        .await
+        .unwrap();
+
+    let with_doc = |key: &str, vector: Vec<f32>, doc: &str| {
+        let mut m = item(key, vector, "text");
+        m.metadata = vec![("document_id".into(), doc.into())];
+        m
+    };
+    let mut writer = Writer::new(ns.clone());
+    writer.commit(vec![Op::Upsert(with_doc("a", vec![1.0, 0.0], "d1"))]).await.unwrap();
+    index(&ns, &Tokenizer::default(), IndexOptions::default()).await.unwrap();
+    // A second memory for d1, left in the WAL tail (not indexed).
+    writer.commit(vec![Op::Upsert(with_doc("b", vec![0.9, 0.1], "d1"))]).await.unwrap();
+
+    let node = QueryNode::open(&Namespace::new("mct", Store::new(backing as _)), Tokenizer::default())
+        .await
+        .unwrap();
+    let by_doc = node.metadata_counts("document_id", &[]).await.unwrap();
+    assert_eq!(by_doc.get("d1"), Some(&2), "the indexed one plus the tail one");
 }

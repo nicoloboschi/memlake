@@ -85,13 +85,14 @@ mostly **operational and packaging**, not features. Grouped by how hard it block
       via the Postgres archive table (the memory is deleted from the index), and
       field edits (text/context/dates/fact_type/entities + re-embed) via an
       `apply_edit` rewrite.
-- [x] **Count surfaces — DONE (scan interim) → §5b.** `get_memories_timeseries`,
-      `list_observation_scopes`, `list_documents` per-doc counts and
-      `get_bank_freshness` pending/failed now route through the store and return
-      real numbers in memlake mode instead of zero/empty — computed by a bounded
-      scan (push-down where the filter is a metadata equality). Bank-stats *link*
-      counts stay `{}` (memlake edges are not a countable relation — §2). §5b below
-      is the perf follow-up that makes these metadata-only reads.
+- [x] **Count surfaces — DONE.** All four route through the store and return real
+      numbers in memlake mode instead of zero/empty. The two keyed on a metadata
+      value — `list_documents` per-doc counts (`document_id`) and
+      `get_bank_freshness` pending/failed (`consolidated`) — are now **metadata-only
+      reads** via `MetadataStats` (§5b, implemented); `get_memories_timeseries` and
+      `list_observation_scopes` stay bounded scans (time buckets and tag sets are
+      different primitives — TimeTable / a tag multiset). Bank-stats *link* counts
+      stay `{}` (memlake edges are not a countable relation — §2).
 - [ ] **`list_tags` is O(corpus) per call → §5.** No `ListTags` RPC / tag-count
       histogram yet.
 - [ ] **Smaller parity gaps:** no scan ordering (curation list comes back in
@@ -386,13 +387,23 @@ Concrete insertion points, all alongside structures that already exist:
 Cost is bounded by distinct `(declared key, value)` pairs, not corpus size — the
 same shape as the per-cluster tag set.
 
-- [ ] **Implement it.** Blocked on nothing conceptually; the fold-side build lands
-      in `indexer.rs` / `streaming.rs` / `generation.rs`, which is the layer being
-      rewritten for segmented indexes (`write_generation`'s signature has already
-      churned once). Worth landing after that settles rather than against it.
-- [ ] **Decide the declaration surface**: `CreateNamespace` field (simple, fixed at
-      creation) vs a `SetNamespaceConfig` RPC (changeable, needs a re-fold to
-      backfill counts for a newly-declared key).
+- [x] **Implemented.** `Manifest.indexed_metadata_keys` (declared once, carried
+      across every swap); the fold tallies each item's value for exactly those keys
+      into `Stats.meta_counts` (per fact type, per segment), built on both the
+      in-RAM and streaming paths beside `tag_summary`. `MetadataStats(namespace,
+      key)` sums the per-segment tallies and folds in the WAL tail, the same
+      adjustment `EntityStats` makes. The stats blob is read on demand (only by
+      this admin call), so the query hot path never pays for it. Verified: the fold
+      counts by value, the tail is included, and an undeclared key returns empty.
+      Wired into the extension — `document_memory_counts` and the freshness
+      pending/failed are now `MetadataStats` reads, falling back to a scan for a
+      namespace created before the keys were declared.
+- [x] **Declaration surface decided: a `CreateNamespace` field**
+      (`indexed_metadata_keys`), fixed at creation. Simple, and it matches how the
+      keys are used — the extension declares `document_id` + `consolidated` when it
+      first ensures a bank's namespace. A changeable `SetNamespaceConfig` (needing a
+      re-fold to backfill a newly-declared key) is a later refinement, not needed
+      for the surfaces this serves.
 
 ---
 
