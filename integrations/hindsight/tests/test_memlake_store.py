@@ -366,6 +366,53 @@ async def test_entity_ids_ride_on_the_memory_and_names_come_from_postgres(store,
     assert named[unit_ids[0]] == [{"entity_id": entity_id, "canonical_name": "Ada Lovelace"}]
 
 
+# --------------------------------------------------------------------------- graph view
+
+
+async def test_graph_units_page_filters_and_counts(store, bank_id, index_pass):
+    """The graph endpoint's node read: a filtered page plus the total.
+
+    The three reads behind ``get_graph_data`` are the store's — nodes with their
+    filters, the entity rows for their names, and the memory-to-memory edges. This
+    exercises the node read (page + total, filtered by fact_type and document) and
+    the entity-row read that names them.
+    """
+    ns = store._namespace(bank_id)
+    entity_id = "22222222-2222-2222-2222-222222222222"
+    await store.insert_facts(
+        conn=None,
+        ops=None,
+        bank_id=bank_id,
+        facts=[
+            make_fact("graph world a", seed=0.2, document_id="d1", entities=[_entity(entity_id, "Grace Hopper")]),
+            make_fact("graph world b", seed=0.3, document_id="d2"),
+            make_fact("a graph experience", seed=0.4, fact_type="experience", document_id="d1"),
+        ],
+    )
+    index_pass(ns)
+
+    # Filter to one fact_type: the page and the total both reflect the filter.
+    page = await store.graph_units(conn=None, fq_table=_fq_table, bank_id=bank_id, fact_type="world", limit=100)
+    texts = {u["text"] for u in page["units"]}
+    assert texts == {"graph world a", "graph world b"}
+    assert page["total"] == 2
+
+    # And by document, across fact_types.
+    by_doc = await store.graph_units(conn=None, fq_table=_fq_table, bank_id=bank_id, document_id="d1", limit=100)
+    assert {u["text"] for u in by_doc["units"]} == {"graph world a", "a graph experience"}
+
+    # The entity rows that put names on the nodes come from the store too.
+    unit_ids = [u["id"] for u in page["units"]]
+    rows = await store.graph_entity_rows(
+        conn=FakeConn({entity_id: "Grace Hopper"}), fq_table=_fq_table, bank_id=bank_id, unit_ids=unit_ids
+    )
+    assert {(r["unit_id"], r["canonical_name"]) for r in rows} >= {
+        (uid, "Grace Hopper")
+        for uid in unit_ids
+        if any(u["id"] == uid and u["text"] == "graph world a" for u in page["units"])
+    }
+
+
 # --------------------------------------------------------------------------- staleness signal
 
 

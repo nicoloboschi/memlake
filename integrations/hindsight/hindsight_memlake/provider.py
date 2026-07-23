@@ -795,10 +795,31 @@ class MemlakeMemories(MemoriesExtension):
         )
 
     async def graph_units(
-        self, *, conn, fq_table, bank_id: str, unit_ids: list[str] | None = None, limit: int = 200
-    ) -> list[dict[str, Any]]:
+        self,
+        *,
+        conn,
+        fq_table,
+        bank_id: str,
+        fact_type: str | None = None,
+        search_query: str | None = None,
+        document_id: str | None = None,
+        chunk_id: str | None = None,
+        tags: list[str] | None = None,
+        tags_match: str = "all_strict",
+        limit: int = 1000,
+    ) -> dict[str, Any]:
         return await reads.graph_units(
-            self, conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=unit_ids, limit=limit
+            self,
+            conn=conn,
+            fq_table=fq_table,
+            bank_id=bank_id,
+            fact_type=fact_type,
+            search_query=search_query,
+            document_id=document_id,
+            chunk_id=chunk_id,
+            tags=tags,
+            tags_match=tags_match,
+            limit=limit,
         )
 
     async def graph_entity_rows(self, *, conn, fq_table, bank_id: str, unit_ids: list[str]) -> list[dict[str, Any]]:

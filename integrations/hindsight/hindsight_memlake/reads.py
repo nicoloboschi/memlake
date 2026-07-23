@@ -34,6 +34,7 @@ from datetime import datetime, timezone
 from hindsight_api.engine.memories.base import (
     CONSOLIDATED_NO,
     CONSOLIDATED_YES,
+    META_CHUNK_ID,
     META_CONSOLIDATED_FLAG,
     META_DOCUMENT_ID,
     StoredMemory,
@@ -421,21 +422,42 @@ async def prune_orphan_entities(store, *, conn, fq_table, bank_id: str) -> int:
     return int(result.split()[-1]) if isinstance(result, str) and result.startswith("DELETE") else len(orphans)
 
 
-async def graph_units(store, *, conn, fq_table, bank_id: str, unit_ids: list[str] | None, limit: int) -> list[dict]:
-    """Memory nodes for the graph view, in the `memory_units` row shape.
+async def graph_units(
+    store,
+    *,
+    conn,
+    fq_table,
+    bank_id: str,
+    fact_type: str | None = None,
+    search_query: str | None = None,
+    document_id: str | None = None,
+    chunk_id: str | None = None,
+    tags: list[str] | None = None,
+    tags_match: str = "all_strict",
+    limit: int = 1000,
+) -> dict:
+    """Graph-view nodes plus the total matching count, as ``{"units", "total"}``.
 
-    ``unit_ids=None`` returns the bank's units up to ``limit``; a list returns
-    exactly those (no limit — an explicit id set is already bounded, and
-    truncating it would silently drop requested nodes). Ordering differs from the
-    SQL path (`mentioned_at DESC`): a scan walks in cluster order. The view is a
-    node set, not a ranked list, so which nodes you get changes but the rendering
-    does not.
+    The filters that are metadata equalities — ``fact_type`` (via memory_type),
+    ``document_id``, ``chunk_id`` — and ``tags`` are pushed to the server; the
+    free-text ``q`` is the one predicate left for Python, matched here. Ordering
+    differs from the SQL path (`mentioned_at DESC`): a scan walks in cluster
+    order, and the view is a node set rather than a ranked list, so which nodes
+    you get can change but the rendering does not.
+
+    ``total`` is what the walk saw, not a true bank-wide count: a count would mean
+    scanning the whole corpus, which the graph view does not need. Two limits the
+    Postgres path does not have: ``document_id`` / ``chunk_id`` do not reach an
+    observation through its sources (an observation carries its sources' ids, not
+    their document), and the walk is capped, so a very large bank's node set is a
+    sample. Both are logged rather than silent.
     """
-    if unit_ids is not None:
-        if not unit_ids:
-            return []
-        memories = await store.get_memories(conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=unit_ids)
-        return [_graph_unit_row(m) for m in memories]
+    fact_types = [fact_type] if fact_type else None
+    metadata_equals: dict[str, str] = {}
+    if document_id:
+        metadata_equals[META_DOCUMENT_ID] = document_id
+    if chunk_id:
+        metadata_equals[META_CHUNK_ID] = chunk_id
 
     units: list[dict] = []
     page_token = ""
@@ -445,10 +467,16 @@ async def graph_units(store, *, conn, fq_table, bank_id: str, unit_ids: list[str
             conn=conn,
             fq_table=fq_table,
             bank_id=bank_id,
+            fact_types=fact_types,
             limit=max(limit, 200),
             page_token=page_token,
+            tags=tags,
+            tags_match=tags_match,
+            metadata_equals=metadata_equals or None,
         )
         for m in page.memories:
+            if search_query and not _matches(m, search_query=search_query, document_id=None):
+                continue
             units.append(_graph_unit_row(m))
             if len(units) >= limit:
                 break
@@ -456,7 +484,14 @@ async def graph_units(store, *, conn, fq_table, bank_id: str, unit_ids: list[str
         page_token = page.next_page_token
         if not page_token:
             break
-    return units[:limit]
+
+    if page_token and len(units) >= limit:
+        logger.warning(
+            "[memories] graph_units for bank %s hit the node cap (%d); the view is a sample of a larger bank",
+            bank_id,
+            limit,
+        )
+    return {"units": units[:limit], "total": len(units)}
 
 
 def _graph_unit_row(m: StoredMemory) -> dict:
