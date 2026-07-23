@@ -572,9 +572,12 @@ class MemlakeMemories(MemoriesExtension):
         start_date: datetime,
         end_date: datetime,
         limit: int,
+        semantic_threshold: float = 0.1,
         tags: list[str] | None = None,
         tags_match: str = "any",
         tag_groups: list | None = None,
+        created_after: datetime | None = None,
+        created_before: datetime | None = None,
     ) -> dict[str, list]:
         from hindsight_api.engine.search.tags import filter_results_by_tag_groups
 
@@ -597,11 +600,19 @@ class MemlakeMemories(MemoriesExtension):
             graph_top_k=0,
             temporal_from=_to_epoch_ms(start_date),
             temporal_to=_to_epoch_ms(end_date),
+            # The `created_after/before` window filters on `updated_at` server-side,
+            # matching the other arms (the SQL path's `created_after`/`created_before`).
+            updated_from=_to_epoch_ms(created_after),
+            updated_to=_to_epoch_ms(created_before),
         )
 
         ranked: dict[str, list] = {ft: [] for ft in fact_types}
         for hit in hits:
             if not hit.temporal.present:
+                continue
+            # Semantic floor (the SQL path's `1 - (embedding <=> query) >= threshold`): drop a
+            # temporal hit whose dense similarity, when the dense arm scored it, is below the bar.
+            if hit.dense.present and hit.dense.score < semantic_threshold:
                 continue
             fact_type = MEMORY_TYPE_TO_FACT_TYPE.get(hit.memory_type)
             if fact_type not in ranked:
