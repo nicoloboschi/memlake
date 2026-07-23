@@ -980,6 +980,14 @@ fn parse_page_token(token: &str, generation: u64) -> Result<Option<(u8, ScanCurs
 const INDEX_LEASE_TTL_SECS: u64 = 60;
 
 #[allow(clippy::too_many_arguments)]
+/// Per-namespace drain iterations in one pass. One fold folds the whole tail up to the head, so a
+/// second only catches writes that arrived *during* the fold; a small ceiling drains a burst
+/// promptly while still yielding to other namespaces under a continuous write stream.
+const MAX_DRAIN_ITERS: usize = 8;
+/// Short sleep between passes while actively draining a large tail, so the indexer keeps the tail
+/// bounded under load instead of letting it grow for a full `interval` between passes.
+const BUSY_TICK: std::time::Duration = std::time::Duration::from_millis(500);
+
 pub async fn run_indexer(
     store: Store,
     tokenizer: Tokenizer,
@@ -988,6 +996,7 @@ pub async fn run_indexer(
     lease_holder: String,
     budget: FoldBudget,
     streaming_threshold: usize,
+    tail_flush_docs: usize,
 ) -> anyhow::Result<()> {
     loop {
         let targets = if namespaces.is_empty() {
@@ -995,6 +1004,9 @@ pub async fn run_indexer(
         } else {
             namespaces.clone()
         };
+        // Whether any namespace still had a large tail this pass. Under load we come back on a short
+        // tick to keep draining (size-triggered flush); when idle we wait the full interval.
+        let mut busy = false;
         for name in &targets {
             let ns = Namespace::new(name, store.clone());
             // Soft lease: skip a namespace a peer is actively folding, so N indexers don't all
@@ -1004,19 +1016,40 @@ pub async fn run_indexer(
                 tracing::debug!(namespace = name, "index skipped (peer holds lease)");
                 continue;
             }
-            match fold(&ns, &tokenizer, IndexOptions::default(), budget, streaming_threshold).await {
-                Ok(outcome) => tracing::info!(
-                    namespace = name,
-                    generation = outcome.generation,
-                    docs = outcome.doc_count,
-                    published = outcome.published,
-                    "indexed"
-                ),
-                Err(e) => tracing::warn!(namespace = name, error = %e, "index failed"),
+            // Drain: keep folding until the tail is empty (a fold that consumed nothing) or the
+            // per-pass ceiling is hit, so a bulk load is folded promptly rather than accumulating
+            // an unbounded, memory-heavy un-indexed tail (see docs/ARCHITECTURE.md §6).
+            let mut folded = 0usize;
+            for _ in 0..MAX_DRAIN_ITERS {
+                match fold(&ns, &tokenizer, IndexOptions::default(), budget, streaming_threshold).await
+                {
+                    Ok(outcome) => {
+                        if outcome.doc_count > 0 {
+                            tracing::info!(
+                                namespace = name,
+                                generation = outcome.generation,
+                                docs = outcome.doc_count,
+                                published = outcome.published,
+                                "indexed"
+                            );
+                        }
+                        folded += outcome.doc_count;
+                        if outcome.doc_count == 0 {
+                            break; // tail fully drained
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(namespace = name, error = %e, "index failed");
+                        break;
+                    }
+                }
+            }
+            if folded >= tail_flush_docs {
+                busy = true;
             }
             ns.release_index_lease(&lease_holder).await;
         }
-        tokio::time::sleep(interval).await;
+        tokio::time::sleep(if busy { BUSY_TICK.min(interval) } else { interval }).await;
     }
 }
 

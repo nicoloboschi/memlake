@@ -134,6 +134,18 @@ fn indexer_streaming_threshold() -> usize {
         .unwrap_or(mlake_index::DEFAULT_STREAMING_THRESHOLD_DOCS)
 }
 
+/// Per-pass folded-doc count above which the indexer treats a namespace as "under load" and comes
+/// back on a short tick to keep draining, instead of waiting the full `--interval-secs`. This is
+/// the size-triggered flush that keeps a bulk write from accumulating an unbounded un-indexed tail.
+/// From `MEMLAKE_INDEXER_TAIL_FLUSH_DOCS`; default 20_000.
+fn indexer_tail_flush_docs() -> usize {
+    std::env::var("MEMLAKE_INDEXER_TAIL_FLUSH_DOCS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(20_000)
+}
+
 async fn serve(args: &[String], node: String) -> Result<()> {
     let addr = flag(args, "--addr")
         .unwrap_or_else(|| "0.0.0.0:50051".into())
@@ -204,6 +216,7 @@ async fn indexer(args: &[String], node: String) -> Result<()> {
         lease_holder(&node),
         indexer_fold_budget(),
         indexer_streaming_threshold(),
+        indexer_tail_flush_docs(),
     )
     .await
 }
