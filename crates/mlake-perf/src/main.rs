@@ -451,6 +451,7 @@ async fn run_workload(
                 text: config.arm_depth,
                 graph: if config.graph_weight > 0.0 { config.arm_depth } else { 0 },
                 nprobe: config.nprobe,
+                graph_seed_min: config.graph_seed_min_similarity,
             };
             let t = Instant::now();
             node.query_raw_metered(

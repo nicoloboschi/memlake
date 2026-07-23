@@ -27,11 +27,12 @@ use crate::generation::{read_fts_split, TagSummary};
 use crate::sstable::{EntityTable, PayloadTable, PkTable, RadjTable, RerankTable, TimeTable};
 use crate::{QueryConfig, Result};
 
-/// Minimum query-similarity (exact cosine) a vector hit must reach to seed the graph arm's link
-/// expansion. Matches Hindsight's `_find_semantic_seeds(threshold=0.3)`: expanding from a
-/// barely-relevant seed only pulls its (equally off-query) neighbours into fusion, so weak seeds
-/// are dropped before the one-hop spread.
-const GRAPH_SEED_MIN_SIMILARITY: f32 = 0.3;
+/// Default minimum query-similarity (exact cosine) a vector hit must reach to seed the graph arm's
+/// link expansion, when a query does not override it via [`ArmDepths::graph_seed_min`] /
+/// [`crate::QueryConfig::graph_seed_min_similarity`]. Matches Hindsight's
+/// `_find_semantic_seeds(threshold=0.3)`: expanding from a barely-relevant seed only pulls its
+/// (equally off-query) neighbours into fusion, so weak seeds are dropped before the one-hop spread.
+pub const DEFAULT_GRAPH_SEED_MIN_SIMILARITY: f32 = 0.3;
 
 /// One arm's contribution to a hit: its 0-based rank within that arm and its raw score
 /// (dense cosine similarity, BM25 score, or graph activation).
@@ -72,6 +73,10 @@ pub struct ArmDepths {
     pub text: usize,
     pub graph: usize,
     pub nprobe: usize,
+    /// Minimum exact-cosine similarity a vector hit needs to seed the graph arm (see
+    /// [`DEFAULT_GRAPH_SEED_MIN_SIMILARITY`]). A vector hit below it still ranks in the dense arm;
+    /// it just does not spawn a one-hop expansion.
+    pub graph_seed_min: f32,
 }
 
 /// An `updated_at` window pushed into the dense arm, in epoch ms. Half-open on both ends and
@@ -774,6 +779,7 @@ impl QueryNode {
             text: config.arm_depth,
             graph: if config.graph_weight > 0.0 { config.arm_depth } else { 0 },
             nprobe: config.nprobe,
+            graph_seed_min: config.graph_seed_min_similarity,
         };
         let raw = self
             .query_raw_metered(
@@ -982,7 +988,7 @@ impl QueryNode {
         let graph_scored = if depths.graph > 0 && !vector_scored.is_empty() {
             let seed_ids: Vec<MemoryId> = vector_scored
                 .iter()
-                .filter(|(_, score)| *score >= GRAPH_SEED_MIN_SIMILARITY)
+                .filter(|(_, score)| *score >= depths.graph_seed_min)
                 .map(|(id, _)| *id)
                 .collect();
             if seed_ids.is_empty() {

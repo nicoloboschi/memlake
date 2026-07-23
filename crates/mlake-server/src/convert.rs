@@ -511,14 +511,24 @@ const DEFAULT_ARM_DEPTH: usize = 100;
 /// snapshot resolves it from its own cluster count (see `QueryNode::resolve_nprobe`).
 const NPROBE_FROM_INDEX: usize = 0;
 
-/// Resolve per-arm depths from the wire request, filling server defaults for zero fields.
-pub fn arm_depths(vector_top_k: u32, text_top_k: u32, graph_top_k: u32, nprobe: u32) -> ArmDepths {
+/// Resolve per-arm depths from the wire request, filling server defaults for zero/unset fields.
+pub fn arm_depths(
+    vector_top_k: u32,
+    text_top_k: u32,
+    graph_top_k: u32,
+    nprobe: u32,
+    graph_seed_min_similarity: Option<f32>,
+) -> ArmDepths {
     let depth = |v: u32| if v == 0 { DEFAULT_ARM_DEPTH } else { v as usize };
     ArmDepths {
         vector: depth(vector_top_k),
         text: depth(text_top_k),
         graph: depth(graph_top_k),
         nprobe: if nprobe == 0 { NPROBE_FROM_INDEX } else { nprobe as usize },
+        // Unset (None) uses the server default; an explicit value — including 0.0 to seed from
+        // every dense hit — is honored.
+        graph_seed_min: graph_seed_min_similarity
+            .unwrap_or(mlake_index::query_node::DEFAULT_GRAPH_SEED_MIN_SIMILARITY),
     }
 }
 

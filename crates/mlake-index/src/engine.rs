@@ -27,6 +27,11 @@ pub struct QueryConfig {
     pub graph_weight: f32,
     /// How many candidates each arm contributes to fusion before truncation.
     pub arm_depth: usize,
+    /// Minimum exact-cosine similarity a vector hit must reach to seed the graph arm's link
+    /// expansion (see [`crate::query_node::DEFAULT_GRAPH_SEED_MIN_SIMILARITY`]). Client-tunable:
+    /// raise it to keep the graph arm from spreading off weak dense hits, or set it to 0 to seed
+    /// from every dense hit.
+    pub graph_seed_min_similarity: f32,
 }
 
 impl Default for QueryConfig {
@@ -38,6 +43,7 @@ impl Default for QueryConfig {
             fts_weight: 1.0,
             graph_weight: 1.0,
             arm_depth: 100,
+            graph_seed_min_similarity: crate::query_node::DEFAULT_GRAPH_SEED_MIN_SIMILARITY,
         }
     }
 }

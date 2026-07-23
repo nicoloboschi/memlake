@@ -232,7 +232,13 @@ async fn derive_corpus_links(
     let tags = mlake_core::TagFilter::new(Vec::new(), mlake_core::TagsMatch::Any);
     // A few over the cap so self and any tombstoned hit can be dropped and still fill the slots.
     let depths =
-        crate::ArmDepths { vector: MAX_SEMANTIC_OUT + 4, text: 0, graph: 0, nprobe: 16 };
+        crate::ArmDepths {
+            vector: MAX_SEMANTIC_OUT + 4,
+            text: 0,
+            graph: 0,
+            nprobe: 16,
+            graph_seed_min: crate::query_node::DEFAULT_GRAPH_SEED_MIN_SIMILARITY,
+        };
     for item in items.iter_mut() {
         if item.vector.is_empty() {
             continue;

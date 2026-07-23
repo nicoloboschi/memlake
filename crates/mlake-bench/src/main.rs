@@ -76,6 +76,10 @@ fn main() -> Result<()> {
         fts_weight: env_f32("MEMLAKE_FTS_WEIGHT", 1.0),
         graph_weight: env_f32("MEMLAKE_GRAPH_WEIGHT", 0.25),
         arm_depth: env_usize("MEMLAKE_ARM_DEPTH", 200),
+        graph_seed_min_similarity: env_f32(
+            "MEMLAKE_GRAPH_SEED_MIN_SIM",
+            mlake_index::query_node::DEFAULT_GRAPH_SEED_MIN_SIMILARITY,
+        ),
     };
 
     let emb_dir = testdata.join("embeddings").join(dataset);

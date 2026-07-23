@@ -441,6 +441,7 @@ class MemlakeClient:
         text_top_k: int = 0,
         graph_top_k: int = 0,
         nprobe: int = 0,
+        graph_seed_min_similarity: Optional[float] = None,
         temporal_from: Optional[int] = None,
         temporal_to: Optional[int] = None,
         updated_from: Optional[int] = None,
@@ -470,6 +471,8 @@ class MemlakeClient:
         )
         if tags:
             req.tags.CopyFrom(pb.TagFilter(tags=list(tags), mode=tags_mode))
+        if graph_seed_min_similarity is not None:
+            req.graph_seed_min_similarity = graph_seed_min_similarity
         if temporal_from is not None:
             req.temporal_from = temporal_from
         if temporal_to is not None:

@@ -256,7 +256,13 @@ impl Memlake for MemlakeService {
         }
         let vector = req.vector.as_ref().map(convert::decode_vector).transpose()?;
         let tags = convert::tag_filter(req.tags);
-        let depths = convert::arm_depths(req.vector_top_k, req.text_top_k, req.graph_top_k, req.nprobe);
+        let depths = convert::arm_depths(
+            req.vector_top_k,
+            req.text_top_k,
+            req.graph_top_k,
+            req.nprobe,
+            req.graph_seed_min_similarity,
+        );
         let text: Option<String> = if req.text.is_empty() { None } else { Some(req.text) };
         // Temporal arm runs only when both window bounds are set.
         let temporal_window = match (req.temporal_from, req.temporal_to) {

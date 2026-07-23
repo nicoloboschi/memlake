@@ -710,7 +710,7 @@ async fn query_fetches_only_probed_clusters_and_warms_the_cache() {
     assert!(cluster_count >= 15, "test needs many clusters, got {cluster_count}");
 
     let nprobe = 4;
-    let depths = ArmDepths { vector: 100, text: 100, graph: 100, nprobe };
+    let depths = ArmDepths { vector: 100, text: 100, graph: 100, nprobe, graph_seed_min: 0.3 };
     let q = vec![0.5f32, 0.5, 0.5];
 
     // Cold query: fetches only the probed clusters (≤ nprobe requests), far fewer than the
@@ -2042,7 +2042,7 @@ async fn a_tag_filtered_query_filters_before_reading_any_payload() {
 
     let node = QueryNode::open(&ns, Tokenizer::default()).await.unwrap();
     let filter = mlake_core::TagFilter::new(vec!["rare".into()], TagsMatch::AnyStrict);
-    let depths = ArmDepths { vector: 10, text: 0, graph: 0, nprobe: 8 };
+    let depths = ArmDepths { vector: 10, text: 0, graph: 0, nprobe: 8, graph_seed_min: 0.3 };
     let q = vec![0.4f32, 0.6, 0.2];
 
     let metrics = QueryMetrics::new();
@@ -2083,7 +2083,7 @@ async fn graph_seeds_are_covered_by_the_hydrated_winners() {
     index(&ns, &Tokenizer::default(), IndexOptions::default()).await.unwrap();
 
     let node = QueryNode::open(&ns, Tokenizer::default()).await.unwrap();
-    let depths = ArmDepths { vector: 20, text: 0, graph: 20, nprobe: 8 };
+    let depths = ArmDepths { vector: 20, text: 0, graph: 20, nprobe: 8, graph_seed_min: 0.3 };
     let q = vec![0.3f32, 0.9, 0.1];
     let metrics = QueryMetrics::new();
     let hits = node
@@ -2149,7 +2149,7 @@ async fn the_updated_window_reaches_past_the_arm_depth() {
         .await
         .unwrap();
     let q = [1.0f32, 0.0, 0.0];
-    let depths = ArmDepths { vector: 10, text: 0, graph: 0, nprobe: 64 };
+    let depths = ArmDepths { vector: 10, text: 0, graph: 0, nprobe: 64, graph_seed_min: 0.3 };
     let metrics = mlake_store::QueryMetrics::new();
 
     // Unfiltered, the page is the nearest 10 — none of which the window admits. This is what
