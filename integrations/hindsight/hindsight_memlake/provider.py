@@ -820,11 +820,13 @@ class MemlakeMemories(MemoriesExtension):
     async def link_counts(self, *, conn, fq_table, bank_id: str) -> dict[str, int]:
         """Live link totals for the bank stats page, keyed by link type.
 
-        In memlake the links live inside the memory — derived semantic (kNN) edges and
-        intrinsic causal edges — so this is a metadata read of the fold-time per-segment
-        tally plus the WAL tail (LinkStats), never a corpus walk. There is no separate
-        "entity" link type: shared-entity affinity is folded into the derived semantic
-        links. Zero-valued types are omitted; an un-written bank has no links.
+        In memlake the links live inside the memory — derived semantic (pure vector kNN)
+        edges and intrinsic causal edges — so this is a metadata read of the fold-time
+        per-segment tally plus the WAL tail (LinkStats), never a corpus walk. memlake does
+        not model Postgres's "temporal" or "entity" link types as stored edges: link
+        derivation is vector-only (top-k nearest neighbours), and entities drive graph
+        *expansion at query time* rather than standing links. So those buckets are
+        structurally 0 here. Zero-valued types are omitted; an un-written bank has no links.
         """
         try:
             stats = await asyncio.to_thread(self._client.link_stats, self._namespace(bank_id))
