@@ -12,3 +12,4 @@ target/criterion
 __pycache__/
 *.pyc
 .venv/
+memlake-trace.jsonl

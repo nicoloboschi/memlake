@@ -1,16 +1,22 @@
-//! Optional per-call tracing: an append-only JSONL audit log of every client call, with the
+//! Per-call tracing: an append-only JSONL audit log of every client call, with the
 //! phase/timing/cache breakdown needed to explain why one read was instant and the next took
 //! seconds.
 //!
-//! Off unless `MEMLAKE_TRACE_LOG=<path>` is set — zero overhead when off. When on, the request
-//! path only builds a small JSON value and hands it to a background writer thread over an
-//! unbounded channel, so tracing never adds latency to (or backpressures) the very call it is
-//! measuring. The writer flushes each line, so a trace survives even if the server then stalls —
-//! which is the whole point when chasing a hang.
+//! **On by default in this phase** — it writes to `MEMLAKE_TRACE_LOG` if set, else to
+//! [`DEFAULT_TRACE_LOG`] in the working directory. Set `MEMLAKE_TRACE_LOG=off` (or `0`/`false`/
+//! `none`) to disable it entirely. The request path only builds a small JSON value and hands it
+//! to a background writer thread over an unbounded channel, so tracing never adds latency to (or
+//! backpressures) the very call it is measuring. The writer flushes each line, so a trace
+//! survives even if the server then stalls — which is the whole point when chasing a hang.
 
 use std::io::Write;
 use std::sync::mpsc::{self, Sender};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+/// Where traces go when `MEMLAKE_TRACE_LOG` is unset — a file in the process's working directory.
+/// In the perf docker stack the compose file points `MEMLAKE_TRACE_LOG` at the mounted `/traces`
+/// instead, so the log is readable on the host.
+pub const DEFAULT_TRACE_LOG: &str = "memlake-trace.jsonl";
 
 /// A tracer sink. `emit` is a no-op unless `MEMLAKE_TRACE_LOG` was set at startup.
 #[derive(Clone)]
@@ -19,12 +25,23 @@ pub struct Tracer {
 }
 
 impl Tracer {
-    /// Build from the environment. `MEMLAKE_TRACE_LOG=<path>` turns tracing on and spawns the
-    /// background writer; anything else (unset/empty) yields a disabled tracer.
+    /// Build from the environment. On by default: traces to `MEMLAKE_TRACE_LOG` if set to a path,
+    /// else to [`DEFAULT_TRACE_LOG`]. `MEMLAKE_TRACE_LOG=off` (or `0`/`false`/`none`) disables it.
     pub fn from_env() -> Self {
         let path = match std::env::var("MEMLAKE_TRACE_LOG") {
-            Ok(p) if !p.trim().is_empty() => p,
-            _ => return Self { tx: None },
+            // Explicit opt-out.
+            Ok(v)
+                if matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "off" | "0" | "false" | "none" | "disabled"
+                ) =>
+            {
+                return Self { tx: None }
+            }
+            // Explicit path.
+            Ok(v) if !v.trim().is_empty() => v,
+            // Unset or empty: default ON, to the working-directory file.
+            _ => DEFAULT_TRACE_LOG.to_string(),
         };
         let (tx, rx) = mpsc::channel::<serde_json::Value>();
         let spawned = std::thread::Builder::new()
