@@ -427,7 +427,7 @@ export interface CacheStatsRequestBody {
 /**
  * Mirror of the proto's `ObjectKind`, as the string names proto-loader hands
  * back (`enums: String`). Ordered for display: the two namespace-level objects
- * first, then a generation's files roughly in the order a cold query touches
+ * first, then a segment's files roughly in the order a cold query touches
  * them, unclassified last. The prose for each lives in `lib/objectKinds.ts`.
  *
  * NOTE this is a different thing from `ObjectKind` above: that one is a cache
@@ -436,9 +436,15 @@ export interface CacheStatsRequestBody {
  */
 export const STORAGE_OBJECT_KINDS = [
   "MANIFEST",
+  "WAL_HEAD",
+  "INDEX_LEASE",
   "WAL_ENTRY",
+  "SEGMENT_TOMBSTONES",
   "CENTROIDS",
   "CLUSTER",
+  "VECTOR_BLOCK",
+  "RERANK_INDEX",
+  "RERANK_DATA",
   "PK_INDEX",
   "PK_DATA",
   "PAYLOAD_INDEX",
@@ -461,20 +467,21 @@ export interface ObjectInfoJson {
   sizeBytes: string;
   kind: StorageObjectKind;
   /**
-   * Parsed out of the key. "0" means the key does not carry one at all — the
-   * manifest and WAL entries live above any generation — so render it as absent
-   * rather than as generation zero.
+   * The `seg-{id}` this file belongs to, parsed from its key. Empty for the
+   * manifest and WAL entries, which live above any segment. A segment persists
+   * across manifest generations until a compaction or GC drops it.
    */
-  generation: string;
+  segment: string;
   /** null when `has_memory_type` was false: only `mt{n}/` keys carry one. */
   memoryType: number | null;
   /** WAL entries only; "0" elsewhere. */
   seq: string;
   /**
-   * Whether the CURRENT manifest still references this object. False means
-   * garbage awaiting GC — a superseded generation, or a folded WAL entry. Since
-   * nothing is ever rewritten, dead objects accumulating between GC runs is
-   * normal, not an error.
+   * Whether the CURRENT manifest still references this object. Everything but the
+   * manifest is immutable, so GC — not overwrite — reclaims space. False means
+   * garbage awaiting GC: a folded WAL entry, or a segment a compaction replaced.
+   * A flush does NOT orphan older segments (they are carried forward by
+   * reference), so most segment files stay live across many generations.
    */
   live: boolean;
 }

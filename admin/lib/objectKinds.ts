@@ -23,17 +23,32 @@ export const OBJECT_KIND_COPY: Record<StorageObjectKind, ObjectKindCopy> = {
   MANIFEST: {
     label: "manifest.json",
     blurb:
-      "The single mutable object. Every other file is immutable, so publishing new data means writing new files then CAS-swapping this one — a reader sees a whole generation or none of it. It names the current generation's files, the previous generation's (a GC grace window), and the WAL cursor.",
+      "The single mutable object. Every other file is immutable, so publishing means writing new files then CAS-swapping this one — a reader sees a whole generation or none of it. It names the current stack of segments (an LSM: L0 flushes over older, larger levels), the previous stack (a GC grace window), and the WAL cursor. A flush usually adds one segment and reuses the rest by reference, so most files it points at are unchanged from the last generation.",
   },
   WAL_ENTRY: {
     label: "wal entry",
     blurb:
       "One group-commit batch, PUT with If-None-Match so a sequence can only ever be claimed once; everything inside one entry is all-or-nothing to every reader. Once the indexer folds it into a generation (seq ≤ wal_index_cursor) nothing reads it again and it waits for GC.",
   },
+  WAL_HEAD: {
+    label: "wal-head",
+    blurb:
+      "The cached WAL head pointer: a tiny object holding the highest sequence any writer has committed, as a decimal number. Readers GET it (etag-cacheable) to learn the live head without a LIST — on S3 both slower and ~12× the per-request price. A writer bumps it after durably appending its entry, and it only ever increases. Purely an accelerator: if it is missing or lags a crashed writer's un-acked entry, readers fall back to the authoritative LIST.",
+  },
+  INDEX_LEASE: {
+    label: "index-lease.json",
+    blurb:
+      "A soft, best-effort lease that lets one node announce it is currently folding this namespace, so the others' periodic indexers skip it and don't duplicate the compute and S3 PUTs. Only an optimization — losing or ignoring it costs a wasted but safe duplicate fold, never correctness, since the randomly-suffixed segment prefixes already make concurrent folds safe.",
+  },
   CLUSTER: {
     label: "cluster-{i}.bin",
     blurb:
-      "An IVF cluster: the memories assigned to one centroid, sized so one probe is a single coalesced ranged GET. The vector arm fetches these whole and re-ranks exactly over them, and the memories' inline outgoing links give the graph arm its seed adjacency for free. Unchanged clusters are carried forward by reference rather than rewritten, so a live cluster commonly sits under an older generation's prefix.",
+      "An IVF cluster's memory RECORDS — everything but the embedding, which is split out into the sibling cluster-{i}.vec. The memories assigned to one centroid, sized so one probe hydrates in a single coalesced ranged GET, and their inline outgoing links give the graph arm its seed adjacency for free. A segment's clusters are written once and never rewritten; a flush carries the older segments' clusters forward by reference, so a live cluster commonly sits under an older segment's prefix.",
+  },
+  VECTOR_BLOCK: {
+    label: "cluster-{i}.vec",
+    blurb:
+      "The quantized vector block for one cluster: the RaBitQ codes (1-bit per dimension) plus norms and the tag/updated_at columns, split out of the record file because the embedding is ~84% of a memory's bytes. The vector arm scans this block to rank candidates by an error-bounded estimate, then reranks only the survivors against the exact f32 in rerank.data — so a probe reads a small block, not the whole record.",
   },
   CENTROIDS: {
     label: "centroids.json",
@@ -53,12 +68,12 @@ export const OBJECT_KIND_COPY: Record<StorageObjectKind, ObjectKindCopy> = {
   RADJ_INDEX: {
     label: "radj.idx",
     blurb:
-      "The sparse index over radj.csr: every Kth target id → byte offset, sized to stay small enough to hold in memory. Walking edges backwards is a binary search here plus one coalesced ranged GET.",
+      "The sparse index over radj.data: every Kth target id → byte offset, sized to stay small enough to hold in memory. Walking edges backwards is a binary search here plus one coalesced ranged GET.",
   },
   RADJ_DATA: {
-    label: "radj.csr",
+    label: "radj.data",
     blurb:
-      "Reverse adjacency in CSR form: target → its incoming semantic and causal edges, sorted by target. Forward edges ride inline in the cluster files, so this file is what makes the backward direction — who links to this seed — one bounded read instead of a scan of the corpus.",
+      "Reverse adjacency: target → its incoming semantic and causal edges, sorted by target. Forward edges ride inline in the cluster files, so this file is what makes the backward direction — who links to this seed — one bounded read instead of a scan of the corpus.",
   },
   ENTITY_INDEX: {
     label: "entity.idx",
@@ -90,6 +105,16 @@ export const OBJECT_KIND_COPY: Record<StorageObjectKind, ObjectKindCopy> = {
     blurb:
       "The payload store: MemoryId → the memory's bytes, in SSTable blocks. Hydrating a search hit is one ranged GET of one block, instead of pulling the whole multi-megabyte cluster file the memory happens to live in.",
   },
+  RERANK_INDEX: {
+    label: "rerank.idx",
+    blurb:
+      "The sparse index over rerank.data — the same in-memory-binary-search-then-one-ranged-GET split as the other SSTable pairs. It maps a candidate id to the block holding its exact f32 embedding.",
+  },
+  RERANK_DATA: {
+    label: "rerank.data",
+    blurb:
+      "MemoryId → the exact float32 embedding, in SSTable blocks. The vector arm's first stage ranks candidates from the quantized cluster-{i}.vec; this file is what the second stage reads to rescore the survivors at full precision, so the quantization only ever changes which candidates are considered, never the final score.",
+  },
   FTS_SPLIT: {
     label: "fts/split.bin",
     blurb:
@@ -104,6 +129,11 @@ export const OBJECT_KIND_COPY: Record<StorageObjectKind, ObjectKindCopy> = {
     label: "tags.json",
     blurb:
       "Per cluster: the union of its memories' tags, plus whether it holds untagged ones. Read at open so a tag-filtered query can prune clusters that cannot contain a match before probing — the filter is applied before the fetch, not after it.",
+  },
+  SEGMENT_TOMBSTONES: {
+    label: "tombstones.json",
+    blurb:
+      "A segment's delete overlay: the ids it supersedes in OLDER segments, so a re-upsert or a delete hides the stale copy without rewriting the segment that holds it. Written at the segment level (not per memory_type). This is how an append-only LSM deletes — the overlay is consulted at read time and the shadowed rows are physically reclaimed only when a compaction rewrites the segments they live in.",
   },
   OBJECT_KIND_UNKNOWN: {
     label: "unknown",

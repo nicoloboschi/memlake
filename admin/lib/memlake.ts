@@ -301,8 +301,8 @@ export interface WireObjectInfo {
   sizeBytes: string;
   /** `enums: String` — the enum member name, e.g. "CLUSTER". */
   kind: string;
-  /** 0 when the key carries no generation (manifest, WAL entries). */
-  generation: string;
+  /** The `seg-{id}` from the key; empty for the manifest and WAL entries. */
+  segment: string;
   memoryType: number;
   /** memory_type is a real 0, so the flag is the only way to say "absent". */
   hasMemoryType: boolean;

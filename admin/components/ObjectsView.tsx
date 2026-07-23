@@ -33,15 +33,15 @@ import {
 
 const COLS = 6;
 
-type SortKey = "generation" | "size" | "path";
+type SortKey = "segment" | "size" | "path";
 type LiveFilter = "all" | "live" | "dead";
 
 const SORTS = [
   {
-    value: "generation" as const,
-    label: "by generation",
+    value: "segment" as const,
+    label: "by segment",
     title:
-      "newest generation first, then kind — the current generation's files group above the superseded ones",
+      "group each segment's files together, then by kind — the manifest and WAL entries (no segment) sort first",
   },
   { value: "size" as const, label: "by size", title: "largest object first" },
   { value: "path" as const, label: "by path", title: "the server's own key order" },
@@ -71,7 +71,7 @@ export function ObjectsView({ namespace }: { namespace: string }) {
   // server pages by key, not by kind or size.
   const [kindFilter, setKindFilter] = useState<"ALL" | StorageObjectKind>("ALL");
   const [liveFilter, setLiveFilter] = useState<LiveFilter>("all");
-  const [sortKey, setSortKey] = useState<SortKey>("generation");
+  const [sortKey, setSortKey] = useState<SortKey>("segment");
   const [selected, setSelected] = useState<ObjectInfoJson | null>(null);
   const [showAllKinds, setShowAllKinds] = useState(false);
 
@@ -136,14 +136,13 @@ export function ObjectsView({ namespace }: { namespace: string }) {
     } else if (sortKey === "path") {
       sorted.sort((a, b) => a.path.localeCompare(b.path));
     } else {
-      // Generation descending, then the kind order, then path. Objects with no
-      // generation in their key (the manifest, WAL entries) are not generation
-      // zero — they sit above every generation, which is also where they belong
-      // in the story: they are what the generations are published through.
+      // Group each segment's files together, then the kind order, then path.
+      // Objects with no segment in their key (the manifest, WAL entries) sort
+      // first — they are what the segments are published through.
       sorted.sort(
         (a, b) =>
           groupRank(a) - groupRank(b) ||
-          cmpU64(b.generation, a.generation) ||
+          a.segment.localeCompare(b.segment) ||
           kindRank(a.kind) - kindRank(b.kind) ||
           a.path.localeCompare(b.path),
       );
@@ -173,7 +172,7 @@ export function ObjectsView({ namespace }: { namespace: string }) {
               <span className="font-mono">{"{ns}/manifest.json"}</span>,{" "}
               <span className="font-mono">{"{ns}/wal/{seq}.bin"}</span> and{" "}
               <span className="font-mono">
-                {"{ns}/mt{type}/gen-{N}-{nonce}/{file}"}
+                {"{ns}/seg-{id}/mt{type}/{file}"}
               </span>
               .
             </>
@@ -363,19 +362,17 @@ export function ObjectsView({ namespace }: { namespace: string }) {
           )}
 
           {/*
-            Paging is by key, so the current generation's files land wherever
-            their prefix sorts — often not on page one. Saying so beats letting
-            an operator read "generation 140" in a tile and then find nothing
-            newer than gen-99 at the top of the table.
+            Paging is by key, so a segment's files land wherever its prefix sorts
+            — often not on page one, and one segment can straddle a page boundary.
+            Flag when nothing on this page is live, so an operator does not read the
+            page as the current segment set.
           */}
           {data &&
             objects.length > 0 &&
-            !objects.some((o) => o.generation === data.generation) && (
+            !objects.some((o) => o.live) && (
               <p className="px-3 py-1.5 border-b border-line bg-panel-2 text-[11px] text-ink-dim">
-                No object from the current generation (
-                <span className="font-mono">{data.generation}</span>) is on this
-                page — the listing pages by key, and a generation&apos;s prefix
-                sorts wherever it falls.
+                Nothing on this page is live — the listing pages by key, so the
+                current segments&apos; files may sort onto another page.
               </p>
             )}
 
@@ -402,8 +399,8 @@ export function ObjectsView({ namespace }: { namespace: string }) {
                   <Th>path</Th>
                   <Th className="w-44">kind</Th>
                   <Th className="w-24 text-right">size</Th>
-                  <Th className="w-20 text-right" title="parsed out of the key">
-                    gen
+                  <Th className="w-28" title="the seg-{id} prefix parsed out of the key">
+                    segment
                   </Th>
                   <Th
                     className="w-20 text-right"
@@ -425,7 +422,7 @@ export function ObjectsView({ namespace }: { namespace: string }) {
                   key={o.path}
                   object={o}
                   groupHeader={
-                    sortKey === "generation" && startsGroup(rows, i)
+                    sortKey === "segment" && startsGroup(rows, i)
                       ? groupLabel(o)
                       : null
                   }
@@ -456,11 +453,13 @@ export function ObjectsView({ namespace }: { namespace: string }) {
 /**
  * The reason this page exists.
  *
- * Every object except the manifest is immutable: a mutation writes new files and
- * CAS-swaps the manifest, so superseded generations and folded WAL entries pile
- * up until GC reclaims them. Deliberately NOT styled as an error — accumulating
- * garbage between GC runs is correct behaviour, and colouring it red would tell
- * an operator to act on a healthy namespace.
+ * Every object except the manifest is immutable. The index is segmented (LSM): a
+ * flush appends ONE new L0 segment and carries the rest forward by reference, so
+ * publishing does not orphan the old files — only a compaction (merging several
+ * segments into one) turns its inputs into garbage, alongside folded WAL entries.
+ * Deliberately NOT styled as an error — accumulating garbage between GC runs is
+ * correct behaviour, and colouring it red would tell an operator to act on a
+ * healthy namespace.
  */
 function LiveDeadSplit({ data }: { data: ListObjectsJson }) {
   const dead = data.deadShare ?? 0;
@@ -501,21 +500,23 @@ function LiveDeadSplit({ data }: { data: ListObjectsJson }) {
       </div>
       <p className="mt-1.5 text-[11px] text-ink-dim leading-relaxed max-w-4xl">
         Dead means <strong>no longer referenced by the current manifest</strong>,
-        not broken. Nothing here is ever rewritten in place, so every fold
-        publishes a fresh set of files and the generation it replaced becomes
-        garbage the moment the manifest CAS lands. GC reclaims it after a grace
-        window (the manifest keeps <span className="font-mono">prev_generation</span>{" "}
-        readable for in-flight readers), so a healthy namespace always carries
-        some dead bytes — a large and growing share is a signal that GC is not
-        keeping up, not that anything is wrong with the data.
+        not broken. Nothing is rewritten in place, but a flush does NOT orphan the
+        older files — it appends one new segment and carries the rest forward by
+        reference. Dead bytes come from folded WAL entries and from{" "}
+        <strong>compaction</strong>, which merges several segments into one and
+        leaves the inputs unreferenced. GC reclaims them after a grace window (the
+        manifest keeps the <span className="font-mono">prev</span> segment set
+        readable for in-flight readers), so a healthy namespace always carries some
+        dead bytes — a large and growing share is a signal that GC is not keeping
+        up, not that anything is wrong with the data.
       </p>
       <p className="mt-1 text-[11px] text-ink-faint leading-relaxed max-w-4xl">
-        The <span className="font-mono">-{"{nonce}"}</span>{" "}
-        on a generation
-        prefix is what makes that safe under concurrency: two indexers may build
-        generation N at once, each into its own randomly-suffixed directory, so
-        neither can overwrite the other. One wins the manifest CAS; the loser&apos;s
-        files are complete, correct, and dead on arrival.
+        Each segment lives under a randomly-suffixed{" "}
+        <span className="font-mono">seg-{"{id}"}</span> prefix, which is what makes
+        building safe under concurrency: two indexers may fold at once, each writing
+        its own segment directory, so neither can overwrite the other. One wins the
+        manifest CAS; the loser&apos;s segment is complete, correct, and dead on
+        arrival.
       </p>
     </div>
   );
@@ -701,13 +702,13 @@ function ratio(part: string, total: string): number {
 
 // ---- the object table -------------------------------------------------------
 
-/** Objects whose key carries no generation lead the listing; see the sort. */
+/** Objects whose key carries no segment (manifest, WAL) lead the listing; see the sort. */
 function groupRank(o: ObjectInfoJson): number {
-  return o.generation === "0" ? 0 : 1;
+  return o.segment === "" ? 0 : 1;
 }
 
 function groupKey(o: ObjectInfoJson): string {
-  return groupRank(o) === 0 ? "ns" : o.generation;
+  return groupRank(o) === 0 ? "ns" : o.segment;
 }
 
 function startsGroup(rows: ObjectInfoJson[], i: number): boolean {
@@ -716,8 +717,8 @@ function startsGroup(rows: ObjectInfoJson[], i: number): boolean {
 
 function groupLabel(o: ObjectInfoJson): string {
   return groupRank(o) === 0
-    ? "namespace level — above any generation"
-    : `generation ${o.generation}`;
+    ? "namespace level — above any segment"
+    : `segment seg-${o.segment}`;
 }
 
 function ObjectRow({
@@ -766,16 +767,16 @@ function ObjectRow({
           </span>
         </Td>
         <Td className="font-mono text-right tnum">{fmtBytes(object.sizeBytes)}</Td>
-        <Td className="font-mono text-right tnum text-ink-dim">
-          {object.generation === "0" ? (
+        <Td className="font-mono text-left text-ink-dim">
+          {object.segment === "" ? (
             <span
               className="text-ink-faint/60"
-              title="this key carries no generation — the manifest and the WAL live above them"
+              title="this key carries no segment — the manifest and the WAL live above them"
             >
               —
             </span>
           ) : (
-            object.generation
+            <span title={`seg-${object.segment}`}>seg-{object.segment.slice(0, 8)}</span>
           )}
         </Td>
         <Td className="font-mono text-right tnum text-ink-dim">

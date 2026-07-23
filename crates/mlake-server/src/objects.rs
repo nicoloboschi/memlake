@@ -53,6 +53,14 @@ pub fn classify(namespace: &str, path: &str, size_bytes: u64) -> Classified {
         out.kind = ObjectKind::Manifest;
         return out;
     }
+    if rest == "index-lease.json" {
+        out.kind = ObjectKind::IndexLease;
+        return out;
+    }
+    if rest == "wal-head" {
+        out.kind = ObjectKind::WalHead;
+        return out;
+    }
     if let Some(file) = rest.strip_prefix("wal/") {
         out.kind = ObjectKind::WalEntry;
         out.seq = file.strip_suffix(".bin").and_then(|s| s.parse().ok());
@@ -168,9 +176,19 @@ pub async fn decode(
         | ObjectKind::Centroids
         | ObjectKind::Stats
         | ObjectKind::TagSummary
-        | ObjectKind::SegmentTombstones => match serde_json::from_slice::<Value>(&bytes) {
+        | ObjectKind::SegmentTombstones
+        | ObjectKind::IndexLease => match serde_json::from_slice::<Value>(&bytes) {
             Ok(v) => Decoded::whole(summarize_json(kind, v, limit)),
             Err(e) => Decoded::undecodable(json!({}), &format!("not valid JSON: {e}")),
+        },
+
+        // The head pointer is a decimal-ASCII u64: the highest committed WAL sequence.
+        ObjectKind::WalHead => match std::str::from_utf8(&bytes).map(|s| s.trim().parse::<u64>()) {
+            Ok(Ok(head_seq)) => Decoded::whole(json!({ "head_seq": head_seq })),
+            _ => Decoded::undecodable(
+                json!({ "raw": String::from_utf8_lossy(&bytes) }),
+                "not a valid head pointer (expected a decimal sequence number)",
+            ),
         },
 
         ObjectKind::WalEntry => match mlake_core::WalEntry::from_bytes(&bytes) {

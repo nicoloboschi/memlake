@@ -720,9 +720,10 @@ message CacheStatsResponse {
 
 // ---- Object storage browser ------------------------------------------------
 
-// What a stored object is, inferred from its key. The layout is
-// `{namespace}/manifest.json`, `{namespace}/wal/{seq}.bin`, a per-segment delete overlay at
-// `{namespace}/seg-{id}/tombstones.json`, and the per-memory_type index files at
+// What a stored object is, inferred from its key. The namespace-level objects are
+// `{namespace}/manifest.json`, `{namespace}/wal/{seq}.bin`, `{namespace}/wal-head` (the head
+// pointer), and `{namespace}/index-lease.json` (a soft indexer lease); a per-segment delete overlay
+// lives at `{namespace}/seg-{id}/tombstones.json`, and the per-memory_type index files at
 // `{namespace}/seg-{id}/mt{type}/{file}`. The index is segmented (LSM): a flush appends a new L0
 // segment, unchanged segments are carried forward by reference across manifest generations, and
 // only a compaction rewrites — so a segment's files are NOT tied to one generation.
@@ -749,6 +750,8 @@ enum ObjectKind {
   RERANK_INDEX = 19;   // sparse index over rerank.data
   RERANK_DATA = 20;    // MemoryId -> exact f32 embedding, for the final exact rerank
   SEGMENT_TOMBSTONES = 21; // tombstones.json — a segment's delete overlay over older segments
+  INDEX_LEASE = 22;    // index-lease.json — a soft, best-effort indexer lease
+  WAL_HEAD = 23;       // wal-head — the cached WAL head pointer (highest committed sequence)
 }
 
 message ListObjectsRequest {

@@ -501,7 +501,7 @@ export function objectInfoToJson(o: WireObjectInfo): ObjectInfoJson {
     path: o.path ?? "",
     sizeBytes: u64(o.sizeBytes),
     kind: storageKind(o.kind),
-    generation: u64(o.generation),
+    segment: o.segment ?? "",
     // memory_type 0 is a legitimate type, so the flag — not the value — decides
     // whether the key carried one at all.
     memoryType: o.hasMemoryType ? (o.memoryType ?? 0) : null,
