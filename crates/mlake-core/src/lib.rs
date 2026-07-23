@@ -55,21 +55,35 @@ pub enum Error {
 /// It deliberately does not fall back to comparing the overlapping prefix. Truncating to
 /// the shorter side turns "you queried with the wrong embedding model" into a confident,
 /// plausible-looking ranking — a silent wrong answer, which is worse than a loud failure.
+/// SIMD dot product over the common prefix of `a` and `b` (8 lanes of `f32` at a time via
+/// `wide`, FMA-accumulated, scalar remainder). Every cosine/norm below routes through this, so
+/// they share one summation order — which keeps [`cosine_opt_prenorm`] bit-identical to
+/// [`cosine`] (a covered invariant) and gets the ~8× speedup uniformly.
+#[inline]
+fn simd_dot(a: &[f32], b: &[f32]) -> f32 {
+    let n = a.len().min(b.len());
+    let chunks = n / 8;
+    let mut acc = wide::f32x8::ZERO;
+    for k in 0..chunks {
+        let off = k * 8;
+        let va = wide::f32x8::from(<[f32; 8]>::try_from(&a[off..off + 8]).unwrap());
+        let vb = wide::f32x8::from(<[f32; 8]>::try_from(&b[off..off + 8]).unwrap());
+        acc = va.mul_add(vb, acc);
+    }
+    let mut sum = acc.reduce_add();
+    for i in (chunks * 8)..n {
+        sum += a[i] * b[i];
+    }
+    sum
+}
+
 pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
     assert_eq!(a.len(), b.len(), "cosine over mismatched dimensions");
-    let mut dot = 0.0f32;
-    let mut na = 0.0f32;
-    let mut nb = 0.0f32;
-    for i in 0..a.len() {
-        dot += a[i] * b[i];
-        na += a[i] * a[i];
-        nb += b[i] * b[i];
-    }
-    let denom = na.sqrt() * nb.sqrt();
+    let denom = simd_dot(a, a).sqrt() * simd_dot(b, b).sqrt();
     if denom == 0.0 {
         0.0
     } else {
-        dot / denom
+        simd_dot(a, b) / denom
     }
 }
 
@@ -89,7 +103,7 @@ pub fn cosine_opt(a: &[f32], b: &[f32]) -> f32 {
 
 /// L2 norm of a vector — for precomputing a query's norm once before a rerank loop.
 pub fn norm(a: &[f32]) -> f32 {
-    a.iter().map(|x| x * x).sum::<f32>().sqrt()
+    simd_dot(a, a).sqrt()
 }
 
 /// [`cosine_opt`] with `a`'s L2 norm precomputed. The rerank scores thousands of candidate
@@ -105,17 +119,27 @@ pub fn cosine_opt_prenorm(a: &[f32], a_norm: f32, b: &[f32]) -> f32 {
         return 0.0;
     }
     assert_eq!(a.len(), b.len(), "cosine over mismatched dimensions");
-    let mut dot = 0.0f32;
-    let mut nb = 0.0f32;
-    for i in 0..a.len() {
-        dot += a[i] * b[i];
-        nb += b[i] * b[i];
-    }
-    let denom = a_norm * nb.sqrt();
+    let denom = a_norm * simd_dot(b, b).sqrt();
     if denom == 0.0 {
         0.0
     } else {
-        dot / denom
+        simd_dot(a, b) / denom
+    }
+}
+
+/// [`cosine_opt`] with *both* norms precomputed — for an O(n²) all-pairs loop (link derivation's
+/// within-batch compare), where every vector's norm is otherwise recomputed once per row. `a_norm`
+/// / `b_norm` must be `norm(a)` / `norm(b)`. Absent (empty) side or a zero norm scores 0.0.
+pub fn cosine_prenorm_both(a: &[f32], a_norm: f32, b: &[f32], b_norm: f32) -> f32 {
+    if a.is_empty() || b.is_empty() {
+        return 0.0;
+    }
+    assert_eq!(a.len(), b.len(), "cosine over mismatched dimensions");
+    let denom = a_norm * b_norm;
+    if denom == 0.0 {
+        0.0
+    } else {
+        simd_dot(a, b) / denom
     }
 }
 
@@ -145,11 +169,7 @@ pub fn uniform_dim<'a>(
 /// Dot product, for callers that maintain pre-normalized vectors and want to skip the
 /// magnitude work on the hot path.
 pub fn dot(a: &[f32], b: &[f32]) -> f32 {
-    let mut acc = 0.0f32;
-    for i in 0..a.len().min(b.len()) {
-        acc += a[i] * b[i];
-    }
-    acc
+    simd_dot(a, b)
 }
 
 /// Normalize in place to unit length. A zero vector is left untouched.
@@ -170,6 +190,63 @@ mod tests {
     fn cosine_of_identical_vectors_is_one() {
         let v = vec![1.0, 2.0, 3.0];
         assert!((cosine(&v, &v) - 1.0).abs() < 1e-6);
+    }
+
+    // Micro-benchmark: scalar cosine vs the SIMD+prenorm path, on 384-dim vectors, over an
+    // all-pairs loop like link derivation's within-batch compare. Run with:
+    //   cargo test -p mlake-core --release bench_cosine -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn bench_cosine() {
+        use std::time::Instant;
+        const DIM: usize = 384;
+        const N: usize = 2000;
+        const ROWS: usize = 200; // ROWS × N pairs, to keep it quick
+        let mut vecs: Vec<Vec<f32>> = Vec::with_capacity(N);
+        let mut s: u64 = 0x1234_5678;
+        for _ in 0..N {
+            let mut v = vec![0f32; DIM];
+            for x in v.iter_mut() {
+                s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
+                *x = ((s >> 40) as f32 / (1u64 << 24) as f32) - 0.5;
+            }
+            vecs.push(v);
+        }
+        fn scalar_cos(a: &[f32], b: &[f32]) -> f32 {
+            let (mut d, mut na, mut nb) = (0f32, 0f32, 0f32);
+            for i in 0..a.len() {
+                d += a[i] * b[i];
+                na += a[i] * a[i];
+                nb += b[i] * b[i];
+            }
+            let den = na.sqrt() * nb.sqrt();
+            if den == 0.0 { 0.0 } else { d / den }
+        }
+        let t = Instant::now();
+        let mut acc = 0f32;
+        for i in 0..ROWS {
+            for j in 0..N {
+                acc += scalar_cos(&vecs[i], &vecs[j]);
+            }
+        }
+        let scalar_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+        let norms: Vec<f32> = vecs.iter().map(|v| norm(v)).collect();
+        let t = Instant::now();
+        let mut acc2 = 0f32;
+        for i in 0..ROWS {
+            for j in 0..N {
+                acc2 += cosine_prenorm_both(&vecs[i], norms[i], &vecs[j], norms[j]);
+            }
+        }
+        let simd_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+        println!(
+            "cosine {DIM}-dim, {ROWS}x{N} pairs: scalar={scalar_ms:.1}ms  simd+prenorm={simd_ms:.1}ms  speedup={:.1}x  (checksums {:.3}/{:.3})",
+            scalar_ms / simd_ms,
+            acc,
+            acc2
+        );
     }
 
     #[test]

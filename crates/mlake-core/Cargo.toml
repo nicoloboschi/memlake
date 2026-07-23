@@ -11,3 +11,4 @@ serde_json.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
 half = { version = "2", features = ["rkyv"] }
+wide = "0.7"

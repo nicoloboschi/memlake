@@ -78,6 +78,11 @@ pub struct ArmDepths {
     /// [`DEFAULT_GRAPH_SEED_MIN_SIMILARITY`]). A vector hit below it still ranks in the dense arm;
     /// it just does not spawn a one-hop expansion.
     pub graph_seed_min: f32,
+    /// Whether the vector arm runs its exact f32 rerank (stage two). `true` for user queries —
+    /// the exact rescore is what makes recall precise. `false` for link derivation, which only
+    /// needs approximate neighbours: it then ranks by the RaBitQ scan estimate and skips the
+    /// rerank tier fetch + exact cosine entirely (the dominant per-item cost at scale).
+    pub exact_rerank: bool,
 }
 
 /// An `updated_at` window pushed into the dense arm, in epoch ms. Half-open on both ends and
@@ -986,6 +991,7 @@ impl QueryNode {
             graph: if config.graph_weight > 0.0 { config.arm_depth } else { 0 },
             nprobe: config.nprobe,
             graph_seed_min: config.graph_seed_min_similarity,
+            exact_rerank: true,
         };
         let raw = self
             .query_raw_metered(
@@ -1149,6 +1155,7 @@ impl QueryNode {
                             depths.nprobe,
                             tags,
                             updated,
+                            depths.exact_rerank,
                             metrics,
                         )
                         .await?
@@ -1233,6 +1240,7 @@ impl QueryNode {
         nprobe: usize,
         tags: &TagFilter,
         updated: UpdatedWindow,
+        exact_rerank: bool,
         metrics: &QueryMetrics,
     ) -> Result<Vec<(MemoryId, f32)>> {
         if state.centroids.is_empty() {
@@ -1251,6 +1259,19 @@ impl QueryNode {
         let mut cands: Vec<(MemoryId, f32, f32, f32)> = Vec::new(); // id, est, lo, hi
         self.scan_blocks(&blocks, state, q, tags, updated, &mut cands)?;
         metrics.record_phase(Phase::Rerank, t.elapsed());
+
+        // Approximate mode (link derivation): skip stage two entirely — rank by the RaBitQ scan
+        // estimate and return the top-`depth`. No rerank-tier fetch, no exact cosine. Links only
+        // need approximate neighbours, and this is the dominant per-item cost that O(new·N) writes
+        // pay at scale.
+        if !exact_rerank {
+            let mut scored: Vec<(MemoryId, f32)> = cands.iter().map(|c| (c.0, c.1)).collect();
+            scored.sort_by(|a, b| {
+                b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal).then(a.0.cmp(&b.0))
+            });
+            scored.truncate(depth);
+            return Ok(scored);
+        }
 
         // Stage two: rescore exactly, but only what the bound leaves in contention. `tau` is the
         // k-th best lower bound; anything whose upper bound cannot reach it is outside the top-k.

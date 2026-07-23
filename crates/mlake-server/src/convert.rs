@@ -523,6 +523,7 @@ pub fn arm_depths(
 ) -> ArmDepths {
     let depth = |v: u32| if v == 0 { DEFAULT_ARM_DEPTH } else { v as usize };
     ArmDepths {
+        exact_rerank: true,
         vector: depth(vector_top_k),
         text: depth(text_top_k),
         graph: depth(graph_top_k),

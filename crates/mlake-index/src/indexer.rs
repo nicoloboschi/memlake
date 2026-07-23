@@ -244,12 +244,19 @@ pub async fn derive_links_for_write(
         graph: 0,
         nprobe: 16,
         graph_seed_min: crate::query_node::DEFAULT_GRAPH_SEED_MIN_SIMILARITY,
+        // Links only need approximate neighbours: rank by the RaBitQ scan estimate and skip the
+        // exact rerank (the dominant per-item cost at scale). See ArmDepths::exact_rerank.
+        exact_rerank: false,
     };
     let n = memories.len();
     // Snapshot vectors/ids/types so the within-batch compare can read while we mutate semantic_out.
     let vecs: Vec<Vec<f32>> = memories.iter().map(|m| m.vector.clone()).collect();
     let ids: Vec<MemoryId> = memories.iter().map(|m| m.id).collect();
     let mts: Vec<u8> = memories.iter().map(|m| m.memory_type).collect();
+    // Precompute each vector's norm ONCE, so the O(n²) within-batch compare below is a bare SIMD
+    // dot per pair instead of re-deriving `|vecs[i]|²` on every one of its `n` comparisons.
+    let norms: Vec<f32> =
+        vecs.iter().map(|v| if v.is_empty() { 0.0 } else { mlake_core::norm(v) }).collect();
     let mut stats = DeriveStats::default();
     for i in 0..n {
         if vecs[i].is_empty() {
@@ -277,7 +284,7 @@ pub async fn derive_links_for_write(
             if j == i || mts[j] != mts[i] || vecs[j].is_empty() {
                 continue;
             }
-            let sim = mlake_core::cosine_opt(&vecs[i], &vecs[j]);
+            let sim = mlake_core::cosine_prenorm_both(&vecs[i], norms[i], &vecs[j], norms[j]);
             if sim >= SEMANTIC_LINK_THRESHOLD {
                 neigh.push((ids[j], sim));
             }
