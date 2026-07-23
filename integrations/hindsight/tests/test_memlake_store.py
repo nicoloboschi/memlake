@@ -283,6 +283,46 @@ async def test_link_counts_report_derived_edges(store, bank_id, index_pass):
     assert "temporal" not in counts
 
 
+async def test_record_unit_entities_attaches_to_written_memories(store, bank_id, index_pass):
+    """Retain writes the memory first, then records entity postings — memlake attaches them.
+
+    This is how the retain orchestrator flows: insert_facts writes the memory without
+    entities (their ids aren't resolved yet), then record_unit_entities is called with the
+    resolved unit→entity pairs. memlake keeps entities on the memory, so it must rewrite the
+    memories — the same seam the Postgres store fills with a unit_entities insert.
+    """
+    unit_ids = await store.insert_facts(
+        conn=None,
+        ops=None,
+        bank_id=bank_id,
+        facts=[make_fact("alpha", seed=0.5), make_fact("beta", seed=0.5)],
+    )
+    # Written without entities, exactly like retain phase 2.
+    got = await store.entities_for_units(conn=None, fq_table=_fq_table, bank_id=bank_id, unit_ids=unit_ids)
+    assert got.get(unit_ids[0], []) == []
+
+    e1 = "33333333-3333-3333-3333-333333333333"
+    e2 = "44444444-4444-4444-4444-444444444444"
+    # Parallel lists, the way link_units_to_entities_batch hands them over: unit0→{e1,e2}, unit1→{e1}.
+    await store.record_unit_entities(
+        conn=None,
+        ops=None,
+        fq_table=_fq_table,
+        bank_id=bank_id,
+        unit_ids=[unit_ids[0], unit_ids[0], unit_ids[1]],
+        entity_ids=[e1, e2, e1],
+    )
+
+    got = await store.entities_for_units(conn=None, fq_table=_fq_table, bank_id=bank_id, unit_ids=unit_ids)
+    assert set(got[unit_ids[0]]) == {e1, e2}
+    assert got[unit_ids[1]] == [e1]
+
+    # And the derived entity-link count now reflects them: e1 in 2 memories → min(1,10)=1, e2 in 1 → 0.
+    index_pass(store._namespace(bank_id))
+    counts = await store.link_counts(conn=None, fq_table=_fq_table, bank_id=bank_id)
+    assert counts.get("entity") == 1, counts
+
+
 # --------------------------------------------------------------------------- curation archive
 
 

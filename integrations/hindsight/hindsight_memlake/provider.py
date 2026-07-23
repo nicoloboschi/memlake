@@ -286,6 +286,51 @@ class MemlakeMemories(MemoriesExtension):
         """
         await self._write_records(bank_id, build_fact_records(unit_ids, facts, document_id, unit_entity_ids))
 
+    async def record_unit_entities(
+        self, *, conn, ops, fq_table, bank_id: str | None = None, unit_ids: list[Any], entity_ids: list[Any]
+    ) -> None:
+        """Attach unit→entity postings to their memories in memlake.
+
+        Postgres keeps this join in a `unit_entities` table; memlake keeps each memory's
+        entities inline, so recording the postings means rewriting the affected memories with
+        their entity ids. The memory was just written without entities by :meth:`insert_facts`
+        (retain resolves entities only after the ids exist), so this is the second half of that
+        write: a re-upsert is an upsert — the higher WAL sequence wins, memlake re-derives the
+        memory's semantic links, and every other field (vector, causal edges, metadata,
+        timestamps) round-trips through the fetched record so nothing is lost. Without this the
+        entity graph arm has nothing to expand through and the stats page counts zero entity
+        links, even though the memories clearly share entities.
+        """
+        if not unit_ids or bank_id is None:
+            return
+        # Parallel (unit, entity) pairs → unit → its entity ids.
+        by_unit: dict[str, set[str]] = {}
+        for u, e in zip(unit_ids, entity_ids):
+            by_unit.setdefault(str(u), set()).add(str(e))
+        ns = self._namespace(bank_id)
+        ids = [uuid.UUID(u).bytes for u in by_unit]
+        try:
+            records = await asyncio.to_thread(
+                partial(self._client.get, ns, ids, include_vector=True, include_edges=True)
+            )
+        except Exception as ex:
+            if _is_missing_namespace(ex):
+                return
+            raise
+        memories = []
+        for rec in records:
+            unit_id = str(uuid.UUID(bytes=rec.id))
+            ent = by_unit.get(unit_id)
+            if not ent:
+                continue
+            blob = _serialize_record(rec)
+            # 32-char hex (no dashes) so _memory_from_blob's bytes.fromhex yields 16-byte ids.
+            blob["entity_ids"] = sorted(uuid.UUID(e).hex for e in ent)
+            memories.append(_memory_from_blob(blob, unit_id))
+        if memories:
+            await asyncio.to_thread(self._client.write, ns, memories)
+            logger.debug("[memories] attached entities to %d memory/ies in memlake ns=%s", len(memories), bank_id)
+
     async def _write_records(self, bank_id: str, records: list[FactRecord]) -> None:
         """Upsert a batch of complete records. The one write path in this module."""
         if not records:
