@@ -13,14 +13,19 @@ Status legend: ✅ fixed & verified · 🔬 diagnosed, fix pending · ❓ open.
 ## TL;DR
 
 The mixed load exposed that **the read path collapsed under concurrency** — 145 QPS single-namespace
-read-only vs **2.3 QPS / p50 4.9s** at 12 concurrent readers across 6 namespaces, *fully warm*.
-Root cause was **not** CPU, cache-hit-rate, snapshot, or the query limiter — it was the disk-tier
-cache re-`mmap`ing a file **on every lookup** and never promoting hot blocks to the (near-empty)
-memory tier. One fix — promote disk hits into mem — took it to **283–399 QPS / p50 24–28ms
-(~150×)**, and serve CPU went 60% → 616% (reads finally parallelize). ✅
+read-only vs **2.3 QPS / p50 4.9s** at 12 concurrent readers across 6 namespaces, *fully warm*. Two
+fixes this session:
 
-Remaining: writes still disrupt reads (mixed p90 ~2.6s), and per-query cost scales with L0 segment
-count. Details below.
+1. ✅ **Cache: promote disk hits into the memory tier.** The mem tier was near-empty (3MB/512MB) so
+   ~all hits re-`mmap`ed a file *per lookup* → kernel serialization (serve at <1 core). → **~150×**.
+2. ✅ **Lazy tail BM25 index.** Reopen/open eagerly built a tantivy index for the tail that
+   vector-only queries never use. → median reopen **2s → 52ms**.
+
+**Cumulative (full mixed, 12 readers + 4 writers, warm): READ 2.1 → 58.6 QPS (~28×), p50 7.4s → 26ms
+(~280×); WRITE p50 3.0s → 495ms.** Both fixes committed, all tests green.
+
+**#1 next task:** the p99 (~6s) is `full_open` after a fold — reuse persisting segments across a
+fold (design in the doc). Details below.
 
 ---
 
@@ -115,17 +120,41 @@ end-to-end tests pass (text arm still correct).
 Remaining tail: p99 still ~6s (reads) / ~7s (writes); max reopen 5.9s — a few outliers, likely
 `full_open` on a fold (segments changed → can't reuse) or heavy-contention moments. Next.
 
-## 🔬 Writes still disrupt reads (next target)
+## 🔬 THE remaining tail — `full_open` after a fold (p99, reads AND writes)
 
-Full mixed (12 readers + 4 writers, 6 ns, warm), after the cache fix: **READ 16.8 QPS, p50 82ms**
-(was 2.1 QPS / 7.4s — already ~8× QPS, ~90× p50), but **p90 2.6s / p99 4.5s**, and **WRITE p50 3s**.
-The writers' `derive_links` is CPU-heavy and runs **inline on the write RPC** on the tokio worker
-threads, so a burst of writes still stalls reads. Candidate fixes:
-- Move link derivation **off the request path** (async/background), so a write acks after the WAL
-  commit and links land in a later pass. Biggest lever for write latency + read isolation.
-- Or run derivation on a **bounded blocking pool** (`spawn_blocking` with a semaphore) so it can't
-  monopolize the async request-serving threads.
-- Approximate derivation (`exact_rerank=false`, done earlier) already cut its cost ~4×.
+After fixes #1 and #2 the p50/p90 are excellent (26ms / 240ms), but **p99 ~6s (reads) / ~7s
+(writes)** remains. The trace pins it: of reads > 1s, **23/25 are `full_open`** with `open_ms`
+200–1200ms; slow writes are dominated by **`link_snapshot_ms`** (the derive opens a snapshot) — same
+cause.
+
+**Why.** The etag-reopen fast-path (fix from earlier this session) reuses the loaded segment
+metadata only when the manifest is *unchanged* (a write → 304). A **fold changes the manifest**
+(200), so every fold forces a `full_open` = reload+deserialize **all** segments' metadata
+(centroids, tables, FTS split) for the 6+ L0 segments. It is once-per-fold-per-namespace (the first
+read after a fold; then the snapshot is cached), so it is bounded by fold frequency — but it is the
+whole p99, and it hits the write path too (the writer derives against a freshly-opened snapshot).
+
+**Fix (designed, not yet built) — reuse the segments that persist across a fold.** A flush adds one
+L0 segment; a compaction replaces a few with one — either way *most* segments persist unchanged
+(same content-nonce `seg-<uuid>` id). So a fold-triggered reopen should reuse the loaded
+`SegmentState` for persisting ids and only load the genuinely-new ones. Concretely:
+1. `FactType.segments: Arc<Vec<SegmentState>>` → `Vec<Arc<SegmentState>>` (per-segment sharing;
+   ~14 `.segments.iter()` sites are mechanical — deref still works).
+2. Add the seg id to `SegmentState` (or parse it from `cluster_paths[0]`/`stats_path`).
+3. A `reopen_after_fold(old, new_manifest)` that keys old segments by id, reuses the `Arc` for
+   matches, loads only new ones, rebuilds the tail (as `reopen_extending_tail` already does).
+4. `snapshot_traced` calls it on the 200 branch instead of `QueryNode::open`.
+This makes a fold as cheap as a write-reopen in the common case, collapsing the p99 for reads and
+writes together. **This is the #1 next task.**
+
+## 🔬 Writes: derive still runs inline on the request path (secondary)
+
+`derive_links` is CPU work run **inline on the write RPC** on the tokio worker threads. With the two
+fixes it is no longer the dominant write cost (p50 495ms, mostly the full_open above), but a burst of
+writes still competes with reads for worker threads. If write p99 stays a problem after the
+full_open fix: move derivation **off the request path** (ack after the WAL commit, derive in a later
+pass) or onto a **bounded blocking pool** (`spawn_blocking` + semaphore) so it can't monopolize the
+request-serving threads. Approximate derivation (`exact_rerank=false`) already cut its cost ~4×.
 
 ---
 
@@ -138,17 +167,35 @@ threads, so a burst of writes still stalls reads. Candidate fixes:
 
 ---
 
-## Open / to try next (the loop)
+## Open / to try next (the loop) — priority order
 
-- ❓ **Write-path isolation** (above) — the current #1 remaining read-latency disruptor.
-- ❓ **Size-based compaction** to bound read-time segment fan-out.
-- ❓ **Speculative reads** — value unclear now that warm reads are ~24ms; only helps the cold/reopen
-  tail. Park until the cold-tier (real S3) numbers exist.
-- ❓ **500-namespace working set vs 512 MB mem cache** — with promotion, mem fills with the hot set;
-  at 500 busy namespaces the combined hot set may exceed the budget → the noisy-neighbour /
-  per-namespace isolation question (see TODOS "Cache: namespace isolation"). Needs a 500-ns run.
-- ❓ **Cold-cache tail** — the first (cold) run showed p90 ~10s from warmup misses to S3; the promote
-  fix doesn't help cold. Real S3 latency numbers still needed.
+1. ❓ **Reuse persisting segments across a fold** (the `full_open` fix, designed above) — collapses
+   the current p99 for both reads and writes. **#1.**
+2. ❓ **Size-based compaction** — a namespace at 6+ L0 segments makes every read fan out 6× and every
+   `full_open` reload 6×. Compact many tiny segments sooner (the load's 50-item writes each became a
+   segment). Reduces both the fan-out cost and the full_open cost.
+3. ❓ **Write-path isolation** — move `derive_links` off the request path or onto a bounded blocking
+   pool, if write p99 persists after #1.
+4. ❓ **500-namespace run** — with promotion the mem tier fills with the hot set; at 500 busy
+   namespaces the combined hot set may exceed 512 MB → noisy-neighbour / per-namespace isolation
+   (TODOS "Cache: namespace isolation"). Need an actual 500-ns seed to test the working-set math.
+5. ❓ **Speculative reads** — low value now that warm reads are ~26ms; would only help the cold /
+   full_open tail, which #1 addresses more directly. Park until real-S3 cold-tier numbers exist.
+6. ❓ **Cold-cache tail** — a cold cache showed p90 ~10s from warmup misses to S3; the promote fix
+   doesn't help cold. Needs real-S3 latency numbers.
+
+## Reproduce
+
+```
+# release binary against the running MinIO, isolated bucket, tracing on:
+MEMLAKE_QUERY_S3_BUCKET=mix … MEMLAKE_TRACE_LOG=$(pwd)/mix-trace.jsonl \
+  target/release/mlake-server serve --addr 127.0.0.1:50052 --mem-mb 512 --disk-mb 4096 …
+# seed once, then warm, then measure:
+uv run --project perf python -m memlake_perf.mixed --addr localhost:50052 \
+  --namespaces 6 --scale 6000 --readers 12 --writers 4 --write-batch 50 --duration 20
+# analyse: jq over mix-trace.jsonl (snapshot.action, open_ms, phases_us, in_flight, link_*)
+# NB: truncate the trace with `: > file`, never `rm` (server holds the fd → orphaned inode).
+```
 
 ## What did NOT pan out
 - The graph arm was *not* the cost (vector-only was no faster). It's the **vector arm's rerank**.
