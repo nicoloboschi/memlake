@@ -1221,6 +1221,7 @@ const MAX_DRAIN_ITERS: usize = 8;
 /// bounded under load instead of letting it grow for a full `interval` between passes.
 const BUSY_TICK: std::time::Duration = std::time::Duration::from_millis(500);
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run_indexer(
     store: Store,
     tokenizer: Tokenizer,
@@ -1230,7 +1231,13 @@ pub async fn run_indexer(
     budget: FoldBudget,
     streaming_threshold: usize,
     tail_flush_docs: usize,
+    gc_interval: std::time::Duration,
+    gc_min_age: std::time::Duration,
 ) -> anyhow::Result<()> {
+    // Per-namespace GC throttle: reclaiming runs on a slower cadence than folding (dead objects are
+    // min-age-gated inside `gc`, so more-frequent passes would mostly be no-op LISTs). `None` in the
+    // map means "never GC'd this process" → due immediately.
+    let mut last_gc: HashMap<String, std::time::Instant> = HashMap::new();
     loop {
         let targets = if namespaces.is_empty() {
             discover_namespaces(&store).await.unwrap_or_default()
@@ -1280,6 +1287,30 @@ pub async fn run_indexer(
             if folded >= tail_flush_docs {
                 busy = true;
             }
+
+            // Reclaim unreferenced objects (folded WAL entries, compacted-away segments, CAS-race
+            // losers). Run under the fold lease so peers don't GC the same namespace concurrently,
+            // and throttled to `gc_interval` — well below `gc`'s own min-age guard, which keeps
+            // anything a slow reader on the previous manifest might still be scanning. GC reads the
+            // manifest fresh and only deletes what the CURRENT manifest doesn't reference, so it is
+            // safe to run alongside a peer that just published a new generation.
+            let gc_due = last_gc.get(name).map(|t| t.elapsed() >= gc_interval).unwrap_or(true);
+            if gc_due {
+                match mlake_index::gc_with_min_age(&ns, gc_min_age).await {
+                    Ok(out) if out.generation_files_deleted + out.wal_entries_deleted > 0 => {
+                        tracing::info!(
+                            namespace = name,
+                            generation_files = out.generation_files_deleted,
+                            wal_entries = out.wal_entries_deleted,
+                            "gc reclaimed"
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(namespace = name, error = %e, "gc failed"),
+                }
+                last_gc.insert(name.clone(), std::time::Instant::now());
+            }
+
             ns.release_index_lease(&lease_holder).await;
         }
         tokio::time::sleep(if busy { BUSY_TICK.min(interval) } else { interval }).await;

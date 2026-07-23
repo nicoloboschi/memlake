@@ -147,6 +147,31 @@ fn indexer_tail_flush_docs() -> usize {
         .unwrap_or(20_000)
 }
 
+/// How often the indexer runs GC per namespace to reclaim unreferenced objects (folded WAL
+/// entries, compacted-away segments). Throttled below `gc`'s own min-age guard, so it stays a
+/// cheap mostly-no-op LIST. From `MEMLAKE_INDEXER_GC_INTERVAL_SECS`; default 300 (5 min).
+fn indexer_gc_interval() -> Duration {
+    let secs = std::env::var("MEMLAKE_INDEXER_GC_INTERVAL_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(300);
+    Duration::from_secs(secs)
+}
+
+/// The min-age GC guard: an unreferenced object younger than this is kept, so GC never deletes the
+/// in-flight output of a concurrent fold that has not yet published its manifest. Default 900s
+/// (15 min) matches `mlake_index::DEFAULT_MIN_AGE`; lower it (e.g. for a demo) to reclaim sooner.
+/// From `MEMLAKE_INDEXER_GC_MIN_AGE_SECS`.
+fn indexer_gc_min_age() -> Duration {
+    let secs = std::env::var("MEMLAKE_INDEXER_GC_MIN_AGE_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(900);
+    Duration::from_secs(secs)
+}
+
 async fn serve(args: &[String], node: String) -> Result<()> {
     let addr = flag(args, "--addr")
         .unwrap_or_else(|| "0.0.0.0:50051".into())
@@ -219,6 +244,8 @@ async fn indexer(args: &[String], node: String) -> Result<()> {
         indexer_fold_budget(),
         indexer_streaming_threshold(),
         indexer_tail_flush_docs(),
+        indexer_gc_interval(),
+        indexer_gc_min_age(),
     )
     .await
 }
