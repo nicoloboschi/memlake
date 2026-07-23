@@ -457,40 +457,18 @@ async def _walk(store, *, conn, fq_table, bank_id, fact_types=None, metadata_equ
 
 
 async def consolidation_freshness(store, *, conn, fq_table, bank_id: str) -> dict:
-    """Last consolidation time + pending/failed counts, walked from memlake.
+    """Last consolidation time + pending/failed counts.
 
-    The SQL path is one FILTER query over `memory_units`. Here each count is a
-    filtered walk — pending and failed push their flag to the server, so each is
-    O(matching), not O(corpus); `last_consolidated_at` is the max over the
-    consolidated ones, which is the one that costs a full walk of them.
-
-    §5b (declared indexed metadata keys → a MetadataStats RPC) is what makes this
-    a metadata-only read instead. Until then it is a walk, which is why
-    get_bank_freshness should not be on a hot per-request path against a huge bank.
+    `consolidated` is a declared indexed key, so pending and failed are one
+    MetadataStats read — the value-counts of the flag — rather than a walk. The
+    SQL path is one FILTER query over `memory_units`; this is its metadata-read
+    twin. `last_consolidated_at` still comes from the observations (below).
     """
     from .provider import CONSOLIDATED_FAILED
 
-    # `consolidated` is a declared indexed key, so pending/failed are one MetadataStats read
-    # (value-counts of the flag) rather than two filtered walks. A namespace that predates the
-    # declaration returns nothing, so it falls back to the walk.
     by_flag = await store._metadata_stats(bank_id, META_CONSOLIDATED_FLAG)
-    if by_flag:
-        pending = int(by_flag.get(CONSOLIDATED_NO, 0))
-        failed = int(by_flag.get(CONSOLIDATED_FAILED, 0))
-    else:
-        facts = ["experience", "world"]
-        pending = 0
-        async for _ in _walk(
-            store, conn=conn, fq_table=fq_table, bank_id=bank_id, fact_types=facts,
-            metadata_equals={META_CONSOLIDATED_FLAG: CONSOLIDATED_NO},
-        ):
-            pending += 1
-        failed = 0
-        async for _ in _walk(
-            store, conn=conn, fq_table=fq_table, bank_id=bank_id, fact_types=facts,
-            metadata_equals={META_CONSOLIDATED_FLAG: CONSOLIDATED_FAILED},
-        ):
-            failed += 1
+    pending = int(by_flag.get(CONSOLIDATED_NO, 0))
+    failed = int(by_flag.get(CONSOLIDATED_FAILED, 0))
 
     # The bank's last consolidation is the newest consolidated_at across its
     # observations — an observation is written when consolidation runs, so the
@@ -507,9 +485,7 @@ async def document_memory_counts(store, *, conn, fq_table, bank_id: str, documen
     """Live memory count per document id, for the ids given.
 
     `document_id` is a declared indexed key, so this is a MetadataStats read — a
-    per-segment tally, not a corpus walk. A namespace created before the key was
-    declared returns nothing there, so it falls back to a scan (the same walk the
-    other aggregates use).
+    per-segment tally, not a corpus walk — filtered to the documents asked for.
     """
     if not document_ids:
         return {}
@@ -517,15 +493,7 @@ async def document_memory_counts(store, *, conn, fq_table, bank_id: str, documen
 
     wanted = set(document_ids)
     by_value = await store._metadata_stats(bank_id, META_DOCUMENT_ID)
-    if by_value:
-        return {doc: count for doc, count in by_value.items() if doc in wanted}
-
-    counts: dict[str, int] = {}
-    async for memory in _walk(store, conn=conn, fq_table=fq_table, bank_id=bank_id):
-        doc = memory.document_id
-        if doc in wanted:
-            counts[doc] = counts.get(doc, 0) + 1
-    return counts
+    return {doc: count for doc, count in by_value.items() if doc in wanted}
 
 
 def _truncate_utc(dt, trunc: str):

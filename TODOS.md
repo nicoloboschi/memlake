@@ -396,8 +396,10 @@ same shape as the per-cluster tag set.
       this admin call), so the query hot path never pays for it. Verified: the fold
       counts by value, the tail is included, and an undeclared key returns empty.
       Wired into the extension — `document_memory_counts` and the freshness
-      pending/failed are now `MetadataStats` reads, falling back to a scan for a
-      namespace created before the keys were declared.
+      pending/failed are `MetadataStats` reads, no scan fallback (every bank
+      declares the keys; backwards compat for pre-declaration namespaces is not
+      handled yet — such a bank would need a reindex, or the changeable
+      declaration surface below).
 - [x] **Declaration surface decided: a `CreateNamespace` field**
       (`indexed_metadata_keys`), fixed at creation. Simple, and it matches how the
       keys are used — the extension declares `document_id` + `consolidated` when it
@@ -818,3 +820,60 @@ green; what follows is what is left.
       **frequency-aware admission** (TinyLFU / S3-FIFO — a one-shot scan block never
       displaces a repeatedly-hit one, no per-namespace bookkeeping). Decide behind a
       multi-namespace load test that reproduces the noisy-neighbour eviction first.
+
+## Write fold cost is O(N) per memory, not O(1) — semantic link derivation (surfaced by the SLA model)
+
+- [ ] **The fold cost per memory grows with corpus size, because `derive_links` runs one
+      full-corpus kNN query per new memory.** Measured on MinIO (4 vCPU, `perf` namespace,
+      3 fact types, `wait_for_index`-style continuous fold): a 100k-memory seed folded at
+      **~35 docs/s and never caught up** — cursor crawled 4→16 of 50 WAL entries over ~15 min
+      of indexer time even with *no other namespace competing*. This is not the earlier
+      "indexer folds all namespaces sequentially" starvation (that compounds it); a single
+      isolated namespace is already this slow.
+
+      **Root cause.** `IndexOptions::default()` has `derive_links: true` (`indexer.rs:48`),
+      and both the indexer loop (`service.rs:1007`) and the CLI (`main.rs:235`) fold with the
+      default. Every fold — the steady-state `flush` (`indexer.rs:173`) and the compaction
+      rebuild — calls `derive_corpus_links`, whose own doc comment states the cost:
+      "**O(new items) queries ... the accepted incremental O(new · N) link-derivation cost**"
+      (`indexer.rs:234`). So folding a WAL slice of `new` memories issues `new × 3` (fact
+      types) vector queries, each scanning the *whole growing corpus* at `nprobe=16`. At 100k
+      that is ~300k growing-corpus kNN queries. Compaction every `COMPACT_FANOUT=8` flushes
+      adds a full O(N) tantivy rebuild on top (logs show it re-committing the entire
+      accumulated doc set: 2669 → 30669 docs per cycle).
+
+      **Why it matters for the SLA model.** `docs/sla-model.md` assumes a flat
+      `CPU_S_PER_FOLDED_MEM_1T` constant and derives `WPS_mem = vcpu / (const × FANOUT)`.
+      That is wrong while `derive_links` is on: the per-memory fold cost is `O(N)`, so
+      `wait_for_index` write throughput **decays as the namespace grows** — the write SLA is a
+      function of corpus size, not a constant. A namespace under steady ingest can reach a
+      point where it never catches up (arrival rate > fold rate), which is the "indexer hang"
+      symptom.
+
+      **Options (a design decision — Hindsight owns the semantic-graph requirement):**
+      1. **Amortize / batch link derivation** off the synchronous `wait_for_index` path — ack
+         the write after the WAL commit + index, derive links asynchronously in a later pass.
+         Makes the write SLA O(1) again; costs immediate semantic-edge freshness.
+      2. **Bound the derivation** — approximate kNN (probe fewer clusters, or only the new
+         items' own clusters) so it is O(new), not O(new · N). Cheaper links, slightly worse graph.
+      3. **Make `derive_links` opt-in per namespace** — namespaces that don't render the
+         semantic graph fold at O(1). Hindsight *does* use semantic edges (§2), so this is a
+         per-workload knob, not a global default flip.
+      4. **Leave as-is and quote the decayed write SLA honestly** — document that
+         `wait_for_index` ingest is O(N)/memory and cap namespace size or ingest rate accordingly.
+
+      Blocks the write half of the SLA card: until this is decided, `CPU_S_PER_FOLDED_MEM_1T`
+      cannot be a single number and the write-SLA formula needs an `N` term.
+
+- [ ] **Single indexer folds all namespaces sequentially (starvation, compounds the above).**
+      The `index` loop with empty `--namespaces` discovers *every* namespace and folds them
+      round-robin in one thread; each namespace's tantivy commit is O(its corpus). With N
+      namespaces present, any one namespace's fold latency is inflated by the sum of all
+      others, and a namespace under steady ingest can starve indefinitely. Observed live: the
+      shared MinIO bucket accumulated 18 `ext-test-*` corpse namespaces (from a parallel
+      Hindsight test run on the same endpoint), and the target `perf` namespace published only
+      its first 8k docs before the indexer moved on and never returned. The built image's
+      `index` subcommand also **ignored `--namespaces`/`--once`** (help was a no-op, it just
+      ran discover-all) — verify these flags actually reach the loop, since §0a lists them as
+      the operational scoping mechanism. Fix direction: per-namespace fold concurrency/fairness,
+      or one indexer per (group of) namespace(s).
