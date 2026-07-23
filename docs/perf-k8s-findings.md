@@ -11,7 +11,8 @@ Findings from running memlake on the `hindsight-dev` GKE cluster over the real
 | pre-queue, 256 MB cache | 1 | 82 | 62 ms | small cache; un-indexed tail |
 | queue build, 1 GB cache | 1 | 121 | — | indexer starved (see F4), so index empty |
 | fix build, 1 GB cache | 1 | 95 | 51 ms | indexer folding concurrently; still large tail |
-| queue build, 1 GB cache | 8 | — | — | **failed**: writes timed out (F2, F3) |
+| queue build, 1 GB cache | 8 (1 ns) | — | — | **failed**: writes timed out (F2, F3) |
+| fix build, **6 namespaces** | 6×1 | **~828 agg** | — | scales across pods (F2 upside); per-ns 106–231/s |
 
 Query p50 stays ~50 ms because in every run a large share of the corpus is still in the
 **un-indexed WAL tail** (brute-force-scanned in-memory: 0 S3 roundtrips but CPU-heavy). A truly
@@ -31,6 +32,12 @@ namespace's traffic to one pod (cache + commit affinity, by design). Under 8 con
 pod hit ~1.4 of its 2 vCPU while the other two sat idle. A single hot namespace cannot use the
 fleet — that is turbopuffer's **sharding** case, and the motivation for namespace **pinning** to
 dedicated pods. Multi-*namespace* load spreads across pods; single-namespace load does not.
+
+*Upside, measured:* 6 namespaces at once reached **~828 writes/s aggregate** (per-namespace
+106–231/s) — ~8.7× the single-namespace ~100/s — as the hash spread them across the 3 pods. So the
+system scales horizontally with tenants + pods. Caveat: with *few* namespaces the Maglev hash is
+lumpy (observed ~4/2/0 across 3 pods — one pod at 1.7 CPU, one idle), so aggregate is capped by the
+busiest pod; many namespaces even out, few hot ones want pinning.
 
 **F3 — Envoy's 15 s route timeout hard-failed slow writes.** A derivation-heavy write under load
 exceeded it and the RPC failed as `upstream request timeout` rather than merely being slow.
