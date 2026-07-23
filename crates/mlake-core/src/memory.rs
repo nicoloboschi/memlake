@@ -217,9 +217,14 @@ pub struct Memory {
     pub timestamps: Timestamps,
     pub proof_count: u32,
     pub entity_ids: Vec<EntityId>,
-    /// Causal edges are intrinsic and travel in the WAL. Semantic edges are absent here
-    /// by construction: they are derived by the indexer (SPEC §3.2).
+    /// Causal edges are intrinsic and travel in the WAL.
     pub causal_out: Vec<CausalEdge>,
+    /// Derived kNN links. These are computed by the **server, at write time, before the ack**, and
+    /// written into the WAL as intrinsic data — NOT by the indexer. The index is a pure speed
+    /// optimization: everything needed for a correct answer (links included) is already in the WAL,
+    /// so a query over the un-indexed tail is fully correct, just slower. A client leaves this
+    /// empty; the server fills it. See docs/ARCHITECTURE.md.
+    pub semantic_out: Vec<SemanticEdge>,
     /// Opaque key→value metadata, stored and returned verbatim, never indexed. See
     /// [`StoredMemory::metadata`].
     pub metadata: Vec<(String, String)>,
@@ -243,7 +248,7 @@ impl Memory {
             timestamps: self.timestamps,
             proof_count: self.proof_count,
             entity_ids: self.entity_ids,
-            semantic_out: Vec::new(),
+            semantic_out: self.semantic_out, // derived by the server at write time (SPEC change)
             causal_out: self.causal_out,
             metadata: self.metadata,
             write_seq: 0, // set by the WAL fold from the entry's sequence.
@@ -296,6 +301,7 @@ mod tests {
             proof_count: 0,
             entity_ids: [5, 1, 5, 3].map(eid).to_vec(),
             causal_out: vec![],
+            semantic_out: vec![],
             metadata: vec![],
         };
         let stored = item.into_stored();

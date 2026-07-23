@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 /// hydrate hits; to 4 for the split vector blocks (`cluster-{i}.vec`) and the rerank tier
 /// (`rerank.idx`/`rerank.data`) the two-stage search reads; to 5 for the segmented manifest
 /// (a list of LSM segments instead of one generation — see docs/segmented-index.md).
-pub const FORMAT_VERSION: u32 = 5;
+pub const FORMAT_VERSION: u32 = 6;
 
 /// Paths to the files making up a generation. Stored as an explicit struct rather than a
 /// map so a missing file is a deserialization error rather than a runtime surprise.

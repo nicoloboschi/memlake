@@ -195,6 +195,7 @@ mod tests {
             proof_count: 0,
             entity_ids: vec![EntityId::from_bytes([1; 16]), EntityId::from_bytes([2; 16])],
             causal_out: vec![],
+            semantic_out: vec![],
             metadata: vec![],
         }
     }

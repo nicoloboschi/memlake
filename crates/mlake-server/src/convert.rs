@@ -139,6 +139,8 @@ pub fn memory(m: pb::Memory) -> Result<Memory, Status> {
         proof_count: m.proof_count,
         entity_ids: entity_ids_in(&m.entity_ids)?,
         causal_out,
+        // Derived by the server at write time (before the WAL commit), never by the client.
+        semantic_out: Vec::new(),
         metadata: m.metadata.into_iter().collect(),
     })
 }

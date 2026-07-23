@@ -27,6 +27,7 @@ fn item(key: &str, vector: Vec<f32>, text: &str) -> Memory {
         proof_count: 0,
         entity_ids: vec![],
         causal_out: vec![],
+        semantic_out: vec![],
         metadata: vec![],
     }
 }
@@ -1537,6 +1538,7 @@ fn rich_item(i: usize) -> Memory {
         proof_count: (i % 3) as u32,
         entity_ids: vec![mlake_core::EntityId::from_bytes([(i % 7) as u8; 16])],
         causal_out: vec![],
+        semantic_out: vec![],
         metadata: vec![("doc".into(), format!("d{}", i % 8))],
     }
 }
