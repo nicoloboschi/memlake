@@ -13,11 +13,30 @@ dependencies = [
     "hindsight-api-slim>=0.8.4",
 ]
 
+[dependency-groups]
+# Tests drive a real memlake server over gRPC (see tests/conftest.py), so they
+# need pytest and its asyncio plugin. hindsight-api-slim is NOT pinned to a
+# local path here — the MemoriesExtension seam is unreleased, so the interface
+# and RetrievalResult/config types come from a checkout the runner supplies:
+#
+#   uv run --with-editable /path/to/hindsight-api-slim pytest
+#
+# The tests skip themselves if the installed hindsight-api-slim predates the
+# seam, so a plain `pytest` degrades to a skip rather than an import error.
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.24.0",
+]
+
 # memlake-client ships from this repo, not PyPI: the client and the server it
 # talks to move together, so the integration pins the tree it was built against
 # rather than a release.
 [tool.uv.sources]
 memlake-client = { path = "../../clients/python" }
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["hindsight_memlake"]
