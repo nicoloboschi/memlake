@@ -32,9 +32,6 @@ pub struct IndexOptions {
     pub derive_links: bool,
     /// Deterministic seed for centroid training (G-6).
     pub seed: u64,
-    /// Force a full centroid retrain this fold, regardless of the 2× growth trigger. Used
-    /// by the recall-vs-churn study to compare assign-only drift against a fresh retrain.
-    pub force_retrain: bool,
     /// How embeddings are encoded in the vector block. The embedding is ~84% of a stored
     /// memory, so this is the single biggest lever on both stored bytes and bytes scanned
     /// per query — and the one place where storage is traded directly against recall.
@@ -46,7 +43,6 @@ impl Default for IndexOptions {
         Self {
             derive_links: true,
             seed: 42,
-            force_retrain: false,
             vector_codec: VectorCodec::Binary,
         }
     }
@@ -71,7 +67,7 @@ pub const DEFAULT_STREAMING_THRESHOLD_DOCS: usize = 4_000_000;
 const NOMINAL_DOC_BYTES: u64 = 2048;
 
 /// The fold entry point: **auto-selects** which fold to run. Below `streaming_threshold_docs` the
-/// in-RAM [`index`] fold runs — faster, incremental copy-forward, and it derives semantic links.
+/// in-RAM [`index`] fold runs — faster, and it derives semantic links in-fold.
 /// At or above it, the bounded-RAM [`crate::streaming::index_streaming_with_budget`] runs so a
 /// corpus too big for memory still folds (at the cost of a full rebuild and no in-fold links).
 ///
@@ -184,7 +180,7 @@ pub async fn flush(ns: &Namespace, tokenizer: &Tokenizer, opts: IndexOptions) ->
     let all: HashSet<[u8; 16]> = touched;
     let mut indexes: BTreeMap<u8, mlake_core::manifest::FactTypeIndex> = BTreeMap::new();
     for (ft, ft_items) in items_by_ft {
-        let fti = build_memory_type_index(ns, &seg_id, ft, ft_items, &all, &all, None, None, build_opts)
+        let fti = build_memory_type_index(ns, &seg_id, ft, ft_items, &all, build_opts)
             .await?;
         indexes.insert(ft, fti);
     }
@@ -297,7 +293,7 @@ async fn estimate_corpus_docs(ns: &Namespace) -> Result<usize> {
 ///
 /// Fact types are fully independent indexes (no shared links/vectors/postings), so the fold
 /// partitions the live item set by `memory_type` and builds a separate generation per type,
-/// each with its own assign-only/copy-forward state (SCALE.md Phase 4). One WAL, one
+/// each a fresh build over its slice (SCALE.md Phase 4). One WAL, one
 /// manifest — so a `bank + [memory_types]` query reads a single manifest and fans out.
 pub async fn index(ns: &Namespace, tokenizer: &Tokenizer, opts: IndexOptions) -> Result<IndexOutcome> {
     let (manifest, etag) = ns.read_manifest().await?;
@@ -400,7 +396,7 @@ pub async fn index(ns: &Namespace, tokenizer: &Tokenizer, opts: IndexOptions) ->
         // A full rebuild of the merged live set — no copy-forward (that is the flush's job); prev
         // is None so this segment is fresh, retrained, with its centroids over the merged set.
         let fti =
-            build_memory_type_index(ns, &seg_id, ft, ft_items, &new_ids, &touched, None, None, opts)
+            build_memory_type_index(ns, &seg_id, ft, ft_items, &new_ids, opts)
                 .await?;
         indexes.insert(ft, fti);
     }
@@ -442,26 +438,23 @@ pub async fn index(ns: &Namespace, tokenizer: &Tokenizer, opts: IndexOptions) ->
 }
 
 
-/// Build one fact type's independent generation (assign-only + copy-forward + local split +
-/// IVF link derivation) from its slice of the live items, and return its manifest entry.
-#[allow(clippy::too_many_arguments)]
+/// Build one fact type's independent generation (train centroids + local split + IVF link
+/// derivation) from its slice of the live items, and return its manifest entry.
+///
+/// The segmented index always builds a fresh segment: a flush writes an L0 segment over its
+/// slice, a compaction rebuilds the merged live set. There is no incremental in-place fold,
+/// so centroids are always trained from scratch and every cluster is written — the
+/// assign-only-vs-retrain and copy-forward paths that a single mutable generation needed are
+/// gone with it.
 async fn build_memory_type_index(
     ns: &Namespace,
     seg_id: &str,
     memory_type: u8,
     mut items: Vec<StoredMemory>,
     new_ids: &std::collections::HashSet<[u8; 16]>,
-    touched: &std::collections::HashSet<[u8; 16]>,
-    prev_gen: Option<&crate::generation::Generation>,
-    prev_index: Option<&mlake_core::manifest::FactTypeIndex>,
     opts: IndexOptions,
 ) -> Result<mlake_core::manifest::FactTypeIndex> {
     let doc_count = items.len();
-    let prev_train_count = prev_index.map(|p| p.train_count).unwrap_or(0);
-
-    // Assign-only vs retrain, scoped to this fact type.
-    let retrain =
-        prev_gen.is_none() || opts.force_retrain || doc_count as u64 > 2 * prev_train_count.max(1);
     let vectors: Vec<Vec<f32>> = items.iter().map(|i| i.vector.clone()).collect();
     // One dimension per fact type, checked once here rather than deep inside the parallel
     // link derivation: everything downstream (centroid training, probing, semantic-edge
@@ -470,10 +463,8 @@ async fn build_memory_type_index(
     // Also the dimension the vector block encodes against; 0 when the type is text-only.
     let vector_dim = mlake_core::uniform_dim(vectors.iter().map(|v| v.as_slice()))?.unwrap_or(0);
     let tt = std::time::Instant::now();
-    let (mut centroids, train_count) = match (prev_gen, retrain) {
-        (Some(p), false) => (p.centroids.clone(), prev_train_count),
-        _ => (train_centroids(&vectors, opts.seed), doc_count as u64),
-    };
+    let mut centroids = train_centroids(&vectors, opts.seed);
+    let train_count = doc_count as u64;
     phase_log("train", tt);
 
     // Assign every item to its nearest centroid. The other dominant O(N·k) fold pass; each
@@ -485,7 +476,9 @@ async fn build_memory_type_index(
         items.par_iter().map(|i| centroids.assign(&i.vector)).collect()
     };
 
-    let split_clusters = local_split(&mut centroids, &items, &mut assignments, opts.seed);
+    // Reshapes centroids/assignments in place; which clusters split no longer matters now
+    // that every cluster is written fresh (it only guarded copy-forward before).
+    local_split(&mut centroids, &items, &mut assignments, opts.seed);
 
     let td = std::time::Instant::now();
     if opts.derive_links && !centroids.is_empty() {
@@ -504,87 +497,58 @@ async fn build_memory_type_index(
     // Per-fact-type prefix so different types never collide on object keys.
     let prefix = format!("{}/mt{memory_type}", mlake_core::manifest::segment_prefix(&ns.name, seg_id));
 
-    // Copy-forward unchanged clusters (skip their PUT); rewrite only dirty ones.
-    let empty: Vec<Vec<StoredMemory>> = Vec::new();
-    let old_clusters = prev_gen.map(|p| &p.clusters).unwrap_or(&empty);
-    let empty_paths: Vec<String> = Vec::new();
-    let old_paths = prev_index.map(|p| &p.files.clusters).unwrap_or(&empty_paths);
+    // Write every cluster as a pair: `cluster-{i}.bin` (payload) and `cluster-{i}.vec` (the
+    // codes, tag bitmaps and update times). Members stay in one order across both.
     let tw = std::time::Instant::now();
-    let old_vec_paths = prev_index.map(|p| &p.files.vectors).unwrap_or(&empty_paths);
-    // The codec each old cluster's `.vec` block was written under (self-describing header, read by
-    // `read_generation`). Copy-forward reuses that block verbatim, so a cluster may only be copied
-    // forward when its stored codec still matches `opts.vector_codec` — otherwise flipping the
-    // codec would leave every untouched cluster pinned to the old encoding forever. This is the
-    // migration copy-forward otherwise skips (docs/vector-storage.md, TODOS §Vector storage).
-    let empty_codecs: Vec<Option<mlake_ivf::VectorCodec>> = Vec::new();
-    let old_codecs = prev_gen.map(|p| &p.codecs).unwrap_or(&empty_codecs);
     let mut cluster_paths: Vec<Option<String>> = vec![None; k];
     let mut vector_paths: Vec<Option<String>> = vec![None; k];
-    let mut dirty_writes = Vec::new();
+    let mut writes = Vec::new();
     for i in 0..k {
-        let can_copy_forward = !retrain
-            && !split_clusters.contains(&i)
-            && i < old_clusters.len()
-            && i < old_paths.len()
-            // The pair is copied forward together or not at all: `.bin` and `.vec` are
-            // joined positionally, so a mismatched pair would silently misattribute every
-            // embedding in the cluster.
-            && i < old_vec_paths.len()
-            // The stored codec must match the requested one; a mismatch forces a re-encode so a
-            // codec change actually migrates. Missing/unknown codec (`None`) also forces it —
-            // re-encoding is always safe, only ever costing one extra PUT.
-            && old_codecs.get(i).copied().flatten() == Some(opts.vector_codec)
-            && !cluster_changed(&clusters[i], &old_clusters[i], touched);
-        if can_copy_forward {
-            cluster_paths[i] = Some(old_paths[i].clone());
-            vector_paths[i] = Some(old_vec_paths[i].clone());
-        } else {
-            // The embedding leaves the cluster file and lives in the vector block; the two
-            // stay in member order so index `j` means the same memory in both.
-            let ids: Vec<MemoryId> = clusters[i].iter().map(|m| m.id).collect();
-            // A text-only memory carries no embedding. Absent is not a dimension error —
-            // pad it to zeros, which scores 0 on the vector arm and so never surfaces there,
-            // exactly as an empty vector did through `cosine_opt`.
-            let vectors: Vec<Vec<f32>> = clusters[i]
-                .iter()
-                .map(|m| if m.vector.is_empty() { vec![0.0; vector_dim] } else { m.vector.clone() })
-                .collect();
-            let mut items = clusters[i].clone();
-            for m in items.iter_mut() {
-                m.vector = Vec::new();
-            }
-            let cf = ClusterFile { centroid_id: i as u32, items };
-            // Tags and write times travel with the codes so the probe can filter without the
-            // payload half.
-            let member_tags: Vec<Vec<String>> = clusters[i].iter().map(|m| m.tags.clone()).collect();
-            let member_updated: Vec<i64> = clusters[i]
-                .iter()
-                .map(|m| m.timestamps.updated_at.unwrap_or(mlake_ivf::UPDATED_UNKNOWN))
-                .collect();
-            let block = VectorBlock::encode_with_columns(
-                opts.vector_codec,
-                vector_dim,
-                &ids,
-                &vectors,
-                Some(&member_tags),
-                &member_updated,
-            )?;
-            let block_bytes = block.to_bytes();
-            let store = ns.store.clone();
-            let prefix = prefix.clone();
-            dirty_writes.push(async move {
-                let cluster = crate::generation::write_cluster_file(&store, &prefix, i, &cf).await?;
-                let vectors =
-                    crate::generation::write_vector_block(&store, &prefix, i, block_bytes).await?;
-                Ok::<_, crate::Error>((i, cluster, vectors))
-            });
+        // The embedding leaves the cluster file and lives in the vector block; the two
+        // stay in member order so index `j` means the same memory in both.
+        let ids: Vec<MemoryId> = clusters[i].iter().map(|m| m.id).collect();
+        // A text-only memory carries no embedding. Absent is not a dimension error —
+        // pad it to zeros, which scores 0 on the vector arm and so never surfaces there,
+        // exactly as an empty vector did through `cosine_opt`.
+        let vectors: Vec<Vec<f32>> = clusters[i]
+            .iter()
+            .map(|m| if m.vector.is_empty() { vec![0.0; vector_dim] } else { m.vector.clone() })
+            .collect();
+        let mut items = clusters[i].clone();
+        for m in items.iter_mut() {
+            m.vector = Vec::new();
         }
+        let cf = ClusterFile { centroid_id: i as u32, items };
+        // Tags and write times travel with the codes so the probe can filter without the
+        // payload half.
+        let member_tags: Vec<Vec<String>> = clusters[i].iter().map(|m| m.tags.clone()).collect();
+        let member_updated: Vec<i64> = clusters[i]
+            .iter()
+            .map(|m| m.timestamps.updated_at.unwrap_or(mlake_ivf::UPDATED_UNKNOWN))
+            .collect();
+        let block = VectorBlock::encode_with_columns(
+            opts.vector_codec,
+            vector_dim,
+            &ids,
+            &vectors,
+            Some(&member_tags),
+            &member_updated,
+        )?;
+        let block_bytes = block.to_bytes();
+        let store = ns.store.clone();
+        let prefix = prefix.clone();
+        writes.push(async move {
+            let cluster = crate::generation::write_cluster_file(&store, &prefix, i, &cf).await?;
+            let vectors =
+                crate::generation::write_vector_block(&store, &prefix, i, block_bytes).await?;
+            Ok::<_, crate::Error>((i, cluster, vectors))
+        });
     }
-    // Write the dirty clusters with bounded concurrency instead of one sequential PUT at a
-    // time — the dominant cost of a full build over S3 (SCALE.md Phase 3 perf).
+    // Bounded concurrency instead of one sequential PUT at a time — the dominant cost of a
+    // build over S3 (SCALE.md Phase 3 perf).
     {
         use futures::stream::{StreamExt, TryStreamExt};
-        let written: Vec<(usize, String, String)> = futures::stream::iter(dirty_writes)
+        let written: Vec<(usize, String, String)> = futures::stream::iter(writes)
             .buffer_unordered(32)
             .try_collect()
             .await?;
@@ -718,25 +682,6 @@ fn phase_log(phase: &str, start: std::time::Instant) {
     if std::env::var("MEMLAKE_TIMING").is_ok() {
         eprintln!("[index] {phase}: {:.2}s", start.elapsed().as_secs_f64());
     }
-}
-
-/// True if a cluster's membership or content changed versus the previous generation. Both
-/// slices are id-sorted, so a position-wise compare suffices; a member touched by this
-/// WAL slice (re-upserted or patched) also counts as changed.
-fn cluster_changed(
-    new: &[StoredMemory],
-    old: &[StoredMemory],
-    touched: &std::collections::HashSet<[u8; 16]>,
-) -> bool {
-    if new.len() != old.len() {
-        return true;
-    }
-    for (n, o) in new.iter().zip(old.iter()) {
-        if n.id != o.id || touched.contains(&n.id.0) {
-            return true;
-        }
-    }
-    false
 }
 
 /// Split any cluster grown past 8× the average size, in place: a 2-means over just that
@@ -1086,134 +1031,3 @@ pub fn bench_derive_links(
     (elapsed, total)
 }
 
-#[cfg(test)]
-mod migration_tests {
-    use super::*;
-    use mlake_ivf::VectorCodec;
-    use mlake_store::Store;
-    use mlake_wal::Namespace;
-
-    /// A deterministic, structured set of embeddings: a few topics so k-means yields several
-    /// clusters, all at dim `DIM`. No randomness crate — a cheap hash keeps it reproducible.
-    fn items(n: usize) -> Vec<StoredMemory> {
-        const DIM: usize = 16;
-        (0..n)
-            .map(|i| {
-                let topic = (i % 4) as f32;
-                let vector: Vec<f32> = (0..DIM)
-                    .map(|d| {
-                        let h = (i.wrapping_mul(2654435761) ^ (d * 40503)) as f32;
-                        topic + (d as f32) + ((h % 97.0) / 97.0) * 0.1
-                    })
-                    .collect();
-                StoredMemory {
-                    id: MemoryId::from_key(&format!("m{i}")),
-                    vector,
-                    text: format!("memory {i}"),
-                    index_text: String::new(),
-                    memory_type: 1,
-                    tags: Vec::new(),
-                    timestamps: Default::default(),
-                    proof_count: 0,
-                    entity_ids: Vec::new(),
-                    semantic_out: Vec::new(),
-                    causal_out: Vec::new(),
-                    metadata: Vec::new(),
-                    write_seq: i as u64,
-                }
-            })
-            .collect()
-    }
-
-    fn opts(codec: VectorCodec) -> IndexOptions {
-        IndexOptions { derive_links: false, seed: 42, force_retrain: false, vector_codec: codec }
-    }
-
-    async fn ns() -> Namespace {
-        let ns = Namespace::new("mig", Store::in_memory());
-        ns.create_if_absent("tok").await.unwrap();
-        ns
-    }
-
-    /// The `.vec` block a cluster path points at, decoded far enough to report its codec.
-    async fn codec_at(ns: &Namespace, path: &str) -> VectorCodec {
-        let bytes = ns.store.get(path, None).await.unwrap();
-        mlake_ivf::VectorBlock::from_bytes(&bytes.bytes).unwrap().codec()
-    }
-
-    /// Build gen 1 (fresh) then gen 2 (assign-only, prev wired in) with the SAME codec: the
-    /// unchanged clusters must copy forward by reference — the same object paths, no re-PUT.
-    /// This is the guard that the migration change did not silently disable copy-forward
-    /// (SCALE.md Phase 3).
-    #[tokio::test]
-    async fn unchanged_codec_copies_clusters_forward() {
-        let ns = ns().await;
-        let all: std::collections::HashSet<[u8; 16]> = items(40).iter().map(|i| i.id.0).collect();
-        let empty: std::collections::HashSet<[u8; 16]> = std::collections::HashSet::new();
-
-        let fti1 =
-            build_memory_type_index(&ns, "seg1", 1, items(40), &all, &all, None, None, opts(VectorCodec::F32))
-                .await
-                .unwrap();
-        let gen1 = crate::generation::read_generation(&ns.store, &fti1.files, 1, None).await.unwrap();
-
-        // Gen 2: same items, same codec, nothing touched — assign-only over gen 1's centroids.
-        let fti2 = build_memory_type_index(
-            &ns, "seg2", 1, items(40), &empty, &empty, Some(&gen1), Some(&fti1), opts(VectorCodec::F32),
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(
-            fti2.files.clusters, fti1.files.clusters,
-            "unchanged clusters must reuse the previous generation's cluster paths"
-        );
-        assert_eq!(
-            fti2.files.vectors, fti1.files.vectors,
-            "unchanged clusters must reuse the previous generation's .vec paths (copy-forward)"
-        );
-    }
-
-    /// The bug this task fixes: flipping `vector_codec` between generations must re-encode the
-    /// copied-forward clusters rather than reuse their old-codec `.vec` blocks. Everything else
-    /// (membership, touched set) is identical, so a difference can only come from the codec gate.
-    #[tokio::test]
-    async fn codec_change_reencodes_copied_forward_clusters() {
-        let ns = ns().await;
-        let all: std::collections::HashSet<[u8; 16]> = items(40).iter().map(|i| i.id.0).collect();
-        let empty: std::collections::HashSet<[u8; 16]> = std::collections::HashSet::new();
-
-        // Gen 1 under F32 — a lossless codec, so gen 2's re-read vectors are byte-identical and
-        // cluster membership is guaranteed unchanged. That isolates the codec as the only reason
-        // a cluster is rewritten.
-        let fti1 =
-            build_memory_type_index(&ns, "seg1", 1, items(40), &all, &all, None, None, opts(VectorCodec::F32))
-                .await
-                .unwrap();
-        let gen1 = crate::generation::read_generation(&ns.store, &fti1.files, 1, None).await.unwrap();
-        for path in fti1.files.vectors.iter().filter(|p| !p.is_empty()) {
-            assert_eq!(codec_at(&ns, path).await, VectorCodec::F32);
-        }
-
-        // Gen 2: identical items, but the codec flips to Int8.
-        let fti2 = build_memory_type_index(
-            &ns, "seg2", 1, items(40), &empty, &empty, Some(&gen1), Some(&fti1), opts(VectorCodec::Int8),
-        )
-        .await
-        .unwrap();
-
-        // Every non-empty cluster must have a NEW path (re-encoded), and its block must now be
-        // Int8 — the migration actually happened.
-        for (i, (new, old)) in fti2.files.vectors.iter().zip(&fti1.files.vectors).enumerate() {
-            if new.is_empty() {
-                continue;
-            }
-            assert_ne!(new, old, "cluster {i} .vec must be re-encoded, not copied forward");
-            assert_eq!(
-                codec_at(&ns, new).await,
-                VectorCodec::Int8,
-                "cluster {i} must be re-encoded in the new codec"
-            );
-        }
-    }
-}
