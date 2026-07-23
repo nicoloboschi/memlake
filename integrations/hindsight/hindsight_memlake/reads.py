@@ -151,11 +151,13 @@ async def list_memory_units(
     """
     if state is not None and state not in ("valid", "invalidated"):
         raise ValueError(f"Invalid state '{state}': expected 'valid' or 'invalidated'.")
-    # Invalidated memories live in the sibling archive namespace; "valid" (the
-    # default) is the bank's own. Scanning the archive means the "invalidated" tab
-    # shows what it should, the same way the SQL path reads a second table.
-    is_archived = state == "invalidated"
-    scan_ns = store._archive_namespace(bank_id) if is_archived else None
+    if state == "invalidated":
+        # Invalidated memories are deleted from the index and kept in the Postgres
+        # archive table, so the "invalidated" tab is a plain SELECT there — no fold,
+        # no walk — exactly what the SQL path does.
+        return await _list_archived(
+            conn, fq_table, bank_id, fact_type=fact_type, search_query=search_query, limit=limit, offset=offset
+        )
 
     fact_types = [fact_type] if fact_type else None
 
@@ -183,9 +185,10 @@ async def list_memory_units(
     pages = 0
 
     while len(collected) < wanted and pages < _MAX_SCAN_PAGES:
-        page = await store.scan_raw(
-            bank_id,
-            namespace=scan_ns,
+        page = await store.scan_memories(
+            conn=conn,
+            fq_table=fq_table,
+            bank_id=bank_id,
             fact_types=fact_types,
             limit=max(limit, 100),
             page_token=page_token,
@@ -235,7 +238,7 @@ async def list_memory_units(
             # Written to the metadata bag by `mark_consolidated(failed=True)`, but
             # StoredMemory models no field for it, so it does not survive the read.
             "consolidation_failed_at": None,
-            "state": "invalidated" if is_archived else "valid",
+            "state": "valid",
             "invalidation_reason": None,
             "invalidated_at": None,
             "edited_at": None,
@@ -243,14 +246,77 @@ async def list_memory_units(
         for m in window
     ]
 
-    if is_archived or needs_python_filter or metadata_equals:
-        # A filtered walk — or a walk of the archive, which count_memories does not
-        # see — cannot know the true total without scanning the rest.
+    if needs_python_filter or metadata_equals:
+        # A filtered walk cannot know the true total without scanning the rest.
         total = len(collected)
     else:
         counts = await store.count_memories(conn=conn, fq_table=fq_table, bank_id=bank_id)
         total = counts.get(fact_type, 0) if fact_type else sum(counts.values())
 
+    return {"items": items, "total": total, "limit": limit, "offset": offset}
+
+
+async def _list_archived(conn, fq_table, bank_id, *, fact_type, search_query, limit, offset) -> dict:
+    """The invalidated tab: a paged SELECT of the Postgres archive table.
+
+    A plain query, not a memlake scan — invalidated memories were deleted from the
+    index on invalidation and kept only here, so this is O(archived), not O(corpus),
+    and the count is exact. `fact_type` and free-text `search` are the filters the
+    UI offers on this tab.
+    """
+    from .provider import _archived_row_to_stored
+
+    conditions = ["bank_id = $1"]
+    params: list = [bank_id]
+    if fact_type:
+        params.append(fact_type)
+        conditions.append(f"fact_type = ${len(params)}")
+    if search_query:
+        params.append(f"%{search_query}%")
+        conditions.append(f"(text ILIKE ${len(params)} OR context ILIKE ${len(params)})")
+    where = " AND ".join(conditions)
+    arch = fq_table("invalidated_memory_units")
+
+    total_row = await conn.fetchrow(f"SELECT COUNT(*) AS total FROM {arch} WHERE {where}", *params)
+    total = total_row["total"] if total_row else 0
+
+    from .provider import _ARCHIVE_SELECT
+
+    rows = await conn.fetch(
+        f"SELECT {_ARCHIVE_SELECT} FROM {arch} WHERE {where} "
+        f"ORDER BY invalidated_at DESC NULLS LAST LIMIT ${len(params) + 1} OFFSET ${len(params) + 2}",
+        *params,
+        limit,
+        offset,
+    )
+    stored = [_archived_row_to_stored(r) for r in rows]
+    entity_ids = [eid for m in stored for eid in m.entity_ids]
+    names = await resolve_entity_names(conn, entity_ids, fq_table)
+    items = [
+        {
+            "id": m.unit_id,
+            "text": m.text,
+            "context": m.context or "",
+            "date": _iso(m.event_date) or "",
+            "fact_type": m.fact_type,
+            "document_id": m.document_id,
+            "mentioned_at": _iso(m.mentioned_at),
+            "occurred_start": _iso(m.occurred_start),
+            "occurred_end": _iso(m.occurred_end),
+            "entities": ", ".join(filter(None, (names.get(eid) for eid in m.entity_ids))),
+            "chunk_id": m.chunk_id,
+            "proof_count": m.proof_count if m.proof_count is not None else 1,
+            "tags": list(m.tags or []),
+            "metadata": m.metadata or {},
+            "consolidated_at": _iso(m.consolidated_at),
+            "consolidation_failed_at": None,
+            "state": "invalidated",
+            "invalidation_reason": row["invalidation_reason"],
+            "invalidated_at": _iso(row["invalidated_at"]),
+            "edited_at": None,
+        }
+        for m, row in zip(stored, rows)
+    ]
     return {"items": items, "total": total, "limit": limit, "offset": offset}
 
 
@@ -260,22 +326,27 @@ async def get_memory_unit(store, *, conn, fq_table, bank_id: str, unit_id: str) 
     For an observation this also expands ``source_memories`` — the facts behind
     it — the same way the SQL detail view does, so the UI can render the chain.
     """
-    from .provider import META_INVALIDATED_AT, META_INVALIDATION_REASON, _stored_from_record
+    from .provider import _ARCHIVE_SELECT, _archived_row_to_stored
 
     memories = await store.get_memories(conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=[unit_id])
     memory = memories[0] if memories else None
-    # An invalidated memory lives in the archive namespace, not the bank's; the
-    # detail view still renders it, flagged, the same way the SQL path reads the
-    # `invalidated_memory_units` table. The reason/timestamp are in the archived
-    # record's raw metadata bag, which `StoredMemory` does not carry, so read it.
+    # An invalidated memory is out of the index and in the Postgres archive table;
+    # the detail view still renders it, flagged, the same way the SQL path reads
+    # `invalidated_memory_units`.
     archived = memory is None
-    archived_meta: dict[str, str] = {}
+    archived_reason: str | None = None
+    archived_at = None
     if memory is None:
-        record = await store._get_record(store._archive_namespace(bank_id), unit_id)
-        if record is None:
+        row = await conn.fetchrow(
+            f"SELECT {_ARCHIVE_SELECT} FROM {fq_table('invalidated_memory_units')} WHERE id = $1 AND bank_id = $2",
+            unit_id,
+            bank_id,
+        )
+        if row is None:
             return None
-        memory = _stored_from_record(record)
-        archived_meta = dict(record.memory.metadata or {})
+        memory = _archived_row_to_stored(row)
+        archived_reason = row["invalidation_reason"]
+        archived_at = _iso(row["invalidated_at"])
     names = await resolve_entity_names(conn, memory.entity_ids, fq_table)
     result: dict = {
         "id": memory.unit_id,
@@ -297,8 +368,8 @@ async def get_memory_unit(store, *, conn, fq_table, bank_id: str, unit_id: str) 
         "consolidated_at": _iso(memory.consolidated_at),
         "consolidation_failed_at": None,
         "edited_at": None,
-        "invalidation_reason": archived_meta.get(META_INVALIDATION_REASON) or None if archived else None,
-        "invalidated_at": archived_meta.get(META_INVALIDATED_AT) if archived else None,
+        "invalidation_reason": archived_reason if archived else None,
+        "invalidated_at": archived_at if archived else None,
     }
 
     if memory.fact_type == "observation":

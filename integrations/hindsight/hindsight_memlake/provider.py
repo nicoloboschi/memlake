@@ -110,14 +110,18 @@ META_CONSOLIDATION_FAILED_AT = "consolidation_failed_at"
 #: failed memory stays out of the queue just as a succeeded one does.
 CONSOLIDATED_FAILED = "2"
 
-#: The curation archive lives in a sibling namespace, so an invalidated memory is
-#: physically out of every recall/scan surface (which only ever touch the bank's
-#: own namespace) without a per-query "valid?" filter — the same effect Postgres
-#: gets by moving the row to `invalidated_memory_units`. The reason and the moment
-#: ride in the metadata bag, since memlake has no columns for them.
-_ARCHIVE_SUFFIX = "__invalidated"
-META_INVALIDATION_REASON = "invalidation_reason"
-META_INVALIDATED_AT = "invalidated_at"
+#: Reserved key inside an archived row's `metadata` holding the full memlake
+#: memory (vector, memory_type, causal edges, the raw metadata bag) — everything
+#: the archive's memory_units-shaped columns cannot hold — so restore rebuilds it
+#: faithfully. Stripped from the metadata the read surfaces return.
+_ARCHIVE_PAYLOAD_KEY = "__memlake_archive__"
+
+#: Columns read back from the archive table for the detail/list views and restore.
+_ARCHIVE_SELECT = (
+    "id, text, fact_type, context, event_date, occurred_start, occurred_end, mentioned_at, "
+    "document_id, chunk_id, tags, metadata, proof_count, created_at, consolidated_at, "
+    "entity_ids, invalidation_reason, invalidated_at"
+)
 
 
 def _to_epoch_ms(dt: datetime | None) -> int | None:
@@ -188,17 +192,12 @@ class MemlakeMemories(MemoriesExtension):
     def _namespace(self, bank_id: str) -> str:
         return f"{self._namespace_prefix}{bank_id}"
 
-    async def _ensure_ns(self, ns: str) -> None:
+    async def ensure_namespace(self, bank_id: str) -> None:
+        ns = self._namespace(bank_id)
         if ns in self._ensured:
             return
         await asyncio.to_thread(self._client.create_namespace, ns)
         self._ensured.add(ns)
-
-    async def ensure_namespace(self, bank_id: str) -> None:
-        await self._ensure_ns(self._namespace(bank_id))
-
-    def _archive_namespace(self, bank_id: str) -> str:
-        return self._namespace(bank_id) + _ARCHIVE_SUFFIX
 
     # -- writes --------------------------------------------------------------
 
@@ -708,7 +707,6 @@ class MemlakeMemories(MemoriesExtension):
         self,
         bank_id: str,
         *,
-        namespace: str | None = None,
         fact_types: list[str] | None = None,
         limit: int = 100,
         page_token: str = "",
@@ -734,7 +732,7 @@ class MemlakeMemories(MemoriesExtension):
         response = await asyncio.to_thread(
             partial(
                 self._client.scan,
-                namespace or self._namespace(bank_id),
+                self._namespace(bank_id),
                 memory_types=sorted(memory_types),
                 page_token=page_token,
                 limit=limit,
@@ -805,13 +803,15 @@ class MemlakeMemories(MemoriesExtension):
 
     # -- curation archive ----------------------------------------------------
     #
-    # Invalidation moves a memory to a sibling `__invalidated` namespace and back,
-    # rather than tombstoning it: recall and scans only ever touch the bank's own
-    # namespace, so an archived memory is out of every result set for free, yet
-    # still readable and restorable. The move reconstructs the whole memory —
-    # vector, entity ids, causal edges, timestamps, metadata — from a single
-    # addressed read, so nothing but the derived semantic edges (re-derived on the
-    # next fold) and the write-only `index_text` is lost across the round trip.
+    # Invalidation deletes the memory from the bank's namespace — so it never
+    # touches the IVF/FTS index again — and stashes it in Postgres'
+    # `invalidated_memory_units`, the archive table that already exists for this
+    # exact purpose (cold storage, no index). Restore writes it back. Everything
+    # memlake-specific that the archive columns cannot hold — the vector, the
+    # memory_type, the causal edges, the raw metadata bag — rides in a reserved
+    # key inside the row's `metadata`, so the round trip is faithful; the derived
+    # semantic edges (re-derived on the next fold) and the write-only `index_text`
+    # are the only things not carried.
 
     async def _get_record(self, ns: str, unit_id: str):
         try:
@@ -827,76 +827,91 @@ class MemlakeMemories(MemoriesExtension):
             raise
         return recs[0] if recs else None
 
-    def _memory_from_record(self, record, *, set_metadata: dict | None = None, drop_metadata: tuple = ()):
-        payload = record.memory
-        metadata = dict(payload.metadata or {})
-        for key in drop_metadata:
-            metadata.pop(key, None)
-        if set_metadata:
-            metadata.update(set_metadata)
-
-        raw = record.vector.f32le if record.vector else b""
-        vector = list(struct.unpack(f"<{len(raw) // 4}f", raw)) if raw else []
-
-        ts = payload.timestamps
-        m = mc.memory(
-            payload.text,
-            vector,
-            memory_type=record.memory_type,
-            id=record.id,
-            tags=list(payload.tags),
-            proof_count=payload.proof_count,
-            entity_ids=list(payload.entity_ids),
-            metadata=metadata,
-            event_date=ts.event_date if ts.HasField("event_date") else None,
-            updated_at=ts.updated_at if ts.HasField("updated_at") else None,
-            occurred_start=ts.occurred_start if ts.HasField("occurred_start") else None,
-            occurred_end=ts.occurred_end if ts.HasField("occurred_end") else None,
-            mentioned_at=ts.mentioned_at if ts.HasField("mentioned_at") else None,
-        )
-        # Causal edges are the memory's own and must survive the move; semantic
-        # edges are indexer-derived and re-appear on the next fold, so are dropped.
-        for edge in payload.causal_out:
-            m.causal_out.add(target=edge.target, link_type=edge.link_type, weight=edge.weight)
-        return m
-
-    async def _move(self, from_ns: str, to_ns: str, unit_id: str, *, set_metadata=None, drop_metadata=()):
-        """Move one memory between namespaces; returns its record, or None if absent."""
-        record = await self._get_record(from_ns, unit_id)
-        if record is None:
-            return None
-        await self._ensure_ns(to_ns)
-        memory = self._memory_from_record(record, set_metadata=set_metadata, drop_metadata=drop_metadata)
-        await asyncio.to_thread(self._client.write, to_ns, [memory])
-        await asyncio.to_thread(self._client.delete, from_ns, [record.id])
-        return record
-
     async def get_archived_memory(self, *, conn, fq_table, bank_id: str, unit_id: str) -> StoredMemory | None:
-        record = await self._get_record(self._archive_namespace(bank_id), unit_id)
-        return _stored_from_record(record) if record is not None else None
+        row = await conn.fetchrow(
+            f"SELECT {_ARCHIVE_SELECT} FROM {fq_table('invalidated_memory_units')} WHERE id = $1 AND bank_id = $2",
+            unit_id,
+            bank_id,
+        )
+        return _archived_row_to_stored(row) if row else None
 
     async def invalidate_memory(self, *, conn, fq_table, bank_id: str, unit_id: str, reason: str | None) -> bool:
-        now = datetime.now(timezone.utc).isoformat()
-        record = await self._move(
-            self._namespace(bank_id),
-            self._archive_namespace(bank_id),
+        record = await self._get_record(self._namespace(bank_id), unit_id)
+        if record is None:
+            return False
+        stored = _stored_from_record(record)
+        # The user metadata carries the full memlake memory under a reserved key,
+        # so restore can rebuild it exactly; the archive columns hold what the
+        # list/detail views render.
+        metadata = dict(stored.metadata or {})
+        metadata[_ARCHIVE_PAYLOAD_KEY] = _serialize_record(record)
+        # event_date is NOT NULL on the archive (LIKE memory_units); fall back
+        # through the other times, then to the write time, so the insert holds.
+        event_date = stored.event_date or stored.occurred_start or stored.mentioned_at or stored.created_at
+        await conn.execute(
+            f"""
+            INSERT INTO {fq_table("invalidated_memory_units")}
+                (id, bank_id, text, fact_type, context, event_date, occurred_start, occurred_end,
+                 mentioned_at, document_id, chunk_id, tags, metadata, proof_count, created_at,
+                 consolidated_at, entity_ids, invalidation_reason, invalidated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::jsonb, $14, $15, $16,
+                    $17::uuid[], $18, now())
+            ON CONFLICT (id) DO UPDATE SET
+                metadata = EXCLUDED.metadata,
+                invalidation_reason = EXCLUDED.invalidation_reason,
+                invalidated_at = now()
+            """,
             unit_id,
-            set_metadata={META_INVALIDATION_REASON: reason or "", META_INVALIDATED_AT: now},
+            bank_id,
+            stored.text,
+            stored.fact_type,
+            stored.context,
+            event_date or datetime.now(timezone.utc),
+            stored.occurred_start,
+            stored.occurred_end,
+            stored.mentioned_at,
+            stored.document_id,
+            stored.chunk_id,
+            list(stored.tags or []),
+            json.dumps(metadata),
+            stored.proof_count,
+            stored.created_at or datetime.now(timezone.utc),
+            stored.consolidated_at,
+            [uuid.UUID(e) for e in stored.entity_ids],
+            reason,
         )
-        return record is not None
+        # Only now, once the archive row is written, drop it from the index.
+        await asyncio.to_thread(self._client.delete, self._namespace(bank_id), [record.id])
+        return True
 
     async def set_invalidation_reason(self, *, conn, fq_table, bank_id: str, unit_id: str, reason: str | None) -> None:
-        op = self._client.patch(uuid.UUID(unit_id).bytes, metadata={META_INVALIDATION_REASON: reason or ""})
-        await asyncio.to_thread(self._client.write_ops, self._archive_namespace(bank_id), [op])
+        await conn.execute(
+            f"UPDATE {fq_table('invalidated_memory_units')} SET invalidation_reason = $3 WHERE id = $1 AND bank_id = $2",
+            unit_id,
+            bank_id,
+            reason,
+        )
 
     async def restore_memory(self, *, conn, fq_table, bank_id: str, unit_id: str) -> StoredMemory | None:
-        record = await self._move(
-            self._archive_namespace(bank_id),
-            self._namespace(bank_id),
+        row = await conn.fetchrow(
+            f"SELECT {_ARCHIVE_SELECT} FROM {fq_table('invalidated_memory_units')} WHERE id = $1 AND bank_id = $2",
             unit_id,
-            drop_metadata=(META_INVALIDATION_REASON, META_INVALIDATED_AT),
+            bank_id,
         )
-        return _stored_from_record(record) if record is not None else None
+        if row is None:
+            return None
+        blob = _archive_payload(row)
+        # Reconstruct the memory from the stashed payload and write it back to the
+        # bank's namespace — the next fold re-indexes it and re-derives its
+        # semantic edges. The caller re-embeds afterwards (set_memory_embedding).
+        if blob is not None:
+            await self.ensure_namespace(bank_id)
+            memory = _memory_from_blob(blob, unit_id)
+            await asyncio.to_thread(self._client.write, self._namespace(bank_id), [memory])
+        await conn.execute(
+            f"DELETE FROM {fq_table('invalidated_memory_units')} WHERE id = $1 AND bank_id = $2", unit_id, bank_id
+        )
+        return _archived_row_to_stored(row)
 
     async def set_memory_embedding(self, *, conn, fq_table, bank_id: str, unit_id: str, embedding) -> None:
         op = self._client.patch(uuid.UUID(unit_id).bytes, vector=_parse_embedding(embedding))
@@ -1173,6 +1188,102 @@ def _stored_from_record(record: Any) -> StoredMemory:
         semantic_edges=[
             (str(uuid.UUID(bytes=e.target)), float(e.weight)) for e in getattr(payload, "semantic_out", [])
         ],
+    )
+
+
+# --------------------------------------------------------------------- archive round-trip
+
+
+_ARCHIVE_TS_FIELDS = ("event_date", "updated_at", "occurred_start", "occurred_end", "mentioned_at")
+
+
+def _serialize_record(record: Any) -> dict:
+    """The full memlake memory as a JSON-able dict, for the archive's reserved key.
+
+    Carries what the archive's memory_units-shaped columns cannot: the vector, the
+    memory_type, the causal edges and the raw metadata bag. Bytes become hex so it
+    round-trips through JSONB.
+    """
+    payload = record.memory
+    raw = record.vector.f32le if record.vector else b""
+    ts = payload.timestamps
+    return {
+        "text": payload.text,
+        "memory_type": record.memory_type,
+        "vector": list(struct.unpack(f"<{len(raw) // 4}f", raw)) if raw else [],
+        "tags": list(payload.tags),
+        "proof_count": payload.proof_count,
+        "entity_ids": [e.hex() for e in payload.entity_ids],
+        "metadata": dict(payload.metadata or {}),
+        "timestamps": {f: getattr(ts, f) for f in _ARCHIVE_TS_FIELDS if ts.HasField(f)},
+        "causal_out": [
+            {"target": e.target.hex(), "link_type": int(e.link_type), "weight": float(e.weight)}
+            for e in payload.causal_out
+        ],
+    }
+
+
+def _memory_from_blob(blob: dict, unit_id: str):
+    """Rebuild a memlake ``Memory`` from a :func:`_serialize_record` blob."""
+    ts = blob.get("timestamps", {})
+    memory = mc.memory(
+        blob["text"],
+        blob.get("vector") or [],
+        memory_type=blob["memory_type"],
+        id=uuid.UUID(unit_id).bytes,
+        tags=blob.get("tags", []),
+        proof_count=blob.get("proof_count", 1),
+        entity_ids=[bytes.fromhex(e) for e in blob.get("entity_ids", [])],
+        metadata=blob.get("metadata", {}),
+        event_date=ts.get("event_date"),
+        updated_at=ts.get("updated_at"),
+        occurred_start=ts.get("occurred_start"),
+        occurred_end=ts.get("occurred_end"),
+        mentioned_at=ts.get("mentioned_at"),
+    )
+    for edge in blob.get("causal_out", []):
+        memory.causal_out.add(target=bytes.fromhex(edge["target"]), link_type=edge["link_type"], weight=edge["weight"])
+    return memory
+
+
+def _archived_metadata(row: Any) -> dict:
+    """The archived row's `metadata` as a dict (asyncpg hands back str or dict)."""
+    value = row["metadata"]
+    if isinstance(value, str):
+        value = _parse_json_object(value) or {}
+    return dict(value or {})
+
+
+def _archive_payload(row: Any) -> dict | None:
+    """The stashed memlake memory from an archived row, or None if absent."""
+    return _archived_metadata(row).get(_ARCHIVE_PAYLOAD_KEY)
+
+
+def _archived_row_to_stored(row: Any) -> StoredMemory:
+    """Map an `invalidated_memory_units` row onto :class:`StoredMemory`.
+
+    The reserved memlake payload is stripped, so the user metadata surfaced is
+    exactly what the memory carried.
+    """
+    meta = _archived_metadata(row)
+    meta.pop(_ARCHIVE_PAYLOAD_KEY, None)
+    return StoredMemory(
+        unit_id=str(row["id"]),
+        text=row["text"],
+        fact_type=row["fact_type"],
+        context=row["context"],
+        document_id=row["document_id"],
+        chunk_id=str(row["chunk_id"]) if row["chunk_id"] else None,
+        tags=list(row["tags"] or []),
+        metadata=meta or None,
+        proof_count=row["proof_count"] or 1,
+        event_date=row["event_date"],
+        occurred_start=row["occurred_start"],
+        occurred_end=row["occurred_end"],
+        mentioned_at=row["mentioned_at"],
+        created_at=row["created_at"],
+        consolidated_at=row["consolidated_at"],
+        entity_ids=[str(e) for e in (row["entity_ids"] or [])],
     )
 
 

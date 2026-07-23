@@ -389,32 +389,51 @@ same shape as the per-cluster tag set.
 
 ## 6. Curation archive state
 
-- [x] **Invalidate / revert — DONE, via an archive namespace.** Invalidation is
-      structural on both stores now: Postgres moves the row to
-      `invalidated_memory_units`, and the extension moves the memory to a sibling
-      `<ns>__invalidated` namespace. Recall and scans only ever touch the bank's
-      own namespace, so an invalidated memory is out of every result set for free
-      — no per-query "valid?" filter — yet stays readable, flagged, and
-      restorable. The move reconstructs the whole memory (vector, entity ids,
-      causal edges, timestamps, metadata) from one addressed read, so nothing but
-      the indexer-derived semantic edges (re-derived on the next fold) and the
-      write-only `index_text` is lost across it. `get_memory_unit` reports
-      `state: "invalidated"` with the reason/timestamp, and `list_memory_units(
-      state="invalidated")` scans the archive namespace.
+- [x] **Invalidate / revert — DONE. Invalidated units leave the index entirely.**
+      Invalidation is structural on both stores: Postgres moves the row to
+      `invalidated_memory_units`, and the extension **deletes the memory from the
+      bank's namespace** — so it never touches the IVF/FTS index again — and keeps
+      it in that same Postgres archive table (cold storage, no index, which is what
+      it exists for). Restore writes it back and deletes the archive row.
+
+      An earlier cut moved the memory to a sibling `<ns>__invalidated` namespace,
+      but a namespace *is* an indexed structure — folding it re-indexed the very
+      units that should be inert. Deleting from memlake + parking the payload in
+      Postgres is the fix: invalidated units cost nothing to keep, and
+      `list_memory_units(state="invalidated")` is a plain `SELECT` on the archive
+      (no fold, exact count), exactly like the SQL path.
+
+      Everything the memory_units-shaped archive columns cannot hold — the vector,
+      the memory_type, the causal edges, the raw metadata bag — rides in a reserved
+      key inside the row's `metadata`, so revert rebuilds the memory faithfully.
+      `get_memory_unit` reports `state: "invalidated"` with the reason/timestamp.
 
       Behind a five-method archive lifecycle on the store interface
       (`invalidate_memory` / `restore_memory` / `get_archived_memory` /
       `set_invalidation_reason` / `set_memory_embedding`), so no call site branches
-      on which store is installed. Verified live: invalidate removes a memory from
-      recall/scan and archives it; the reason updates; the invalidated tab lists
-      it; revert brings it back searchable.
+      on which store is installed. Verified live against a real memlake server *and*
+      a real Postgres: invalidate deletes from memlake and writes the archive row;
+      the reason updates; the invalidated tab lists it; restore reconstructs the
+      memory (tags/edges/metadata intact) and clears the archive.
 
-      Two residues, both minor: **(a)** the archive namespace needs its own index
-      pass for the invalidated *listing* to be current (the same
-      write-then-index staleness every scan has; the lifecycle itself is
-      strong-consistency); **(b)** `index_text` (entity/date BM25 enrichment) does
-      not survive the round trip, so a reverted memory loses it until its next
-      edit — the archive is never FTS-queried, and revert re-embeds anyway.
+      This is a deliberate, narrow relaxation of "nothing memory-shaped in
+      Postgres" — only for cold, invalidated units, in the archive table, never
+      `memory_units` / `memory_links` / `unit_entities`. The proper long-term fix
+      is a memlake-server *archived* state the fold skips (kept in the payload
+      store, out of IVF/FTS, fetchable by Get) — tracked below.
+
+      One residue: `index_text` (entity/date BM25 enrichment) does not survive the
+      round trip, so a reverted memory loses it until its next edit — the archive
+      is never FTS-queried, and revert re-embeds anyway.
+
+- [ ] **Proper fix: a memlake-server `archived` state.** The Postgres-archive
+      approach above keeps invalidated units out of the index, but at the cost of
+      writing them to Postgres. The clean version is a state memlake owns: the fold
+      skips archived units (kept in the payload SSTable so Get/restore work), recall
+      and scan exclude them, an op flips it back. Then invalidation is a single op,
+      nothing memory-shaped touches Postgres, and the archive is native. Rust work
+      across the fold + query path + proto; do it once the segmented-index refactor
+      settles.
 
 - [ ] **Edit (`update_memory_unit` field edits) still writes `memory_units`
       directly.** The state changes (this item) are routed through the store; the

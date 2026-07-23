@@ -229,3 +229,58 @@ async def store(_serve: str):
 def bank_id() -> str:
     """A unique bank (namespace) per test, so nothing leaks between them."""
     return f"ext-test-{uuid.uuid4().hex[:12]}"
+
+
+# The archive table `invalidated_memory_units` a curation invalidate/restore round
+# trip reads and writes — a minimal clone of the columns the extension touches, so
+# the archive tests exercise the real SQL without standing up all of Hindsight.
+_ARCHIVE_DDL = """
+CREATE TABLE IF NOT EXISTS invalidated_memory_units (
+    id uuid PRIMARY KEY,
+    bank_id text NOT NULL,
+    text text NOT NULL,
+    fact_type text NOT NULL,
+    context text,
+    event_date timestamptz NOT NULL,
+    occurred_start timestamptz,
+    occurred_end timestamptz,
+    mentioned_at timestamptz,
+    document_id text,
+    chunk_id uuid,
+    tags text[],
+    metadata jsonb,
+    proof_count int DEFAULT 1,
+    created_at timestamptz DEFAULT now(),
+    consolidated_at timestamptz,
+    entity_ids uuid[],
+    invalidation_reason text,
+    invalidated_at timestamptz DEFAULT now()
+)
+"""
+
+
+@pytest.fixture
+async def pg_conn():
+    """A real Postgres connection for the curation archive, which lives there.
+
+    Invalidation deletes a memory from the index and keeps it in Postgres'
+    `invalidated_memory_units`, so exercising invalidate/restore needs a live
+    connection — unlike every other method, which ignores `conn`. Skips (never
+    fails) if no Postgres is reachable; point it elsewhere with
+    ``MEMLAKE_TEST_PG_DSN``.
+    """
+    import asyncpg
+
+    dsn = os.environ.get(
+        "MEMLAKE_TEST_PG_DSN",
+        "postgresql://hindsight_user:hindsight_password@localhost:5436/hindsight_db",
+    )
+    try:
+        conn = await asyncpg.connect(dsn, timeout=3)
+    except Exception as exc:  # noqa: BLE001 - any connect failure means "skip"
+        pytest.skip(f"Postgres not reachable for the curation-archive tests ({exc}); set MEMLAKE_TEST_PG_DSN")
+    await conn.execute(_ARCHIVE_DDL)
+    try:
+        yield conn
+    finally:
+        await conn.close()
