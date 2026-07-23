@@ -95,15 +95,41 @@ impl MemlakeService {
         self.snapshots.lock().unwrap().get(name).cloned()
     }
 
-    /// Get a current snapshot for `ns`, reusing the cached one while no write has landed
-    /// since it was opened — one cheap WAL-head check. A write invalidates the cache for its
-    /// namespace, and reads are always strongly consistent, so a reader re-opens promptly and
-    /// never serves a stale view.
+    /// Get a current snapshot for `ns`, reusing work while no fold has landed since it was opened.
+    ///
+    /// Three cases, cheapest first:
+    /// * head unchanged → reuse the cached snapshot wholesale (one head-pointer GET, no LIST);
+    /// * head advanced but the **manifest is unchanged** (a write, not a fold — a conditional GET
+    ///   returns 304) → reopen reusing the segments and rebuilding only the WAL tail;
+    /// * the manifest changed (a fold) → full reopen.
+    /// Reads stay strongly consistent: a reader re-derives the tail up to the live head every time
+    /// it advances, so no acked write is ever missed.
     async fn snapshot(&self, ns: &Namespace) -> Result<Arc<Snapshot>, Status> {
         if let Some(cached) = self.cached_snapshot(&ns.name) {
-            let head = ns.wal_head().await.map_err(internal)?;
+            // The per-query staleness check: the head from the pointer (one GET), not a LIST.
+            let head = ns.resolve_head().await.map_err(internal)?;
             if head == cached.through_seq {
                 return Ok(cached);
+            }
+
+            // Head advanced. If the manifest is unchanged, only the tail grew — reopen cheaply,
+            // reusing the loaded segment metadata instead of re-decoding it.
+            if let Some(etag) = cached.node.manifest_etag() {
+                let manifest_path = mlake_core::manifest::manifest_path(&ns.name);
+                match ns.store.get_if_modified(&manifest_path, etag).await {
+                    Ok(None) => {
+                        let node = Arc::new(
+                            cached
+                                .node
+                                .reopen_extending_tail(head, self.tokenizer.clone())
+                                .await
+                                .map_err(internal)?,
+                        );
+                        return Ok(self.install_snapshot(&ns.name, node));
+                    }
+                    Ok(Some(_)) => {} // manifest changed (a fold) — fall through to full reopen
+                    Err(_) => {}      // conditional GET failed — fall through to the safe full path
+                }
             }
         }
 
@@ -112,12 +138,17 @@ impl MemlakeService {
                 .await
                 .map_err(internal)?,
         );
+        Ok(self.install_snapshot(&ns.name, node))
+    }
+
+    /// Cache `node` as the current snapshot for `name` and return it.
+    fn install_snapshot(&self, name: &str, node: Arc<QueryNode>) -> Arc<Snapshot> {
         let snap = Arc::new(Snapshot {
             through_seq: node.through_seq,
             node,
         });
-        self.snapshots.lock().unwrap().insert(ns.name.clone(), snap.clone());
-        Ok(snap)
+        self.snapshots.lock().unwrap().insert(name.to_string(), snap.clone());
+        snap
     }
 
     /// Wait until the background indexer has folded `name`'s WAL up to `seq` into a segment, by
@@ -540,6 +571,28 @@ impl Memlake for MemlakeService {
         Ok(Response::new(pb::MetadataStatsResponse { values }))
     }
 
+    async fn link_stats(
+        &self,
+        req: Request<pb::LinkStatsRequest>,
+    ) -> Result<Response<pb::LinkStatsResponse>, Status> {
+        let req = req.into_inner();
+        if req.namespace.is_empty() {
+            return Err(Status::invalid_argument("namespace is required"));
+        }
+        let mut types: Vec<u8> = req
+            .memory_types
+            .iter()
+            .map(|&t| convert::memory_type_u8(t))
+            .collect::<Result<Vec<_>, _>>()?;
+        types.sort_unstable();
+        types.dedup();
+
+        let ns = self.namespace(&req.namespace);
+        let snap = self.snapshot(&ns).await?;
+        let (semantic_edge_count, causal_edge_count) = snap.node.link_counts(&types).await.map_err(internal)?;
+        Ok(Response::new(pb::LinkStatsResponse { semantic_edge_count, causal_edge_count }))
+    }
+
     async fn scan(
         &self,
         req: Request<pb::ScanRequest>,
@@ -876,11 +929,12 @@ impl Memlake for MemlakeService {
         }
         let total_objects = all.len() as u64;
 
-        // Newest generation first, then by kind, so the current generation's files read as
-        // a group above the superseded ones.
+        // Group a segment's files together (by segment id), then by kind, then path — so one
+        // segment's index files read as a block. The manifest and WAL entries have no segment and
+        // sort first (empty string), which is where they belong: they publish the segments.
         all.sort_by(|a, b| {
-            b.0.generation
-                .cmp(&a.0.generation)
+            a.0.segment
+                .cmp(&b.0.segment)
                 .then((a.0.kind as i32).cmp(&(b.0.kind as i32)))
                 .then(a.0.path.cmp(&b.0.path))
         });

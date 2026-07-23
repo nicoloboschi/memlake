@@ -12,6 +12,7 @@
 //! write visible immediately (INV-5).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Arc;
 use std::time::Instant;
 
 use mlake_core::{EntityId, MemoryId, Predicate, StoredMemory, TagFilter};
@@ -19,7 +20,7 @@ use mlake_fts::{TantivyFts, Tokenizer};
 use mlake_graph::radj::InEdge;
 use mlake_graph::{GraphParams, GraphSource};
 use mlake_ivf::Centroids;
-use mlake_store::{Phase, QueryMetrics};
+use mlake_store::{Etag, Phase, QueryMetrics};
 use mlake_wal::{Namespace, WalTail};
 
 use crate::fusion::{rrf, weighted_rrf, FusedHit, RankedArm};
@@ -144,7 +145,10 @@ struct SegmentState {
 /// un-indexed WAL-tail overlay. Every arm reads across `segments` + the tail and merges, with a
 /// newer segment (or the tail) shadowing an older copy of the same id.
 struct FactType {
-    segments: Vec<SegmentState>,
+    /// The fold-produced segment metadata for this fact type. `Arc`-shared so a reopen that only
+    /// extends the WAL tail (a write, not a fold — detected by an unchanged manifest etag) can
+    /// reuse it without re-decoding centroids, tables and the FTS split.
+    segments: Arc<Vec<SegmentState>>,
     tail_items: Vec<StoredMemory>,
     tail_fts: TantivyFts,
     doc_count: usize,
@@ -160,12 +164,22 @@ pub struct QueryNode {
     /// indexed item from a segment with `seq_hi = S` is hidden if `seg_superseded[id] > S` (a newer
     /// segment deleted or re-upserted it). Built from each segment's `tombstones.bin` at open.
     seg_superseded: HashMap<MemoryId, u64>,
-    /// Active predicate deletes from the tail: `(sequence, predicate)`. A generation memory
-    /// is hidden if it matches one whose sequence exceeds the memory's `write_seq`. Evaluated
-    /// lazily at read; materialized at the next fold.
+    /// Active predicate deletes (tail + segment), `(sequence, predicate)`. A generation memory is
+    /// hidden if it matches one whose sequence exceeds the memory's `write_seq`. Evaluated lazily
+    /// at read; materialized at the next fold.
     predicate_tombstones: Vec<(u64, mlake_core::Predicate)>,
+    /// Just the *segment-derived* predicate deletes — the write-invariant subset of
+    /// `predicate_tombstones`, kept so a tail-extending reopen can rebuild the union without
+    /// re-reading every segment's tombstone object.
+    seg_predicate_tombstones: Vec<(u64, mlake_core::Predicate)>,
     /// The WAL sequence this snapshot reflects.
     pub through_seq: u64,
+    /// The manifest cursor this snapshot's segments were folded up to — the low bound of the tail
+    /// scan. Unchanged by a write, so a tail-extending reopen scans `(wal_index_cursor, new_head]`.
+    wal_index_cursor: u64,
+    /// The etag of the manifest this snapshot was built from. A reopen compares it (conditional
+    /// GET): unchanged ⇒ only the tail grew (reuse segments); changed ⇒ a fold ⇒ full rebuild.
+    manifest_etag: Option<Etag>,
     /// The generation this snapshot's indexed files belong to. Part of the snapshot's
     /// identity: a `ScanCursor` is only meaningful against the generation that issued it,
     /// since cluster paths and ordering change when the indexer publishes a new one.
@@ -205,24 +219,28 @@ impl QueryNode {
     pub async fn open(ns: &Namespace, tokenizer: Tokenizer) -> Result<Self> {
         let metrics = QueryMetrics::new();
 
-        // RT1: manifest, then the live WAL head (the read's consistency point).
-        let (manifest, _etag) = ns.read_manifest().await?;
-        let head = ns.wal_head().await?;
+        // RT1: manifest, then the live WAL head (the read's consistency point). The head comes
+        // from the pointer (one GET), not a LIST — it is `>=` every acked write by construction.
+        let (manifest, manifest_etag) = ns.read_manifest().await?;
+        let head = ns.resolve_head().await?;
 
-        // RT4: the WAL tail (exhaustive overlay), partitioned by fact type.
+        // RT4: the WAL tail (exhaustive overlay), partitioned by fact type. Enumerated by
+        // construction from the pointer's head — no LIST.
         let scan = WalTail::new(ns)
-            .scan(manifest.wal_index_cursor, Some(head))
+            .scan_up_to(manifest.wal_index_cursor, head)
             .await?;
         let tombstones: HashSet<MemoryId> = scan.tombstones.iter().copied().collect();
-        let mut predicate_tombstones = scan.predicate_tombstones.clone();
+        let tail_predicate_tombstones = scan.predicate_tombstones.clone();
         let mut tail_by_ft: BTreeMap<u8, Vec<StoredMemory>> = BTreeMap::new();
         for item in scan.upserts.into_values() {
             tail_by_ft.entry(item.memory_type).or_default().push(item);
         }
 
         // Each segment's delete overlay: the ids it kills in older segments (keyed by its seq_hi,
-        // so a newer segment wins) plus its predicate-deletes (aggregated with the tail's).
+        // so a newer segment wins) plus its predicate-deletes. Kept separate from the tail's so a
+        // tail-extending reopen can reuse this (segment) half unchanged.
         let mut seg_superseded: HashMap<MemoryId, u64> = HashMap::new();
+        let mut seg_predicate_tombstones: Vec<(u64, Predicate)> = Vec::new();
         for seg in &manifest.segments {
             let tomb =
                 crate::generation::read_tombstones(&ns.store, &seg.tombstones, Some(&metrics)).await?;
@@ -230,8 +248,14 @@ impl QueryNode {
                 let e = seg_superseded.entry(id).or_insert(0);
                 *e = (*e).max(seg.seq_hi);
             }
-            predicate_tombstones.extend(tomb.predicates);
+            seg_predicate_tombstones.extend(tomb.predicates);
         }
+        // Query-time overlay is the union of tail and segment predicate deletes.
+        let predicate_tombstones: Vec<(u64, Predicate)> = tail_predicate_tombstones
+            .iter()
+            .cloned()
+            .chain(seg_predicate_tombstones.iter().cloned())
+            .collect();
 
         // Fact types to load: those with an index, plus any that appear only in the tail.
         let mut memory_types: HashSet<u8> = manifest.memory_types().collect();
@@ -395,7 +419,10 @@ impl QueryNode {
                     doc_count += 1;
                 }
             }
-            per_type.insert(ft, FactType { segments, tail_items, tail_fts, doc_count });
+            per_type.insert(
+                ft,
+                FactType { segments: Arc::new(segments), tail_items, tail_fts, doc_count },
+            );
         }
 
         Ok(Self {
@@ -404,10 +431,105 @@ impl QueryNode {
             tombstones,
             seg_superseded,
             predicate_tombstones,
+            seg_predicate_tombstones,
             through_seq: head,
+            wal_index_cursor: manifest.wal_index_cursor,
+            manifest_etag,
             generation: manifest.version,
             load_roundtrips: metrics.roundtrips(),
         })
+    }
+
+    /// Reopen for a new WAL head **without a fold** — the manifest (hence every segment) is
+    /// unchanged, so only the tail grew. Reuses each fact type's `Arc`-shared `SegmentState`
+    /// (no re-decoding of centroids/tables/FTS) and the segment-derived tombstone overlay, and
+    /// rebuilds only the tail: a fresh scan of `(wal_index_cursor, new_head]`, its per-type FTS,
+    /// the tail deletes, and the live doc counts. The caller establishes "no fold happened" with
+    /// a conditional GET on the manifest etag; this must only be called when that holds.
+    pub async fn reopen_extending_tail(&self, new_head: u64, tokenizer: Tokenizer) -> Result<Self> {
+        let ns = &self.ns;
+        let metrics = QueryMetrics::new();
+
+        // Fresh tail scan over the same (unchanged) cursor — constructed from the head, no LIST.
+        let scan = WalTail::new(ns)
+            .scan_up_to(self.wal_index_cursor, new_head)
+            .await?;
+        let tombstones: HashSet<MemoryId> = scan.tombstones.iter().copied().collect();
+        let mut tail_by_ft: BTreeMap<u8, Vec<StoredMemory>> = BTreeMap::new();
+        for item in scan.upserts.into_values() {
+            tail_by_ft.entry(item.memory_type).or_default().push(item);
+        }
+        // Union the fresh tail predicates with the reused segment ones.
+        let predicate_tombstones: Vec<(u64, Predicate)> = scan
+            .predicate_tombstones
+            .iter()
+            .cloned()
+            .chain(self.seg_predicate_tombstones.iter().cloned())
+            .collect();
+
+        // Fact types to answer: those that already have segments, plus any that appear only in
+        // the (new) tail.
+        let mut memory_types: HashSet<u8> = self.per_type.keys().copied().collect();
+        memory_types.extend(tail_by_ft.keys().copied());
+
+        let mut per_type = BTreeMap::new();
+        for ft in memory_types {
+            let tail_items = tail_by_ft.remove(&ft).unwrap_or_default();
+            let tail_fts = TantivyFts::build_with_tags(
+                tail_items.iter().map(|i| (i.id, i.fts_text(), i.tags.as_slice())),
+                tokenizer.clone(),
+            )?;
+            // Reuse the fold-produced segments for this fact type (empty for a tail-only type).
+            let segments = self
+                .per_type
+                .get(&ft)
+                .map(|f| Arc::clone(&f.segments))
+                .unwrap_or_else(|| Arc::new(Vec::new()));
+
+            // Live doc count: indexed records + genuinely-new tail items, minus tombstoned ones —
+            // same accounting as `open`, over the reused segments.
+            let mut doc_count: usize = segments.iter().map(|s| s.doc_count).sum();
+            for t in &tombstones {
+                for s in segments.iter() {
+                    if s.pk.lookup(&ns.store, t, None).await?.is_some() {
+                        doc_count -= 1;
+                        break;
+                    }
+                }
+            }
+            for it in &tail_items {
+                let mut indexed = false;
+                for s in segments.iter() {
+                    if s.pk.lookup(&ns.store, &it.id, None).await?.is_some() {
+                        indexed = true;
+                        break;
+                    }
+                }
+                if !indexed {
+                    doc_count += 1;
+                }
+            }
+            per_type.insert(ft, FactType { segments, tail_items, tail_fts, doc_count });
+        }
+
+        Ok(Self {
+            ns: ns.clone(),
+            per_type,
+            tombstones,
+            seg_superseded: self.seg_superseded.clone(),
+            predicate_tombstones,
+            seg_predicate_tombstones: self.seg_predicate_tombstones.clone(),
+            through_seq: new_head,
+            wal_index_cursor: self.wal_index_cursor,
+            manifest_etag: self.manifest_etag.clone(),
+            generation: self.generation,
+            load_roundtrips: metrics.roundtrips(),
+        })
+    }
+
+    /// The manifest etag this snapshot was built from, for a conditional-GET reopen check.
+    pub fn manifest_etag(&self) -> Option<&Etag> {
+        self.manifest_etag.as_ref()
     }
 
     /// Total live items across all fact types.
@@ -511,7 +633,7 @@ impl QueryNode {
     /// stands in. `None` means nothing in this type carries an embedding, so there is no
     /// dimension to violate.
     fn expected_dim(state: &FactType) -> Option<usize> {
-        for seg in &state.segments {
+        for seg in state.segments.iter() {
             if !seg.centroids.is_empty() && seg.centroids.dim > 0 {
                 return Some(seg.centroids.dim);
             }
@@ -526,7 +648,7 @@ impl QueryNode {
         let metrics = QueryMetrics::new();
         let mut found: HashSet<MemoryId> = HashSet::new();
         for ft in self.per_type.values() {
-            for seg in &ft.segments {
+            for seg in ft.segments.iter() {
                 let by_cluster = seg.pk.lookup_batch(&self.ns.store, ids, Some((&metrics, 1))).await?;
                 found.extend(by_cluster.keys().copied());
             }
@@ -562,7 +684,7 @@ impl QueryNode {
         // Anything the tail did not answer comes from a segment. Resolve against every fact type's
         // segments, newest-first, so a re-upserted id's current (newest-segment) copy wins.
         for ft in self.per_type.values() {
-            for seg in &ft.segments {
+            for seg in ft.segments.iter() {
                 let missing: Vec<MemoryId> =
                     wanted.iter().copied().filter(|id| !found.contains_key(id)).collect();
                 if missing.is_empty() {
@@ -634,7 +756,7 @@ impl QueryNode {
         let walk: Vec<u8> = if types.is_empty() { self.memory_types() } else { types.to_vec() };
         for ty in walk {
             let Some(ft) = self.per_type.get(&ty) else { continue };
-            for seg in &ft.segments {
+            for seg in ft.segments.iter() {
                 if seg.stats_path.is_empty() {
                     continue;
                 }
@@ -660,6 +782,39 @@ impl QueryNode {
         Ok(out)
     }
 
+    /// Live edge totals `(semantic, causal)` across a bank's segments plus the WAL tail.
+    ///
+    /// Sums each segment's `Stats.{semantic,causal}_edge_count` (tallied at fold) and adds the
+    /// un-indexed tail's visible items' `semantic_out` / `causal_out`. Like `metadata_counts` and
+    /// `entity_counts`, it does not subtract edges a newer segment tombstoned — the residual is
+    /// bounded by not-yet-compacted re-upserts/deletes, which a stats surface tolerates.
+    pub async fn link_counts(&self, types: &[u8]) -> Result<(u64, u64)> {
+        let metrics = QueryMetrics::new();
+        let (mut semantic, mut causal): (u64, u64) = (0, 0);
+        let walk: Vec<u8> = if types.is_empty() { self.memory_types() } else { types.to_vec() };
+        for ty in walk {
+            let Some(ft) = self.per_type.get(&ty) else { continue };
+            for seg in ft.segments.iter() {
+                if seg.stats_path.is_empty() {
+                    continue;
+                }
+                let bytes = self.ns.store.get_immutable(&seg.stats_path, Some((&metrics, 2))).await?;
+                let stats: crate::generation::Stats = serde_json::from_slice(&bytes).unwrap_or_default();
+                semantic += stats.semantic_edge_count as u64;
+                causal += stats.causal_edge_count as u64;
+            }
+            // The tail is not in any segment's stats yet, so add its visible items' edges.
+            for m in &ft.tail_items {
+                if self.hidden(m) {
+                    continue;
+                }
+                semantic += m.semantic_out.len() as u64;
+                causal += m.causal_out.len() as u64;
+            }
+        }
+        Ok((semantic, causal))
+    }
+
     pub async fn entity_counts(
         &self,
         types: &[u8],
@@ -673,7 +828,7 @@ impl QueryNode {
         for ty in walk {
             let Some(ft) = self.per_type.get(&ty) else { continue };
 
-            for seg in &ft.segments {
+            for seg in ft.segments.iter() {
                 if !seg.entity.is_empty() {
                     for (entity, count) in seg
                         .entity
@@ -779,7 +934,7 @@ impl QueryNode {
             // Tail overrides the indexed copy of a re-upserted id (newer wins), same as a scan.
             let superseded: HashSet<MemoryId> = ft.tail_items.iter().map(|m| m.id).collect();
             // Every segment's clusters, then the tail.
-            for seg in &ft.segments {
+            for seg in ft.segments.iter() {
                 for cluster in 0..seg.cluster_paths.len() {
                     for m in self
                         .fetch_clusters(seg, &[cluster], &metrics, 3)
@@ -913,7 +1068,7 @@ impl QueryNode {
             by_id.keys().filter(|id| !materialized.contains_key(id)).copied().collect();
         if !missing.is_empty() {
             // Hydrate across segments, newest-first, via each segment's payload store.
-            for seg in &state.segments {
+            for seg in state.segments.iter() {
                 for (id, item) in
                     seg.payload.lookup_batch(&self.ns.store, &missing, Some((metrics, 3))).await?
                 {
@@ -978,7 +1133,7 @@ impl QueryNode {
                         merged.entry(m.id).or_insert(mlake_core::cosine_opt(q, &m.vector));
                     }
                 }
-                for seg in &state.segments {
+                for seg in state.segments.iter() {
                     for (id, sc) in
                         self.vector_arm_segment(
                             seg,
@@ -1363,7 +1518,7 @@ impl QueryNode {
         into: &mut HashMap<MemoryId, StoredMemory>,
         metrics: &QueryMetrics,
     ) -> Result<()> {
-        for seg in &state.segments {
+        for seg in state.segments.iter() {
             let missing: Vec<MemoryId> = ids
                 .iter()
                 .filter(|id| !into.contains_key(id) && !self.tombstones.contains(id))
@@ -1449,7 +1604,7 @@ impl QueryNode {
         // 1. Entry-point pool: ids whose effective_ts is in the window (one ranged scan per
         //    segment's time index) plus in-window tail items.
         let mut window_ids: Vec<MemoryId> = Vec::new();
-        for seg in &state.segments {
+        for seg in state.segments.iter() {
             if !seg.time.is_empty() {
                 window_ids.extend(
                     seg.time
@@ -1504,7 +1659,7 @@ impl QueryNode {
         // Incoming edges may live in any segment (an edge is stored where its target is), so union
         // each segment's radj for the seeds.
         let mut incoming: HashMap<MemoryId, Vec<InEdge>> = HashMap::new();
-        for seg in &state.segments {
+        for seg in state.segments.iter() {
             for (id, edges) in seg.radj.incoming_batch(&self.ns.store, &seeds, Some((metrics, 4))).await? {
                 incoming.entry(id).or_default().extend(edges);
             }
@@ -1564,7 +1719,7 @@ impl QueryNode {
                 .into_iter()
                 .filter(|h| !self.tombstones.contains(&h.id)),
         );
-        for seg in &state.segments {
+        for seg in state.segments.iter() {
             hits.extend(
                 seg.gen_fts
                     .search_filtered(text, depth, tags)
@@ -1622,7 +1777,7 @@ impl QueryNode {
         // so union each segment's radj + entity index for the seeds.
         let mut incoming: HashMap<MemoryId, Vec<InEdge>> = HashMap::new();
         let mut entity_candidates: HashMap<EntityId, Vec<MemoryId>> = HashMap::new();
-        for seg in &state.segments {
+        for seg in state.segments.iter() {
             let (inc, ents) = futures::try_join!(
                 seg.radj.incoming_batch(&self.ns.store, &seed_ids, Some((metrics, 4))),
                 seg.entity.candidates_batch(&self.ns.store, &seed_entities, per_entity_cap, Some((metrics, 4))),
@@ -1665,7 +1820,7 @@ impl QueryNode {
         let tf = Instant::now();
         let ranked_ids: Vec<MemoryId> =
             ranked.iter().map(|r| r.id).filter(|id| !by_id.contains_key(id)).collect();
-        for seg in &state.segments {
+        for seg in state.segments.iter() {
             for (id, item) in
                 seg.payload.lookup_batch(&self.ns.store, &ranked_ids, Some((metrics, 4))).await?
             {

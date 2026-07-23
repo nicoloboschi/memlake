@@ -109,15 +109,62 @@ impl<'a> WalTail<'a> {
         // this scan is awaited from inside the gRPC server's `Send` future.
         let ordered: Vec<String> = paths.into_iter().map(|(_, p)| p).collect();
         let store = &self.namespace.store;
+        // Read entry bodies through the immutable NVMe cache. A `{ns}/wal/{seq}` object is
+        // written once (conditional create) and its sequence never repeats (see
+        // `Writer::cold_next_seq`), so its path names one immutable body forever — sound to
+        // cache by path. Strongly-consistent reads re-scan this tail every query, so caching
+        // the bodies turns the per-query re-fetch of an unchanged tail into local hits; only
+        // the enumerating LIST above still touches S3.
         let objects: Vec<_> = futures::stream::iter(ordered)
-            .map(|path| async move { store.get(&path, None).await })
+            .map(|path| async move { store.get_immutable(&path, None).await })
             .buffered(FETCH_CONCURRENCY)
             .try_collect()
             .await?;
 
         let mut entries = Vec::with_capacity(objects.len());
         for obj in &objects {
-            entries.push(WalEntry::from_bytes(&obj.bytes)?);
+            entries.push(WalEntry::from_bytes(obj)?);
+        }
+        Ok(fold_entries(&entries))
+    }
+
+    /// Like [`scan`] with a known `head`, but enumerates the tail by **construction** —
+    /// `seq_path(after_seq+1..=head)` — instead of a LIST. This is the read path's tail scan:
+    /// `head` comes from the head pointer, and entries in `(cursor, head]` are never GC'd (GC
+    /// reclaims only `<= prev_wal_index_cursor`), so a `NotFound` there can only be a genuine
+    /// `commit_many` gap and is skipped. Bodies read through the immutable cache. This removes the
+    /// last per-reopen S3 LIST on reads — the indexer keeps using [`scan`] (a LIST is fine on the
+    /// background fold, which is also the authority that reconciles gaps).
+    pub async fn scan_up_to(&self, after_seq: u64, head: u64) -> Result<TailScan> {
+        use futures::stream::{StreamExt, TryStreamExt};
+
+        const FETCH_CONCURRENCY: usize = 16;
+
+        if head <= after_seq {
+            return Ok(fold_entries(&[]));
+        }
+        let store = &self.namespace.store;
+        let name = &self.namespace.name;
+        // Ascending sequences; `buffered` preserves order, so entries reach the fold in sequence
+        // order (a later tombstone must win over an earlier upsert of the same id).
+        let objects: Vec<Option<_>> = futures::stream::iter((after_seq + 1)..=head)
+            .map(|seq| {
+                let path = crate::seq_path(name, seq);
+                async move {
+                    match store.get_immutable(&path, None).await {
+                        Ok(b) => Ok(Some(b)),
+                        Err(mlake_store::Error::NotFound(_)) => Ok(None), // a gap — skip it
+                        Err(e) => Err(crate::Error::from(e)),
+                    }
+                }
+            })
+            .buffered(FETCH_CONCURRENCY)
+            .try_collect()
+            .await?;
+
+        let mut entries = Vec::new();
+        for obj in objects.into_iter().flatten() {
+            entries.push(WalEntry::from_bytes(&obj)?);
         }
         Ok(fold_entries(&entries))
     }

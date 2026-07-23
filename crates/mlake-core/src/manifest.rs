@@ -283,6 +283,19 @@ pub fn index_lease_path(namespace: &str) -> String {
     format!("{namespace}/index-lease.json")
 }
 
+/// Object key for a namespace's WAL head pointer — a small, monotonic record of the highest
+/// sequence any writer has committed. Readers GET it (etag-cacheable) to learn the live head
+/// without a LIST, which on S3 is both slower and ~12× the per-request price of a GET. A writer
+/// bumps it after durably appending its entry; the pointer never decreases, so it has no
+/// fold/GC race (unlike deriving the head from the live WAL objects, which GC reclaims). It is
+/// only an accelerator: if it is missing or lags a crashed writer's un-acked entry, readers fall
+/// back to the LIST, and the indexer (which LISTs anyway) reconciles it. Lives under the
+/// namespace prefix — but NOT under `{ns}/wal/` — so `delete_all` reclaims it while the WAL GC,
+/// which parses `{ns}/wal/` keys as sequences, never touches it.
+pub fn wal_head_pointer_path(namespace: &str) -> String {
+    format!("{namespace}/wal-head")
+}
+
 /// Object key for a WAL entry. Zero-padded so lexicographic listing is sequence order —
 /// this is what makes "find the head" a single LIST with a start-after cursor.
 ///

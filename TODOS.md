@@ -806,6 +806,66 @@ green; what follows is what is left.
       or vector-block bulk, but that is untested — it could not be measured from
       inside `mlake-store`, which has no fold to run.
 
+## WAL read path: caching + the hot-path LIST (high-QPS reads)
+
+Strongly-consistent reads re-scan the WAL tail every query. Two costs per query: a LIST to
+enumerate the tail, and a GET per tail entry. Progress and what's left:
+
+- [x] **Tail entry bodies are now cached.** `WalTail::scan` and `read_wal_entry` read through
+      `get_immutable` (the NVMe cache), not the uncached `get`. A `{ns}/wal/{seq}` object is
+      write-once and — after the fix below — its sequence never repeats, so its path names one
+      immutable body forever; caching by path is sound. An unchanged tail re-read across queries
+      is now local hits instead of N S3 GETs. Only the enumerating LIST still hits S3.
+- [x] **Sequences are monotonic for the namespace's life (correctness fix).**
+      `Writer::cold_next_seq` now resumes at `max(live head, manifest.wal_head) + 1`. Before, a
+      fully-folded-and-GC'd namespace had an empty `/wal/` (live head 0) and a cold writer
+      restarted at seq 1 — which is **at or below `wal_index_cursor`, so the write was invisible
+      to readers (`(cursor, head]` is empty) and never folded (`head <= cursor` short-circuits):
+      a silently lost write.** The manifest's `wal_head` survives GC as a high-water mark, so the
+      resume is always past it. Also the precondition for the caching above (no path reuse → no
+      stale-body aliasing). Covered by `a_reset_wal_resumes_past_the_manifest_high_water_mark`.
+- [x] **Per-query LIST eliminated via a head pointer.** `snapshot()`'s validity check and
+      `QueryNode::open`'s consistency point now call `Namespace::resolve_head` — one GET of a
+      monotonic `{ns}/wal-head` pointer — instead of `wal_head()`'s LIST. A writer CAS-bumps the
+      pointer after durably appending and **before** acking (`Writer::bump_head_pointer`, cached
+      etag → one CAS on the single-writer path), so it is `>=` every acked write; a reader trusting
+      it never misses one. A missing/malformed pointer falls back to the authoritative LIST, so
+      correctness never depends on it. The indexer keeps LISTing (background) and reconciles a
+      crashed writer's un-acked entry. Tests: `commit_publishes_the_head_pointer`,
+      `resolve_head_falls_back_to_list_when_pointer_absent`,
+      `concurrent_writers_leave_the_head_pointer_at_the_max`.
+- [x] **Tail-enumeration LIST eliminated too — the read path is now LIST-free.**
+      `WalTail::scan_up_to(after_seq, head)` enumerates the tail by construction —
+      `seq_path(after_seq+1..=head)`, `head` from the pointer — and GETs each through the immutable
+      cache, tolerating a `NotFound` as a `commit_many` gap. Safe because GC reclaims only
+      `seq <= prev_wal_index_cursor`, so entries in `(cursor, head]` are never GC'd — a miss there
+      is only a genuine gap. `QueryNode::open` and `reopen_extending_tail` use it; the **indexer
+      keeps `scan` (LIST)** on the background fold, which is also the authority that reconciles
+      gaps. Validated by the full 52-test end-to-end suite (all exercise `open` → `scan_up_to`).
+      So a read now touches S3 with: one pointer GET (staleness) + on reopen, constructed tail
+      GETs (cached) + a conditional manifest GET — **no LIST anywhere on the read path.**
+- [ ] **WAL naming: incremental seq vs random UUID — keep incremental.** Random-UUID WAL objects
+      would remove the `put_if_absent` claim contention and be reset-proof, *but* they make the
+      hot-path LIST **mandatory** (you cannot probe or enumerate an unpredictable name) and lose
+      the total order the fold and supersede logic rely on (you'd need an explicit `write_seq`
+      key). Since "avoid LIST" is the higher-value goal and incremental seq is what enables it,
+      UUID naming is the wrong trade. The clash it targets is already absent within a replica
+      (one `Writer` per namespace serializes claims) and is best handled across replicas by
+      per-namespace ownership, not by giving up ordering and probeability.
+
+## Snapshot reopen: reuse segment metadata across a write (etag fast-path)
+
+- [x] **On a write (not a fold), reopen rebuilds only the tail and reuses the segments — gated on
+      the manifest etag.** `snapshot()` now, when the head advanced, does a conditional GET of the
+      manifest (`Store::get_if_modified`, `If-None-Match`): a **304** (a write, segments unchanged)
+      → `QueryNode::reopen_extending_tail`, which reuses each fact type's `Arc<Vec<SegmentState>>`
+      (no re-decoding of centroids/tables/FTS) plus the segment-derived tombstone overlay, and
+      re-scans only `(wal_index_cursor, head]`; a **200** (a fold) → full `open`. The tail is
+      correctly re-scanned (not reused), so no acked write is missed. `FactType.segments` became
+      `Arc`-shared; the segment vs tail predicate-tombstones were split so the segment half is
+      reused verbatim. Proven equivalent to a fresh open (incl. a tail delete of an already-folded
+      item) by `reopen_extending_tail_matches_a_fresh_open`.
+
 ## Cache: namespace isolation (surfaced by the SLA model)
 
 - [ ] **The read cache needs per-namespace isolation or frequency-awareness; global CLOCK
@@ -821,59 +881,36 @@ green; what follows is what is left.
       displaces a repeatedly-hit one, no per-namespace bookkeeping). Decide behind a
       multi-namespace load test that reproduces the noisy-neighbour eviction first.
 
-## Write fold cost is O(N) per memory, not O(1) — semantic link derivation (surfaced by the SLA model)
+## Indexer fold throughput and fairness (surfaced by the SLA model)
 
-- [ ] **The fold cost per memory grows with corpus size, because `derive_links` runs one
-      full-corpus kNN query per new memory.** Measured on MinIO (4 vCPU, `perf` namespace,
-      3 fact types, `wait_for_index`-style continuous fold): a 100k-memory seed folded at
-      **~35 docs/s and never caught up** — cursor crawled 4→16 of 50 WAL entries over ~15 min
-      of indexer time even with *no other namespace competing*. This is not the earlier
-      "indexer folds all namespaces sequentially" starvation (that compounds it); a single
-      isolated namespace is already this slow.
+**The "indexer hang" is starvation, not fold cost — corrected after a clean measurement.** An
+earlier draft of this section blamed `derive_links` O(N); a controlled MinIO run disproved that.
 
-      **Root cause.** `IndexOptions::default()` has `derive_links: true` (`indexer.rs:48`),
-      and both the indexer loop (`service.rs:1007`) and the CLI (`main.rs:235`) fold with the
-      default. Every fold — the steady-state `flush` (`indexer.rs:173`) and the compaction
-      rebuild — calls `derive_corpus_links`, whose own doc comment states the cost:
-      "**O(new items) queries ... the accepted incremental O(new · N) link-derivation cost**"
-      (`indexer.rs:234`). So folding a WAL slice of `new` memories issues `new × 3` (fact
-      types) vector queries, each scanning the *whole growing corpus* at `nprobe=16`. At 100k
-      that is ~300k growing-corpus kNN queries. Compaction every `COMPACT_FANOUT=8` flushes
-      adds a full O(N) tantivy rebuild on top (logs show it re-committing the entire
-      accumulated doc set: 2669 → 30669 docs per cycle).
-
-      **Why it matters for the SLA model.** `docs/sla-model.md` assumes a flat
-      `CPU_S_PER_FOLDED_MEM_1T` constant and derives `WPS_mem = vcpu / (const × FANOUT)`.
-      That is wrong while `derive_links` is on: the per-memory fold cost is `O(N)`, so
-      `wait_for_index` write throughput **decays as the namespace grows** — the write SLA is a
-      function of corpus size, not a constant. A namespace under steady ingest can reach a
-      point where it never catches up (arrival rate > fold rate), which is the "indexer hang"
-      symptom.
-
-      **Options (a design decision — Hindsight owns the semantic-graph requirement):**
-      1. **Amortize / batch link derivation** off the synchronous `wait_for_index` path — ack
-         the write after the WAL commit + index, derive links asynchronously in a later pass.
-         Makes the write SLA O(1) again; costs immediate semantic-edge freshness.
-      2. **Bound the derivation** — approximate kNN (probe fewer clusters, or only the new
-         items' own clusters) so it is O(new), not O(new · N). Cheaper links, slightly worse graph.
-      3. **Make `derive_links` opt-in per namespace** — namespaces that don't render the
-         semantic graph fold at O(1). Hindsight *does* use semantic edges (§2), so this is a
-         per-workload knob, not a global default flip.
-      4. **Leave as-is and quote the decayed write SLA honestly** — document that
-         `wait_for_index` ingest is O(N)/memory and cap namespace size or ingest rate accordingly.
-
-      Blocks the write half of the SLA card: until this is decided, `CPU_S_PER_FOLDED_MEM_1T`
-      cannot be a single number and the write-SLA formula needs an `N` term.
-
-- [ ] **Single indexer folds all namespaces sequentially (starvation, compounds the above).**
+- [ ] **Single indexer folds all namespaces sequentially → starvation (the real "hang").**
       The `index` loop with empty `--namespaces` discovers *every* namespace and folds them
-      round-robin in one thread; each namespace's tantivy commit is O(its corpus). With N
-      namespaces present, any one namespace's fold latency is inflated by the sum of all
-      others, and a namespace under steady ingest can starve indefinitely. Observed live: the
-      shared MinIO bucket accumulated 18 `ext-test-*` corpse namespaces (from a parallel
-      Hindsight test run on the same endpoint), and the target `perf` namespace published only
-      its first 8k docs before the indexer moved on and never returned. The built image's
-      `index` subcommand also **ignored `--namespaces`/`--once`** (help was a no-op, it just
-      ran discover-all) — verify these flags actually reach the loop, since §0a lists them as
-      the operational scoping mechanism. Fix direction: per-namespace fold concurrency/fairness,
-      or one indexer per (group of) namespace(s).
+      round-robin in one thread. **Measured:** a 100k-memory namespace **isolated** (its own
+      bucket, no other namespaces) folds to completion in **~34 s (~2 900 docs/s @ 4 vCPU)**. The
+      *same* 100k in a bucket the parallel Hindsight test suite had polluted with 18 `ext-test-*`
+      corpse namespaces **crawled to ~35 docs/s and never converged** — the target published its
+      first 8k docs, then the indexer spent every cycle re-folding the 18 others and never came
+      back. That is the "hang": per-namespace fold latency is inflated by the sum of all other
+      namespaces, and a namespace under steady ingest can starve indefinitely.
+      The built image's `index` subcommand also **ignored `--namespaces`/`--once`** (the flag was
+      a no-op; it just ran discover-all) — verify these flags actually reach the loop, since §0a
+      lists them as the operational scoping mechanism. Fix direction: per-namespace fold
+      concurrency/fairness (round-robin with a per-namespace time slice, or a work queue), or one
+      indexer per (group of) namespace(s). This is what blocks a *multi-namespace* write SLA.
+
+- [ ] **`derive_links` is O(new·N) — a scaling watch-item, NOT the current bottleneck.**
+      Every fold derives semantic kNN links: `IndexOptions::default()` has `derive_links: true`
+      (`indexer.rs:48`), used by both the indexer loop (`service.rs:1007`) and the CLI
+      (`main.rs:235`); `derive_corpus_links` runs one full-corpus vector query per new memory per
+      fact type (`indexer.rs:234`, comment: "the accepted incremental O(new · N) link-derivation
+      cost"). This is genuinely super-linear and *will* dominate fold cost at much larger `N`.
+      **But at 100k it is already included in the 34 s bulk fold above**, so it is not what caps
+      throughput today — the isolated fold is fast. Re-measure before quoting a fold SLA at
+      ≫1M memories/namespace; if it bites there, the levers are: amortize link derivation off the
+      synchronous path (async pass after ack — costs edge freshness), bound the kNN to the new
+      items' own clusters (O(new), slightly worse graph), or make `derive_links` opt-in per
+      namespace (Hindsight uses edges §2, so per-workload not a global flip). No action needed for
+      the current SLA card; `CPU_S_PER_FOLDED_MEM_1T ≈ 0.45 ms` is valid at the 100k scale measured.

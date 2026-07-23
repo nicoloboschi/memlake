@@ -127,7 +127,15 @@ pub async fn read_tombstones(
 pub struct Stats {
     pub doc_count: usize,
     pub cluster_count: usize,
-    pub edge_count: usize,
+    /// Derived semantic (kNN) edges in this segment — the sum of every item's `semantic_out`.
+    /// Summed across segments (plus the WAL tail) by `link_counts`, so the bank stats page can
+    /// report a link total without a corpus walk. `#[serde(default)]` so a stats blob written
+    /// before this field existed reads back 0 rather than failing to deserialize.
+    #[serde(default)]
+    pub semantic_edge_count: usize,
+    /// Intrinsic causal edges in this segment — the sum of every item's `causal_out`.
+    #[serde(default)]
+    pub causal_edge_count: usize,
     /// For each declared metadata key (`Manifest::indexed_metadata_keys`), the count of live
     /// items per distinct value in *this* segment. `MetadataStats` sums these across segments
     /// and corrects for the WAL tail, turning a "count grouped by document_id / consolidated"
@@ -267,6 +275,8 @@ pub async fn write_generation(
     rerank_tables: SsTablePair,
     tag_summary: &TagSummary,
     doc_count: usize,
+    semantic_edge_count: usize,
+    causal_edge_count: usize,
     meta_counts: std::collections::BTreeMap<String, std::collections::BTreeMap<String, u64>>,
 ) -> Result<GenerationFiles> {
     // All metadata objects are independent, immutable, and unique to this prefix, so write
@@ -274,7 +284,8 @@ pub async fn write_generation(
     let stats = Stats {
         doc_count,
         cluster_count: cluster_paths.len(),
-        edge_count: 0,
+        semantic_edge_count,
+        causal_edge_count,
         meta_counts,
     };
     let centroids_bytes = centroids.to_bytes()?;

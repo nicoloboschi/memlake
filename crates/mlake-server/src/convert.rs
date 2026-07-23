@@ -394,7 +394,7 @@ pub fn object_info(c: &crate::objects::Classified, live: bool) -> pb::ObjectInfo
         path: c.path.clone(),
         size_bytes: c.size_bytes,
         kind: c.kind as i32,
-        generation: c.generation,
+        segment: c.segment.clone(),
         memory_type: c.memory_type.unwrap_or(0) as u32,
         has_memory_type: c.memory_type.is_some(),
         seq: c.seq.unwrap_or(0),

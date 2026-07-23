@@ -1,0 +1,28 @@
+# Keep the build context small and secrets out of the image.
+target
+**/target
+.git
+.gitignore
+**/.venv
+**/__pycache__
+**/node_modules
+admin/.next
+admin/out
+bench/results
+testdata
+*.log
+
+# Not needed to build the server binary; excluding them keeps the build context small and
+# stable so editing the harness/docs/clients does not invalidate the `COPY . .` layer.
+perf
+bench
+admin
+clients
+integrations
+docs
+testdata
+
+# Secrets — never bake credentials into the image.
+.env
+.env.*
+!.env.example

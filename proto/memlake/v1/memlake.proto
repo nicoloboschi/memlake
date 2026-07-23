@@ -66,6 +66,12 @@ service Memlake {
   // adjustment Stats.doc_count and EntityStats make. Empty for a key that was not declared.
   rpc MetadataStats(MetadataStatsRequest) returns (MetadataStatsResponse);
 
+  // Live edge totals — derived semantic (kNN) links and intrinsic causal links — across a
+  // namespace. Read from the per-segment tally plus the WAL tail (the same adjustment
+  // Stats.doc_count and MetadataStats make), so it is a metadata read, not a corpus scan. The
+  // primitive behind the bank stats page's link count.
+  rpc LinkStats(LinkStatsRequest) returns (LinkStatsResponse);
+
   // Page through a memory_type's stored memories in cluster order. This is a full scan by
   // construction — the cost DOES grow with the corpus — so it exists for browsing and
   // debugging, never for retrieval. Use `Query` to find things.
@@ -498,6 +504,17 @@ message MetadataStatsResponse {
   repeated MetadataValueCount values = 1;
 }
 
+message LinkStatsRequest {
+  string namespace = 1;
+  // Restrict to these memory_types; empty means every type in the snapshot.
+  repeated uint32 memory_types = 2;
+}
+
+message LinkStatsResponse {
+  uint64 semantic_edge_count = 1;   // derived kNN links
+  uint64 causal_edge_count = 2;     // intrinsic causal links (causes/caused_by/enables/prevents)
+}
+
 message ScanRequest {
   string namespace = 1;
   // Types to walk, in ascending order. Empty means every type in the snapshot.
@@ -704,17 +721,20 @@ message CacheStatsResponse {
 // ---- Object storage browser ------------------------------------------------
 
 // What a stored object is, inferred from its key. The layout is
-// `{namespace}/manifest.json`, `{namespace}/wal/{seq}.bin`, and
-// `{namespace}/mt{type}/gen-{N}-{nonce}/{file}`.
+// `{namespace}/manifest.json`, `{namespace}/wal/{seq}.bin`, a per-segment delete overlay at
+// `{namespace}/seg-{id}/tombstones.json`, and the per-memory_type index files at
+// `{namespace}/seg-{id}/mt{type}/{file}`. The index is segmented (LSM): a flush appends a new L0
+// segment, unchanged segments are carried forward by reference across manifest generations, and
+// only a compaction rewrites — so a segment's files are NOT tied to one generation.
 enum ObjectKind {
   OBJECT_KIND_UNKNOWN = 0;
-  MANIFEST = 1;        // the one mutable object: the pointer defining the current generation
+  MANIFEST = 1;        // the one mutable object: the pointer defining the current segment set
   WAL_ENTRY = 2;       // one atomic group-commit batch
-  CLUSTER = 3;         // an IVF cluster's memories
+  CLUSTER = 3;         // an IVF cluster's memory records (vectors stripped out)
   CENTROIDS = 4;       // the trained centroid table
   PK_INDEX = 5;        // sparse index over pk.data
   PK_DATA = 6;         // id -> cluster, in SSTable blocks
-  RADJ_INDEX = 7;      // sparse index over radj.csr
+  RADJ_INDEX = 7;      // sparse index over radj.data
   RADJ_DATA = 8;       // reverse adjacency (incoming edges) blocks
   ENTITY_INDEX = 9;
   ENTITY_DATA = 10;    // EntityId -> [MemoryId] postings
@@ -725,6 +745,10 @@ enum ObjectKind {
   TAG_SUMMARY = 15;    // per-cluster tag unions, for pruning before fetch
   PAYLOAD_INDEX = 16;
   PAYLOAD_DATA = 17;   // MemoryId -> memory bytes, so a hit hydrates without a cluster read
+  VECTOR_BLOCK = 18;   // cluster-{i}.vec — the quantized vector block the vector arm scans
+  RERANK_INDEX = 19;   // sparse index over rerank.data
+  RERANK_DATA = 20;    // MemoryId -> exact f32 embedding, for the final exact rerank
+  SEGMENT_TOMBSTONES = 21; // tombstones.json — a segment's delete overlay over older segments
 }
 
 message ListObjectsRequest {
@@ -737,16 +761,20 @@ message ObjectInfo {
   string path = 1;
   uint64 size_bytes = 2;
   ObjectKind kind = 3;
-  // Parsed out of the key where the layout carries them, else 0. `generation` is absent
-  // for the manifest and WAL entries; `memory_type` only appears under `mt{n}/`.
-  uint64 generation = 4;
+  // The segment this file belongs to, parsed from its `seg-{id}` key prefix (empty for the
+  // manifest and WAL entries, which live above any segment). Files of one segment share an id,
+  // and a segment persists across manifest generations until a compaction or GC drops it.
+  string segment = 4;
+  // Only appears under `mt{n}/` (empty for the manifest, WAL entries, and a segment's tombstones).
   uint32 memory_type = 5;
   bool has_memory_type = 6;
   // WAL entries only: the claimed sequence.
   uint64 seq = 7;
-  // Whether the CURRENT manifest still references this object. False means it is garbage
-  // awaiting GC — a superseded generation, or a WAL entry already folded. Immutability
-  // means nothing is ever rewritten, so dead objects accumulate until GC reclaims them.
+  // Whether the CURRENT manifest still references this object. Every object except the manifest is
+  // immutable, so GC — not overwrite — is what reclaims space. False means garbage awaiting GC: a
+  // WAL entry already folded, or a segment dropped by a compaction (whose inputs it replaced). A
+  // flush does NOT make older segments garbage — they are carried forward by reference — so most
+  // segment files stay live across many generations.
   bool live = 8;
 }
 

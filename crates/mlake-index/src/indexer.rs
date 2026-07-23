@@ -660,6 +660,11 @@ async fn build_memory_type_index(
     // segments (and corrected for the tail) by `MetadataStats`.
     let meta_counts = crate::generation::build_meta_counts(&items, &opts.indexed_metadata_keys);
 
+    // Edge totals for this segment's slice, summed across segments (and corrected for the tail)
+    // by `LinkStats` so the bank stats page reports a link count without a corpus walk.
+    let semantic_edge_count: usize = items.iter().map(|m| m.semantic_out.len()).sum();
+    let causal_edge_count: usize = items.iter().map(|m| m.causal_out.len()).sum();
+
     let twg = std::time::Instant::now();
     let files = write_generation(
         &ns.store,
@@ -676,6 +681,8 @@ async fn build_memory_type_index(
         rerank_tables.into(),
         &tag_summary,
         doc_count,
+        semantic_edge_count,
+        causal_edge_count,
         meta_counts,
     )
     .await?;

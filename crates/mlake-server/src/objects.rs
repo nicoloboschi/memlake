@@ -5,9 +5,11 @@
 //!
 //! * **What each file is.** The engine's on-disk vocabulary (clusters, SSTable index/data
 //!   pairs, the FTS split, the manifest) is otherwise invisible.
-//! * **What is still referenced.** Every object except the manifest is immutable, so
-//!   publishing new data writes new files and CAS-swaps the manifest; superseded
-//!   generations and folded WAL entries linger as garbage until GC reclaims them.
+//! * **What is still referenced.** Every object except the manifest is immutable. The index is
+//!   segmented (LSM): a flush appends a new L0 segment and carries the unchanged ones forward by
+//!   reference, so publishing does NOT orphan the previous segments — only a compaction (which
+//!   merges several segments into one) makes its inputs garbage. Compacted-away segments and
+//!   folded WAL entries linger until GC reclaims them.
 //!
 //! Decoding is deliberately best-effort and its JSON shape is not a contract: it follows
 //! the on-disk formats, which change.
@@ -27,20 +29,22 @@ pub struct Classified {
     pub path: String,
     pub size_bytes: u64,
     pub kind: ObjectKind,
-    pub generation: u64,
+    /// The `seg-{id}` this file belongs to, or empty for the manifest / WAL entries.
+    pub segment: String,
     pub memory_type: Option<u8>,
     pub seq: Option<u64>,
 }
 
-/// Classify an object by its key. The layout is `{ns}/manifest.json`,
-/// `{ns}/wal/{seq}.bin`, and `{ns}/mt{type}/gen-{N}-{nonce}/{file}`.
+/// Classify an object by its key. The layout is `{ns}/manifest.json`, `{ns}/wal/{seq}.bin`, a
+/// per-segment delete overlay at `{ns}/seg-{id}/tombstones.json`, and the per-memory_type index
+/// files at `{ns}/seg-{id}/mt{type}/{file}`.
 pub fn classify(namespace: &str, path: &str, size_bytes: u64) -> Classified {
     let rest = path.strip_prefix(namespace).unwrap_or(path).trim_start_matches('/');
     let mut out = Classified {
         path: path.to_string(),
         size_bytes,
         kind: ObjectKind::Unknown,
-        generation: 0,
+        segment: String::new(),
         memory_type: None,
         seq: None,
     };
@@ -55,39 +59,44 @@ pub fn classify(namespace: &str, path: &str, size_bytes: u64) -> Classified {
         return out;
     }
 
+    // Everything else lives under a segment: `seg-{id}/...`.
     let mut parts = rest.split('/');
-    let (Some(mt), Some(gen)) = (parts.next(), parts.next()) else {
-        return out;
-    };
-    out.memory_type = mt.strip_prefix("mt").and_then(|n| n.parse().ok());
-    // `gen-{N}-{nonce}`: take the generation, ignore the per-attempt nonce.
-    out.generation = gen
-        .strip_prefix("gen-")
-        .and_then(|s| s.split('-').next())
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
+    let Some(seg) = parts.next() else { return out };
+    let Some(seg_id) = seg.strip_prefix("seg-") else { return out };
+    out.segment = seg_id.to_string();
 
-    // The remainder is the file name, except the FTS split which nests under `fts/`.
-    let file: Vec<&str> = parts.collect();
-    out.kind = match file.as_slice() {
-        ["fts", _] => ObjectKind::FtsSplit,
-        [name] => match *name {
-            "centroids.bin" => ObjectKind::Centroids,
-            "stats.json" => ObjectKind::Stats,
-            "tags.json" => ObjectKind::TagSummary,
-            "pk.idx" => ObjectKind::PkIndex,
-            "pk.data" => ObjectKind::PkData,
-            "radj.idx" => ObjectKind::RadjIndex,
-            "radj.data" => ObjectKind::RadjData,
-            "entity.idx" => ObjectKind::EntityIndex,
-            "entity.data" => ObjectKind::EntityData,
-            "time.idx" => ObjectKind::TimeIndex,
-            "time.data" => ObjectKind::TimeData,
-            "payload.idx" => ObjectKind::PayloadIndex,
-            "payload.data" => ObjectKind::PayloadData,
-            n if n.starts_with("cluster-") && n.ends_with(".bin") => ObjectKind::Cluster,
-            _ => ObjectKind::Unknown,
-        },
+    // The rest is either a segment-level file (its tombstone overlay) or, under `mt{type}/`, one
+    // per-memory_type index file (which may itself nest, as the FTS split does under `fts/`).
+    let tail: Vec<&str> = parts.collect();
+    out.kind = match tail.as_slice() {
+        ["tombstones.json"] => ObjectKind::SegmentTombstones,
+        [mt, rest_parts @ ..] if mt.starts_with("mt") => {
+            out.memory_type = mt.strip_prefix("mt").and_then(|n| n.parse().ok());
+            match rest_parts {
+                ["fts", _] => ObjectKind::FtsSplit,
+                [name] => match *name {
+                    "centroids.bin" => ObjectKind::Centroids,
+                    "stats.json" => ObjectKind::Stats,
+                    "tags.json" => ObjectKind::TagSummary,
+                    "pk.idx" => ObjectKind::PkIndex,
+                    "pk.data" => ObjectKind::PkData,
+                    "radj.idx" => ObjectKind::RadjIndex,
+                    "radj.data" => ObjectKind::RadjData,
+                    "entity.idx" => ObjectKind::EntityIndex,
+                    "entity.data" => ObjectKind::EntityData,
+                    "time.idx" => ObjectKind::TimeIndex,
+                    "time.data" => ObjectKind::TimeData,
+                    "payload.idx" => ObjectKind::PayloadIndex,
+                    "payload.data" => ObjectKind::PayloadData,
+                    "rerank.idx" => ObjectKind::RerankIndex,
+                    "rerank.data" => ObjectKind::RerankData,
+                    n if n.starts_with("cluster-") && n.ends_with(".bin") => ObjectKind::Cluster,
+                    n if n.starts_with("cluster-") && n.ends_with(".vec") => ObjectKind::VectorBlock,
+                    _ => ObjectKind::Unknown,
+                },
+                _ => ObjectKind::Unknown,
+            }
+        }
         _ => ObjectKind::Unknown,
     };
     out
@@ -158,7 +167,8 @@ pub async fn decode(
         ObjectKind::Manifest
         | ObjectKind::Centroids
         | ObjectKind::Stats
-        | ObjectKind::TagSummary => match serde_json::from_slice::<Value>(&bytes) {
+        | ObjectKind::TagSummary
+        | ObjectKind::SegmentTombstones => match serde_json::from_slice::<Value>(&bytes) {
             Ok(v) => Decoded::whole(summarize_json(kind, v, limit)),
             Err(e) => Decoded::undecodable(json!({}), &format!("not valid JSON: {e}")),
         },
@@ -200,7 +210,8 @@ pub async fn decode(
         | ObjectKind::RadjIndex
         | ObjectKind::EntityIndex
         | ObjectKind::TimeIndex
-        | ObjectKind::PayloadIndex => match SsTableIndex::parse(&bytes) {
+        | ObjectKind::PayloadIndex
+        | ObjectKind::RerankIndex => match SsTableIndex::parse(&bytes) {
             Ok(idx) => Decoded::whole(json!({
                 "record_count": idx.record_count(),
                 "note": "sparse index: loaded whole, then one ranged GET per lookup into \
@@ -215,10 +226,18 @@ pub async fn decode(
         | ObjectKind::RadjData
         | ObjectKind::EntityData
         | ObjectKind::TimeData
-        | ObjectKind::PayloadData => Decoded::undecodable(
+        | ObjectKind::PayloadData
+        | ObjectKind::RerankData => Decoded::undecodable(
             json!({ "size_bytes": bytes.len() }),
             "SSTable block data: addressed by byte range through its sibling .idx, so it \
              has no standalone decoding. Open the .idx to see the table's shape.",
+        ),
+
+        ObjectKind::VectorBlock => Decoded::undecodable(
+            json!({ "size_bytes": bytes.len() }),
+            "the quantized vector block for one cluster (RaBitQ codes + norms), scanned as a unit \
+             by the vector arm — it has no per-record standalone decoding. The exact f32 vectors \
+             live in the sibling rerank.data.",
         ),
 
         ObjectKind::FtsSplit => Decoded::undecodable(

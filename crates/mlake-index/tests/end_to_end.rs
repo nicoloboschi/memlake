@@ -145,6 +145,48 @@ async fn writes_after_indexing_are_visible_under_strong_consistency() {
     assert_eq!(hits[0].id, MemoryId::from_key("b"), "the tail write must be queryable");
 }
 
+/// The cheap tail-extending reopen (reuses the loaded segments, no fold happened) must produce
+/// a snapshot identical to a full fresh open — including a tail delete of an *already-folded* item.
+#[tokio::test]
+async fn reopen_extending_tail_matches_a_fresh_open() {
+    let store = Store::in_memory();
+    let ns = namespace(store, "ns").await;
+    let mut writer = Writer::new(ns.clone());
+
+    writer.commit(vec![Op::Upsert(item("a", vec![1.0, 0.0], "first"))]).await.unwrap();
+    index(&ns, &Tokenizer::default(), IndexOptions::default()).await.unwrap();
+
+    // Open a snapshot, then extend the WAL tail without folding: add `b`, delete the folded `a`.
+    let node = QueryNode::open(&ns, Tokenizer::default()).await.unwrap();
+    writer.commit(vec![Op::Upsert(item("b", vec![0.0, 1.0], "second"))]).await.unwrap();
+    writer.commit(vec![Op::Tombstone { id: MemoryId::from_key("a") }]).await.unwrap();
+    let head = ns.resolve_head().await.unwrap();
+
+    let reopened = node.reopen_extending_tail(head, Tokenizer::default()).await.unwrap();
+    let fresh = QueryNode::open(&ns, Tokenizer::default()).await.unwrap();
+
+    assert_eq!(reopened.doc_count(), fresh.doc_count(), "doc_count must match a fresh open");
+    assert_eq!(reopened.doc_count(), 1, "`a` deleted, `b` added => 1 live");
+
+    let q = vec![0.0, 1.0];
+    let via_reopen: Vec<_> = reopened
+        .query(1, Some(&q), None, &tf(), 10, QueryConfig::default())
+        .await
+        .unwrap()
+        .iter()
+        .map(|h| h.id)
+        .collect();
+    let via_fresh: Vec<_> = fresh
+        .query(1, Some(&q), None, &tf(), 10, QueryConfig::default())
+        .await
+        .unwrap()
+        .iter()
+        .map(|h| h.id)
+        .collect();
+    assert_eq!(via_reopen, via_fresh, "reopen results must match a fresh open");
+    assert_eq!(via_reopen, vec![MemoryId::from_key("b")], "only the live tail item `b` survives");
+}
+
 /// A delete committed after indexing removes the item from strongly-consistent results,
 /// even though the generation still physically contains it.
 #[tokio::test]
@@ -460,6 +502,8 @@ async fn crash_before_manifest_swap_leaves_the_old_generation_serving() {
         mlake_index::RerankTable::build(&[]).into(),
         &Vec::new(),
         0,
+        0,
+        0,
         Default::default(),
     )
     .await
@@ -630,6 +674,8 @@ async fn concurrent_generation_builds_write_disjoint_files() {
         mlake_index::RerankTable::build(&[]).into(),
         &Vec::new(),
         1,
+        0,
+        0,
         Default::default(),
     )
     .await
@@ -649,6 +695,8 @@ async fn concurrent_generation_builds_write_disjoint_files() {
         mlake_index::RerankTable::build(&[]).into(),
         &Vec::new(),
         1,
+        0,
+        0,
         Default::default(),
     )
     .await

@@ -15,7 +15,9 @@ pub mod tail;
 pub use commit::{CommitResult, Writer};
 pub use tail::{TailScan, WalTail};
 
-use mlake_core::manifest::{index_lease_path, manifest_path, wal_path};
+use mlake_core::manifest::{
+    index_lease_path, manifest_path, wal_head_pointer_path, wal_path,
+};
 use mlake_core::{Manifest, WalEntry};
 use mlake_store::{Error as StoreError, Etag, Store};
 
@@ -194,11 +196,37 @@ impl Namespace {
     /// The highest committed WAL sequence, discovered by listing.
     ///
     /// WAL keys are zero-padded, so lexicographic order is sequence order and the head is
-    /// simply the last key. Returns 0 for an empty log.
+    /// simply the last key. Returns 0 for an empty log. This is the authoritative-but-slow
+    /// path (a LIST); the query hot path uses [`resolve_head`] instead.
     pub async fn wal_head(&self) -> Result<u64> {
         let prefix = format!("{}/wal/", self.name);
         let paths = self.store.list(&prefix).await?;
         Ok(paths.last().and_then(|p| parse_wal_seq(p)).unwrap_or(0))
+    }
+
+    /// The live WAL head for a read, preferring the O(1) head pointer over a LIST.
+    ///
+    /// A writer bumps the pointer after durably appending — and before acking — so it is `>=`
+    /// every acked write; a reader that trusts it therefore never misses an acked write. Reading
+    /// it is one GET versus [`wal_head`]'s LIST (slower and ~12× the request price on S3). If the
+    /// pointer is missing (a namespace that predates it, or one never written) it falls back to
+    /// the LIST, so correctness never depends on the pointer existing.
+    pub async fn resolve_head(&self) -> Result<u64> {
+        match self.read_head_pointer().await? {
+            Some(h) => Ok(h),
+            None => self.wal_head().await,
+        }
+    }
+
+    /// Read the WAL head pointer, or `None` if it has not been written yet (or is malformed,
+    /// in which case the caller falls back to the authoritative LIST).
+    pub async fn read_head_pointer(&self) -> Result<Option<u64>> {
+        let path = wal_head_pointer_path(&self.name);
+        match self.store.get(&path, None).await {
+            Ok(v) => Ok(parse_head_pointer(&v.bytes)),
+            Err(StoreError::NotFound(_)) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// The WAL objects currently retained, ascending by sequence, starting at `start_seq`.
@@ -231,9 +259,12 @@ impl Namespace {
     }
 
     /// Read and decode one WAL entry. `Err(NotFound)` if GC has already reclaimed it.
+    ///
+    /// Through the immutable cache: a WAL object is write-once and its sequence never repeats
+    /// (`Writer::cold_next_seq`), so the path uniquely identifies its bytes for all time.
     pub async fn read_wal_entry(&self, seq: u64) -> Result<WalEntry> {
-        let bytes = self.store.get(&seq_path(&self.name, seq), None).await?;
-        Ok(WalEntry::from_bytes(&bytes.bytes)?)
+        let bytes = self.store.get_immutable(&seq_path(&self.name, seq), None).await?;
+        Ok(WalEntry::from_bytes(&bytes)?)
     }
 }
 
@@ -281,6 +312,18 @@ fn parse_lease(bytes: &[u8]) -> Option<(String, u64)> {
 /// Object key for a WAL sequence in a namespace.
 pub fn seq_path(namespace: &str, seq: u64) -> String {
     wal_path(namespace, seq)
+}
+
+/// Encode the head pointer's payload: the sequence as a plain decimal string (small and
+/// eyeball-able in the bucket).
+pub(crate) fn head_pointer_bytes(seq: u64) -> Vec<u8> {
+    seq.to_string().into_bytes()
+}
+
+/// Parse the head-pointer payload, or `None` if it is malformed (treated as absent so the
+/// caller falls back to the LIST).
+pub(crate) fn parse_head_pointer(bytes: &[u8]) -> Option<u64> {
+    std::str::from_utf8(bytes).ok()?.trim().parse::<u64>().ok()
 }
 
 #[cfg(test)]

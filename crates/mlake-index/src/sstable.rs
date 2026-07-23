@@ -181,6 +181,11 @@ impl SsTableIndex {
 
     /// Look up `key`, issuing one ranged GET for the containing block. Returns the value
     /// bytes, or `None` if the key is absent.
+    ///
+    /// Goes through `get_ranges` (not `get_range`) so the block is served from — and admitted
+    /// to — the NVMe cache: an SSTable block is immutable (nonce-prefixed `data_path`), so
+    /// caching it by `path#start-end` is sound, and a re-lookup of a key in the same block is a
+    /// local hit. `get_range` is the uncached primitive and no longer used on the read path.
     pub async fn get(
         &self,
         store: &Store,
@@ -193,8 +198,8 @@ impl SsTableIndex {
         };
         let start = block.offset as usize;
         let end = start + block.len as usize;
-        let bytes = store.get_range(data_path, start..end, ctx).await?;
-        Ok(scan_block(&bytes, &key.0))
+        let blocks = store.get_ranges(data_path, &[start..end], ctx).await?;
+        Ok(blocks.first().and_then(|b| scan_block(b, &key.0)))
     }
 
     /// Look up many keys in **one coalesced request**: the distinct blocks the keys fall

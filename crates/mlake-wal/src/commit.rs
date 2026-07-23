@@ -7,10 +7,11 @@
 
 use std::time::Duration;
 
+use mlake_core::manifest::wal_head_pointer_path;
 use mlake_core::{Op, WalEntry};
-use mlake_store::Error as StoreError;
+use mlake_store::{Error as StoreError, Etag};
 
-use crate::{seq_path, Error, Namespace, Result};
+use crate::{head_pointer_bytes, parse_head_pointer, seq_path, Error, Namespace, Result};
 
 /// Bounded retry for the claim loop. Contention is proportional to the number of writers
 /// on a namespace, not to data size, so this only needs to absorb a burst.
@@ -32,6 +33,10 @@ pub struct Writer {
     /// Cached view of the head, to skip a LIST on the common uncontended path. Only ever
     /// an optimization: a wrong value costs a conflict and a re-read, never correctness.
     next_seq: Option<u64>,
+    /// Cached etag of the head-pointer object, so the common single-writer bump is one CAS with
+    /// no preceding read. `None` forces a re-read; a stale value costs one conflict + re-read,
+    /// never correctness.
+    head_etag: Option<Etag>,
 }
 
 impl Writer {
@@ -39,11 +44,93 @@ impl Writer {
         Self {
             namespace,
             next_seq: None,
+            head_etag: None,
         }
     }
 
     pub fn namespace(&self) -> &Namespace {
         &self.namespace
+    }
+
+    /// Cold-path sequence claim: when the writer has no cached `next_seq` (first commit, or after a
+    /// CAS conflict reset it), pick the slot just past the highest sequence ever used.
+    ///
+    /// That is `max(live WAL head, manifest's persisted `wal_head`) + 1`. The manifest survives
+    /// WAL GC, so even a fully-folded-and-reclaimed WAL (live head `0`) resumes *past* the last
+    /// folded sequence instead of reusing seq 1. Reusing it would be a correctness bug, not just
+    /// an inefficiency: a write at a seq at or below `wal_index_cursor` is invisible to a reader
+    /// scanning `(wal_index_cursor, head]` and never folds (`head <= cursor` short-circuits), so
+    /// the write is silently lost. Monotonic sequences also keep every `{ns}/wal/{seq}` path
+    /// bound to one immutable body for the life of the namespace, which is what lets the tail
+    /// read be served from the immutable NVMe cache without aliasing a stale entry.
+    async fn cold_next_seq(&self) -> Result<u64> {
+        let listed = self.namespace.wal_head().await?;
+        let folded = match self.namespace.read_manifest().await {
+            Ok((m, _)) => m.wal_head,
+            Err(Error::NoManifest(_)) => 0, // brand-new namespace: nothing folded yet
+            Err(e) => return Err(e),
+        };
+        Ok(listed.max(folded) + 1)
+    }
+
+    /// Advance the head pointer to at least `seq`, so readers learn the new head with a GET
+    /// instead of a LIST (see [`Namespace::resolve_head`]). Called after the WAL entry is durable
+    /// and **before** the commit is acked, so the pointer is always `>=` every acked write — a
+    /// reader trusting it can never miss one.
+    ///
+    /// Monotonic: a concurrent writer that already pushed the pointer past `seq` is success, not
+    /// conflict. The cached etag makes the single-writer steady state one CAS with no read. On
+    /// exhausting the retry budget under heavy contention it returns an error rather than acking
+    /// a write the pointer does not yet reflect (which would be a stale-read hole); the entry is
+    /// durable regardless, so the caller's retry is idempotent.
+    async fn bump_head_pointer(&mut self, seq: u64) -> Result<()> {
+        let path = wal_head_pointer_path(&self.namespace.name);
+        let store = self.namespace.store.clone();
+        let payload = head_pointer_bytes(seq);
+        for _ in 0..MAX_CLAIM_ATTEMPTS {
+            // Fast path: CAS from the cached etag — one round trip on the single-writer path.
+            if let Some(etag) = self.head_etag.clone() {
+                match store.cas_swap(&path, &etag, payload.clone()).await {
+                    Ok(new) => {
+                        self.head_etag = new;
+                        return Ok(());
+                    }
+                    Err(e) if e.is_conflict() => self.head_etag = None, // stale — re-read below
+                    Err(e) => return Err(e.into()),
+                }
+                continue;
+            }
+            // Slow path: read the current pointer and decide.
+            match store.get(&path, None).await {
+                Ok(v) => {
+                    if parse_head_pointer(&v.bytes).is_some_and(|cur| seq <= cur) {
+                        self.head_etag = v.etag; // already covers our seq
+                        return Ok(());
+                    }
+                    match v.etag {
+                        Some(etag) => match store.cas_swap(&path, &etag, payload.clone()).await {
+                            Ok(new) => {
+                                self.head_etag = new;
+                                return Ok(());
+                            }
+                            Err(e) if e.is_conflict() => self.head_etag = None,
+                            Err(e) => return Err(e.into()),
+                        },
+                        None => return Ok(()), // no etag to CAS against — leave to the LIST fallback
+                    }
+                }
+                Err(StoreError::NotFound(_)) => match store.put_if_absent(&path, payload.clone()).await {
+                    Ok(etag) => {
+                        self.head_etag = etag;
+                        return Ok(());
+                    }
+                    Err(StoreError::AlreadyExists(_)) => self.head_etag = None,
+                    Err(e) => return Err(e.into()),
+                },
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Err(Error::CommitRetriesExhausted(MAX_CLAIM_ATTEMPTS))
     }
 
     /// Commit a batch of ops as one atomic entry.
@@ -70,7 +157,7 @@ impl Writer {
 
         let mut seq = match self.next_seq {
             Some(s) => s,
-            None => self.namespace.wal_head().await? + 1,
+            None => self.cold_next_seq().await?,
         };
 
         for attempt in 1..=MAX_CLAIM_ATTEMPTS {
@@ -94,6 +181,10 @@ impl Writer {
             {
                 Ok(_) => {
                     self.next_seq = Some(seq + 1);
+                    // Publish the new head before acking, so a reader's `resolve_head` sees it
+                    // without a LIST. The entry is already durable; the bump is what makes it
+                    // discoverable cheaply.
+                    self.bump_head_pointer(seq).await?;
                     return Ok(CommitResult { seq, attempts: attempt });
                 }
                 Err(StoreError::AlreadyExists(_)) => {
@@ -142,7 +233,7 @@ impl Writer {
         }
         let start = match self.next_seq {
             Some(s) => s,
-            None => self.namespace.wal_head().await? + 1,
+            None => self.cold_next_seq().await?,
         };
         // Serialize each entry against its pre-assigned sequence up front, so the pipelined
         // stage is pure I/O.
@@ -172,10 +263,13 @@ impl Writer {
         match result {
             Ok(_) => {
                 self.next_seq = Some(start + count);
+                // Publish the burst's head (the last assigned sequence) before returning.
+                self.bump_head_pointer(start + count - 1).await?;
                 Ok((start..start + count).collect())
             }
             Err(e) => {
                 self.next_seq = None; // effect unknown under concurrency; re-derive next time
+                self.head_etag = None;
                 Err(e)
             }
         }
@@ -185,6 +279,7 @@ impl Writer {
     /// re-derives the head from storage.
     pub fn reset(&mut self) {
         self.next_seq = None;
+        self.head_etag = None;
     }
 }
 
@@ -249,6 +344,78 @@ mod tests {
         let result = w.commit(vec![Op::Upsert(item("c"))]).await.unwrap();
         assert_eq!(result.seq, 3, "must land past the other writer's entry");
         assert!(result.attempts > 1, "should have observed the conflict");
+    }
+
+    #[tokio::test]
+    async fn a_reset_wal_resumes_past_the_manifest_high_water_mark() {
+        // Regression: an idle namespace whose WAL was fully folded and GC'd has an empty
+        // `/wal/` prefix, so `wal_head()` reports 0. A cold writer must NOT restart at seq 1 —
+        // that seq is at or below the manifest's `wal_index_cursor`, so the write would be
+        // invisible to readers scanning `(cursor, head]` and never folded (`head <= cursor`).
+        let ns = namespace().await;
+        let mut w = Writer::new(ns.clone());
+        for k in ["a", "b", "c"] {
+            w.commit(vec![Op::Upsert(item(k))]).await.unwrap();
+        }
+
+        // The indexer folded through seq 3 and recorded it as the manifest high-water mark.
+        let (mut m, etag) = ns.read_manifest().await.unwrap();
+        m.wal_index_cursor = 3;
+        m.wal_head = 3;
+        m.prev_wal_index_cursor = 3;
+        ns.swap_manifest(&etag.unwrap(), &m).await.unwrap();
+
+        // GC reclaimed the folded entries: the WAL is now empty.
+        for seq in 1..=3 {
+            ns.store.delete(&seq_path(&ns.name, seq)).await.unwrap();
+        }
+        assert_eq!(ns.wal_head().await.unwrap(), 0, "WAL is empty after GC");
+
+        // A fresh writer resumes past the persisted head, not at the reused seq 1.
+        let mut w2 = Writer::new(ns.clone());
+        let r = w2.commit(vec![Op::Upsert(item("d"))]).await.unwrap();
+        assert_eq!(r.seq, 4, "resumes at manifest wal_head + 1, not the reclaimed seq 1");
+    }
+
+    #[tokio::test]
+    async fn commit_publishes_the_head_pointer() {
+        let ns = namespace().await;
+        let mut w = Writer::new(ns.clone());
+        w.commit(vec![Op::Upsert(item("a"))]).await.unwrap();
+        w.commit(vec![Op::Upsert(item("b"))]).await.unwrap();
+        // The pointer reflects the head, so a reader gets it with a GET, not a LIST.
+        assert_eq!(ns.read_head_pointer().await.unwrap(), Some(2));
+        assert_eq!(ns.resolve_head().await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn resolve_head_falls_back_to_list_when_pointer_absent() {
+        // A namespace whose entries exist but that has no pointer object (e.g. written before
+        // the pointer existed): correctness must not depend on the pointer being present.
+        let ns = namespace().await;
+        ns.store.put_if_absent(&seq_path(&ns.name, 1), b"x".to_vec()).await.unwrap();
+        ns.store.put_if_absent(&seq_path(&ns.name, 2), b"x".to_vec()).await.unwrap();
+        assert_eq!(ns.read_head_pointer().await.unwrap(), None);
+        assert_eq!(ns.resolve_head().await.unwrap(), 2, "falls back to the authoritative LIST");
+    }
+
+    #[tokio::test]
+    async fn concurrent_writers_leave_the_head_pointer_at_the_max() {
+        let ns = Arc::new(namespace().await);
+        let mut handles = Vec::new();
+        for i in 0..8 {
+            let ns = Arc::clone(&ns);
+            handles.push(tokio::spawn(async move {
+                let mut w = Writer::new((*ns).clone());
+                w.commit(vec![Op::Upsert(item(&format!("c-{i}")))]).await.unwrap();
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+        // The pointer is monotonic under contention: it converges to the highest committed seq.
+        assert_eq!(ns.resolve_head().await.unwrap(), 8);
+        assert_eq!(ns.read_head_pointer().await.unwrap(), Some(8));
     }
 
     #[tokio::test]

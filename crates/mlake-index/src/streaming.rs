@@ -507,6 +507,10 @@ async fn build_type_streaming(
         indexed_metadata_keys.iter().map(|s| s.as_str()).collect();
     let mut meta_counts: std::collections::BTreeMap<String, std::collections::BTreeMap<String, u64>> =
         std::collections::BTreeMap::new();
+    // Edge totals, tallied in the same assign pass (mirrors the in-RAM fold), summed across
+    // segments and corrected for the tail by `LinkStats`.
+    let mut semantic_edge_count: usize = 0;
+    let mut causal_edge_count: usize = 0;
 
     // Single assignment pass over the spill, in batches: the per-item centroid assignment and the
     // two rkyv serializations (full item for the cluster file, payload for the store) are the
@@ -557,6 +561,8 @@ async fn build_type_streaming(
                 time_sort.add(ts_key(ts), item.id.0.to_vec())?;
             }
             fts.add(item.id, item.fts_text(), &item.tags).map_err(|e| crate::Error::Fts(e.to_string()))?;
+            semantic_edge_count += item.semantic_out.len();
+            causal_edge_count += item.causal_out.len();
             for edge in &item.causal_out {
                 let ie = InEdge {
                     source: item.id,
@@ -681,6 +687,8 @@ async fn build_type_streaming(
         rerank.into(),
         &tag_summary,
         n,
+        semantic_edge_count,
+        causal_edge_count,
         meta_counts,
     )
     .await?;

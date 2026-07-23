@@ -11,7 +11,7 @@ use bytes::Bytes;
 use futures::TryStreamExt;
 use object_store::path::Path;
 use object_store::{
-    Attributes, ObjectStore, PutMode, PutOptions, PutPayload, TagSet, UpdateVersion,
+    Attributes, GetOptions, ObjectStore, PutMode, PutOptions, PutPayload, TagSet, UpdateVersion,
 };
 
 use crate::metrics::QueryMetrics;
@@ -154,6 +154,32 @@ impl Store {
         Ok(Versioned { bytes, etag })
     }
 
+    /// Conditional read: fetch the object only if its etag differs from `etag` (`If-None-Match`).
+    ///
+    /// Returns `Ok(None)` when the object is **unchanged** (a 304) — so a caller holding the
+    /// previous bytes skips both the body transfer and re-parsing them — and `Ok(Some(..))` with
+    /// the new bytes+etag when it changed. Used on snapshot reopen to tell a plain write (manifest
+    /// unchanged) from a fold (manifest changed) without shipping the manifest when nothing moved.
+    pub async fn get_if_modified(&self, path: &str, etag: &Etag) -> Result<Option<Versioned>> {
+        let opts = GetOptions {
+            if_none_match: Some(etag.0.clone()),
+            ..Default::default()
+        };
+        match self.inner.get_opts(&Path::from(path), opts).await {
+            Ok(result) => {
+                let etag = result.meta.e_tag.clone().map(Etag);
+                let bytes = result.bytes().await?;
+                if let Some(m) = &self.store_metrics {
+                    m.record_get(bytes.len() as u64);
+                }
+                Ok(Some(Versioned { bytes, etag }))
+            }
+            Err(object_store::Error::NotModified { .. }) => Ok(None),
+            Err(object_store::Error::NotFound { .. }) => Err(Error::NotFound(path.to_string())),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Read an *immutable* object, through the NVMe cache if one is attached.
     ///
     /// Generation files live under a per-attempt nonce prefix, so their path uniquely
@@ -181,33 +207,6 @@ impl Store {
             return Ok(versioned.bytes);
         }
         Ok(self.get(path, ctx).await?.bytes)
-    }
-
-    /// Read a byte range. This is the workhorse of the warm path: the hotcache and
-    /// sparse indexes exist so that a query can turn "which bytes do I need" into a
-    /// handful of coalesced ranged GETs.
-    pub async fn get_range(
-        &self,
-        path: &str,
-        range: std::ops::Range<usize>,
-        ctx: Option<(&QueryMetrics, usize)>,
-    ) -> Result<Bytes> {
-        let start = Instant::now();
-        let bytes = self
-            .inner
-            .get_range(&Path::from(path), range)
-            .await
-            .map_err(|e| match e {
-                object_store::Error::NotFound { .. } => Error::NotFound(path.to_string()),
-                other => other.into(),
-            })?;
-        if let Some((metrics, rt)) = ctx {
-            metrics.record_request(rt, bytes.len() as u64, start.elapsed());
-        }
-        if let Some(m) = &self.store_metrics {
-            m.record_get(bytes.len() as u64);
-        }
-        Ok(bytes)
     }
 
     /// Read several ranges of one *immutable* object, through the NVMe cache when attached.
