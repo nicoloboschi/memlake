@@ -1,6 +1,6 @@
 # memlake-bench
 
-Benchmark harness for [memlake](../docs/SPEC.md). Two jobs:
+Benchmark harness for [memlake](ARCHITECTURE.md). Two jobs:
 
 1. Establish a **Qdrant hybrid-search baseline** (dense + BM25 sparse, RRF-fused) on BEIR.
 2. Later, evaluate **memlake** against that baseline on *identical data and identical

@@ -34,7 +34,7 @@ still a join against a table that is still populated.
 uv pip install hindsight-memlake
 ```
 
-`memlake-client` is resolved from this repo (`../../clients/python`), because the
+`memlake-client` is resolved from this repo (`../clients/python`), because the
 client and the server it talks to move together.
 
 ## Enable

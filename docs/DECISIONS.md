@@ -1,17 +1,17 @@
 # Decisions
 
-Choices made at project kickoff (2026-07-20), resolving ambiguity in `SPEC.md`.
+Choices made at project kickoff (2026-07-20), resolving ambiguity in `ARCHITECTURE.md`.
 
 ## Naming
 
 The spec calls the project `pufferlite` with `plite-*` crates. **We use `memlake` with
-`mlake-*` crates**, matching the repository name. All `plite-*` paths in `SPEC.md` §9 map
+`mlake-*` crates**, matching the repository name. All `plite-*` paths in `ARCHITECTURE.md` §9 map
 one-to-one onto `mlake-*`.
 
 ### Domain vocabulary (memory-lake theme)
 
 The spec's generic/Postgres terms are renamed to fit "memory lake". This is the vocabulary
-the code and API use; `SPEC.md` keeps the original terms as historical:
+the code and API use; `ARCHITECTURE.md` keeps the original terms as historical:
 
 | concept | spec / Hindsight term | memlake term |
 |---|---|---|

@@ -43,7 +43,7 @@ These move; the *ratios* between them are what the analysis rests on, and those 
 
 A "memory" = short text + a little metadata + one embedding. The embedding dominates. We
 parametrise on embedding dimension `D`. memlake's numbers are **measured** at `D=384`
-(bge-small, via `ListObjects`/`DecodeObject` — see `docs/vector-storage.md`) and scaled to
+(bge-small, via `ListObjects`/`DecodeObject` — see `docs/arms/vector.md`) and scaled to
 larger `D` by holding the ~300 B non-embedding part fixed and scaling the embedding linearly.
 Hindsight production likely uses a larger embedding; the base case below is `D=1536`
 (e.g. OpenAI `text-embedding-3-small`), with `D=384` shown for reference.

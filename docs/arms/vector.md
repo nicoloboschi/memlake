@@ -1,180 +1,172 @@
 # The vector arm
 
-Dense retrieval over embeddings, via **IVF** (inverted file / coarse-quantized search):
-cluster the corpus with k-means, then at query time probe only the nearest few clusters and
-re-rank them exactly. Cost scales with `nprobe`, not with the corpus (INV-7).
+Dense retrieval over embeddings via **IVF** (inverted-file / coarse-quantized search) with a
+**two-stage RaBitQ scan**: cluster the corpus with k-means, at query time probe only the nearest
+few clusters, scan them with **1-bit codes** under a provable error bound, and exact-rerank only
+the candidates the bound cannot rule out. Cost scales with `nprobe`, not the corpus (INV-7).
 
-Everything here is per **memory_type** — each type has its own centroids and cluster files;
-nothing is shared across types.
+Everything is per **memory_type** and per **segment** — each has its own centroids and cluster
+files, nothing shared. Code: `mlake-ivf` (k-means, vector blocks, RaBitQ, codecs),
+`mlake-index/indexer.rs` + `streaming.rs` (the build), `mlake-index/query_node.rs::run_arms` +
+`vector_arm_segment` (the read).
 
-Relevant code: `mlake-ivf` (k-means, cluster files, probe/rerank), `mlake-index/indexer.rs`
-(the build), `mlake-index/query_node.rs::run_arms` (the read).
+## The vector/payload split
 
----
+The embedding is ~84% of a stored memory, and the vector arm scores it once and discards it. So
+it is split out of the record:
 
-## Write path
+- **`cluster-{i}.bin`** — the `StoredMemory` records with the **embedding stripped** (text, tags,
+  timestamps, links, metadata). Read only to hydrate a hit.
+- **`cluster-{i}.vec`** — the `VectorBlock`: the quantized vectors the scan reads, ~62 B/member
+  (Binary) vs ~1.8 KB for the full record.
+- **`rerank.idx` / `rerank.data`** — full-precision f32 embeddings, keyed by id, one record per
+  block so a point-fetch reads exactly one vector. Never scanned; fetched only for the stage-2
+  rerank contenders. Keeping f32 here is what lets the scan tier be 1 bit/dimension without losing
+  the exact ranking.
 
-The indexer folds the un-indexed WAL tail onto the previous generation and rebuilds the IVF
-structure into a new immutable `gen-{G}-{nonce}/` tree (`indexer.rs`).
+## The `VectorBlock` and its codecs
 
-1. **Assemble items.** New memories from the WAL slice, plus the memories carried forward
-   from the previous generation's clusters. Each is a `StoredMemory` (id, `vector`, text,
-   tags, timestamps, entity_ids, edges, metadata).
+`cluster-{i}.vec` is a self-describing block (magic `MLVB`, `FORMAT_VERSION = 3`): a 16-byte
+header (`codec`, `flags`, `dim`, `count`), then the member ids, the block **mean**, an optional
+tag column and `updated_at` column (pushed down for filtering — below), and the fixed-stride
+**codes** as the tail. Quantized codecs encode the *residual* `v − mean`; the mean's exact
+contribution is computed once per query. Three codecs (`bytes_per_vector` at dim 384):
 
-2. **Train centroids** (`mlake-ivf/kmeans.rs`). `k = round(sqrt(N))` (SPEC §5.1). Training
-   is **mini-batch k-means++**: seed spread-out centres, then Lloyd iterations. Over
-   `TRAIN_SAMPLE_CAP` (50k) items it trains on a strided sample; assignment of *all* items
-   still happens afterward. The assignment step and the k-means++ seeding are parallelized
-   with rayon while keeping the f64 accumulation order fixed, so the output stays
-   byte-identical for a given seed (G-6). Retraining is **not** every fold: centroids are
-   reused (assign-only) until the corpus grows ~2× or a retrain is forced, so steady-state
-   folds are cheap.
+| codec | bytes/vec | what it stores | bound |
+|---|---|---|---|
+| `Binary` (**default**) | `ceil(dim/8)+12` ≈ 60 | one sign bit/dim of the **rotated** residual + a corrective triple `(‖r‖, cos(r,u), ‖v‖)` | probabilistic (RaBitQ) |
+| `Int8` | `dim+12` = 396 | per-vector affine quant of the (un-rotated) residual + `(offset, scale, ‖v‖)` | absolute (`≤ scale/2`) |
+| `F32` | `dim*4` = 1536 | raw f32 | exact |
 
-3. **Assign + split.** Each item is assigned to its nearest centroid. Oversized clusters are
-   locally subdivided (SPFresh-lite) so no single cluster file dominates a read.
+**Rotation** (Binary only): a deterministic randomized-Hadamard transform (3 rounds of
+permute → sign-flip → normalized fast Walsh–Hadamard, segmented into powers of two to avoid
+zero-padding). It is what makes RaBitQ's probabilistic bound applicable, is derived on read, and
+is **never serialized** (it would cost more than the codes). Binary is ~25× smaller than F32 with
+`ann_recall@10` identical to Int8 on BEIR — because the exact rerank makes the scan codec's error
+irrelevant to the final ranking.
 
-4. **Write cluster files.** One object per cluster, `gen-…/cluster-{i}.bin`, holding that
-   cluster's `StoredMemory` records serialized with **rkyv** (zero-copy readable). Only
-   **dirty** clusters (those that changed this fold) are written; unchanged clusters are
-   referenced by their existing path — *copy-forward-by-reference*, so a fold writes O(new
-   clusters), not O(all). Dirty-cluster PUTs run concurrently (`buffer_unordered`).
+## Query time
 
-5. **Centroids** are serialized to `gen-…/centroids.json` and listed in the manifest's
-   `GenerationFiles`. The cluster paths are listed too.
+Per segment, `vector_arm_segment`:
 
-The generation is published by a single `If-Match` CAS-swap of the manifest (INV-2), so a
-reader sees either the whole new IVF structure or the whole old one.
+1. **Probe** — the `nprobe` nearest centroids by **squared-Euclidean** distance (Euclidean, to
+   match assignment). Under a tag filter or `updated_at` window it instead ranks all centroids,
+   keeps only clusters whose per-cluster summary could admit a match, and caps the admissible set
+   at `nprobe*4`. Push-down here is load-bearing: a match in an *unprobed* cluster is lost outright.
+2. **Fetch vector blocks only** — the `.vec` blocks (not the `.bin` payload), one concurrent wave
+   (RT3, fan-out 8).
+3. **Stage 1 — 1-bit scan** — per block, `prepare(q)` once, then per member push `(id, est, lo,
+   hi)` where `est = block.score` and `(lo,hi)` are its error-bound interval; whole-block and
+   per-member tag/`updated`/supersede filters applied inline.
+4. **Error bound → τ → contenders** — `τ` = the k-th best **lower** bound (k = arm depth).
+   Contenders = every candidate whose **upper** bound `hi ≥ τ`. This is *derived*, not an
+   oversampling guess: nothing with `hi < τ` can be in the true top-k, because k candidates already
+   have a lower bound ≥ τ.
+5. **Stage 2 — exact f32 rerank** — point-fetch the contenders' full-precision vectors from the
+   rerank tier (RT3), rescore with exact cosine (fall back to `est` if a vector is missing), sort,
+   truncate to depth.
 
-**What the vector arm persists per generation:** `centroids.json` + `cluster-{i}.bin` (one
-per cluster). (The `pk` index — id → cluster — is built here too but is consumed by the graph
-arm and hydration; see [graph.md](graph.md).)
+**Cross-segment + tail merge** — the shared WAL tail is scored **exactly** first (cosine over the
+tail items, so a newest copy shadows an older segment's), then each segment's two-stage top-k is
+merged newest-wins and truncated. Exact overall: the global top-k is a subset of the union of
+per-source top-ks, so merging exact scores and truncating is exact. Winners are hydrated once,
+shared across arms.
 
----
+The arm returns `(MemoryId, cosine)` as `hit.dense = { present, rank, score }`; memlake does no
+fusion (a server-side weighted-RRF convenience exists but the primary API is the raw signal).
 
-## Read path
+### nprobe auto-selection
 
-Driven by `run_arms` in `query_node.rs`, for a query carrying a `vector`.
+`nprobe = 0` (the default) means "the index decides": **half the clusters, floor 8, cap 64**. A
+fixed constant made recall depend on corpus size — 8 clusters is 11% of a small index and a
+rounding error on a large one. On scifact this moved `ann_recall@10` from 0.859 (quarter) to
+0.963 (half). The wire field remains as an escape hatch. (The cap binds at scale — 1M docs ≈ 1000
+clusters → 64 probed ≈ 6% — which is untested territory.)
 
-1. **Open the snapshot** (once per namespace, cached across queries — see below). Loading a
-   memory_type reads `centroids.json` into memory (`get_immutable`, cached). This is part of
-   the bounded cold-open, amortized by the snapshot cache.
+### Optimizations
 
-2. **Probe** (`Centroids::probe`, in-memory). Compute the `nprobe` centroids nearest the query
-   vector — pure CPU over the cached centroids, **0 roundtrips**. With a tag filter, per-cluster
-   tag summaries prune clusters that cannot contain a match *before* probing, so a selective
-   filter still finds its matches (`select_clusters`, SCALE.md Phase 4b).
+- **Payload/vector split** — the scan reads ~60 B/member, not the ~1.8 KB record.
+- **Asymmetric encoding** — the query stays full-precision f32 against 1-bit/8-bit codes; against
+  1-bit the dot is a branch-free signed accumulation.
+- **Estimator on `q_perp`** — the query with its along-mean component removed (then rotated), so
+  noise scales with the *discriminating* part of the query rather than the shared mean (stated to
+  ~3× recall@10).
+- **Tag + `updated_at` push-down into the block** — member tags and write times ride in the
+  `.vec` block, so a non-matching member never takes a top-k slot; and the per-cluster summary
+  carries the tag set + write-time span so a selective filter isn't starved out of the probe set.
+- **Binary bound is probabilistic** — RaBitQ Theorem 3.2, `RABITQ_EPSILON = 5.0` → per-member
+  failure ≈ 7.5e-6. One rotation serves a whole block, so failures correlate within a block; a
+  caller needing a hard guarantee should use Int8/F32, whose bounds are absolute.
 
-3. **Fetch the probed clusters** (`fetch_clusters`). A ranged/`get_immutable` read per probed
-   cluster object, issued **concurrently** (one roundtrip wave, RT3). Immutable, so cached by
-   `(path)` — a warm cluster is **0 roundtrips**. The fetched `StoredMemory` records are also
-   what the graph arm reuses and what the hit payload is materialized from — one fetch, three
-   uses.
+## Build
 
-4. **Overlay the WAL tail** and **apply the tag filter** inline (memories carry their tags, so
-   filtering is free once fetched). Tombstoned ids are dropped.
-
-5. **Exact re-rank** (`exact_search`). Brute-force cosine of the query against every fetched
-   candidate, sorted, truncated to `vector_top_k`. This is the "coarse probe, exact rerank"
-   of IVF: recall comes from probing enough clusters; precision from the exact final scoring.
-
-The arm returns `(MemoryId, cosine)` pairs. memlake does **no** fusion — the raw cosine and
-the candidate's rank in this arm are returned to the client as `hit.dense = {present, rank,
-score}`, and the client fuses (see [text.md](text.md), [graph.md](graph.md)).
-
-### Roundtrips & caching
-
-- **Cold:** RT1 manifest + RT2 metadata (open, amortized) + **RT3 = one wave** of concurrent
-  cluster GETs. The whole cold query is bounded at 4 waves (`COLD_ROUNDTRIP_BUDGET`, INV-7),
-  verified by test.
-- **Warm:** the server caches the open `QueryNode` snapshot per namespace and the immutable
-  cluster blocks by path, so a repeat query is pure in-memory probe + rerank — **0
-  roundtrips**. A write invalidates the snapshot; `EVENTUAL` reads reuse it within a TTL,
-  `STRONG` re-checks the WAL head.
-- **Tuning:** `nprobe` trades recall for cost (more clusters fetched = higher recall, more
-  bytes/roundtrip-wave width); `vector_top_k` bounds how many candidates the arm contributes.
+- **Centroid training** — `k = round(√N)` k-means++ + Lloyd iterations; over `TRAIN_SAMPLE_CAP
+  (50k)` it trains on a deterministic stride sample (15 iters) but **assigns all N**. Distance is
+  squared-Euclidean via a **fixed-lane SIMD** accumulator kept bit-deterministic for G-6.
+- **Assign + `local_split`** — every item to its nearest centroid; a 2-means splits any cluster
+  > 8× the average size, so no cluster file dominates a read.
+- **Cluster + vector-block writing** — per cluster, the embedding-stripped records to
+  `cluster-{i}.bin` and `encode_with_columns(codec, …)` (with tag + `updated_at` columns) to
+  `cluster-{i}.vec`, in the same member order; then the rerank tier and the per-cluster tag
+  summary.
+- **Segments, not copy-forward.** Every fold writes a **fresh** segment with centroids trained
+  from scratch over its slice — there is no assign-only / copy-forward reuse (immutable object
+  storage rules out in-place mutation, and the segmented model makes incrementality come from
+  *new segments + compaction*, §[ARCHITECTURE](../ARCHITECTURE.md)). Codec migration is therefore
+  incremental by the segment lifecycle: a flush writes L0 in the current codec, a compaction
+  re-encodes what it merges, and blocks stay self-describing so a mixed-codec index reads
+  correctly. The **streaming** fold trains on a reservoir sample, reads the WAL once, and feeds
+  clusters/rerank through bounded external sorts.
 
 ---
 
 ## Adaptive probing — tried, measured, rejected (negative result)
 
 **Status: implemented, measured on BEIR, and removed.** No code, no env flag, no radii on the
-centroid table. This section is the record so nobody re-derives it. The stopping rule is
-*sound*; it simply never fires at these dimensions, and the number below says by how much.
+centroid table (`Centroids` carries only `vectors/sizes/dim`). This is the record so nobody
+re-derives it. The stopping rule is *sound*; it simply never fires at these dimensions.
 
-`nprobe` is a fixed fraction of the cluster count (half, floor 8, cap 64). The fraction is a
-guess: at a quarter, nfcorpus measured `ann_recall@10` 0.8598 and scifact 0.9517 — the same
-fraction nine points apart, because the right number depends on how a corpus clusters, not on
-how many clusters it has. The principled replacement is a **stopping rule**: probe
-nearest-first, and stop when the k-th best score already in hand beats the best score any
-unprobed cluster could possibly yield.
+`nprobe` is a fixed fraction of the cluster count. The fraction is a guess — at a quarter,
+nfcorpus measured `ann_recall@10` 0.86 and scifact 0.95, the same fraction nine points apart,
+because the right number depends on how a corpus clusters, not how many clusters it has. The
+principled replacement is a **stopping rule**: probe nearest-first, stop when the k-th best score
+in hand beats the best any unprobed cluster could yield.
 
-### The bound (sound — this part was never the problem)
+### The bound (sound — never the problem)
 
-Give each centroid a **radius** `R = max ‖v̂ − c‖` over its members, where `v̂ = v/‖v‖` is the
-member direction (one `f32` per cluster, recomputed every fold — it cannot be carried forward,
-because the assign-only fold adds members to centroids it did not retrain). With
-`q̂ = q/‖q‖`, no member of cluster `i` can score better than
+Give each centroid a radius `R = max ‖v̂ − c‖` over its members (`v̂ = v/‖v‖`). With `q̂ = q/‖q‖`,
+no member of cluster `i` can score better than
 
 ```
-  cos(q, v) = ⟨q̂, v̂⟩ = ⟨q̂, c⟩ + ⟨q̂, v̂ − c⟩ ≤ ⟨q̂, c⟩ + R        (Cauchy–Schwarz)
-  cos(q, v) = 1 − ‖q̂ − v̂‖²/2               ≤ 1 − max(0, ‖q̂ − c‖ − R)²/2   (triangle)
+  cos(q,v) = ⟨q̂,v̂⟩ ≤ ⟨q̂,c⟩ + R                         (Cauchy–Schwarz)
+  cos(q,v) = 1 − ‖q̂−v̂‖²/2 ≤ 1 − max(0, ‖q̂−c‖ − R)²/2   (triangle)
 ```
 
-taking the smaller of the two. Neither form assumes a unit-length centroid (centroids are
-means, so they are not) nor a unit-length member (the radius is measured against the member
-*direction*, which is all cosine can see). The bound is absolute, unlike the RaBitQ per-member
-bounds it is compared against, and it was checked against brute force in a test.
-
-Adaptivity was bounded at **two waves**, never a probe→look→decide→probe loop, which would turn
-one coalesced wave into N and break INV-7: probe a seed (a quarter of the probe set), compute
-`tau` from it, then use the bound — which needs only resident data — to decide the remainder in
-one more wave. The chosen set is a *subset* of the fixed-fraction probe, so recall cannot fall
-below the baseline.
+taking the smaller. Absolute (unlike the RaBitQ per-member bounds), checked against brute force.
+Adaptivity was bounded at **two fetch waves** (probe a seed → compute τ → decide the rest from
+resident data), and the chosen set was a *subset* of the fixed probe, so recall couldn't fall
+below baseline.
 
 ### The measurement, and why it was dropped
 
-Measured e2e on BEIR (bge-small, 384-d, `nprobe` = half, arm depth 100):
+Measured e2e on BEIR (bge-small, 384-d, `nprobe` = half, depth 100):
 
-| dataset  | clusters | probed (fixed) | probed (adaptive) | `ann_recall@10` | mean `tau` | tightest bound in the tail |
-|----------|---------:|---------------:|------------------:|----------------:|-----------:|---------------------------:|
-| scifact  | 72       | 36.0           | **36.0**          | 0.9893 (both)   | 0.653      | 0.979                      |
-| nfcorpus | 60       | 30.0           | **30.0**          | 0.9625 (both)   | 0.548      | 0.962                      |
+| dataset | clusters | probed fixed | probed adaptive | `ann_recall@10` | mean τ | tightest tail bound |
+|---|--:|--:|--:|--:|--:|--:|
+| scifact | 72 | 36.0 | **36.0** | 0.9893 (both) | 0.653 | 0.979 |
+| nfcorpus | 60 | 30.0 | **30.0** | 0.9625 (both) | 0.548 | 0.962 |
 
-**It retires nothing.** Not "rarely" — **zero clusters across 623 queries**, on both datasets,
-with `ann_recall@10` bit-identical to the fixed probe. The bound sits ~0.3 above the threshold
-it would have to fall below.
+**It retires nothing** — zero clusters across 623 queries, recall bit-identical. The cause is
+**dimensional, not statistical**: at 384-d these clusters have radius ~0.62 while the query's
+k-th nearest neighbour sits ~0.77 away, so every probed cluster's ball reaches into the query's
+neighbourhood and none can be ruled out — the classic curse-of-dimensionality failure of
+ball-bound pruning. (Not outlier-driven: mean max radius 0.62 vs mean p95 0.58, so a quantile
+radius moves the bound ~0.04 and still retires 0%.)
 
-And it is not outliers inflating `R`, which was the expected failure mode: the mean *max*
-radius is 0.62 and the mean *p95* radius is 0.58, so a quantile radius — which would cost the
-soundness proof — moves the bound by only ~0.04 and still retires 0.00% (measured at p90). **The
-cause is dimensional, not statistical.** At 384-d these clusters have radius ~0.62 while the
-query's own k-th nearest neighbour sits ~0.77 away, so every probed cluster's ball reaches into
-the query's neighbourhood and none can be ruled out. Cluster geometry offers no separation at
-this scale — the classic curse-of-dimensionality failure of ball-bound pruning, arriving well
-before 384 dimensions.
+So it cost a second serial fetch wave for nothing, and was deleted rather than kept behind a flag.
+The implementation and its soundness test are in git history (`git log -S adaptive_probe`).
 
-So it cost a second serial fetch wave and bought nothing, and the code was deleted rather than
-kept behind a flag: dead code that is never exercised rots, and the expensive part to recover
-is the *reasoning*, which is this page. The implementation and its brute-force soundness test
-are recoverable from git history (`git log -S adaptive_probe`).
-
-**Before re-deriving this, note what would have to change.** The verdict is a property of the
-*embedding space*, not of the corpus size — a bigger corpus at 384-d fails the same way. It
-would take genuinely lower intrinsic dimensionality, or much tighter clusters (many more
-centroids, so `R` shrinks faster than the k-th-NN distance), for the bound to start firing.
-Re-measure the two numbers — mean cluster radius vs. mean distance to the k-th nearest
-neighbour — *before* writing any code; if the radius is not comfortably below that distance,
-the stopping rule cannot fire and nothing else matters.
-
-**Caveats that applied to the measurement:**
-
-- `tau` is the k-th best *lower* bound from the scan, and `Binary`'s lower bound is
-  probabilistic, not absolute. A `tau` that is optimistic makes the stopping rule slightly
-  over-eager. `Int8` and `F32` bounds are absolute.
-- `k` is the arm depth (100), not the reported `@10`. A `tau` at k=10 would be ~0.05 higher —
-  still nowhere near the bound.
-- The radius was computed from the vectors the fold holds. From the second generation onward
-  those are decodes of the previous `.vec` block, not the caller's original embeddings — but
-  the rerank tier the query scores against is built from the same values in the same fold, so
-  the bound stayed sound with respect to what the query actually ranks. Any future attempt
-  inherits this constraint.
+**Before re-deriving this:** the verdict is a property of the *embedding space*, not corpus size —
+a bigger corpus at 384-d fails the same way. Re-measure mean cluster radius vs mean k-th-NN
+distance *first*; if the radius isn't comfortably below that distance, the stopping rule cannot
+fire.

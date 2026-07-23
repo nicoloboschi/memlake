@@ -2,9 +2,9 @@
 
 Bounded one-hop **link expansion**: given seeds from the vector arm, reach one hop out through
 three independent relations and merge their scores. A behavioural port of Hindsight's
-`LinkExpansionRetriever` (SPEC §7). The hard rule is that graph retrieval must never become an
-unbounded chain of object-storage reads — exactly one hop, per-entity fan-out capped, timeout
-fallback, never recursion.
+`LinkExpansionRetriever`. The hard rule: graph retrieval must never become an unbounded chain of
+object-storage reads — exactly one hop, per-entity fan-out capped, timeout fallback, never
+recursion (INV-7).
 
 The three relations:
 
@@ -13,102 +13,108 @@ The three relations:
   from reverse adjacency);
 * **causal** — the same mechanics over client-supplied causal edges.
 
-Relevant code: `mlake-graph` (`retriever.rs` expansion, `scorer.rs` math, `radj.rs` reverse
-adjacency), `mlake-index/sstable.rs` (`EntityTable`, `RadjTable`, `PkTable`),
-`mlake-index/query_node.rs::graph_arm` (the read).
+Code: `mlake-graph` (`retriever.rs` expansion, `scorer.rs` math, `radj.rs` reverse adjacency),
+`mlake-index/sstable.rs` (`EntityTable`, `RadjTable`), `mlake-index/query_node.rs::graph_arm`
+(the read), `mlake-index/indexer.rs` + `streaming.rs` (semantic-link derivation).
 
----
+## Query time
 
-## Write path
+`graph_arm` runs only when a `vector` was given (it needs dense seeds) and `graph_top_k > 0`.
 
-The graph arm persists **three** range-readable SSTables per generation, each the same shape
-(a small whole-loaded `.idx` + a block-structured `.data` read by bounded ranged GET). Built in
-`indexer.rs` and published atomically with the generation (INV-2).
+1. **Seeds — with a configurable similarity floor.** The vector arm's ranking (exact cosine,
+   sorted) is first **filtered to hits at cosine ≥ `graph_seed_min` (default 0.3)**, then the top
+   20 are taken. Expanding from a barely-relevant seed only pulls its (equally off-query)
+   neighbours into fusion, so weak seeds are dropped before the hop. The floor is
+   `QueryConfig::graph_seed_min_similarity` / `ArmDepths::graph_seed_min`, exposed over gRPC as
+   `graph_seed_min_similarity` (unset → server default 0.3, `0` → seed from every dense hit),
+   matching Hindsight's `_find_semantic_seeds(threshold=0.3)`. Seeds come from the memories the
+   vector arm already fetched, so their inline `semantic_out` / `causal_out` are free.
 
-1. **Derive semantic links** (`indexer.rs::derive_links_ivf`). For each *new* memory, find its
-   nearest neighbours (probe the IVF, exact cosine over probed clusters), keep the top
-   `MAX_SEMANTIC_OUT` with cosine ≥ `SEMANTIC_LINK_THRESHOLD`, and store them **inline** on the
-   memory as `semantic_out`. This is incremental — only new memories are linked against the
-   current corpus (`O(new · neighbourhood)`), not a full O(N²) rebuild — and parallelized with
-   rayon. Carried-forward memories keep the links they were indexed with. **memlake derives its
-   own semantic links; it does not ingest external link tables.**
+2. **One-hop expansion over three signals** (`mlake_graph::retrieve`):
+   - **entity** — union of all seed entities; a candidate's score is how many distinct
+     seed-entity postings it appears in, read via `entity.candidates_batch` (capped at
+     `per_entity_cap = 200` per entity).
+   - **semantic** — the seeds' inline `semantic_out` plus incoming `Semantic` edges from each
+     segment's `radj` (unioned across segments — an edge lives where its target lives).
+   - **causal** — the seeds' inline `causal_out` plus incoming `Causal` radj edges.
 
-2. **Reverse adjacency — `radj.idx` / `radj.data`** (`RadjTable::build`). The inverse of the
-   inline forward edges: `target → [incoming edges]`, over both semantic and causal edge kinds
-   (each edge tagged with its kind + weight). Lets the read walk edges *backward* (who links to
-   this seed) with one ranged read, without scanning.
+3. **Structural scoring — no query-similarity rerank.** This is the key property: candidates are
+   scored purely by graph structure, never re-ranked against the query vector.
+   - entity: `tanh(shared_count · 0.5)` — saturating (1→0.46, 2→0.76, 3→0.91, 4→0.96).
+   - semantic / causal: the **max** edge weight reaching the candidate (two weak links are not
+     as strong as one strong link).
+   - additive merge across signals → activation in `[0, 3]`. Seeds excluded; ranked desc,
+     tie-broken by id (deterministic, G-2/G-3); truncated to `graph_top_k`.
 
-3. **Entity postings — `entity.idx` / `entity.data`** (`EntityTable::build`). `EntityId →
-   sorted [MemoryId]`, i.e. every memory that carries each entity. Built from every item's
-   `entity_ids` (16-byte `EntityId`s). **This is what makes the entity arm real** — without it
-   the arm could only reconnect memories already fetched by the vector probe; with it, the arm
-   finds entity-sharers anywhere in the corpus via one bounded ranged read.
+4. **No candidate hydration.** Scoring runs over a `LazyGraphSource` — the entity postings, radj
+   edges, and a liveness (`exists`, i.e. not-tombstoned) check — with **no memory fetched to be
+   scored**. Only the ≤budget *ranked* results are hydrated, and only when a tag filter needs
+   their tags; without a filter the arm fetches nothing here. (This removed the old whole-corpus
+   candidate hydration — previously every entity candidate, up to 200 per entity, was read from
+   its cluster just to be scored and truncated.)
 
-4. **Primary key — `pk.idx` / `pk.data`** (`PkTable::build`). `MemoryId → cluster index`.
-   Shared infrastructure (also used for live doc counts and inline-payload hydration), but the
-   graph arm is its main reader: after expansion yields candidate ids, pk maps each to the
-   cluster it lives in so the candidate can be fetched.
+The arm returns `(MemoryId, activation)`, surfaced as `hit.graph = { present, rank, score }`;
+memlake does no fusion.
 
-All four (`radj`, `entity`, `pk`, plus the inline `semantic_out`/`causal_out` that ride in the
-cluster files) are listed in `GenerationFiles` and kept live by GC (`all_paths`).
+**Note on entity-less data.** With no entities/causal edges (e.g. BEIR corpora), the arm reduces
+to flat semantic-neighbour weights (all ≥ 0.7, near-tied) — its discriminating signal is entity
+convergence. This is faithful to Hindsight, which is built for entity-rich production; on
+entity-less data at equal fusion weight it can add noise. See DECISIONS/TODOS.
 
----
+### Bounds & caching
 
-## Read path
+- **One hop only.** Cost is bounded by seed count, the per-entity cap, and the batch reads —
+  independent of graph shape. A timeout fallback drops the entity arm and serves semantic +
+  causal only.
+- **Cold:** `radj` + `entity` are coalesced batch reads in RT4; structural scoring adds none.
+- **Warm:** radj/entity blocks are immutable and cached by `(path, range)`, so a warm graph
+  query is effectively 0 roundtrips.
 
-Driven by `graph_arm` in `query_node.rs`. The graph arm runs only when a `vector` was given
-(it needs dense seeds) and `graph_top_k > 0`.
+## What is stored
 
-1. **Seeds.** The top ~20 of the vector arm's ranking, taken from the memories the vector arm
-   already fetched (`by_id`) — so the seeds' inline `semantic_out` / `causal_out` come for free,
-   no extra read.
+- **Inline `semantic_out`** on each memory — up to `MAX_SEMANTIC_OUT (5)` `SemanticEdge
+  { target, weight: f16 }`, read for free from a seed record. Inline `causal_out` is
+  client-supplied `CausalEdge { target, link_type, weight }`.
+- **Reverse adjacency `radj.idx` / `radj.data`** — an SSTable keyed by *target* id, holding
+  incoming `InEdge { source, kind, weight: f32 }` for both `Semantic` and `Causal(LinkType)`
+  kinds. (Incoming weights are full-precision f32; the inline forward weight is f16.) Built from
+  every item's `semantic_out` and `causal_out`, keyed by `edge.target`. Lets the read walk edges
+  *backward* with one ranged read.
+- **Entity postings `entity.idx` / `entity.data`** — `EntityId → sorted [MemoryId]`, every
+  memory carrying each entity. This is what makes the entity arm find sharers *anywhere* in the
+  corpus, not just in the probed clusters.
 
-2. **Two coalesced batch reads, issued together (one wave, RT4):**
-   - `radj.incoming_batch(seed_ids)` — every seed's incoming semantic/causal edges, one
-     request instead of a ranged GET per seed;
-   - `entity.candidates_batch(seed_entities, cap)` — the memories sharing each seed entity,
-     capped per entity (SPEC §7.2's bounded posting prefix).
+**memlake derives its own semantic links; it does not ingest external link tables.**
 
-3. **Collect candidates (`wanted`).** The union of: seeds' inline outgoing targets (semantic +
-   causal), the radj incoming sources, and the entity postings. Drop ids already materialized
-   or tombstoned.
+## Semantic-link derivation (index time)
 
-4. **Resolve + fetch.** `pk.lookup_batch(wanted)` maps the candidates to their clusters (one
-   coalesced read), then `fetch_clusters` materializes the needed clusters (concurrent, cached
-   by path). Now every candidate is a full `StoredMemory` in memory.
+Deriving each item's kNN neighbours was historically the dominant fold cost. It is now a
+**two-stage int8→f32 scan**, run for every *new* item against the current index:
 
-5. **Expand + score** (`mlake-graph::retrieve`, `scorer.rs`). Three arms score independently and
-   merge **additively** into an activation in `[0, 3]`:
-   - **entity:** `tanh(shared_entity_count · 0.5)` — saturating, so 0→1 shared matters far more
-     than 3→4. Candidates come from the persisted postings (step 2), materialized in step 4.
-   - **semantic / causal:** the **max** edge weight reaching the candidate (two weak links are
-     not as strong as one strong link), over the seeds' inline outgoing edges and the radj
-     incoming edges.
-   Seeds are excluded from the output; results are ranked, tie-broken by id (deterministic,
-   G-2/G-3), and truncated to `graph_top_k`. Dangling/tombstoned edges resolve to nothing and
-   vanish with no cleanup (SPEC §7.7).
+1. Probe `DERIVE_NPROBE = 4` clusters (link neighbours sit in the home Voronoi cell, so a small
+   probe recovers ~all of them).
+2. **Stage 1** — rank candidates by an int8 unit-vector dot (`idot` over `quantize_unit` codes),
+   keeping `DERIVE_RERANK_K = 32` finalists. int8 only *ranks* — 4× less RAM traffic, SDOT-wide.
+3. **Stage 2** — rerank the finalists in exact f32 cosine, keeping the top `MAX_SEMANTIC_OUT (5)`
+   at cosine ≥ `SEMANTIC_LINK_THRESHOLD (0.7)`. Quantization never reaches the stored weight.
+4. A **bounded** replace-worst top-5 (never an unbounded collect+sort, so a hub item near
+   thousands of neighbours stays cheap), and **cluster-ordered iteration** so a home cluster's
+   items run back-to-back on one core with their candidate vectors hot in cache (~19× faster at
+   1M vs the old exact f32 scan). Deterministic (ties by id, G-6).
 
-The arm returns `(MemoryId, activation)` pairs, surfaced as `hit.graph = {present, rank,
-score}`. As with the other arms memlake does no fusion — the client combines the raw graph
-activation with the dense and text signals.
+Reverse edges are mirrored into `radj`; the carried-forward links of compacted items are kept,
+not re-derived (matching Hindsight's "compute links once at ingest").
 
-### Roundtrips, bounds & caching
+The **streaming (external-memory) fold** derives links too — it used to drop them. With one
+cluster resident at a time it runs `derive_links_in_cluster` (a one-centroid, nprobe-1 form of
+the same int8→f32 derivation), so links are **home-cluster only**: an item whose nearest
+neighbour is just across a cluster boundary may miss it — the bounded-RAM recall tradeoff, links
+never dropped.
 
-- **One hop only.** Expansion never recurses; the cost is bounded by the seed count, the
-  per-entity cap, and the batch reads — independent of graph shape (INV-7). A timeout fallback
-  drops the entity arm and serves semantic + causal only (SPEC §7.6).
-- **Cold:** the graph arm's reads all land in **RT4** — `radj` + `entity` coalesced, then `pk`,
-  then the candidate cluster fetch. All are batched/concurrent, keeping the whole cold query
-  within the 4-roundtrip budget.
-- **Warm:** radj/entity/pk blocks and candidate clusters are immutable and cached by
-  `(path, range)`, so a warm graph query is **0 roundtrips** — verified in the benchmarks
-  (`graph_pk` 795µs→2µs warm).
+## Deletes and re-ingest
 
-### Where this still differs from Hindsight
-
-- **Semantic links are memlake's own** derived kNN, not Hindsight's explicit `memory_links` —
-  a deliberate choice (the goal is memlake owning the memories *and* links, not mirroring PG).
-  So the semantic arm won't be edge-identical; the entity + causal arms carry the parity.
-- **`source_memory_ids`** (observation ↔ source-fact) has no analogue yet — Hindsight's
-  `expand_observations` walks it bidirectionally. Planned as a new inline + reverse-adjacency
-  relation (TODOS §3 Plan C).
+A `TombstoneWhere { predicate }` op deletes every memory matching a metadata/tag/type predicate
+whose last write is *older* than the entry's sequence — atomic (one entry), idempotent, and
+race-closed by `write_seq` (a later re-ingest with an equal/higher seq survives). Putting it in
+the same entry as a re-ingest's upserts replaces a document's facts atomically. Dangling edges to
+a since-deleted target simply fail the `exists` check and vanish, with no cleanup.

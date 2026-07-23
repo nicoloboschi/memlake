@@ -1,71 +1,100 @@
-# The full-text arm
+# The full-text (FTS / BM25) arm
 
-Keyword retrieval via **BM25**, backed by a real **tantivy** index packaged the S3-native
-way. Complements the vector arm: it catches exact terms, rare tokens, and names that dense
-embeddings blur together.
+Keyword retrieval via **BM25**, backed by a real **tantivy** index packaged the S3-native way,
+with a script-aware, Chinese-capable tokenizer. It catches exact terms, rare tokens, and names
+that dense embeddings blur together. Like every arm it returns a **raw** ranking
+`(id, bm25_score)` and leaves fusion to the caller — see [ARCHITECTURE.md](../ARCHITECTURE.md).
 
-Per **memory_type**, like every arm. Chinese-capable via a dual-emission tokenizer chain.
+Code: `mlake-fts` (tantivy wrapper + tokenizer), `mlake-index/indexer.rs` + `streaming.rs`
+(the build), `mlake-index/query_node.rs::fts_arm` (the read).
 
-Relevant code: `mlake-fts` (tantivy wrapper, tokenizer), `mlake-index/indexer.rs` (the
-build), `mlake-index/query_node.rs::fts_arm` (the read).
+## Query time
 
----
+`fts_arm` runs when the query carries non-empty `text` and `depths.text > 0`. It fans out
+across **every source of the fact type** and pools raw hits:
 
-## Write path
+1. The **WAL-tail** index (`state.tail_fts`, a small in-memory tantivy index built fresh at
+   snapshot open) is searched first — tail-first, so a re-upserted id's tail hit wins the later
+   dedup.
+2. Each **segment**'s split (`seg.gen_fts`) is searched independently.
+3. Each search is `TantivyFts::search_filtered(text, depth, tags)` → `[FtsHit { id, score }]`,
+   where `score` is tantivy's **raw BM25**.
 
-1. **Tokenize.** Each memory's `text` goes through the tokenizer chain (`mlake-fts`,
-   SPEC §8): Unicode **NFKC** normalization, **OpenCC** (traditional→simplified Han), then a
-   **dual emission** — `jieba` word segmentation *and* CJK unigrams — so a query can hit
-   either a segmented word or a single character. Latin text tokenizes conventionally. Tags
-   are indexed alongside the text so the arm can filter on them.
+The pooled hits sort by score (id tiebreak), `dedup_by_key(id)` keeps the highest-scoring copy
+per id, and the result truncates to `depth`. Tombstoned ids are dropped at each search and again
+after the global arm merge; an FTS-only winner that fell outside the probed vector clusters is
+hydrated by one coalesced payload GET.
 
-2. **Build the tantivy index.** `TantivyFts::build_with_tags` builds a normal tantivy index
-   in memory over `(id, text, tags)` for every item in the generation (`indexer.rs`,
-   `fts_build` phase). tantivy computes and stores the BM25 statistics (term frequencies,
-   document frequencies, field norms).
+The arm returns `(MemoryId, bm25_score)`; memlake does **no** fusion — the raw score and this
+arm's rank surface as `hit.text = { present, rank, score }` for the client to combine.
 
-3. **Pack into one object.** The whole tantivy index is serialized into a single
-   `gen-…/fts/split.bin` — a "split" — rather than left as tantivy's many small segment
-   files. That one object is what the generation references (`GenerationFiles.fts_split`), so
-   the FTS index is write-once and CAS-published with the rest of the generation (INV-2).
+**BM25 is per-segment.** Each split carries its own document frequencies, so pooling raw scores
+across segments is approximate — the same tradeoff Lucene makes. It drifts most right after a
+flush and resolves at compaction, when segments merge into one.
 
-The tokenizer's configuration hash is pinned in the namespace manifest at creation, so the
-same tokenization is used at index and query time (a mismatch would silently break recall).
+## What is stored
 
----
+- **The split** — `fts/split.bin` per segment: one packed blob of the whole tantivy directory
+  (`[count]` then per-file `[name_len][name][data_len][data]`, filenames sorted for stable
+  framing), referenced from the segment's `FactTypeIndex`.
+- Materialization is one ranged GET at snapshot open, unpacked into the local NVMe/mmap tier —
+  so the **FTS arm does 0 object-storage roundtrips at query time**.
+- **Schema — four fields:** `words` and `bigrams`, both indexed `WithFreqs` via the `raw`
+  tokenizer (tokenization happens upstream), plus `STORED` `id` and `STORED` `tags` (JSON).
+  tantivy sums the per-field BM25 contributions.
+- **`index_text` / `fts_text()`** — a memory may carry an `index_text` distinct from its `text`;
+  `fts_text()` returns `index_text` when non-empty, else `text`. It is what BM25 indexes and is
+  **never returned** (`text` is), so a client can enrich matchable tokens — entity names,
+  spelled-out dates ("May 8 2023") — without changing what a hit shows. Wired into all three
+  build sites (in-RAM fold, streaming fold, WAL-tail index). *This closes the earlier gap vs
+  Hindsight's `text_signals`.*
 
-## Read path
+## The tokenizer
 
-Driven by `fts_arm` in `query_node.rs`, for a query carrying non-empty `text`.
+One chain, used by both indexer and query parser, its config hash pinned into the manifest so a
+split and a query agree on tokenization:
 
-1. **Materialize the split** (at snapshot open). `read_fts_split` fetches `split.bin` and
-   maps it into the local NVMe/mmap tier so tantivy can serve reads from it. One ranged read,
-   `get_immutable`-cached, amortized by the snapshot cache — part of the bounded cold-open,
-   not per query.
+1. **Normalize** — Unicode NFKC → optional traditional→simplified (via the `character_converter`
+   crate) → lowercase.
+2. **Script segmentation** — split into runs by Unicode script (Latin / Han / Kana / Hangul /
+   digits).
+3. **Per run** —
+   - *Latin*: split on non-alphanumeric (keeping `_` and digits so identifiers survive), drop
+     stopwords, Snowball-English stem; emitted into **both** fields.
+   - *Han*: **dual emission** — jieba `cut_for_search` words into `words`, character **bigrams**
+     into `bigrams` (a single char only as a length-1 fallback).
+   - *Kana / Hangul*: bigrams.
+4. **Query side** — same chain; a query hits `words OR bigrams`, scores combined by tantivy.
 
-2. **Search — no object-storage roundtrips.** BM25 query execution runs entirely over the
-   materialized split in local memory/mmap. `search_filtered(text, depth, tags)` tokenizes the
-   query with the same chain, scores documents by BM25, applies the tag filter, and returns
-   the top `text_top_k` with their **raw BM25 scores**.
+`config_hash` is FNV-1a over `"v2:t2s={}:stem={}"` (the `v2:` prefix lets a chain change force
+invalidation). It is a **create-time pin** — recorded at namespace creation and echoed on every
+fold — not a query-time assertion, so a mismatch degrades recall silently rather than erroring.
 
-3. **Overlay the WAL tail.** The un-indexed tail has its own small in-memory tantivy index
-   built at open (`tail_fts`); the arm searches it too and merges. Tail hits that were
-   tombstoned are dropped. The generation and tail rankings are merged, de-duplicated by id,
-   re-sorted by score, and truncated to `text_top_k`.
+## Optimizations and properties
 
-The arm returns `(MemoryId, bm25_score)` pairs. As with every arm, memlake does **no**
-fusion: the raw BM25 score and this arm's rank are returned as `hit.text = {present, rank,
-score}`, and the client combines them with the dense and graph signals.
+- **Tail FTS on the fly** — the un-indexed tail's split is rebuilt in memory at every snapshot
+  open, so a just-written memory is text-searchable immediately (INV-5).
+- **Tag filtering is one shared path** — applied inside `search_filtered` by reading each hit's
+  stored `tags` and running the same `TagFilter` every arm uses (not a tantivy tag query). To
+  keep a selective filter from starving `k`, it over-fetches `k*50` (clamped `[k, 10_000]`) when
+  a filter is present, else exactly `k`.
+- **Determinism caveat** — retrieval is reproducible, but the split bytes are **not**
+  byte-identical across rebuilds: tantivy stamps each segment with a random UUID. The one place
+  G-6 byte-determinism does not hold; its *results* still do.
 
-### Roundtrips & caching
+## Caveats
 
-- The FTS arm does **0 object-storage roundtrips at query time** — everything runs against the
-  materialized split. Its only storage cost is the one-time split fetch at snapshot open,
-  shared with every other query on that snapshot.
-- **Warm:** the split stays materialized in the cached snapshot, so BM25 is a local operation
-  throughout. This is why `fts` and `hybrid` workloads show `rt 0.0` even cold in the
-  benchmarks once the snapshot is open.
-- **Known gap vs Hindsight:** memlake indexes `text` only. Hindsight enriches the BM25
-  document with entity names and spelled-out date tokens (`text_signals`), so its keyword arm
-  is stronger on entity/date queries. Closing this means indexing `text + signals` or adding a
-  second indexed-text field (TODOS §2).
+- **The `updated_at` window is not honored by this arm.** The window pushes down only into the
+  vector arm and cluster selection; the FTS arm ignores it, so a stale-but-matching document can
+  surface from FTS outside the requested update window. The server re-applies the window over all
+  arms and remains the authority.
+
+## Build
+
+Two builders share one `add_doc`, so documents index identically either way:
+
+- **Batch** (`TantivyFts::build_with_tags`) — the in-RAM fold and the tail index; a 50 MB writer
+  arena.
+- **Streaming** (`TantivyFtsBuilder`) — the external-memory fold; arena = `MEMLAKE_FOLD_FTS_MB`
+  (default 128 MB), tantivy spilling segments to disk as it indexes, bounding the FTS stage's RAM
+  in a compaction.
