@@ -32,6 +32,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import struct
 import uuid
 from datetime import datetime, timezone
 from functools import partial
@@ -109,6 +110,15 @@ META_CONSOLIDATION_FAILED_AT = "consolidation_failed_at"
 #: failed memory stays out of the queue just as a succeeded one does.
 CONSOLIDATED_FAILED = "2"
 
+#: The curation archive lives in a sibling namespace, so an invalidated memory is
+#: physically out of every recall/scan surface (which only ever touch the bank's
+#: own namespace) without a per-query "valid?" filter — the same effect Postgres
+#: gets by moving the row to `invalidated_memory_units`. The reason and the moment
+#: ride in the metadata bag, since memlake has no columns for them.
+_ARCHIVE_SUFFIX = "__invalidated"
+META_INVALIDATION_REASON = "invalidation_reason"
+META_INVALIDATED_AT = "invalidated_at"
+
 
 def _to_epoch_ms(dt: datetime | None) -> int | None:
     """memlake carries all timestamps as epoch milliseconds."""
@@ -178,12 +188,17 @@ class MemlakeMemories(MemoriesExtension):
     def _namespace(self, bank_id: str) -> str:
         return f"{self._namespace_prefix}{bank_id}"
 
-    async def ensure_namespace(self, bank_id: str) -> None:
-        ns = self._namespace(bank_id)
+    async def _ensure_ns(self, ns: str) -> None:
         if ns in self._ensured:
             return
         await asyncio.to_thread(self._client.create_namespace, ns)
         self._ensured.add(ns)
+
+    async def ensure_namespace(self, bank_id: str) -> None:
+        await self._ensure_ns(self._namespace(bank_id))
+
+    def _archive_namespace(self, bank_id: str) -> str:
+        return self._namespace(bank_id) + _ARCHIVE_SUFFIX
 
     # -- writes --------------------------------------------------------------
 
@@ -693,6 +708,7 @@ class MemlakeMemories(MemoriesExtension):
         self,
         bank_id: str,
         *,
+        namespace: str | None = None,
         fact_types: list[str] | None = None,
         limit: int = 100,
         page_token: str = "",
@@ -718,7 +734,7 @@ class MemlakeMemories(MemoriesExtension):
         response = await asyncio.to_thread(
             partial(
                 self._client.scan,
-                self._namespace(bank_id),
+                namespace or self._namespace(bank_id),
                 memory_types=sorted(memory_types),
                 page_token=page_token,
                 limit=limit,
@@ -786,6 +802,105 @@ class MemlakeMemories(MemoriesExtension):
 
     async def get_memory_unit(self, *, conn, ops, fq_table, bank_id: str, unit_id: str) -> dict[str, Any] | None:
         return await reads.get_memory_unit(self, conn=conn, fq_table=fq_table, bank_id=bank_id, unit_id=unit_id)
+
+    # -- curation archive ----------------------------------------------------
+    #
+    # Invalidation moves a memory to a sibling `__invalidated` namespace and back,
+    # rather than tombstoning it: recall and scans only ever touch the bank's own
+    # namespace, so an archived memory is out of every result set for free, yet
+    # still readable and restorable. The move reconstructs the whole memory —
+    # vector, entity ids, causal edges, timestamps, metadata — from a single
+    # addressed read, so nothing but the derived semantic edges (re-derived on the
+    # next fold) and the write-only `index_text` is lost across the round trip.
+
+    async def _get_record(self, ns: str, unit_id: str):
+        try:
+            recs = await asyncio.to_thread(
+                partial(self._client.get, ns, [uuid.UUID(unit_id).bytes], include_vector=True, include_edges=True)
+            )
+        except Exception as e:
+            # A namespace with no writes yet has no manifest; a get against it is
+            # "nothing there", not an error — invalidating a memory that isn't in
+            # the bank returns False rather than raising.
+            if "no manifest" in str(e):
+                return None
+            raise
+        return recs[0] if recs else None
+
+    def _memory_from_record(self, record, *, set_metadata: dict | None = None, drop_metadata: tuple = ()):
+        payload = record.memory
+        metadata = dict(payload.metadata or {})
+        for key in drop_metadata:
+            metadata.pop(key, None)
+        if set_metadata:
+            metadata.update(set_metadata)
+
+        raw = record.vector.f32le if record.vector else b""
+        vector = list(struct.unpack(f"<{len(raw) // 4}f", raw)) if raw else []
+
+        ts = payload.timestamps
+        m = mc.memory(
+            payload.text,
+            vector,
+            memory_type=record.memory_type,
+            id=record.id,
+            tags=list(payload.tags),
+            proof_count=payload.proof_count,
+            entity_ids=list(payload.entity_ids),
+            metadata=metadata,
+            event_date=ts.event_date if ts.HasField("event_date") else None,
+            updated_at=ts.updated_at if ts.HasField("updated_at") else None,
+            occurred_start=ts.occurred_start if ts.HasField("occurred_start") else None,
+            occurred_end=ts.occurred_end if ts.HasField("occurred_end") else None,
+            mentioned_at=ts.mentioned_at if ts.HasField("mentioned_at") else None,
+        )
+        # Causal edges are the memory's own and must survive the move; semantic
+        # edges are indexer-derived and re-appear on the next fold, so are dropped.
+        for edge in payload.causal_out:
+            m.causal_out.add(target=edge.target, link_type=edge.link_type, weight=edge.weight)
+        return m
+
+    async def _move(self, from_ns: str, to_ns: str, unit_id: str, *, set_metadata=None, drop_metadata=()):
+        """Move one memory between namespaces; returns its record, or None if absent."""
+        record = await self._get_record(from_ns, unit_id)
+        if record is None:
+            return None
+        await self._ensure_ns(to_ns)
+        memory = self._memory_from_record(record, set_metadata=set_metadata, drop_metadata=drop_metadata)
+        await asyncio.to_thread(self._client.write, to_ns, [memory])
+        await asyncio.to_thread(self._client.delete, from_ns, [record.id])
+        return record
+
+    async def get_archived_memory(self, *, conn, fq_table, bank_id: str, unit_id: str) -> StoredMemory | None:
+        record = await self._get_record(self._archive_namespace(bank_id), unit_id)
+        return _stored_from_record(record) if record is not None else None
+
+    async def invalidate_memory(self, *, conn, fq_table, bank_id: str, unit_id: str, reason: str | None) -> bool:
+        now = datetime.now(timezone.utc).isoformat()
+        record = await self._move(
+            self._namespace(bank_id),
+            self._archive_namespace(bank_id),
+            unit_id,
+            set_metadata={META_INVALIDATION_REASON: reason or "", META_INVALIDATED_AT: now},
+        )
+        return record is not None
+
+    async def set_invalidation_reason(self, *, conn, fq_table, bank_id: str, unit_id: str, reason: str | None) -> None:
+        op = self._client.patch(uuid.UUID(unit_id).bytes, metadata={META_INVALIDATION_REASON: reason or ""})
+        await asyncio.to_thread(self._client.write_ops, self._archive_namespace(bank_id), [op])
+
+    async def restore_memory(self, *, conn, fq_table, bank_id: str, unit_id: str) -> StoredMemory | None:
+        record = await self._move(
+            self._archive_namespace(bank_id),
+            self._namespace(bank_id),
+            unit_id,
+            drop_metadata=(META_INVALIDATION_REASON, META_INVALIDATED_AT),
+        )
+        return _stored_from_record(record) if record is not None else None
+
+    async def set_memory_embedding(self, *, conn, fq_table, bank_id: str, unit_id: str, embedding) -> None:
+        op = self._client.patch(uuid.UUID(unit_id).bytes, vector=_parse_embedding(embedding))
+        await asyncio.to_thread(self._client.write_ops, self._namespace(bank_id), [op])
 
     async def list_entities(
         self, *, conn, fq_table, bank_id: str, search: str | None = None, limit: int = 100, offset: int = 0

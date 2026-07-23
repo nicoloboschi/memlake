@@ -188,6 +188,68 @@ async def test_delete_facts_removes_them(store, bank_id):
     assert got == []
 
 
+# --------------------------------------------------------------------------- curation archive
+
+
+async def test_invalidate_then_restore(store, bank_id, index_pass):
+    """Invalidate moves a memory out of every recall surface; restore brings it back.
+
+    The archive is a sibling namespace, so an invalidated memory is physically out
+    of recall and scans (which only touch the bank's own namespace) yet still
+    readable, flagged, and restorable — the same lifecycle Postgres gets by moving
+    the row to `invalidated_memory_units`.
+    """
+    ns = store._namespace(bank_id)
+    unit_ids = await store.insert_facts(
+        conn=None, ops=None, bank_id=bank_id, facts=[make_fact("a curatable fact", seed=0.4)]
+    )
+    uid = unit_ids[0]
+    index_pass(ns)
+
+    # Invalidate: gone from the live set, present in the archive, reported as such.
+    assert (
+        await store.invalidate_memory(conn=None, fq_table=_fq_table, bank_id=bank_id, unit_id=uid, reason="wrong")
+        is True
+    )
+    assert await store.get_memories(conn=None, fq_table=_fq_table, bank_id=bank_id, unit_ids=[uid]) == []
+    archived = await store.get_archived_memory(conn=None, fq_table=_fq_table, bank_id=bank_id, unit_id=uid)
+    assert archived is not None and archived.text == "a curatable fact"
+
+    detail = await store.get_memory_unit(conn=None, ops=None, fq_table=_fq_table, bank_id=bank_id, unit_id=uid)
+    assert detail["state"] == "invalidated"
+    assert detail["invalidation_reason"] == "wrong"
+    assert detail["invalidated_at"]
+
+    # Updating the reason on an already-archived memory sticks.
+    await store.set_invalidation_reason(conn=None, fq_table=_fq_table, bank_id=bank_id, unit_id=uid, reason="dup")
+    detail = await store.get_memory_unit(conn=None, ops=None, fq_table=_fq_table, bank_id=bank_id, unit_id=uid)
+    assert detail["invalidation_reason"] == "dup"
+
+    # The invalidated tab lists it (the archive namespace has to be indexed too).
+    index_pass(store._archive_namespace(bank_id))
+    page = await store.list_memory_units(conn=None, ops=None, fq_table=_fq_table, bank_id=bank_id, state="invalidated")
+    assert uid in {item["id"] for item in page["items"]}
+    assert all(item["state"] == "invalidated" for item in page["items"])
+
+    # Restore: back in the live set, gone from the archive.
+    restored = await store.restore_memory(conn=None, fq_table=_fq_table, bank_id=bank_id, unit_id=uid)
+    assert restored is not None and restored.text == "a curatable fact"
+    assert await store.get_archived_memory(conn=None, fq_table=_fq_table, bank_id=bank_id, unit_id=uid) is None
+    live = await store.get_memories(conn=None, fq_table=_fq_table, bank_id=bank_id, unit_ids=[uid])
+    assert [m.text for m in live] == ["a curatable fact"]
+    detail = await store.get_memory_unit(conn=None, ops=None, fq_table=_fq_table, bank_id=bank_id, unit_id=uid)
+    assert detail["state"] == "valid"
+
+
+async def test_invalidate_missing_is_false(store, bank_id):
+    """Invalidating an id that was never live reports it, rather than archiving nothing."""
+    missing = store.allocate_unit_ids(1)[0]
+    assert (
+        await store.invalidate_memory(conn=None, fq_table=_fq_table, bank_id=bank_id, unit_id=missing, reason=None)
+        is False
+    )
+
+
 async def test_delete_document_takes_only_its_memories(store, bank_id, index_pass):
     """A replaced document's facts go, the rest stay — no cascade to lean on."""
     ns = store._namespace(bank_id)

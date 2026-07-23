@@ -78,10 +78,10 @@ mostly **operational and packaging**, not features. Grouped by how hard it block
 
 ### 0d. Feature-parity gaps — runs, but degraded UX
 
-- [ ] **Curation invalidate/revert unsupported → §6.** `update_memory_unit` (edit
-      *and* the state changes) reads/writes `memory_units` directly, so in memlake
-      mode it finds nothing and silently returns "not found": you cannot edit,
-      invalidate or revert a memory. **This is where we start.**
+- [x] **Curation invalidate/revert — DONE → §6.** Invalidate/revert now work in
+      memlake mode via an archive namespace, tested live. The remaining piece is
+      the *edit* branch of `update_memory_unit` (still raw `memory_units` SQL) —
+      tracked in §6 as the next curation item.
 - [ ] **Count surfaces return zero/degraded → §5b.** bank-stats link counts,
       `get_memories_timeseries`, `list_observation_scopes`, `list_documents`
       per-doc counts, `get_bank_freshness` pending/failed.
@@ -389,12 +389,39 @@ same shape as the per-cluster tag set.
 
 ## 6. Curation archive state
 
-- [ ] **Tombstones are one-way.** Hindsight's curation models invalidation
-      structurally: a row moves to `invalidated_memory_units` and can be reverted.
-      memlake can only tombstone, so invalidate/revert is unsupported and
-      `list_memory_units` always reports `state: "valid"`. Needs either a
-      soft-delete/archived state that `Scan` can filter on, or an explicit
-      "restore tombstoned id" op.
+- [x] **Invalidate / revert — DONE, via an archive namespace.** Invalidation is
+      structural on both stores now: Postgres moves the row to
+      `invalidated_memory_units`, and the extension moves the memory to a sibling
+      `<ns>__invalidated` namespace. Recall and scans only ever touch the bank's
+      own namespace, so an invalidated memory is out of every result set for free
+      — no per-query "valid?" filter — yet stays readable, flagged, and
+      restorable. The move reconstructs the whole memory (vector, entity ids,
+      causal edges, timestamps, metadata) from one addressed read, so nothing but
+      the indexer-derived semantic edges (re-derived on the next fold) and the
+      write-only `index_text` is lost across it. `get_memory_unit` reports
+      `state: "invalidated"` with the reason/timestamp, and `list_memory_units(
+      state="invalidated")` scans the archive namespace.
+
+      Behind a five-method archive lifecycle on the store interface
+      (`invalidate_memory` / `restore_memory` / `get_archived_memory` /
+      `set_invalidation_reason` / `set_memory_embedding`), so no call site branches
+      on which store is installed. Verified live: invalidate removes a memory from
+      recall/scan and archives it; the reason updates; the invalidated tab lists
+      it; revert brings it back searchable.
+
+      Two residues, both minor: **(a)** the archive namespace needs its own index
+      pass for the invalidated *listing* to be current (the same
+      write-then-index staleness every scan has; the lifecycle itself is
+      strong-consistency); **(b)** `index_text` (entity/date BM25 enrichment) does
+      not survive the round trip, so a reverted memory loses it until its next
+      edit — the archive is never FTS-queried, and revert re-embeds anyway.
+
+- [ ] **Edit (`update_memory_unit` field edits) still writes `memory_units`
+      directly.** The state changes (this item) are routed through the store; the
+      *edit* branch — correcting text/context/dates/fact_type/entities — still
+      does raw `UPDATE memory_units` + entity relink SQL, so in memlake mode a
+      field edit silently no-ops. Same shape of fix (route the field update +
+      re-embed through the store), left as the next curation item.
 
 ---
 

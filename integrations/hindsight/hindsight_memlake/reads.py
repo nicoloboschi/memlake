@@ -151,9 +151,11 @@ async def list_memory_units(
     """
     if state is not None and state not in ("valid", "invalidated"):
         raise ValueError(f"Invalid state '{state}': expected 'valid' or 'invalidated'.")
-    if state == "invalidated":
-        # No archive here: an invalidated memory is a tombstone, i.e. absent.
-        return {"items": [], "total": 0, "limit": limit, "offset": offset}
+    # Invalidated memories live in the sibling archive namespace; "valid" (the
+    # default) is the bank's own. Scanning the archive means the "invalidated" tab
+    # shows what it should, the same way the SQL path reads a second table.
+    is_archived = state == "invalidated"
+    scan_ns = store._archive_namespace(bank_id) if is_archived else None
 
     fact_types = [fact_type] if fact_type else None
 
@@ -181,10 +183,9 @@ async def list_memory_units(
     pages = 0
 
     while len(collected) < wanted and pages < _MAX_SCAN_PAGES:
-        page = await store.scan_memories(
-            conn=conn,
-            fq_table=fq_table,
-            bank_id=bank_id,
+        page = await store.scan_raw(
+            bank_id,
+            namespace=scan_ns,
             fact_types=fact_types,
             limit=max(limit, 100),
             page_token=page_token,
@@ -234,7 +235,7 @@ async def list_memory_units(
             # Written to the metadata bag by `mark_consolidated(failed=True)`, but
             # StoredMemory models no field for it, so it does not survive the read.
             "consolidation_failed_at": None,
-            "state": "valid",
+            "state": "invalidated" if is_archived else "valid",
             "invalidation_reason": None,
             "invalidated_at": None,
             "edited_at": None,
@@ -242,8 +243,9 @@ async def list_memory_units(
         for m in window
     ]
 
-    if needs_python_filter or metadata_equals:
-        # A filtered walk cannot know the true total without scanning the rest.
+    if is_archived or needs_python_filter or metadata_equals:
+        # A filtered walk — or a walk of the archive, which count_memories does not
+        # see — cannot know the true total without scanning the rest.
         total = len(collected)
     else:
         counts = await store.count_memories(conn=conn, fq_table=fq_table, bank_id=bank_id)
@@ -258,10 +260,22 @@ async def get_memory_unit(store, *, conn, fq_table, bank_id: str, unit_id: str) 
     For an observation this also expands ``source_memories`` — the facts behind
     it — the same way the SQL detail view does, so the UI can render the chain.
     """
+    from .provider import META_INVALIDATED_AT, META_INVALIDATION_REASON, _stored_from_record
+
     memories = await store.get_memories(conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=[unit_id])
-    if not memories:
-        return None
-    memory = memories[0]
+    memory = memories[0] if memories else None
+    # An invalidated memory lives in the archive namespace, not the bank's; the
+    # detail view still renders it, flagged, the same way the SQL path reads the
+    # `invalidated_memory_units` table. The reason/timestamp are in the archived
+    # record's raw metadata bag, which `StoredMemory` does not carry, so read it.
+    archived = memory is None
+    archived_meta: dict[str, str] = {}
+    if memory is None:
+        record = await store._get_record(store._archive_namespace(bank_id), unit_id)
+        if record is None:
+            return None
+        memory = _stored_from_record(record)
+        archived_meta = dict(record.memory.metadata or {})
     names = await resolve_entity_names(conn, memory.entity_ids, fq_table)
     result: dict = {
         "id": memory.unit_id,
@@ -279,12 +293,12 @@ async def get_memory_unit(store, *, conn, fq_table, bank_id: str, unit_id: str) 
         "proof_count": memory.proof_count if memory.proof_count is not None else 1,
         "entities": [n for n in (names.get(eid) for eid in memory.entity_ids) if n],
         "observation_scopes": None,
-        "state": "valid",
+        "state": "invalidated" if archived else "valid",
         "consolidated_at": _iso(memory.consolidated_at),
         "consolidation_failed_at": None,
         "edited_at": None,
-        "invalidation_reason": None,
-        "invalidated_at": None,
+        "invalidation_reason": archived_meta.get(META_INVALIDATION_REASON) or None if archived else None,
+        "invalidated_at": archived_meta.get(META_INVALIDATED_AT) if archived else None,
     }
 
     if memory.fact_type == "observation":
