@@ -209,11 +209,11 @@ request-serving threads. Approximate derivation (`exact_rerank=false`) already c
 
 ## Open / to try next (the loop) — priority order
 
-1. ❓ **Reuse persisting segments across a fold** (the `full_open` fix, designed above) — collapses
-   the current p99 for both reads and writes. **#1.**
-2. ❓ **Size-based compaction** — a namespace at 6+ L0 segments makes every read fan out 6× and every
-   `full_open` reload 6×. Compact many tiny segments sooner (the load's 50-item writes each became a
-   segment). Reduces both the fan-out cost and the full_open cost.
+1. ✅ **Reuse persisting segments across a fold** — DONE (fix #3). `full_open` eliminated on the hot
+   path; p99 collapsed.
+2. ❓ **Size-based compaction** — a namespace still sits at 6+ L0 segments, so every read fans the
+   vector arm out 6× (rerank per segment) and every reopen touches 6 segments. Now the top remaining
+   cost. Compact many tiny segments sooner (the load's 50-item writes each became a segment).
 3. ❓ **Write-path isolation** — move `derive_links` off the request path or onto a bounded blocking
    pool, if write p99 persists after #1.
 4. ❓ **500-namespace run** — with promotion the mem tier fills with the hot set; at 500 busy
