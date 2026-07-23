@@ -306,11 +306,17 @@ impl Memlake for MemlakeService {
             })
             .collect();
         let upsert_count = upserts.len();
+        // Broken out so the trace shows whether link derivation is bound by opening the snapshot,
+        // by cold S3 reads (roundtrips/cache_misses), or by CPU in the kNN arms (phase breakdown).
+        let mut link_snapshot_ms = 0.0;
+        let mut link_io = serde_json::Value::Null;
         let link_ms = if !upserts.is_empty() {
             let link_t = std::time::Instant::now();
+            let snap_t = std::time::Instant::now();
             let snap = self.snapshot(&ns).await?;
+            link_snapshot_ms = ms(snap_t);
             let metrics = QueryMetrics::new();
-            mlake_index::derive_links_for_write(&snap.node, &mut upserts, &metrics)
+            let derive_stats = mlake_index::derive_links_for_write(&snap.node, &mut upserts, &metrics)
                 .await
                 .map_err(query_error)?;
             let mut derived = upserts.into_iter();
@@ -318,6 +324,20 @@ impl Memlake for MemlakeService {
                 if let mlake_core::Op::Upsert(m) = op {
                     *m = derived.next().expect("one derived memory per upsert");
                 }
+            }
+            if self.tracer.enabled() {
+                link_io = serde_json::json!({
+                    // The two costs inside link derivation, split:
+                    "corpus_query_ms": derive_stats.query_ms,   // step (a): O(new·N) queries
+                    "within_batch_ms": derive_stats.batch_ms,   // step (b): O(batch²) cosine
+                    "queries": derive_stats.queries,
+                    // I/O the corpus queries did (0 ⇒ pure CPU, warm):
+                    "roundtrips": metrics.roundtrips(),
+                    "cache_hits": metrics.cache_hits(),
+                    "cache_misses": metrics.cache_misses(),
+                    "bytes": metrics.bytes(),
+                    "phases_us": metrics.phase_breakdown(),
+                });
             }
             ms(link_t)
         } else {
@@ -354,6 +374,8 @@ impl Memlake for MemlakeService {
                 "namespace": req.namespace,
                 "total_ms": ms(t0),
                 "link_ms": link_ms,
+                "link_snapshot_ms": link_snapshot_ms,
+                "link_io": link_io,
                 "commit_ms": commit_ms,
                 "wait_for_index_ms": wait_for_index_ms,
                 "params": {

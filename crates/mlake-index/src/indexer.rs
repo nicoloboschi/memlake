@@ -220,11 +220,23 @@ pub async fn flush(ns: &Namespace, tokenizer: &Tokenizer, opts: IndexOptions) ->
 /// tail is already correct. `node` is a snapshot of the *committed* corpus (index + existing tail);
 /// the batch's own items are compared in RAM because they are not yet committed and so invisible to
 /// `node`. Sets each memory's `semantic_out` (top-`MAX_SEMANTIC_OUT` at cosine ≥ threshold).
+/// Timing split of [`derive_links_for_write`], so a trace can tell the O(new·N) corpus queries
+/// apart from the O(n²) within-batch compare.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DeriveStats {
+    /// Wall time in the per-item corpus queries (step a) — grows with corpus size.
+    pub query_ms: f64,
+    /// Wall time in the within-batch cosine compare (step b) — grows with batch size squared.
+    pub batch_ms: f64,
+    /// Number of corpus queries issued (one per non-empty new item).
+    pub queries: usize,
+}
+
 pub async fn derive_links_for_write(
     node: &crate::QueryNode,
     memories: &mut [mlake_core::Memory],
     metrics: &mlake_store::QueryMetrics,
-) -> Result<()> {
+) -> Result<DeriveStats> {
     let tags = mlake_core::TagFilter::new(Vec::new(), mlake_core::TagsMatch::Any);
     let depths = crate::ArmDepths {
         vector: MAX_SEMANTIC_OUT + 4,
@@ -238,15 +250,19 @@ pub async fn derive_links_for_write(
     let vecs: Vec<Vec<f32>> = memories.iter().map(|m| m.vector.clone()).collect();
     let ids: Vec<MemoryId> = memories.iter().map(|m| m.id).collect();
     let mts: Vec<u8> = memories.iter().map(|m| m.memory_type).collect();
+    let mut stats = DeriveStats::default();
     for i in 0..n {
         if vecs[i].is_empty() {
             continue;
         }
         let mut neigh: Vec<(MemoryId, f32)> = Vec::new();
         // (a) neighbours already in the committed index + tail (one exact-scored vector query).
+        let qt = std::time::Instant::now();
         let raw = node
             .query_raw_metered(mts[i], Some(&vecs[i]), None, &tags, depths, None, Default::default(), metrics)
             .await?;
+        stats.query_ms += qt.elapsed().as_secs_f64() * 1000.0;
+        stats.queries += 1;
         for h in raw {
             if let Some(d) = h.dense {
                 if h.id != ids[i] && d.score >= SEMANTIC_LINK_THRESHOLD {
@@ -256,6 +272,7 @@ pub async fn derive_links_for_write(
         }
         // (b) neighbours within this same batch (not yet committed, so invisible to `node`). The
         // batch is disjoint from the index, so these never duplicate the query hits.
+        let bt = std::time::Instant::now();
         for j in 0..n {
             if j == i || mts[j] != mts[i] || vecs[j].is_empty() {
                 continue;
@@ -265,6 +282,7 @@ pub async fn derive_links_for_write(
                 neigh.push((ids[j], sim));
             }
         }
+        stats.batch_ms += bt.elapsed().as_secs_f64() * 1000.0;
         neigh.sort_by(|a, b| {
             b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal).then(a.0.cmp(&b.0))
         });
@@ -272,7 +290,7 @@ pub async fn derive_links_for_write(
         memories[i].semantic_out =
             neigh.into_iter().map(|(id, sim)| SemanticEdge { target: id, weight: Weight::from_f32(sim) }).collect();
     }
-    Ok(())
+    Ok(stats)
 }
 
 /// Cheap live-document estimate for fold selection: the previous generation's indexed count
