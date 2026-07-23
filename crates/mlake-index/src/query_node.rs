@@ -155,13 +155,19 @@ struct FactType {
     /// reuse it without re-decoding centroids, tables and the FTS split.
     segments: Arc<Vec<SegmentState>>,
     tail_items: Vec<StoredMemory>,
-    tail_fts: TantivyFts,
+    /// The tail's BM25 index, built **lazily** on first text-arm use and cached — a tantivy build
+    /// has fixed per-index overhead (schema + writer + commit), and a snapshot reopen (every write)
+    /// used to pay it eagerly even though the vast majority of queries are vector-only and never
+    /// touch it. Vector-only reads and reopens now skip it entirely.
+    tail_fts: std::sync::OnceLock<TantivyFts>,
     doc_count: usize,
 }
 
 /// A loaded, queryable snapshot of a bank namespace across its fact types.
 pub struct QueryNode {
     ns: Namespace,
+    /// Kept so a fact type's `tail_fts` can be built lazily on first text-arm use.
+    tokenizer: Tokenizer,
     per_type: BTreeMap<u8, FactType>,
     /// Tail deletes — newest of all, so they hide every segment's copy.
     tombstones: HashSet<MemoryId>,
@@ -269,10 +275,7 @@ impl QueryNode {
         let mut per_type = BTreeMap::new();
         for ft in memory_types {
             let tail_items = tail_by_ft.remove(&ft).unwrap_or_default();
-            let tail_fts = TantivyFts::build_with_tags(
-                tail_items.iter().map(|i| (i.id, i.fts_text(), i.tags.as_slice())),
-                tokenizer.clone(),
-            )?;
+            // `tail_fts` is built lazily on first text-arm use (see `FactType::tail_fts`).
 
             // Load every segment that indexes this fact type, newest-first; the query fans each
             // arm out across them and merges. A fact type present only in the tail has no segments.
@@ -426,12 +429,18 @@ impl QueryNode {
             }
             per_type.insert(
                 ft,
-                FactType { segments: Arc::new(segments), tail_items, tail_fts, doc_count },
+                FactType {
+                    segments: Arc::new(segments),
+                    tail_items,
+                    tail_fts: std::sync::OnceLock::new(),
+                    doc_count,
+                },
             );
         }
 
         Ok(Self {
             ns: ns.clone(),
+            tokenizer,
             per_type,
             tombstones,
             seg_superseded,
@@ -480,10 +489,9 @@ impl QueryNode {
         let mut per_type = BTreeMap::new();
         for ft in memory_types {
             let tail_items = tail_by_ft.remove(&ft).unwrap_or_default();
-            let tail_fts = TantivyFts::build_with_tags(
-                tail_items.iter().map(|i| (i.id, i.fts_text(), i.tags.as_slice())),
-                tokenizer.clone(),
-            )?;
+            // `tail_fts` is built lazily on first text-arm use (see `FactType::tail_fts`) — the
+            // whole point of a cheap reopen is not paying a tantivy build a vector-only query
+            // never uses.
             // Reuse the fold-produced segments for this fact type (empty for a tail-only type).
             let segments = self
                 .per_type
@@ -514,11 +522,15 @@ impl QueryNode {
                     doc_count += 1;
                 }
             }
-            per_type.insert(ft, FactType { segments, tail_items, tail_fts, doc_count });
+            per_type.insert(
+                ft,
+                FactType { segments, tail_items, tail_fts: std::sync::OnceLock::new(), doc_count },
+            );
         }
 
         Ok(Self {
             ns: ns.clone(),
+            tokenizer,
             per_type,
             tombstones,
             seg_superseded: self.seg_superseded.clone(),
@@ -794,37 +806,68 @@ impl QueryNode {
         Ok(out)
     }
 
-    /// Live edge totals `(semantic, causal)` across a bank's segments plus the WAL tail.
+    /// Live edge totals `(semantic, causal, temporal)` across a bank's segments plus the WAL tail.
     ///
-    /// Sums each segment's `Stats.{semantic,causal}_edge_count` (tallied at fold) and adds the
-    /// un-indexed tail's visible items' `semantic_out` / `causal_out`. Like `metadata_counts` and
-    /// `entity_counts`, it does not subtract edges a newer segment tombstoned — the residual is
+    /// Semantic/causal sum each segment's `Stats.{semantic,causal}_edge_count` (tallied at fold)
+    /// plus the un-indexed tail's `semantic_out` / `causal_out`. Temporal is *not* stored — it is
+    /// derived here from the time distribution: merge every segment's time index (a compact
+    /// `(ts, count)` sweep, no memory records) with the tail's effective times, then for each
+    /// memory count its neighbours within `±TEMPORAL_SPREAD_WINDOW_MS`, capped per unit — the
+    /// number Hindsight's stored temporal rows would have. Like `metadata_counts` and
+    /// `entity_counts`, it does not subtract items a newer segment tombstoned; the residual is
     /// bounded by not-yet-compacted re-upserts/deletes, which a stats surface tolerates.
-    pub async fn link_counts(&self, types: &[u8]) -> Result<(u64, u64)> {
+    pub async fn link_counts(&self, types: &[u8]) -> Result<(u64, u64, u64)> {
+        use mlake_core::memory::{effective_ts, MAX_TEMPORAL_LINKS_PER_UNIT, TEMPORAL_SPREAD_WINDOW_MS};
         let metrics = QueryMetrics::new();
         let (mut semantic, mut causal): (u64, u64) = (0, 0);
+        // Effective-time histogram across every fact type, merged into ascending buckets.
+        let mut time_buckets: std::collections::BTreeMap<i64, u64> = std::collections::BTreeMap::new();
         let walk: Vec<u8> = if types.is_empty() { self.memory_types() } else { types.to_vec() };
         for ty in walk {
             let Some(ft) = self.per_type.get(&ty) else { continue };
             for seg in ft.segments.iter() {
-                if seg.stats_path.is_empty() {
-                    continue;
+                if !seg.stats_path.is_empty() {
+                    let bytes = self.ns.store.get_immutable(&seg.stats_path, Some((&metrics, 2))).await?;
+                    let stats: crate::generation::Stats = serde_json::from_slice(&bytes).unwrap_or_default();
+                    semantic += stats.semantic_edge_count as u64;
+                    causal += stats.causal_edge_count as u64;
                 }
-                let bytes = self.ns.store.get_immutable(&seg.stats_path, Some((&metrics, 2))).await?;
-                let stats: crate::generation::Stats = serde_json::from_slice(&bytes).unwrap_or_default();
-                semantic += stats.semantic_edge_count as u64;
-                causal += stats.causal_edge_count as u64;
+                if !seg.time.is_empty() {
+                    for (ts, count) in seg.time.timestamp_counts(&self.ns.store, Some((&metrics, 2))).await? {
+                        *time_buckets.entry(ts).or_insert(0) += count;
+                    }
+                }
             }
-            // The tail is not in any segment's stats yet, so add its visible items' edges.
+            // The tail is not in any segment's stats/time index yet, so add its visible items.
             for m in &ft.tail_items {
                 if self.hidden(m) {
                     continue;
                 }
                 semantic += m.semantic_out.len() as u64;
                 causal += m.causal_out.len() as u64;
+                if let Some(ts) = effective_ts(&m.timestamps) {
+                    *time_buckets.entry(ts).or_insert(0) += 1;
+                }
             }
         }
-        Ok((semantic, causal))
+
+        // Sliding-window sweep over the sorted (ts, count) buckets: a memory at `ts` neighbours
+        // every memory (bar itself) in `[ts - W, ts + W]`, capped. All buckets at one `ts` share
+        // the window sum, so each contributes `count * min(window_sum - 1, cap)`.
+        let buckets: Vec<(i64, u64)> = time_buckets.into_iter().collect();
+        let (mut lo, mut hi, mut window_sum, mut temporal): (usize, usize, u64, u64) = (0, 0, 0, 0);
+        for &(ts, mult) in &buckets {
+            while buckets[lo].0 < ts - TEMPORAL_SPREAD_WINDOW_MS {
+                window_sum -= buckets[lo].1;
+                lo += 1;
+            }
+            while hi < buckets.len() && buckets[hi].0 <= ts + TEMPORAL_SPREAD_WINDOW_MS {
+                window_sum += buckets[hi].1;
+                hi += 1;
+            }
+            temporal += mult * (window_sum - 1).min(MAX_TEMPORAL_LINKS_PER_UNIT);
+        }
+        Ok((semantic, causal, temporal))
     }
 
     pub async fn entity_counts(
@@ -1739,10 +1782,18 @@ impl QueryNode {
     /// deduped keeping the first occurrence — see the note).
     fn fts_arm(&self, state: &FactType, text: &str, depth: usize, tags: &TagFilter) -> Vec<(MemoryId, f32)> {
         let mut hits: Vec<mlake_fts::FtsHit> = Vec::new();
+        // Build the tail's BM25 index on first text query and cache it — a vector-only query never
+        // reaches here, so it never pays the tantivy build (the reopen fast-path).
+        let tail_fts = state.tail_fts.get_or_init(|| {
+            TantivyFts::build_with_tags(
+                state.tail_items.iter().map(|i| (i.id, i.fts_text(), i.tags.as_slice())),
+                self.tokenizer.clone(),
+            )
+            .expect("build tail FTS")
+        });
         // Tail first so a re-upserted id's tail hit wins the dedup over an older segment's.
         hits.extend(
-            state
-                .tail_fts
+            tail_fts
                 .search_filtered(text, depth, tags)
                 .into_iter()
                 .filter(|h| !self.tombstones.contains(&h.id)),

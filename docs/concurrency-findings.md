@@ -85,6 +85,36 @@ the rerank candidate count; revisit after the write-path work.
 
 ---
 
+## ✅ FIX #2 — lazy tail FTS (cheap reopen)
+
+**Symptom (after fix #1).** Full mixed (12 readers + 4 writers, warm): READ 16.8 QPS, p50 82ms but
+**p90 2.6s / p99 4.5s**, WRITE p50 3s. The slow reads were all `reopen_tail` with `open_ms` **1.7–3s**
+for a *50-entry* tail, `roundtrips=0` (pure CPU, not S3).
+
+**Root cause.** `reopen_extending_tail` (runs on every write that advances a namespace's head) and
+`open` **eagerly built the tail's tantivy BM25 index** (`TantivyFts::build_with_tags`) — schema +
+RAMDirectory + IndexWriter + commit, a fixed per-build overhead — even though **the vast majority of
+queries are vector-only and never touch it**. Under write load, reopens are frequent and each paid
+the build; the write path pays it too (derive opens a snapshot).
+
+**Fix.** `FactType.tail_fts` is now a `OnceLock<TantivyFts>`, built **lazily on first text-arm use**
+(`fts_arm`) from `tail_items` + the node's tokenizer. Vector-only reads and reopens skip it. 52
+end-to-end tests pass (text arm still correct).
+
+**Result (full mixed, warm):**
+
+| | before (fix #1 only) | after fix #2 |
+|---|---|---|
+| READ QPS | 16.8 | **58.6** |
+| READ p50 / p90 | 82ms / 2.6s | **26.5ms / 240ms** |
+| WRITE p50 / p90 | 3.0s / 5.6s | **495ms / 1.2s** |
+| median reopen `open_ms` | ~2s | **52ms** |
+
+**Cumulative (session start → now):** READ 2.1 → 58.6 QPS (~28×), p50 7.4s → 26ms (~280×).
+
+Remaining tail: p99 still ~6s (reads) / ~7s (writes); max reopen 5.9s — a few outliers, likely
+`full_open` on a fold (segments changed → can't reuse) or heavy-contention moments. Next.
+
 ## 🔬 Writes still disrupt reads (next target)
 
 Full mixed (12 readers + 4 writers, 6 ns, warm), after the cache fix: **READ 16.8 QPS, p50 82ms**
