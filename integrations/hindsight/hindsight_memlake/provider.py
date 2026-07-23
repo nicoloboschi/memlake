@@ -185,6 +185,9 @@ class MemlakeMemories(MemoriesExtension):
     """
 
     name = "memlake"
+    #: memlake owns its rows, so the consolidator must not write observations to Postgres — it
+    #: routes them here (upsert_observation / delete_facts), keeping all observation state in memlake.
+    writes_memory_rows_in_sql = False
 
     def __init__(self, config: dict[str, str]):
         super().__init__(config)
