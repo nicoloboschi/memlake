@@ -9,13 +9,14 @@ recursion (INV-7).
 The three relations:
 
 * **entity** — memories sharing an entity id with the seed set, scored by shared count;
-* **semantic** — the indexer-derived kNN graph (seeds' inline outgoing links + incoming links
+* **semantic** — the write-time-derived kNN graph (seeds' inline outgoing links + incoming links
   from reverse adjacency);
 * **causal** — the same mechanics over client-supplied causal edges.
 
 Code: `mlake-graph` (`retriever.rs` expansion, `scorer.rs` math, `radj.rs` reverse adjacency),
 `mlake-index/sstable.rs` (`EntityTable`, `RadjTable`), `mlake-index/query_node.rs::graph_arm`
-(the read), `mlake-index/indexer.rs` + `streaming.rs` (semantic-link derivation).
+(the read), `mlake-index/indexer.rs::derive_links_for_write` (write-time derivation),
+`mlake-index/streaming.rs::feed_radj` (carrying links into `radj` during the fold).
 
 ## Query time
 
@@ -86,30 +87,30 @@ entity-less data at equal fusion weight it can add noise. See DECISIONS/TODOS.
 
 **memlake derives its own semantic links; it does not ingest external link tables.**
 
-## Semantic-link derivation (index time)
+## Semantic-link derivation (write time)
 
-Deriving each item's kNN neighbours was historically the dominant fold cost. It is now a
-**two-stage int8→f32 scan**, run for every *new* item against the current index:
+Links are derived on the **write path, before the WAL commit** (`derive_links_for_write`), not by
+the fold. This is the load-bearing invariant: **the index is a pure speed optimization, never a
+correctness dependency.** Because the links are set on each `Memory` before it is committed, they
+travel in the WAL as intrinsic data (`semantic_out`) — so a query over the un-indexed WAL tail is
+*already* correct, and the fold only reorganizes the links for faster reads, it never invents them.
 
-1. Probe `DERIVE_NPROBE = 4` clusters (link neighbours sit in the home Voronoi cell, so a small
-   probe recovers ~all of them).
-2. **Stage 1** — rank candidates by an int8 unit-vector dot (`idot` over `quantize_unit` codes),
-   keeping `DERIVE_RERANK_K = 32` finalists. int8 only *ranks* — 4× less RAM traffic, SDOT-wide.
-3. **Stage 2** — rerank the finalists in exact f32 cosine, keeping the top `MAX_SEMANTIC_OUT (5)`
-   at cosine ≥ `SEMANTIC_LINK_THRESHOLD (0.7)`. Quantization never reaches the stored weight.
-4. A **bounded** replace-worst top-5 (never an unbounded collect+sort, so a hub item near
-   thousands of neighbours stays cheap), and **cluster-ordered iteration** so a home cluster's
-   items run back-to-back on one core with their candidate vectors hot in cache (~19× faster at
-   1M vs the old exact f32 scan). Deterministic (ties by id, G-6).
+For each new memory in a write batch, neighbours come from two sources, merged and truncated to the
+top `MAX_SEMANTIC_OUT (5)` at cosine ≥ `SEMANTIC_LINK_THRESHOLD (0.7)`:
 
-Reverse edges are mirrored into `radj`; the carried-forward links of compacted items are kept,
-not re-derived (matching Hindsight's "compute links once at ingest").
+1. **Committed corpus** — one exact-scored vector query against the current snapshot (index + tail),
+   at `nprobe = 16`, depth `MAX_SEMANTIC_OUT + 4` so self and any tombstoned hit can be dropped and
+   the slots still fill.
+2. **Within the same batch** — an all-pairs cosine over the batch's own memories, which are not yet
+   committed and so invisible to the snapshot. This is what makes a burst of concurrent ingests link
+   to *each other*, not only to the older corpus (mirrors Hindsight's bidirectional within-batch
+   links). Links are one-directional new→old and bidirectional within a batch; a committed item is
+   never re-derived (matching Hindsight's "compute links once at ingest").
 
-The **streaming (external-memory) fold** derives links too — it used to drop them. With one
-cluster resident at a time it runs `derive_links_in_cluster` (a one-centroid, nprobe-1 form of
-the same int8→f32 derivation), so links are **home-cluster only**: an item whose nearest
-neighbour is just across a cluster boundary may miss it — the bounded-RAM recall tradeoff, links
-never dropped.
+The fold — both the in-RAM and the **streaming (external-memory)** path — carries each item's
+`semantic_out` forward untouched and feeds its reverse edges into `radj` (`feed_radj`). Neither
+path derives or drops links; the streaming path proves this at any scale, since the >4M-doc build
+resolves items one cluster at a time yet preserves the WAL's links exactly.
 
 ## Deletes and re-ingest
 

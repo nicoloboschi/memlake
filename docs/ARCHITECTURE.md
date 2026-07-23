@@ -109,7 +109,8 @@ Writes go to the WAL, never to a segment. A commit is one object.
 
 ```
 client ──gRPC──▶ any node
-  Writer::commit(ops)                    # ops = Vec<Op>, one entry per commit
+  derive_links_for_write(snapshot, batch)   # set each upsert's semantic_out BEFORE commit
+  Writer::commit(ops)                        # ops = Vec<Op>, one entry per commit
     seq = head + 1
     PUT wal/{seq:020}.bin  If-None-Match:*
     412 conflict ⇒ re-read head, seq = head+1, retry (bounded)
@@ -122,8 +123,10 @@ client ──gRPC──▶ any node
   tombstones only — a `TombstoneWhere` deletes every memory matching a metadata/tag/type
   predicate whose last write is *older* than the entry's seq, which makes "replace all of a
   document's facts" one atomic, re-ingest-safe op.
-- **Semantic kNN links are not in the WAL** — they are derived by the indexer (§5). Entity
-  ids and causal edges *are* intrinsic and travel in the WAL.
+- **Semantic kNN links are derived on the write path, before the commit** (`derive_links_for_write`,
+  §5), so they travel in the WAL as intrinsic `semantic_out` data alongside entity ids and causal
+  edges. This is what makes the index a pure speed optimization: a query over the un-indexed WAL
+  tail already sees a memory's links, because they are in the WAL, not synthesized by the fold.
 - **Pipelined commits.** `Writer::commit_many(batches, concurrency)` issues many WAL PUTs
   concurrently against a running head, so bulk ingest is bound by S3 throughput, not by
   per-commit round trips. Each batch is still one atomic entry.
@@ -186,12 +189,11 @@ entries `(wal_index_cursor, wal_head]`, produces new segment(s), and CAS-swaps t
    quantized vector block (with tag + `updated_at` columns) to `cluster-{i}.vec`, and the
    per-cluster tag/write-time summary used to prune clusters before fetch. See
    [arms/vector.md](arms/vector.md).
-3. **Semantic link derivation** — for each new item, its top-`MAX_SEMANTIC_OUT (5)` neighbours
-   at cosine `≥ SEMANTIC_LINK_THRESHOLD (0.7)`, written inline as `semantic_out` and mirrored
-   into `radj` as reverse edges. This scan was the dominant fold cost; it is now a **two-stage
-   int8→f32 scan at `DERIVE_NPROBE=4`** with bounded top-5 and cluster-ordered iteration for
-   cache locality (~19× faster at 1M). The streaming fold derives links **home-cluster only**
-   (one cluster resident at a time). See [arms/graph.md](arms/graph.md).
+3. **Semantic links — carried, not derived.** Each item already carries its `semantic_out` from
+   the write path (§3, `derive_links_for_write`), so the fold does *no* derivation: it copies the
+   links forward and mirrors their reverse edges into `radj` (`feed_radj`). This holds on both the
+   in-RAM and streaming paths — the index reorganizes links for fast reads, it never invents or
+   drops them. See [arms/graph.md](arms/graph.md).
 4. **SSTables + FTS** — `pk`, `payload`, `entity`, `time`, `rerank`, `radj` (`.idx` sparse
    offset + `.data` blocks) and the tantivy split.
 
@@ -200,7 +202,7 @@ entries `(wal_index_cursor, wal_head]`, produces new segment(s), and CAS-swaps t
 When the segment stack reaches `COMPACT_FANOUT (8)`, the next fold **compacts**: it merges
 *all* segments + the tail into one fresh segment, resolving last-writer-wins + tombstones and
 physically reclaiming shadowed/deleted items (centroids are retrained over the merged
-population; carried-forward links are kept, not re-derived). A large merge is exactly the
+population; the items' write-time links are kept, never re-derived). A large merge is exactly the
 bounded-RAM workload the **streaming fold** solves, so streaming is the compaction engine and
 the fast in-RAM path builds small L0 flushes. Idempotent and coordination-free (INV-6): a lost
 CAS just means a peer built an equivalent segment; GC drops unreferenced `seg-*` prefixes after

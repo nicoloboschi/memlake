@@ -231,11 +231,13 @@ fn resolve_and_emit(
             }
         }
     }
-    if let Some(mut item) = base {
+    if let Some(item) = base {
         if predicate_deleted(&item) {
             return Ok(());
         }
-        item.semantic_out.clear(); // drop stale links; re-derived per cluster in build_type_streaming
+        // Keep the item's `semantic_out`: links are derived at write time and travel in the WAL as
+        // intrinsic data, so the fold carries them forward (and feeds `radj` from them) rather than
+        // re-deriving. The index stays a pure speed optimization.
         resolver.emit(item)?;
     }
     Ok(())
@@ -415,7 +417,7 @@ pub async fn index_streaming_with_budget(
         doc_count += n;
         let fti = build_type_streaming(
             ns, &seg_id, ft, spill, sample, n, tokenizer, opts.seed, opts.vector_codec,
-            opts.derive_links, &opts.indexed_metadata_keys, budget,
+            &opts.indexed_metadata_keys, budget,
         )
         .await?;
         indexes.insert(ft, fti);
@@ -465,7 +467,6 @@ async fn build_type_streaming(
     tokenizer: &Tokenizer,
     seed: u64,
     codec: VectorCodec,
-    derive_links: bool,
     indexed_metadata_keys: &[String],
     budget: FoldBudget,
 ) -> Result<mlake_core::manifest::FactTypeIndex> {
@@ -606,7 +607,7 @@ async fn build_type_streaming(
                 match cur_c {
                     Some(cc) if cc == c => cur_items.push(item),
                     Some(cc) => {
-                        derive_and_feed_radj(&mut cur_items, cc, &centroids, &mut radj_sort, derive_links)?;
+                        feed_radj(&cur_items, &mut radj_sort)?;
                         let (cp, vp) = flush_cluster(ns, &prefix, cc, std::mem::take(&mut cur_items), codec, vector_dim).await?;
                         cluster_paths[cc] = cp;
                         vector_paths[cc] = vp;
@@ -621,7 +622,7 @@ async fn build_type_streaming(
             }
             None => {
                 if let Some(cc) = cur_c {
-                    derive_and_feed_radj(&mut cur_items, cc, &centroids, &mut radj_sort, derive_links)?;
+                    feed_radj(&cur_items, &mut radj_sort)?;
                     let (cp, vp) = flush_cluster(ns, &prefix, cc, std::mem::take(&mut cur_items), codec, vector_dim).await?;
                     cluster_paths[cc] = cp;
                     vector_paths[cc] = vp;
@@ -688,23 +689,10 @@ async fn build_type_streaming(
     Ok(mlake_core::manifest::FactTypeIndex { train_count: n as u64, files })
 }
 
-/// Derive home-cluster semantic links for one cluster's resident items (setting each item's
-/// `semantic_out`) and feed their reverse edges into `radj`, in the same layout the in-RAM fold
-/// uses (`EdgeKind::Semantic`, keyed by the target). A no-op when link derivation is disabled.
-/// See [`crate::indexer::derive_links_in_cluster`] for the home-cluster-only recall tradeoff that
-/// keeps this pass within one cluster of RAM.
-fn derive_and_feed_radj(
-    items: &mut Vec<StoredMemory>,
-    cc: usize,
-    centroids: &mlake_ivf::Centroids,
-    radj_sort: &mut ExternalSort,
-    derive_links: bool,
-) -> Result<()> {
-    if !derive_links {
-        return Ok(());
-    }
-    let centroid: &[f32] = centroids.vectors.get(cc).map(|v| v.as_slice()).unwrap_or(&[]);
-    crate::indexer::derive_links_in_cluster(items, centroid);
+/// Feed a cluster's items' inline `semantic_out` (derived at write time, carried in the WAL) into
+/// the reverse-adjacency external sort — a reorganization, not a derivation. Causal reverse edges
+/// are fed elsewhere in the assign pass.
+fn feed_radj(items: &[StoredMemory], radj_sort: &mut ExternalSort) -> Result<()> {
     for item in items.iter() {
         for edge in &item.semantic_out {
             let ie =

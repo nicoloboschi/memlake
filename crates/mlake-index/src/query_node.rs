@@ -959,7 +959,13 @@ impl QueryNode {
         // the shared tail exactly, and merge — newest source (tail, then newest segment) wins for a
         // re-upserted id. The per-segment search is unchanged; only the merge is new.
         let (probed_items, vector_scored) = match vector {
-            Some(q) if depths.vector > 0 && state.segments.iter().any(|s| !s.centroids.is_empty()) => {
+            // Score the dense arm whenever there is a query vector, even with an EMPTY index: the
+            // tail is scored by exact brute-force cosine (below) and needs no centroids, while the
+            // segment loop no-ops on centroid-less/absent segments. Gating this on "at least one
+            // indexed segment" silently dropped the dense arm for a tail-only namespace — which
+            // breaks strong consistency (a query before the first fold saw no dense hits) and, worse,
+            // starved write-time link derivation of corpus neighbours during a bulk backfill.
+            Some(q) if depths.vector > 0 => {
                 let mut merged: HashMap<MemoryId, f32> = HashMap::new();
                 // Tail first (newest): scored exactly, so `or_insert` below lets it shadow an older
                 // segment's stale copy of the same id.

@@ -210,13 +210,39 @@ impl Memlake for MemlakeService {
         if req.namespace.is_empty() {
             return Err(Status::invalid_argument("namespace is required"));
         }
-        let ops = req
+        let mut ops = req
             .ops
             .into_iter()
             .map(convert::op)
             .collect::<Result<Vec<_>, _>>()?;
         if ops.is_empty() {
             return Err(Status::invalid_argument("write needs at least one op"));
+        }
+
+        // Derive the batch's semantic kNN links HERE, before the commit, so they travel in the WAL
+        // as intrinsic data — the index is then a pure speed optimization, not a correctness
+        // dependency (a query over the un-indexed tail sees the links). Neighbours come from the
+        // current committed snapshot plus the other memories in this batch.
+        let ns = self.namespace(&req.namespace);
+        let mut upserts: Vec<mlake_core::Memory> = ops
+            .iter()
+            .filter_map(|op| match op {
+                mlake_core::Op::Upsert(m) => Some(m.clone()),
+                _ => None,
+            })
+            .collect();
+        if !upserts.is_empty() {
+            let snap = self.snapshot(&ns).await?;
+            let metrics = QueryMetrics::new();
+            mlake_index::derive_links_for_write(&snap.node, &mut upserts, &metrics)
+                .await
+                .map_err(query_error)?;
+            let mut derived = upserts.into_iter();
+            for op in ops.iter_mut() {
+                if let mlake_core::Op::Upsert(m) = op {
+                    *m = derived.next().expect("one derived memory per upsert");
+                }
+            }
         }
 
         let writer = self.writer_for(&req.namespace);

@@ -127,10 +127,10 @@ fold bounded:
   streaming FTS builder. Each external sort spills sorted runs and k-way-merges them, so the
   cluster files and SSTables are written from bounded memory.
 
-Scope: the **bulk build** path — it does not derive semantic kNN links in-fold (that pass reads a
-16-cluster neighbourhood per new item, incompatible with one-cluster streaming; at scale links are
-incremental / query-time, as `--no-links` models) and skips local-split. The result is a correct,
-queryable generation equivalent to an in-RAM first build with `derive_links=false`.
+Scope: the **bulk build** path. The fold derives no semantic links at all (in either the in-RAM or
+streaming path): links are derived on the write path before the commit and carried in the WAL as
+`semantic_out`, so the fold only feeds their reverse edges into `radj`. The streaming build skips
+local-split. The result is a correct, queryable generation.
 
 **Measured @ 800k (--no-links):**
 

@@ -6,8 +6,12 @@ file is the function that does it, and every constant in it is either **[MEASURE
 perf harness), **[ARCH]** (a fixed property of the design), or **[DECIDE]** (a number we pick
 and must agree on).
 
-Status: **draft — constants not yet filled from a real run.** The logic is here to agree on
-first; then we run MinIO to populate `[MEASURED]` and print a worked card.
+Status: **warm/CPU constants filled from a real MinIO run** (4 vCPU, 100k corpus, D=384, 3 fact
+types) — the worked card at the bottom is measured, not derived. Still needs real S3 (not MinIO)
+for the COLD-tier latency and the write `commit` floor, plus `SNAPSHOT_BYTES_PER_NS` for the
+multi-namespace working-set math. Two caveats gate a *per-namespace, multi-tenant* SLA: the cache
+has no inter-namespace isolation and the indexer folds namespaces sequentially (both in TODOS) —
+so today's numbers are a single-busy-namespace SLA.
 
 ## Inputs
 
@@ -42,13 +46,13 @@ first; then we run MinIO to populate `[MEASURED]` and print a worked card.
 | symbol | meaning | value | source |
 |---|---|---|---|
 | `AVG_MEM_BYTES` | avg stored size of one memory (embedding + text + metadata), on the wire for a write | **2 048 B** (384-dim f32 ≈ 1.5 KB embedding + ~0.5 KB text/meta) | `[DECIDE]` — prod at 1536-dim ≈ 6.8 KB; pick per workload |
-| `CPU_S_PER_QUERY_1T` | CPU-seconds for one query, single type, top-k 20, warm | 0.035 s | `[MEASURED]` (28.5 QPS @ 1 vCPU, 92% util) |
+| `CPU_S_PER_QUERY_1T` | CPU-seconds for one query, single type, top-k 20, warm | **~0.056 s @ 100k corpus** (was 0.035 s at a smaller corpus — see note) | `[MEASURED]` (65 QPS @ 4 vCPU, 91% util, MinIO, 100k/D=384) |
 | `FANOUT` | fact-type multiplier on per-query and per-write CPU | 3 | `[ARCH]` |
 | `BYTES_READ_COLD_1T` | S3 bytes a single-type query reads on a full cache miss (nprobe `.vec` blocks + rerank point-fetches + payload for winners) | TBD | `[MEASURED]` |
 | `S3_RTT` | one object-storage round-trip latency | 0 (MinIO) / ~20 ms (real S3) | `[MEASURED]`/param |
 | `READ_WAVES` | coalesced round-trip waves per cold query (INV-7 bounds this to a constant) | ≤ 4 | `[ARCH]` |
-| `CPU_S_PER_FOLDED_MEM_1T` | CPU-seconds to fold one memory into a segment, single type (assign + cluster/vec write + pk/radj/fts + rerank/payload) | TBD | `[MEASURED]` (write_bench) |
-| `BYTES_WRITTEN_PER_MEM_1T` | S3 bytes written per folded memory, single type (its share of the segment objects) | TBD | `[MEASURED]` |
+| `CPU_S_PER_FOLDED_MEM_1T` | CPU-seconds to fold one memory into a segment, single type (assign + cluster/vec write + pk/radj/fts + rerank/payload + link derivation) | ~0.45 ms (valid ≤100k; super-linear beyond, see below) | `[MEASURED]` (MinIO, 100k @ 4 vCPU, 34 s) |
+| `BYTES_WRITTEN_PER_MEM_1T` | S3 bytes written per folded memory, single type (its share of the segment objects) | ~0.8 KB/type (~2.4 KB across 3 types; f32 rerank dominates) | `[MEASURED]` (MinIO, 32k folded @ D=384 Binary) |
 | `SNAPSHOT_BYTES_PER_NS` | resident RAM to hold one namespace's open snapshot (centroids + sparse indexes + FTS split + tail), 3 types | TBD | `[MEASURED]` |
 
 ## The cache-tier model (this is the crux — please sanity-check the shape)
@@ -117,9 +121,47 @@ p50  = service
 p99  = service × P99_FACTOR                              # tail multiplier, [MEASURED] (~2× warm)
 ```
 
-At the measured warm point (MinIO, 3 types): `cpu_qps = vcpu / (0.035 × 3) = ~9.5 QPS/vcpu`,
-`p50 ≈ 105 ms`, `p99 ≈ 200 ms`. (Single-type is ~28 QPS/vcpu / 33 ms — the ×3 is the worst-case
-tax.)
+**Measured warm (MinIO, 100k corpus, D=384, top-k 20, 0 roundtrips = MEMORY tier):**
+
+| | throughput ceiling (saturated) | latency at right-sized conc (≈vcpu) |
+|---|---|---|
+| single type | **65 QPS @ 4 vCPU (~16 QPS/vcpu)**, 91% CPU | p50 **82 ms**, p99 **190 ms** (conc=4, 48 QPS) |
+| 3 types (worst case) | **17.5 QPS @ 4 vCPU (~4.4 QPS/vcpu)**, 88% CPU | p50 **238 ms**, p99 **547 ms** (conc=4) |
+
+So `P99_FACTOR ≈ 2.3` warm, and the ×3 fan-out tax is real: worst-case 3-type recall is ~4.4
+QPS/vcpu, not the single-type ~16.
+
+**Important — the per-query cost grows with corpus size.** These are ~2× the numbers measured on
+a smaller corpus (single-type was ~28 QPS/vcpu / 33 ms), because `nprobe` is index-derived (a
+fraction of clusters, capped at 64) so a bigger corpus scans more per probe. `CPU_S_PER_QUERY_1T`
+is therefore a function of corpus size; **0.056 s is the 100k figure** and must be re-measured at
+the target namespace size. Read the QPS ceiling and latency together: at conc past the knee the
+system is pure queue (single-type p50 goes 82→229 ms from conc 4→16), so QPS rises but latency
+degrades — size concurrency to ≈vcpu for the latency SLA.
+
+## Fold throughput — measured, and what the "hang" actually was
+
+**Measured (MinIO, 4 vCPU, single isolated namespace, 3 fact types):** a 100k-memory bulk
+fold completes in **~34 s ≈ ~2 900 docs/s (~725 docs/s/vCPU)**; a 40k fold in ~16 s (~2 500
+docs/s) — consistent. So `CPU_S_PER_FOLDED_MEM_1T × FANOUT ≈ 34 s / 100k ≈ 0.34 ms/memory` at
+4 vCPU, i.e. **`CPU_S_PER_FOLDED_MEM_1T ≈ 0.45 ms`** (single-type, ÷3 fan-out, ×4 vcpu).
+
+**The "indexer hang" was starvation, not fold cost.** An earlier 100k run appeared to crawl at
+~35 docs/s and never converge. That was **not** the fold: the shared MinIO bucket had
+accumulated 18 `ext-test-*` corpse namespaces (a parallel Hindsight test writing to the same
+endpoint), and the single indexer folds every discovered namespace **sequentially in one
+thread**, so the target namespace starved behind the others. Isolated to one namespace, the same
+100k folds in 34 s. The real defect is the indexer's lack of per-namespace fairness (TODOS
+§"Single indexer folds all namespaces sequentially"), not the per-memory fold cost.
+
+**Semantic-link derivation moved OFF the fold and onto the write path.** Links are now derived
+before the commit (`derive_links_for_write`), not by the fold — so the fold no longer carries the
+O(new·N) derivation cost, and the fold-breakdown numbers above (which predate the change) overstate
+today's fold cost by that pass. The O(new·N) cost is real but now on the *write* path, against the
+current snapshot (indexed segments + un-indexed tail). It stays bounded as long as the indexer keeps
+pace so the tail a write scans is small; a lagging indexer degrades writes toward O(tail). This is a
+scaling watch-item (TODOS), not a blocker. Re-measure before quoting `CPU_S_PER_FOLDED_MEM_1T` at
+≫1M memories/namespace.
 
 ## Write SLA (wait_for_index = true, 3 types)
 
@@ -148,22 +190,47 @@ than 1-memory-at-a-time. The model should take a **batch size `B`** as a write i
 it is the pessimal per-write SLA, at `B=10 000` it is the bulk-ingest SLA. **Recommend adding
 `batch` as an input.**
 
-## The output: an SLA card
+## The output: an SLA card (worked, from measured constants)
 
-Given inputs, the model prints one card:
+All numbers below are **measured end-to-end on MinIO** (100k corpus, D=384, 4 vCPU, MEMORY tier,
+`S3_RTT ≈ 0`) — not derived from a formula:
 
 ```
-node: 4 vCPU, 16 GB, 200 GB disk, 10 Gb/s NIC, 8 namespaces, 3 fact types
-cache tier at this working set: MEMORY (0 roundtrips)
-READ   :  38 QPS   p50  105 ms   p99  210 ms
-WRITE  :  wait_for_index, batch 1 000
-          1 900 mem/s   ·   3.9 MB/s   ·   p50 …   p99 …
+node: 4 vCPU, 16 GB, 200 GB disk, 10 Gb/s NIC, working set in MEMORY tier, 100k memories
+
+READ   (worst-case = all 3 fact types fan out):
+   ceiling  ~17.5 QPS @ 4 vCPU  (~4.4 QPS/vcpu, 88% CPU)
+   latency  p50 238 ms   p99 547 ms   (at right-sized conc ≈ 4)
+   (single-type, the common case:  ceiling ~65 QPS,  p50 82 ms,  p99 190 ms)
+
+WRITE  (wait_for_index = true, fold-bound; NIC ~500k wps so never binds at MinIO):
+   throughput  ~2 900 mem/s @ 4 vCPU  ·  ~6.0 MB/s ingest (@2 KB/mem)
+               [MEASURED: 100k folded in ~34 s]
+   batch latency (B memories, one wait_for_index call):
+     fold = B × 0.00045 × 3 / 4  →  B=1: ~0.3 ms   B=1 000: ~0.34 s   B=10 000: ~3.4 s
+     p50_write ≈ commit(one WAL PUT) + fold ;  p99 ≈ ×2
 ```
 
-## What we still need to measure (the TBD constants)
+Read the READ line as the **worst case** — every recall fans out to all 3 fact types. A typical
+single-type query is ~4× faster (the parenthetical). WRITE throughput is CPU-fold-bound at MinIO;
+`wait_for_index` latency is dominated by the synchronous fold of the batch, so batching is the
+single biggest write-latency lever (B=1 is pessimal, a real document's chunks amortize it).
 
-Run the harness on MinIO to fill: `BYTES_READ_COLD_1T`, `CPU_S_PER_FOLDED_MEM_1T`,
-`BYTES_WRITTEN_PER_MEM_1T`, `SNAPSHOT_BYTES_PER_NS`, `P99_FACTOR`, and confirm
-`CPU_S_PER_QUERY_1T`. MinIO gives the CPU and byte constants honestly; it gives `S3_RTT ≈ 0`,
-so the **cold-tier latency must be re-measured against real S3** before the card's COLD numbers
-are quoted. Warm/MEMORY-tier numbers are valid from MinIO.
+**Caveats on this card:**
+- **Per-namespace under concurrency is not yet guaranteed.** These numbers assume the busy
+  namespace's working set stays resident. The current global CLOCK cache gives no inter-namespace
+  isolation (TODOS §"Cache: namespace isolation"), so a noisy neighbour can drop a namespace to
+  COLD and break the READ p99. The card is a single-busy-namespace SLA until that lands.
+- **Write throughput assumes one namespace per indexer.** The single indexer folds all namespaces
+  sequentially; with N busy namespaces, per-namespace fold rate divides by N (TODOS §"Single
+  indexer folds all namespaces sequentially"). The 2 900 mem/s is an isolated-namespace figure.
+- **Write-path derivation re-check needed ≫1M/namespace** — link derivation is O(new·tail) on the
+  write path (fine when the indexer keeps the tail small; degrades toward O(tail) if it lags).
+
+## What still needs real S3 (not MinIO)
+
+MinIO gives the CPU and byte constants honestly but `S3_RTT ≈ 0`, so the **COLD-tier read
+latency** (`S3_RTT × READ_WAVES`) and the write `commit` floor must be re-measured against real
+S3 before those rows are quoted. `SNAPSHOT_BYTES_PER_NS` (for the cache-tier working-set math) and
+`P99_FACTOR` still need a dedicated pass. Warm/MEMORY-tier READ and CPU-bound WRITE numbers above
+are valid from MinIO.

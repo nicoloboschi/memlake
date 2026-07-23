@@ -56,6 +56,33 @@ async fn namespace(store: Store, name: &str) -> Namespace {
     ns
 }
 
+/// Mirror the server's write path in a test: derive each batch's semantic kNN links against the
+/// committed corpus (index + tail) plus the other memories in the same batch BEFORE committing, so
+/// the links travel in the WAL as intrinsic data. The fold no longer derives links (the index is a
+/// pure speed optimization), so any test that expects links must derive them at write time — this
+/// is exactly what the server's `write` handler does.
+async fn commit_with_links(ns: &Namespace, w: &mut Writer, mut ops: Vec<Op>) -> mlake_wal::CommitResult {
+    let mut upserts: Vec<Memory> = ops
+        .iter()
+        .filter_map(|op| match op {
+            Op::Upsert(m) => Some(m.clone()),
+            _ => None,
+        })
+        .collect();
+    if !upserts.is_empty() {
+        let node = QueryNode::open(ns, Tokenizer::default()).await.unwrap();
+        let metrics = mlake_store::QueryMetrics::new();
+        mlake_index::derive_links_for_write(&node, &mut upserts, &metrics).await.unwrap();
+        let mut derived = upserts.into_iter();
+        for op in ops.iter_mut() {
+            if let Op::Upsert(m) = op {
+                *m = derived.next().expect("one derived memory per upsert");
+            }
+        }
+    }
+    w.commit(ops).await.unwrap()
+}
+
 /// The whole pipeline over a shared backing store: write, index, then query from a node
 /// that has never seen the namespace.
 #[tokio::test]
@@ -210,21 +237,20 @@ async fn graph_arm_works_through_the_full_pipeline() {
     let ns = namespace(store, "ns").await;
     let mut writer = Writer::new(ns.clone());
 
-    // Two near-identical vectors will be linked as kNN neighbours (cosine ≥ 0.7).
-    writer
-        .commit(vec![
+    // Two near-identical vectors will be linked as kNN neighbours (cosine ≥ 0.7). Links are
+    // derived at write time (as the server does), not by the fold.
+    commit_with_links(
+        &ns,
+        &mut writer,
+        vec![
             Op::Upsert(item("a", vec![1.0, 0.0, 0.0], "alpha document")),
             Op::Upsert(item("a2", vec![0.98, 0.02, 0.0], "closely related to alpha")),
             Op::Upsert(item("z", vec![0.0, 0.0, 1.0], "unrelated topic")),
-        ])
-        .await
-        .unwrap();
+        ],
+    )
+    .await;
 
-    let opts = IndexOptions {
-        derive_links: true,
-        ..IndexOptions::default()
-    };
-    index(&ns, &Tokenizer::default(), opts.clone()).await.unwrap();
+    index(&ns, &Tokenizer::default(), IndexOptions::default()).await.unwrap();
 
     let node = QueryNode::open(&ns, Tokenizer::default()).await.unwrap();
     // Query near `a`; the graph arm should also pull in its neighbour `a2`.
@@ -536,15 +562,16 @@ async fn default_indexing_preserves_the_graph_across_reruns() {
     let ns = namespace(store, "ns").await;
     let mut writer = Writer::new(ns.clone());
 
-    // Two near-identical vectors → kNN neighbours (cosine ≥ 0.7).
-    writer
-        .commit(vec![
+    // Two near-identical vectors → kNN neighbours (cosine ≥ 0.7). Links derived at write time.
+    commit_with_links(
+        &ns,
+        &mut writer,
+        vec![
             Op::Upsert(item("a", vec![1.0, 0.0, 0.0], "alpha document")),
             Op::Upsert(item("a2", vec![0.98, 0.02, 0.0], "closely related to alpha")),
-        ])
-        .await
-        .unwrap();
-    // Default options — no explicit derive_links flag.
+        ],
+    )
+    .await;
     index(&ns, &Tokenizer::default(), IndexOptions::default()).await.unwrap();
 
     let cfg = QueryConfig { graph_weight: 1.0, ..QueryConfig::default() };
@@ -556,7 +583,7 @@ async fn default_indexing_preserves_the_graph_across_reruns() {
     );
 
     // Add an unrelated item and re-index. The a↔a2 links must survive.
-    writer.commit(vec![Op::Upsert(item("z", vec![0.0, 0.0, 1.0], "unrelated"))]).await.unwrap();
+    commit_with_links(&ns, &mut writer, vec![Op::Upsert(item("z", vec![0.0, 0.0, 1.0], "unrelated"))]).await;
     index(&ns, &Tokenizer::default(), IndexOptions::default()).await.unwrap();
 
     let node2 = QueryNode::open(&ns, Tokenizer::default()).await.unwrap();
@@ -702,7 +729,7 @@ async fn query_fetches_only_probed_clusters_and_warms_the_cache() {
             .unwrap();
     }
     // No links, so the graph arm stays off and we isolate the vector arm's cluster reads.
-    index(&ns, &Tokenizer::default(), IndexOptions { derive_links: false, ..IndexOptions::default() })
+    index(&ns, &Tokenizer::default(), IndexOptions::default())
         .await
         .unwrap();
 
@@ -764,7 +791,7 @@ async fn graph_arm_materializes_neighbours_from_unprobed_clusters() {
         let a = (i as f32) * 0.37 + 2.0;
         ops.push(Op::Upsert(item(&format!("f{i}"), vec![a.cos(), a.sin(), (a * 0.3).cos()], "filler")));
     }
-    writer.commit(ops).await.unwrap();
+    commit_with_links(&ns, &mut writer, ops).await;
     index(&ns, &Tokenizer::default(), IndexOptions::default()).await.unwrap();
 
     let node = QueryNode::open(&ns, Tokenizer::default()).await.unwrap();
@@ -1550,7 +1577,7 @@ fn rich_item(i: usize) -> Memory {
 async fn streaming_fold_matches_in_ram_fold() {
     use mlake_core::{Predicate, TagsMatch};
 
-    let no_links = IndexOptions { derive_links: false, ..IndexOptions::default() };
+    let no_links = IndexOptions::default();
 
     // The exact same WAL history is written to two namespaces.
     let write_corpus = |ns: Namespace| async move {
@@ -1658,7 +1685,7 @@ async fn streaming_fold_bounded_budget_matches_in_ram() {
     use mlake_core::{Predicate, TagsMatch};
     use mlake_index::streaming::{index_streaming_with_budget, FoldBudget};
 
-    let no_links = IndexOptions { derive_links: false, ..IndexOptions::default() };
+    let no_links = IndexOptions::default();
     // ~8k items ≈ 2 MB of item/event bytes, well over the 1 MB-per-stage budget below, so the
     // resolution sort and the cluster/payload sorts each spill multiple runs and merge them.
     const N: usize = 8_000;
@@ -1749,7 +1776,7 @@ async fn streaming_fold_bounded_budget_matches_in_ram() {
 async fn flush_appends_l0_and_matches_full_rebuild() {
     use mlake_index::fold;
     use mlake_index::streaming::FoldBudget;
-    let opts = IndexOptions { derive_links: false, ..IndexOptions::default() };
+    let opts = IndexOptions::default();
     let budget = FoldBudget::default();
     let hi = usize::MAX; // force the in-RAM first build (not streaming)
 
@@ -1821,7 +1848,7 @@ async fn flush_appends_l0_and_matches_full_rebuild() {
 async fn flush_links_within_a_slice_are_bidirectional() {
     use mlake_index::fold;
     use mlake_index::streaming::FoldBudget;
-    let opts = IndexOptions::default(); // derive_links = true
+    let opts = IndexOptions::default();
     let budget = FoldBudget::default();
     let hi = usize::MAX;
 
@@ -1833,15 +1860,16 @@ async fn flush_links_within_a_slice_are_bidirectional() {
         .into_iter()
         .map(|i| Op::Upsert(rich_item(i)))
         .collect();
-    w.commit(base).await.unwrap();
+    commit_with_links(&ns, &mut w, base).await;
     fold(&ns, &Tokenizer::default(), opts.clone(), budget, hi).await.unwrap();
 
     // Flush a slice containing two fresh family-1 (identical-vector), memory_type-1 items together.
+    // Links are derived at write time, so the two slice-mates link to each other in the WAL.
     let mut a = rich_item(1);
     a.id = MemoryId::from_key("wa");
     let mut b = rich_item(1);
     b.id = MemoryId::from_key("wb");
-    w.commit(vec![Op::Upsert(a), Op::Upsert(b)]).await.unwrap();
+    commit_with_links(&ns, &mut w, vec![Op::Upsert(a), Op::Upsert(b)]).await;
     fold(&ns, &Tokenizer::default(), opts.clone(), budget, hi).await.unwrap();
 
     let node = QueryNode::open(&ns, Tokenizer::default()).await.unwrap();
@@ -1857,14 +1885,14 @@ async fn flush_links_within_a_slice_are_bidirectional() {
     assert!(b_targets.contains(&MemoryId::from_key("wa")), "wb links to its slice-mate wa, got {b_targets:?}");
 }
 
-/// The streaming (external-memory) fold — the >4M-doc path — must NOT drop semantic links: it
-/// derives them home-cluster-at-a-time so identical-vector items in the same cluster link, and
-/// the reverse edges reach radj. Forced here at tiny scale via streaming_threshold_docs = 0.
+/// The streaming (external-memory) fold — the >4M-doc path — must NOT drop semantic links: links
+/// derived at write time (carried in the WAL as `semantic_out`) survive the streaming build and
+/// their reverse edges reach radj. Forced here at tiny scale via streaming_threshold_docs = 0.
 #[tokio::test]
 async fn streaming_fold_derives_home_cluster_links() {
     use mlake_index::fold;
     use mlake_index::streaming::FoldBudget;
-    let opts = IndexOptions::default(); // derive_links = true
+    let opts = IndexOptions::default();
     let budget = FoldBudget::default();
 
     let ns = namespace(Store::in_memory(), "ns").await;
@@ -1872,7 +1900,7 @@ async fn streaming_fold_derives_home_cluster_links() {
     // Four family-1 (identical-vector) memory_type-1 items — m1, m31, m61, m91 — plus other
     // families, so a family-1 cluster forms and its members should link to one another.
     let ids = [1usize, 31, 61, 91, 2, 4, 5, 7];
-    w.commit(ids.iter().map(|&i| Op::Upsert(rich_item(i))).collect()).await.unwrap();
+    commit_with_links(&ns, &mut w, ids.iter().map(|&i| Op::Upsert(rich_item(i))).collect()).await;
     // threshold_docs = 0 forces the streaming fold even at this tiny scale.
     fold(&ns, &Tokenizer::default(), opts.clone(), budget, 0).await.unwrap();
 
@@ -1888,27 +1916,29 @@ async fn streaming_fold_derives_home_cluster_links() {
     );
 }
 
-/// A flush derives semantic links against the WHOLE corpus, not just its own slice: a new item
-/// flushed into an L0 segment links to a same-family item that lives in the older segment.
+/// Write-time link derivation runs against the WHOLE committed corpus, not just the current slice:
+/// a new item committed after an earlier build links to a same-family item that lives in the older
+/// segment, and that link survives the flush into a new L0 segment.
 #[tokio::test]
 async fn flush_derives_links_across_segments() {
     use mlake_index::fold;
     use mlake_index::streaming::FoldBudget;
-    let opts = IndexOptions::default(); // derive_links = true
+    let opts = IndexOptions::default();
     let budget = FoldBudget::default();
     let hi = usize::MAX;
 
     let ns = namespace(Store::in_memory(), "ns").await;
     let mut w = Writer::new(ns.clone());
     // First build: items 0..40 (family 1 = i % 10 == 1). Ids 1, 11, 31 are family 1, memory_type 1.
-    w.commit((0..40).map(|i| Op::Upsert(rich_item(i))).collect()).await.unwrap();
+    commit_with_links(&ns, &mut w, (0..40).map(|i| Op::Upsert(rich_item(i))).collect()).await;
     fold(&ns, &Tokenizer::default(), opts.clone(), budget, hi).await.unwrap();
 
-    // Flush a NEW item with family-1's vector (a copy of item 1 under a fresh id).
+    // Commit a NEW item with family-1's vector (a copy of item 1 under a fresh id): write-time
+    // derivation links it to the older segment's family-1 members, then it flushes to a new L0.
     let mut newitem = rich_item(1);
     newitem.id = MemoryId::from_key("m100");
     newitem.text = "new family one".into();
-    w.commit(vec![Op::Upsert(newitem)]).await.unwrap();
+    commit_with_links(&ns, &mut w, vec![Op::Upsert(newitem)]).await;
     fold(&ns, &Tokenizer::default(), opts.clone(), budget, hi).await.unwrap();
     assert_eq!(ns.read_manifest().await.unwrap().0.segments.len(), 2, "the new item flushed to an L0");
 
@@ -1931,7 +1961,7 @@ async fn flush_derives_links_across_segments() {
 async fn compaction_merges_segments_and_preserves_data() {
     use mlake_index::streaming::FoldBudget;
     use mlake_index::{fold, COMPACT_FANOUT};
-    let opts = IndexOptions { derive_links: false, ..IndexOptions::default() };
+    let opts = IndexOptions::default();
     let budget = FoldBudget::default();
     let hi = usize::MAX;
 
@@ -1977,7 +2007,7 @@ async fn compaction_merges_segments_and_preserves_data() {
 #[tokio::test]
 async fn streaming_fold_incremental_matches_in_ram() {
     async fn build(streaming: bool) -> std::collections::BTreeSet<MemoryId> {
-        let no_links = IndexOptions { derive_links: false, ..IndexOptions::default() };
+        let no_links = IndexOptions::default();
         let store = Store::in_memory();
         let ns = namespace(store, "ns").await;
         let mut w = Writer::new(ns.clone());

@@ -34,7 +34,7 @@ cargo build -p mlake-perf --release
 
 Reproducible (seeded) synthetic memories exercising every arm: clustered vectors, text,
 Zipfian tags over a large vocabulary (high cardinality + realistic selectivity), Zipfian
-entities + causal edges (graph; semantic kNN links are derived by the indexer), across
+entities + causal edges (graph; semantic kNN links are derived on the write path), across
 several independent memory types.
 
 ## Cost model

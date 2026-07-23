@@ -81,7 +81,11 @@ class Generator:
                 ranks = {self._zipf_sample(self._zipf_tag, rng) for _ in range(cfg.tags_per_memory)}
                 tags = sorted(f"tag-{r}" for r in ranks)
 
-            entity_ids = sorted({self._zipf_sample(self._zipf_entity, rng) for _ in range(cfg.entities_per_memory)})
+            # Entity ids are 16-byte ids on the wire; the zipf sample is an int, so encode it.
+            entity_ids = [
+                int(e).to_bytes(16, "little")
+                for e in sorted({self._zipf_sample(self._zipf_entity, rng) for _ in range(cfg.entities_per_memory)})
+            ]
 
             out.append(
                 memory(

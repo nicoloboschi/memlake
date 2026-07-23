@@ -26,7 +26,7 @@ Update this page when a run materially changes a number.
 | Phase | Result | Notes |
 |---|---|---|
 | **write** | ~9–10s — **~10,000 memories/s** | 196 batches via the client; group-committed to the WAL. Acks on durable PUT, not on indexing. |
-| **index (first build)** | **~58s** — ~1,700 memories/s | k-means train + kNN link derivation + FTS + writes, one generation. Varies ~55–75s run-to-run (MinIO + scheduling). |
+| **index (first build)** | **~58s** — ~1,700 memories/s | k-means train + FTS + writes, one generation. Varies ~55–75s run-to-run (MinIO + scheduling). |
 | **index (incremental re-index)** | ~30s | folding new WAL entries onto an existing generation reuses trained centroids (train ≈ 0). |
 
 The indexer runs as its own process (`index --once` here; a Deployment in prod), so its cost
@@ -34,15 +34,20 @@ is off the write path entirely.
 
 ### First-build index breakdown (summed across 3 memory_types, from a `MEMLAKE_TIMING` run)
 
+> **Historical (pre write-time-derivation).** The `derive_links` row below was a *fold* phase.
+> Semantic-link derivation has since moved onto the **write path** (`derive_links_for_write`, before
+> the commit), so it is no longer part of the fold — the fold now only trains, writes clusters/FTS,
+> and feeds `radj` from links already in the WAL. `train` remains the dominant fold phase.
+
 | Phase | Time | Parallelized? |
 |---|---:|---|
 | `train` (k-means) | ~28s | ✅ assignment + k-means++ seeding across cores |
-| `derive_links` (semantic kNN) | ~35s | ✅ per-memory neighbour search across cores |
+| `derive_links` (semantic kNN) — *now on the write path, no longer in the fold* | ~35s | ✅ per-memory neighbour search across cores |
 | `cluster_write` | ~1.9s | ✅ concurrent PUTs |
 | `fts_build` | ~1.4s | tantivy split per type |
 | `write_meta` | ~0.4s | one `try_join!` |
 
-Both dominant phases (`train`, `derive_links`) are CPU-bound and scale with cores. They were
+Both were originally the dominant CPU phases. They were
 serial originally (~140s each ≈ 300s total); parallelizing them (rayon, determinism preserved
 for G-6) is what brought a fresh 100k build down to ~55–75s. The k-means output stays
 byte-identical for a given seed — only the assignment/seeding compute is parallel; the f64

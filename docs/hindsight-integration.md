@@ -15,7 +15,7 @@ With it installed, **nothing memory-shaped reaches Postgres**:
 | `memory_units` row per fact | a memory in the bank's namespace, id minted before the write |
 | `unit_entities` join rows | an entity posting carried on the memory |
 | `memory_links` causal rows | causal edges carried on the memory |
-| `memory_links` semantic rows | kNN edges derived by the indexer at fold time |
+| `memory_links` semantic rows | kNN edges derived on the write path (before the commit), carried in the WAL |
 | hydration `SELECT` after ranking | the memory rides back inline with the hit |
 
 A bank maps to a namespace, a `fact_type` to a `memory_type`, and the columns

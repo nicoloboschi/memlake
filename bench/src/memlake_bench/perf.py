@@ -21,6 +21,11 @@ from .perf_datagen import GenConfig, Generator
 
 ADDR = "127.0.0.1:50251"
 COMMIT_BATCH = 512
+# Fold the WAL tail into a segment every this many written docs during the write phase, so the
+# un-indexed tail stays bounded — as a continuously-running indexer keeps it in production. Write-
+# time link derivation scans that tail, so an unbounded backfill would make the write path O(N^2);
+# this mirrors the deployed topology where writer and indexer run concurrently.
+INDEX_EVERY = 4096
 
 # AWS S3 Standard, us-east-1 (same model as the Rust harness).
 PUT_PER_1K = 0.005
@@ -133,29 +138,49 @@ def run(
     gen = Generator(cfg)
 
     # -- write phase -----------------------------------------------------------
+    # Writer and indexer run concurrently in production; the harness mirrors that by folding every
+    # INDEX_EVERY docs so the un-indexed tail — which write-time link derivation scans — stays
+    # bounded. The interleaved folds are metered into the index totals but kept OUT of commit_secs,
+    # so write throughput reflects durable-write + derivation cost, not the fold subprocess.
     n_batches = 0
+    commit_secs = 0.0
+    index_secs = 0.0
+    index_puts = 0
+    index_lists = 0
+    stored_bytes = 0
     with server.Serve(binary, addr=addr, mem_mb=mem_mb, disk_mb=disk_mb) as _srv:
         client = MemlakeClient(addr)
         client.create_namespace(ns)
-        t0 = time.perf_counter()
         start = 0
+        since_index = 0
         while start < cfg.scale:
             end = min(start + COMMIT_BATCH, cfg.scale)
-            client.write(ns, gen.batch(start, end))
+            batch = gen.batch(start, end)
+            t0 = time.perf_counter()
+            client.write(ns, batch)
+            commit_secs += time.perf_counter() - t0
             n_batches += 1
+            since_index += end - start
             start = end
-        commit_secs = time.perf_counter() - t0
+            if since_index >= INDEX_EVERY:
+                s = server.index_once(binary, ns)
+                index_secs += s["elapsed_s"]
+                index_puts += s["puts"]
+                index_lists += s["lists"]
+                stored_bytes += s["put_bytes"]
+                since_index = 0
         client.close()
 
     # namespace creation is one PUT; each commit batch is one WAL PUT.
     write_requests_usd = (n_batches + 1) / 1000.0 * PUT_PER_1K
 
-    # -- index phase (separate process, as in prod) ---------------------------
+    # -- final catch-up fold (separate process, as in prod) -------------------
     summary = server.index_once(binary, ns)
-    index_secs = summary["elapsed_s"]
-    index_puts = summary["puts"]
-    stored_bytes = summary["put_bytes"]
-    index_requests_usd = (summary["puts"] + summary["lists"]) / 1000.0 * PUT_PER_1K
+    index_secs += summary["elapsed_s"]
+    index_puts += summary["puts"]
+    index_lists += summary["lists"]
+    stored_bytes += summary["put_bytes"]
+    index_requests_usd = (index_puts + index_lists) / 1000.0 * PUT_PER_1K
     stored_gb = stored_bytes / 1e9
     storage_usd_month = stored_gb * STORAGE_GB_MONTH
 
