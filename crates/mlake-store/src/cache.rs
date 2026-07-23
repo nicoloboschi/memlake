@@ -318,44 +318,62 @@ impl DiskCache {
         };
         self.hits.fetch_add(1, Ordering::Relaxed);
 
-        // A file left by a previous process is on disk but not in the ring, so it is
-        // unaccounted against the disk budget. Adopting it costs the write lock, but at most
-        // once per key per process — this is restart recovery, not per-hit bookkeeping.
-        // (The read guard is scoped explicitly: `RwLock` is not reentrant, and taking the
-        // write lock below while still holding it would deadlock.)
-        let unaccounted = {
-            let state = self.state.read().unwrap();
-            match state.disk.get(key) {
-                Some(d) => {
-                    if self.policy == EvictionPolicy::Clock {
-                        d.referenced.store(true, Ordering::Relaxed);
-                    }
-                    false
-                }
-                None => true,
-            }
-        };
-        if unaccounted {
+        // Promote into the MEMORY tier. Otherwise a disk-tier hit re-opens and mmaps the file
+        // on *every* lookup (open + stat + mmap — three syscalls each); at thousands of lookups
+        // per query across concurrent readers this floods the kernel and serialises reads (the
+        // symptom: near-zero CPU, multi-second latency). Holding the bytes in the memory ring
+        // means the next read of this hot block is a map lookup + `Bytes` (Arc) clone under the
+        // *shared* lock — no syscall — so concurrent readers proceed in parallel. It costs the
+        // write lock once per key (until the mem tier evicts it), not once per hit: after the
+        // first promotion this key answers from `state.mem` above and never reaches here.
+        //
+        // This also adopts, in the same critical section, a file left on disk by a previous
+        // process but absent from the rings (restart recovery).
+        {
             let mut state = self.state.write().unwrap();
-            let size = bytes.len() as u64;
-            let seq = state.next_seq;
-            // Vacant-only: another thread may have adopted the same key in between.
-            if let Entry::Vacant(slot) = state.disk.entry(key.clone()) {
-                slot.insert(DiskEntry {
-                    size,
-                    seq,
-                    referenced: AtomicBool::new(false),
-                });
+            // Another reader may have promoted/adopted this key between our read and this write.
+            if !state.mem.contains_key(key) {
+                let size = bytes.len() as u64;
+                let seq = state.next_seq;
                 state.next_seq += 1;
-                state.disk_bytes += size;
-                state.disk_ring.push_back((key.clone(), seq));
-                // Adoption can push the tier over budget, and the eviction that follows may
-                // unlink this very file. Safe: `bytes` owns the mapping, and on Unix a
-                // mapping keeps the inode alive past its last link.
-                self.evict_disk(&mut state);
+                // Admitted with the reference bit CLEAR (scan resistance): a block read straight
+                // through once is evicted at its ring position; a genuinely hot one earns its bit
+                // on the next memory hit.
+                state.mem.insert(
+                    key.clone(),
+                    MemEntry { bytes: bytes.clone(), seq, referenced: AtomicBool::new(false) },
+                );
+                state.mem_bytes += size;
+                state.mem_ring.push_back((key.clone(), seq));
+                self.evict_mem(&mut state);
+                // The disk tier: this block was just hit, so mark it referenced (its CLOCK
+                // second chance) whether it was already accounted or is being adopted from a
+                // previous process's file.
+                match state.disk.entry(key.clone()) {
+                    Entry::Occupied(d) => {
+                        if self.policy == EvictionPolicy::Clock {
+                            d.get().referenced.store(true, Ordering::Relaxed);
+                        }
+                    }
+                    Entry::Vacant(slot) => {
+                        slot.insert(DiskEntry {
+                            size,
+                            seq,
+                            referenced: AtomicBool::new(self.policy == EvictionPolicy::Clock),
+                        });
+                        state.disk_bytes += size;
+                        state.disk_ring.push_back((key.clone(), seq));
+                        // Adoption can push the tier over budget; the eviction that follows may
+                        // unlink this file. Safe: `bytes` owns the mapping, and on Unix a mapping
+                        // keeps the inode alive past its last link.
+                        self.evict_disk(&mut state);
+                    }
+                }
+            } else if self.policy == EvictionPolicy::Clock {
+                if let Some(d) = state.disk.get(key) {
+                    d.referenced.store(true, Ordering::Relaxed);
+                }
             }
-        } else if self.policy == EvictionPolicy::Lru {
-            self.renew(key);
         }
         Some(bytes)
     }
