@@ -1,0 +1,131 @@
+# One-command local memlake, end to end, with something to look at:
+#
+#   docker compose -f docker-compose.demo.yml up --build
+#
+# Brings up the whole topology on one network — object storage (MinIO), the stateless gRPC API
+# (serve), the async indexer, the admin inspection UI, and a trickle writer that feeds a namespace
+# forever so the UI visibly moves. Then open:
+#
+#   admin UI      http://localhost:19999       (namespace: "demo")
+#   MinIO console http://localhost:9001        (memlake / memlake123)
+#   gRPC API      localhost:50051
+#
+# The writer adds a few memories every couple of seconds; watch the doc count climb, the un-indexed
+# WAL tail grow and drain as the indexer folds, and clusters/links appear in the graph arm.
+services:
+  # Object storage. MinIO gives real S3 conditional-write semantics (If-None-Match / If-Match),
+  # which memlake's coordination-free design depends on (INV-3).
+  minio:
+    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: memlake
+      MINIO_ROOT_PASSWORD: memlake123
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio-demo-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  # Creates the dev bucket once MinIO is up, then exits.
+  minio-init:
+    image: minio/mc:RELEASE.2025-04-16T18-13-26Z
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 memlake memlake123 &&
+      mc mb --ignore-existing local/memlake &&
+      echo 'bucket ready'
+      "
+
+  # The stateless gRPC API. All coordination lives in object storage, so this pod holds no state.
+  serve:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: memlake:demo
+    command: ["serve", "--addr", "0.0.0.0:50051"]
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+    ports:
+      - "50051:50051"
+    environment:
+      MEMLAKE_QUERY_S3_BUCKET: memlake
+      MEMLAKE_QUERY_S3_ACCESS_KEY: memlake
+      MEMLAKE_QUERY_S3_SECRET_KEY: memlake123
+      MEMLAKE_QUERY_S3_REGION: us-east-1
+      MEMLAKE_QUERY_S3_ENDPOINT: http://minio:9000
+      MEMLAKE_NODE_ID: serve-1
+      RUST_LOG: ${RUST_LOG:-info}
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "50051"]
+      interval: 3s
+      timeout: 2s
+      retries: 30
+
+  # The indexer loop as its own process (off the request path): discovers namespaces and folds the
+  # WAL tail into generations every interval. Without it, writes stay in the tail (still queryable)
+  # and the admin shows a growing un-indexed backlog.
+  indexer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: memlake:demo
+    command: ["index", "--interval-secs", "5"]
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+    environment:
+      MEMLAKE_INDEXER_S3_BUCKET: memlake
+      MEMLAKE_INDEXER_S3_ACCESS_KEY: memlake
+      MEMLAKE_INDEXER_S3_SECRET_KEY: memlake123
+      MEMLAKE_INDEXER_S3_REGION: us-east-1
+      MEMLAKE_INDEXER_S3_ENDPOINT: http://minio:9000
+      MEMLAKE_NODE_ID: indexer-1
+      RUST_LOG: ${RUST_LOG:-info}
+
+  # The read-only inspection console. Talks gRPC to `serve` server-side; the browser only ever
+  # sees this app's own JSON endpoints.
+  admin:
+    build:
+      context: .
+      dockerfile: admin/Dockerfile
+    image: memlake-admin:demo
+    depends_on:
+      serve:
+        condition: service_healthy
+    ports:
+      # Host 19999 -> container 3000 (a fixed, out-of-the-way port that won't collide with a
+      # local `next dev` on 3000).
+      - "19999:3000"
+    environment:
+      MEMLAKE_ADDR: serve:50051
+      MEMLAKE_PROTO_PATH: /app/proto/memlake/v1/memlake.proto
+
+  # The star of the show: writes a few memories into the "demo" namespace every couple of seconds,
+  # forever, so the UI has a live, moving corpus.
+  writer:
+    build:
+      context: .
+      dockerfile: demo/Dockerfile
+    image: memlake-demo-writer:demo
+    depends_on:
+      serve:
+        condition: service_healthy
+    environment:
+      MEMLAKE_ADDR: serve:50051
+      MEMLAKE_DEMO_NAMESPACE: demo
+      MEMLAKE_DEMO_INTERVAL: "2"
+      MEMLAKE_DEMO_BATCH: "5"
+    restart: unless-stopped
+
+volumes:
+  minio-demo-data:

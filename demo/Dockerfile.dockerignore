@@ -1,0 +1,12 @@
+# Overrides the repo-root .dockerignore for the demo-writer image (BuildKit uses
+# <dockerfile>.dockerignore when present). The root one excludes clients/; this image needs
+# clients/python and demo/, so start from "ignore everything" and un-ignore just those.
+*
+
+!clients/python
+!demo
+
+**/__pycache__
+**/.venv
+**/*.egg-info
+*.log

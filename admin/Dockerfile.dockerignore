@@ -1,0 +1,16 @@
+# Overrides the repo-root .dockerignore for the admin image (BuildKit uses <dockerfile>.dockerignore
+# when present). The root one excludes admin/ and clients/ to keep the SERVER context small; this
+# image needs admin/ and proto/, so we start from "ignore everything" and un-ignore just those.
+*
+
+!admin
+!proto
+
+# Re-exclude the heavy/derived bits inside admin/ so they never enter the context.
+admin/node_modules
+admin/.next
+admin/out
+admin/.env
+admin/.env.*
+**/__pycache__
+*.log
