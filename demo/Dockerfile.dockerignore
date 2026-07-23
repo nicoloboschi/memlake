@@ -5,6 +5,7 @@
 
 !clients/python
 !demo
+!perf/k8s_load.py
 
 **/__pycache__
 **/.venv

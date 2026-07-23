@@ -13,6 +13,8 @@ COPY clients/python /app/clients/python
 RUN pip install --no-cache-dir /app/clients/python
 
 COPY demo/writer.py /app/writer.py
+# Also carry the k8s load driver, so the same image doubles as the perf loadgen Job.
+COPY perf/k8s_load.py /app/k8s_load.py
 
 # Config comes from the environment (see writer.py): MEMLAKE_ADDR, MEMLAKE_DEMO_NAMESPACE,
 # MEMLAKE_DEMO_INTERVAL, MEMLAKE_DEMO_BATCH. Overridable as CLI args too.

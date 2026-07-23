@@ -1,0 +1,33 @@
+# In-cluster perf run: writes a corpus + times queries through the Envoy proxy over real AWS S3.
+# Apply into the release namespace after the deploy is healthy:
+#   kubectl -n memlake-dev apply -f deploy/perf-job.yaml
+#   kubectl -n memlake-dev logs -f job/memlake-loadgen
+# Re-run: kubectl -n memlake-dev delete job memlake-loadgen && kubectl -n memlake-dev apply -f ...
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: memlake-loadgen
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 3600
+  template:
+    spec:
+      restartPolicy: Never
+      imagePullSecrets:
+        - name: ghcr
+      containers:
+        - name: loadgen
+          image: ghcr.io/nicoloboschi/memlake-loadgen:dev
+          imagePullPolicy: Always
+          command: ["python", "/app/k8s_load.py"]
+          env:
+            - { name: MEMLAKE_ADDR, value: "memlake-proxy:50050" }   # the Envoy proxy Service
+            - { name: MEMLAKE_LOAD_NAMESPACE, value: "perf" }
+            - { name: N_DOCS, value: "20000" }
+            - { name: BATCH, value: "512" }
+            - { name: N_QUERIES, value: "200" }
+            - { name: DIM, value: "384" }
+            - { name: WAIT_INDEX_SECS, value: "30" }
+          resources:
+            requests: { cpu: "500m", memory: "512Mi" }
+            limits: { cpu: "2", memory: "1Gi" }
