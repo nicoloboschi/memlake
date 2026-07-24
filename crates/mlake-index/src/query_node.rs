@@ -231,6 +231,28 @@ pub struct ScanCursor {
     pub offset: usize,
 }
 
+/// Which of `ids` are present in the primary key of *any* of `segments`, resolved with ONE
+/// coalesced `lookup_batch` (a single ranged GET over the covering pk blocks) per segment.
+///
+/// This replaces a per-id `pk.lookup` loop that was O(ids × segments) *serial* single-key S3
+/// GETs — over a large WAL tail (tens of thousands of items) that turned a fold into an
+/// hours-long stall. Used only for live doc-count accounting, so an over-batched probe is fine.
+async fn ids_in_segments(
+    store: &mlake_store::Store,
+    segments: &[Arc<SegmentState>],
+    ids: impl Iterator<Item = MemoryId>,
+) -> Result<HashSet<MemoryId>> {
+    let probe: Vec<MemoryId> = ids.collect();
+    let mut found: HashSet<MemoryId> = HashSet::new();
+    if probe.is_empty() {
+        return Ok(found);
+    }
+    for s in segments {
+        found.extend(s.pk.lookup_batch(store, &probe, None).await?.into_keys());
+    }
+    Ok(found)
+}
+
 impl QueryNode {
     /// Open a snapshot of a bank: read the manifest, load each fact type's metadata, scan
     /// and partition the tail. Cluster and pk/radj data blocks are not fetched here.
@@ -451,23 +473,23 @@ impl QueryNode {
             // tombstones that hit an indexed one. Approximate across segments (cross-segment
             // shadowing is resolved at query time, not counted); exact for a single segment.
             let mut doc_count: usize = segments.iter().map(|s| s.doc_count).sum();
+            // Which probe ids (tombstoned + tail) exist in some segment — resolved with ONE
+            // coalesced `lookup_batch` per segment, not a per-id round-trip. The per-id form was
+            // O((tombstones + tail) × segments) *serial* single-key S3 GETs, which turned a fold
+            // over a large tail into an hours-long stall.
+            let in_segment = ids_in_segments(
+                &ns.store,
+                &segments,
+                tombstones.iter().copied().chain(tail_items.iter().map(|it| it.id)),
+            )
+            .await?;
             for t in &tombstones {
-                for s in &segments {
-                    if s.pk.lookup(&ns.store, t, None).await?.is_some() {
-                        doc_count -= 1;
-                        break;
-                    }
+                if in_segment.contains(t) {
+                    doc_count -= 1;
                 }
             }
             for it in &tail_items {
-                let mut indexed = false;
-                for s in &segments {
-                    if s.pk.lookup(&ns.store, &it.id, None).await?.is_some() {
-                        indexed = true;
-                        break;
-                    }
-                }
-                if !indexed {
+                if !in_segment.contains(&it.id) {
                     doc_count += 1;
                 }
             }
@@ -544,23 +566,20 @@ impl QueryNode {
             // Live doc count: indexed records + genuinely-new tail items, minus tombstoned ones —
             // same accounting as `open`, over the reused segments.
             let mut doc_count: usize = segments.iter().map(|s| s.doc_count).sum();
+            // One coalesced `lookup_batch` per segment (see `open` — the per-id form stalled folds).
+            let in_segment = ids_in_segments(
+                &ns.store,
+                &segments,
+                tombstones.iter().copied().chain(tail_items.iter().map(|it| it.id)),
+            )
+            .await?;
             for t in &tombstones {
-                for s in segments.iter() {
-                    if s.pk.lookup(&ns.store, t, None).await?.is_some() {
-                        doc_count -= 1;
-                        break;
-                    }
+                if in_segment.contains(t) {
+                    doc_count -= 1;
                 }
             }
             for it in &tail_items {
-                let mut indexed = false;
-                for s in segments.iter() {
-                    if s.pk.lookup(&ns.store, &it.id, None).await?.is_some() {
-                        indexed = true;
-                        break;
-                    }
-                }
-                if !indexed {
+                if !in_segment.contains(&it.id) {
                     doc_count += 1;
                 }
             }
