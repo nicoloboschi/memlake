@@ -107,6 +107,35 @@ impl MemlakeService {
         self.tracer.enabled()
     }
 
+    /// How often each node overwrites its bounded trace object in object storage.
+    const TRACE_UPLOAD_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// Start the background task that periodically uploads this node's bounded trace ring to
+    /// `_obs/traces/{node_id}.jsonl` (overwrite → bounded footprint of one capped object per node).
+    /// The admin reads that prefix directly from S3 to render a fleet-wide view without scraping
+    /// individual pods (which a load-balanced Service makes unreliable anyway). No-op when tracing is
+    /// off. Call once at startup.
+    pub fn spawn_trace_uploader(&self, node_id: String) {
+        let Some(ring) = self.tracer.ring() else { return };
+        let store = self.store.clone();
+        let path = crate::trace::obs_traces_path(&node_id);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Self::TRACE_UPLOAD_INTERVAL);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tick.tick().await;
+                // Render under the lock, then release it before the network PUT.
+                let body = match ring.lock() {
+                    Ok(r) => r.render(&node_id),
+                    Err(_) => continue,
+                };
+                if let Err(e) = store.put(&path, body).await {
+                    tracing::warn!(%node_id, error = %e, "trace upload failed");
+                }
+            }
+        });
+    }
+
     /// Set the cap on concurrently-executing retrieval requests — the knob that bounds the
     /// server's peak query memory (`max × per-query working set`).
     pub fn with_max_concurrent_queries(mut self, max: usize) -> Self {
@@ -269,6 +298,18 @@ fn internal(e: impl std::fmt::Display) -> Status {
     Status::internal(e.to_string())
 }
 
+/// Reject namespace names in the reserved `_`-prefix. Namespaces are top-level object-store prefixes,
+/// and the `_obs/` observability root (per-node trace objects) must stay unclaimable — so `_`-leading
+/// names are reserved for system use. Cheap enough to run on the create path.
+fn reject_reserved_namespace(name: &str) -> Result<(), Status> {
+    if name.starts_with('_') {
+        return Err(Status::invalid_argument(
+            "namespace names starting with '_' are reserved for system use (e.g. the _obs/ trace root)",
+        ));
+    }
+    Ok(())
+}
+
 /// Map a retrieval error onto a gRPC status. A dimension mismatch is the caller's mistake —
 /// a query embedded with a different model than the index was built with — so it must come
 /// back as INVALID_ARGUMENT with the two dimensions, not as an opaque server fault the
@@ -293,6 +334,7 @@ impl Memlake for MemlakeService {
         if name.is_empty() {
             return Err(Status::invalid_argument("namespace is required"));
         }
+        reject_reserved_namespace(&name)?;
         self.namespace(&name)
             .create_if_absent(&self.tokenizer.config_hash(), &req.indexed_metadata_keys)
             .await
@@ -324,6 +366,7 @@ impl Memlake for MemlakeService {
         if req.namespace.is_empty() {
             return Err(Status::invalid_argument("namespace is required"));
         }
+        reject_reserved_namespace(&req.namespace)?;
         let mut ops = req
             .ops
             .into_iter()

@@ -206,6 +206,10 @@ async fn serve(args: &[String], node: String) -> Result<()> {
         trace_log = svc.tracing_enabled(), node = %node,
         "memlake serving gRPC"
     );
+    // Publish this node's bounded trace ring to `_obs/traces/{node}.jsonl` for the admin's
+    // fleet-wide view (no-op when tracing is off). A stable node id (StatefulSet ordinal) keeps the
+    // object key stable across restarts.
+    svc.spawn_trace_uploader(node.clone());
     Server::builder()
         .add_service(MemlakeServer::new(svc))
         .serve(addr)

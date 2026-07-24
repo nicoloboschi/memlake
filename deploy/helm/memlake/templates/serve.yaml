@@ -1,11 +1,18 @@
 apiVersion: apps/v1
-kind: Deployment
+# StatefulSet (not Deployment) so each serve pod gets a STABLE ordinal hostname
+# (`<fullname>-serve-0`, `-1`, …) that survives restarts. `MEMLAKE_NODE_ID` is `metadata.name`,
+# so the node id — and thus its `_obs/traces/{node_id}.jsonl` object — is stable, instead of
+# churning on every ReplicaSet roll and orphaning trace objects. `podManagementPolicy: Parallel`
+# keeps rollouts fast (serve pods are peers with no start-order dependency).
+kind: StatefulSet
 metadata:
   name: {{ include "memlake.fullname" . }}-serve
   labels:
     {{- include "memlake.labels" . | nindent 4 }}
     app.kubernetes.io/component: serve
 spec:
+  serviceName: {{ include "memlake.serveHeadless" . }}
+  podManagementPolicy: Parallel
   replicas: {{ .Values.serve.replicas }}
   selector:
     matchLabels:
