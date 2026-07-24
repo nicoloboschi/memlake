@@ -43,6 +43,105 @@ export interface TraceRec {
     roundtrips?: number;
     phases_us?: Phase[];
   };
+  // Per-object access spans — the waterfall.
+  objects?: {
+    items: ObjSpan[];
+    dropped: number;
+    count: number;
+  } | null;
+}
+
+type ObjSource = "mem" | "disk" | "s3";
+interface ObjSpan {
+  key: string;
+  src: ObjSource;
+  op: string;
+  start_us: number;
+  end_us: number;
+  bytes: number;
+}
+
+const SRC_BAR: Record<ObjSource, string> = {
+  mem: "bg-ok/80",
+  disk: "bg-accent/70",
+  s3: "bg-danger/80",
+};
+const SRC_TEXT: Record<ObjSource, string> = {
+  mem: "text-ok",
+  disk: "text-accent",
+  s3: "text-danger",
+};
+
+/** Keep the tail of a long object key (the informative part — cluster-52.vec — is the end). */
+function tailKey(k: string, max = 40): string {
+  return k.length > max ? `…${k.slice(-max)}` : k;
+}
+
+/** The object-access waterfall: every mem/disk/S3 read+write on one request, positioned by time. */
+function Waterfall({
+  objects,
+  totalMs,
+}: {
+  objects: NonNullable<TraceRec["objects"]>;
+  totalMs: number;
+}) {
+  const items = [...objects.items].sort((a, b) => a.start_us - b.start_us);
+  const maxEnd = Math.max(totalMs * 1000, ...items.map((s) => s.end_us), 1);
+  const counts: Record<ObjSource, number> = { mem: 0, disk: 0, s3: 0 };
+  const time: Record<ObjSource, number> = { mem: 0, disk: 0, s3: 0 };
+  for (const s of items) {
+    counts[s.src] += 1;
+    time[s.src] += (s.end_us - s.start_us) / 1000;
+  }
+  return (
+    <div>
+      <div className="flex flex-wrap items-center gap-x-4 gap-y-1 mb-1.5">
+        {(["s3", "disk", "mem"] as ObjSource[]).map((src) => (
+          <span key={src} className="flex items-center gap-1.5 font-mono text-[10px]">
+            <span className={`inline-block w-2 h-2 rounded-sm ${SRC_BAR[src]}`} />
+            <span className={SRC_TEXT[src]}>{src}</span>
+            <span className="text-ink-faint">
+              ×{counts[src]} · {fmtMs(time[src])}
+            </span>
+          </span>
+        ))}
+        {objects.dropped > 0 && (
+          <span className="font-mono text-[10px] text-ink-faint">
+            +{groupDigits(String(objects.dropped))} more (capped)
+          </span>
+        )}
+      </div>
+      <div className="max-h-[22rem] overflow-y-auto flex flex-col gap-px pr-1">
+        {items.map((s, i) => {
+          const dur = (s.end_us - s.start_us) / 1000;
+          const left = (s.start_us / maxEnd) * 100;
+          const width = Math.max(((s.end_us - s.start_us) / maxEnd) * 100, 0.4);
+          return (
+            <div key={i} className="flex items-center gap-2 h-3.5">
+              <span className={`w-6 shrink-0 font-mono text-[9px] ${SRC_TEXT[s.src]}`}>{s.src}</span>
+              <span
+                className="w-52 shrink-0 font-mono text-[10px] text-ink-dim truncate"
+                title={`${s.key} · ${s.op}`}
+                dir="rtl"
+              >
+                {tailKey(s.key)}
+              </span>
+              <div className="flex-1 relative h-2.5 bg-panel-2 rounded-sm">
+                <div
+                  className={`absolute h-full rounded-sm ${SRC_BAR[s.src]}`}
+                  style={{ left: `${left}%`, width: `${width}%` }}
+                  title={`${s.op} · ${s.src} · ${fmtMs(dur)} · ${fmtBytes(String(s.bytes))}`}
+                />
+              </div>
+              <span className="w-16 shrink-0 text-right font-mono text-[10px] tnum text-ink-dim">
+                {fmtMs(dur)}
+              </span>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
 }
 
 const MS = (us: number) => us / 1000;
@@ -250,6 +349,12 @@ export function TraceDetail({ rec }: { rec: TraceRec }) {
           ))}
         </div>
       </Section>
+
+      {rec.objects && rec.objects.items.length > 0 && (
+        <Section title={`object accesses · ${rec.objects.count} spans, by time`}>
+          <Waterfall objects={rec.objects} totalMs={total} />
+        </Section>
+      )}
 
       {nonzero.length > 0 && (
         <Section

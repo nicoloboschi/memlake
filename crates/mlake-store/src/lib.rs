@@ -13,6 +13,7 @@
 pub mod cache;
 pub mod latency;
 pub mod metrics;
+pub mod spans;
 pub mod store;
 
 pub use cache::{CacheEntry, CacheKey, DiskCache, EvictionPolicy};

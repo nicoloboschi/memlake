@@ -145,12 +145,14 @@ impl Store {
         };
         let etag = result.meta.e_tag.clone().map(Etag);
         let bytes = result.bytes().await?;
+        let end = Instant::now();
         if let Some((metrics, rt)) = ctx {
             metrics.record_request(rt, bytes.len() as u64, start.elapsed());
         }
         if let Some(m) = &self.store_metrics {
             m.record_get(bytes.len() as u64);
         }
+        crate::spans::record(path, crate::spans::Source::S3, "get", start, end, bytes.len() as u64);
         Ok(Versioned { bytes, etag })
     }
 
@@ -165,16 +167,30 @@ impl Store {
             if_none_match: Some(etag.0.clone()),
             ..Default::default()
         };
+        let start = Instant::now();
         match self.inner.get_opts(&Path::from(path), opts).await {
             Ok(result) => {
                 let etag = result.meta.e_tag.clone().map(Etag);
                 let bytes = result.bytes().await?;
+                let end = Instant::now();
                 if let Some(m) = &self.store_metrics {
                     m.record_get(bytes.len() as u64);
                 }
+                crate::spans::record(
+                    path,
+                    crate::spans::Source::S3,
+                    "get_if_modified",
+                    start,
+                    end,
+                    bytes.len() as u64,
+                );
                 Ok(Some(Versioned { bytes, etag }))
             }
-            Err(object_store::Error::NotModified { .. }) => Ok(None),
+            // A 304 still cost a round trip — record it (zero bytes) so the timeline shows the check.
+            Err(object_store::Error::NotModified { .. }) => {
+                crate::spans::record(path, crate::spans::Source::S3, "get_304", start, Instant::now(), 0);
+                Ok(None)
+            }
             Err(object_store::Error::NotFound { .. }) => Err(Error::NotFound(path.to_string())),
             Err(e) => Err(e.into()),
         }
@@ -193,12 +209,15 @@ impl Store {
     ) -> Result<bytes::Bytes> {
         if let Some(cache) = &self.cache {
             let key = crate::cache::CacheKey::new("", path, "immutable");
-            if let Some(bytes) = cache.get(&key) {
+            let t0 = Instant::now();
+            if let Some((bytes, source)) = cache.get_source(&key) {
                 if let Some((metrics, _)) = ctx {
                     metrics.record_cache_hit();
                 }
+                crate::spans::record(path, source, "get", t0, Instant::now(), bytes.len() as u64);
                 return Ok(bytes);
             }
+            // Miss: `self.get` records the S3 span for `path`.
             let versioned = self.get(path, ctx).await?;
             if let Some((metrics, _)) = ctx {
                 metrics.record_cache_miss();
@@ -233,11 +252,14 @@ impl Store {
         if let Some(cache) = &self.cache {
             for (i, r) in ranges.iter().enumerate() {
                 let key = crate::cache::CacheKey::new("", &range_key(r), "immutable");
-                if let Some(b) = cache.get(&key) {
+                let t0 = Instant::now();
+                if let Some((b, source)) = cache.get_source(&key) {
+                    let len = b.len() as u64;
                     out[i] = Some(b);
                     if let Some((metrics, _)) = ctx {
                         metrics.record_cache_hit();
                     }
+                    crate::spans::record(&range_key(r), source, "get_range", t0, Instant::now(), len);
                 } else {
                     miss_idx.push(i);
                 }
@@ -259,6 +281,7 @@ impl Store {
                     other => other.into(),
                 })?;
             let total: u64 = fetched.iter().map(|b| b.len() as u64).sum();
+            let end = Instant::now();
             if let Some((metrics, rt)) = ctx {
                 metrics.record_request(rt, total, start.elapsed());
                 metrics.record_cache_miss();
@@ -266,6 +289,14 @@ impl Store {
             if let Some(m) = &self.store_metrics {
                 m.record_get(total);
             }
+            crate::spans::record(
+                &format!("{path}#{} ranges", miss_ranges.len()),
+                crate::spans::Source::S3,
+                "get_ranges",
+                start,
+                end,
+                total,
+            );
             for (&i, bytes) in miss_idx.iter().zip(fetched) {
                 if let Some(cache) = &self.cache {
                     let key = crate::cache::CacheKey::new("", &range_key(&ranges[i]), "immutable");
@@ -288,13 +319,16 @@ impl Store {
 
     async fn put_bytes(&self, path: &str, bytes: Bytes) -> Result<Option<Etag>> {
         let len = bytes.len() as u64;
+        let start = Instant::now();
         let result = self
             .inner
             .put(&Path::from(path), PutPayload::from_bytes(bytes))
             .await?;
+        let end = Instant::now();
         if let Some(m) = &self.store_metrics {
             m.record_put(len);
         }
+        crate::spans::record(path, crate::spans::Source::S3, "put", start, end, len);
         Ok(result.e_tag.map(Etag))
     }
 
@@ -339,6 +373,7 @@ impl Store {
             tags: TagSet::default(),
             attributes: Attributes::default(),
         };
+        let start = Instant::now();
         match self
             .inner
             .put_opts(
@@ -352,9 +387,12 @@ impl Store {
                 if let Some(m) = &self.store_metrics {
                     m.record_put(len);
                 }
+                crate::spans::record(path, crate::spans::Source::S3, "put_create", start, Instant::now(), len);
                 Ok(r.e_tag.map(Etag))
             }
             Err(object_store::Error::AlreadyExists { .. }) => {
+                // A lost sequence race is still a round trip — record it so contention is visible.
+                crate::spans::record(path, crate::spans::Source::S3, "put_conflict", start, Instant::now(), 0);
                 Err(Error::AlreadyExists(path.to_string()))
             }
             Err(e) => Err(e.into()),
@@ -380,6 +418,7 @@ impl Store {
             tags: TagSet::default(),
             attributes: Attributes::default(),
         };
+        let start = Instant::now();
         match self
             .inner
             .put_opts(
@@ -393,6 +432,7 @@ impl Store {
                 if let Some(m) = &self.store_metrics {
                     m.record_put(len);
                 }
+                crate::spans::record(path, crate::spans::Source::S3, "cas_swap", start, Instant::now(), len);
                 Ok(r.e_tag.map(Etag))
             }
             Err(object_store::Error::Precondition { .. }) => {

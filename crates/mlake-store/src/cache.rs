@@ -282,7 +282,8 @@ impl DiskCache {
         Self::with_budgets(dir, capacity_bytes / 4, capacity_bytes)
     }
 
-    pub fn get(&self, key: &CacheKey) -> Option<Bytes> {
+    /// Like [`get`](Self::get) but also reports which tier answered — for per-request span tracing.
+    pub fn get_source(&self, key: &CacheKey) -> Option<(Bytes, crate::spans::Source)> {
         // Memory tier under a *shared* lock: the only mutation is an atomic store into the
         // entry's reference bit, which needs no exclusive access, so concurrent readers all
         // proceed. This is the whole point of the ring.
@@ -306,7 +307,7 @@ impl DiskCache {
             if self.policy == EvictionPolicy::Lru {
                 self.renew(key);
             }
-            return Some(bytes);
+            return Some((bytes, crate::spans::Source::Mem));
         }
 
         // Not in memory: the disk tier may still hold it (this or a previous process). The
@@ -375,7 +376,12 @@ impl DiskCache {
                 }
             }
         }
-        Some(bytes)
+        Some((bytes, crate::spans::Source::Disk))
+    }
+
+    /// Fetch by key, or `None` on a miss. Delegates to [`get_source`](Self::get_source).
+    pub fn get(&self, key: &CacheKey) -> Option<Bytes> {
+        self.get_source(key).map(|(b, _)| b)
     }
 
     /// LRU's per-hit mutation: give the entry a fresh sequence number and a fresh slot at

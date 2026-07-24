@@ -362,6 +362,8 @@ impl Memlake for MemlakeService {
         &self,
         req: Request<pb::WriteRequest>,
     ) -> Result<Response<pb::WriteResponse>, Status> {
+        // Per-request object-access spans for the trace waterfall (task-local; see mlake_store::spans).
+        mlake_store::spans::scope(async move {
         let req = req.into_inner();
         if req.namespace.is_empty() {
             return Err(Status::invalid_argument("namespace is required"));
@@ -492,6 +494,7 @@ impl Memlake for MemlakeService {
                 },
                 "seq": result.seq,
                 "attempts": result.attempts,
+                "objects": mlake_store::spans::current_json(),
             }));
         }
 
@@ -500,12 +503,17 @@ impl Memlake for MemlakeService {
             attempts: result.attempts as u32,
             generation,
         }))
+        })
+        .await
     }
 
     async fn query(
         &self,
         req: Request<pb::QueryRequest>,
     ) -> Result<Response<pb::QueryResponse>, Status> {
+        // Collect per-object access spans for the whole request (task-local; see mlake_store::spans),
+        // so the trace can render an mem/disk/S3 waterfall. Body unindented — Rust ignores it.
+        mlake_store::spans::scope(async move {
         let req = req.into_inner();
         if req.namespace.is_empty() {
             return Err(Status::invalid_argument("namespace is required"));
@@ -640,6 +648,7 @@ impl Memlake for MemlakeService {
                     "tier": if rt == 0 { "warm" } else { "cold" },
                 },
                 "result_count": hits.len(),
+                "objects": mlake_store::spans::current_json(),
                 "params": {
                     "nprobe": req.nprobe,
                     "vector_top_k": req.vector_top_k,
@@ -655,6 +664,8 @@ impl Memlake for MemlakeService {
             hits,
             load_roundtrips: metrics.roundtrips() as u32,
         }))
+        })
+        .await
     }
 
     // ---- Admin / introspection ----
