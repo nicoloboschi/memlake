@@ -28,16 +28,13 @@ interface ManifestSegment {
 }
 interface Manifest {
   format_version: number;
-  /** Current manifests use `version`; legacy pre-segmentation ones use `generation`. */
-  version?: number;
-  generation?: number;
+  version: number;
   wal_index_cursor: number;
   wal_head: number;
-  prev_wal_index_cursor?: number;
+  prev_wal_index_cursor: number;
   tokenizer_config_hash: string;
-  indexed_metadata_keys?: string[];
-  /** Absent on legacy manifests, which predate segmentation. */
-  segments?: ManifestSegment[];
+  indexed_metadata_keys: string[];
+  segments: ManifestSegment[];
 }
 interface NamespaceState {
   namespace: string;
@@ -95,10 +92,7 @@ export function NamespaceStatsView({ namespace }: { namespace: string }) {
     );
   }
 
-  // Real buckets hold both manifest shapes; tolerate either rather than assuming the newest writer.
   const segments = m.segments ?? [];
-  const legacy = m.segments === undefined;
-  const generation = m.version ?? m.generation ?? 0;
   const indexedDocs = segments.reduce((s, x) => s + (x.doc_count ?? 0), 0);
   const head = data.walHead ?? m.wal_head;
   const backlog = Math.max(head - m.wal_index_cursor, 0);
@@ -120,11 +114,11 @@ export function NamespaceStatsView({ namespace }: { namespace: string }) {
         bodyClassName="p-3 flex flex-col gap-4"
       >
         <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
-          <StatTile label="generation" value={String(generation)} />
+          <StatTile label="generation" value={String(m.version)} />
           <StatTile
             label="indexed docs"
             value={groupDigits(String(indexedDocs))}
-            hint={legacy ? "legacy manifest" : "across segments"}
+            hint="across segments"
           />
           <StatTile label="wal head" value={groupDigits(String(head))} hint="live pointer" />
           <StatTile
@@ -143,7 +137,7 @@ export function NamespaceStatsView({ namespace }: { namespace: string }) {
           entries={[
             { k: "format version", v: String(m.format_version) },
             { k: "wal index cursor", v: groupDigits(String(m.wal_index_cursor)) },
-            { k: "prev cursor", v: groupDigits(String(m.prev_wal_index_cursor ?? 0)) },
+            { k: "prev cursor", v: groupDigits(String(m.prev_wal_index_cursor)) },
             { k: "tokenizer hash", v: <CopyableId value={m.tokenizer_config_hash} /> },
             { k: "fact types", v: types.length ? types.join(", ") : "—" },
             {
@@ -161,12 +155,8 @@ export function NamespaceStatsView({ namespace }: { namespace: string }) {
       >
         {segments.length === 0 ? (
           <div className="p-3">
-            <Empty title={legacy ? "legacy manifest — pre-segmentation" : "no segments — nothing folded yet"}>
-              <p>
-                {legacy
-                  ? "This manifest predates the segmented index (it carries a flat `indexes` map). It will gain segments the next time the namespace is folded."
-                  : "Nothing has been folded into a segment yet; everything live is still in the WAL tail."}
-              </p>
+            <Empty title="no segments — nothing folded yet">
+              <p>Everything live is still in the WAL tail.</p>
             </Empty>
           </div>
         ) : (

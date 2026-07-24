@@ -429,22 +429,20 @@ export async function listNamespaceNames(): Promise<string[]> {
 /**
  * A namespace manifest — the authoritative index state, and plain JSON in the bucket.
  *
- * Fields are optional because real buckets hold BOTH shapes: the current segmented manifest
- * (`version` + `segments`) and legacy pre-segmentation ones (`generation` + `indexes`, never
- * re-folded since). Readers must tolerate either rather than assuming the newest writer.
+ * Mirrors `mlake_core::manifest::Manifest` exactly. Pre-segmentation manifests (`generation` +
+ * `indexes`) are NOT supported: they are a dead format, and carrying a compatibility shim for them
+ * would mean every reader forever branches on a shape nothing writes.
  */
 export interface Manifest {
   format_version: number;
-  /** Current manifests: monotonic manifest version. Legacy ones use `generation`. */
-  version?: number;
-  generation?: number;
+  /** Monotonic manifest version, bumped on every swap. */
+  version: number;
   wal_index_cursor: number;
   wal_head: number;
-  prev_wal_index_cursor?: number;
+  prev_wal_index_cursor: number;
   tokenizer_config_hash: string;
-  indexed_metadata_keys?: string[];
-  /** Absent on legacy (pre-segmentation) manifests. */
-  segments?: ManifestSegment[];
+  indexed_metadata_keys: string[];
+  segments: ManifestSegment[];
   prev_segments?: ManifestSegment[];
 }
 export interface ManifestSegment {
