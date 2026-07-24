@@ -150,6 +150,30 @@ like-for-like scale comparison; the CPU **share** and the rerank fetch count are
 numbers. Embedding is done offline and the artifact is fetched before timing, so no vector
 generation touches the hot path.
 
+**F9 — The FTS arm's "68% of query CPU" was a per-snapshot empty-index build, plus a duplicated
+posting list.** F8 surfaced the text arm at ~68% once the runner sent real question text. Measuring
+the arm (`where_fts_query_time_goes`) split it into two unrelated problems, and neither was the one
+that looked obvious (turning hits into ids — the `STORED` doc-store fetch + uuid parse — is 0.1%):
+
+1. *A ~1.7 s one-off, per snapshot.* The first text query against a snapshot spent 1.7 s in `fts`;
+   every later query was sub-millisecond. That is `fts_arm` building a tantivy index for an **empty
+   tail** — temp dir, a 50 MB writer arena with indexing threads, a commit, a split pack — to index
+   zero documents. `FactType::tail_fts` is a fresh `OnceLock` per snapshot and a fold installs a new
+   snapshot, so a *drained* namespace pays it again after every fold. Standalone: 82 ms on a laptop,
+   ~1.7 s on a 2-vCPU pod. *Fix: skip the build and the search when the tail is empty.*
+2. *Every Latin term scanned twice.* The tokenizer emitted each Latin token to both the `words` and
+   `bigrams` fields at index **and** query time, so a 15-word question expanded to ~29 terms — and
+   executing that term union is ~98% of the arm's steady-state cost. Indexing already puts the token
+   in `words`, so the second posting list is cost without recall. *Fix: query `words` only for
+   Latin.* Measured 29.4 → 14.7 terms/query and 1.79 → 0.75 ms/query (2.4×). No reindex (indexing is
+   unchanged), CJK untouched, and ranking is provably identical — both fields hold the same Latin
+   content, so dropping one scales every score by the same constant (pinned by
+   `dropping_the_duplicate_latin_field_preserves_ranking`; RRF fuses on rank regardless).
+
+On the cluster, the text arm went from **6.7 ms/query (67.8%)** to **~0.35 ms/query (~8%)**.
+End-to-end query p50 is unchanged (~33 ms) because the arms run concurrently, so this is throughput
+headroom rather than latency — but it removes a multi-second first-query spike after every fold.
+
 ## Recommended next
 
 - **F5**: fixed (batched the fold-time doc-count pk probe); rerun the benchmark to capture the
