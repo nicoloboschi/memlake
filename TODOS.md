@@ -115,8 +115,9 @@ mostly **operational and packaging**, not features. Grouped by how hard it block
       queryable edge relation (§2).
 - [ ] **`list_tags` is O(corpus) per call → §5.** No `ListTags` RPC / tag-count
       histogram yet.
-- [ ] **Smaller parity gaps:** no scan ordering (curation list comes back in
-      storage order, not `mentioned_at DESC` → §5); no key-*absence* predicate
+- [ ] **Smaller parity gaps:** the curation list still comes back in storage order
+      (write-time ordering is indexed now — §5 — but not `mentioned_at DESC`); no
+      key-*absence* predicate
       (worked around with a positive `consolidated` flag → §5). *(Nested tag groups
       were the third gap here — now pushed down and applied inline, §4.)*
 
@@ -339,9 +340,22 @@ curation UI and export:
         flipped to `"1"`), which is fine but means every such state needs a
         pre-declared field. A `metadata_missing` / `metadata_not_equals` form
         would remove the workaround.
-- [ ] **No ordering.** The SQL path returns `ORDER BY mentioned_at DESC NULLS
-      LAST, created_at DESC`; a scan walks in cluster order, so the curation list
-      comes back in storage order.
+- [x] **Ordering by write time — DONE (`ScanOrder.CREATED_ASC`).** A second
+      `TimeTable` keyed on write time (`created.idx`/`created.data`, built on both
+      the in-RAM and streaming folds) plus a bounded forward-scan primitive
+      (`SsTableIndex::scan_forward` / `TimeTable::after` — the oldest N *contiguous*,
+      which `in_window` cannot express because it strides a spread sample). The scan
+      merges that index across the requested fact types into one order, hydrates only
+      the ids it needs, and pages on a write-time cursor.
+
+      This closed a real correctness bug, not a cosmetic one: `find_unconsolidated`
+      stopped at the first `limit` matches a cluster walk reached and sorted *those*,
+      so a backlog deeper than one page drained in arbitrary order. It is now one
+      ordered call, no client-side sort. Back-compatible — a generation folded before
+      the index exists simply has none, and `serde(default)` leaves it empty.
+
+- [ ] **Ordering by other keys.** The curation list wants `mentioned_at DESC NULLS
+      LAST, created_at DESC`; only ascending write time is indexed so far.
 - [x] **Offset/skip paging — DONE.** `skip` discards N matching memories before
       filling the page; verified byte-identical to following the cursor. Hindsight
       uses it for offset in the curation list, falling back to the page walk only
