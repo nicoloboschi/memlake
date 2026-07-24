@@ -1,6 +1,6 @@
 import type { Metadata } from "next";
-import Link from "next/link";
 
+import { Sidebar } from "@/components/Sidebar";
 import "./globals.css";
 
 export const metadata: Metadata = {
@@ -13,39 +13,9 @@ export default function RootLayout({
 }: Readonly<{ children: React.ReactNode }>) {
   return (
     <html lang="en" className="h-full">
-      <body className="min-h-full flex flex-col bg-bg text-ink">
-        <header className="sticky top-0 z-20 border-b border-line bg-panel">
-          <div className="flex items-center gap-4 px-4 h-11">
-            <Link
-              href="/"
-              className="font-mono text-[13px] tracking-tight text-ink hover:text-accent"
-            >
-              memlake<span className="text-ink-faint">/</span>admin
-            </Link>
-            <span className="text-ink-faint font-mono text-[11px]">
-              S3-native retrieval engine
-            </span>
-            {/* Fleet-wide / per-node views hang off the global header rather than
-                the per-namespace tabs. */}
-            <nav className="ml-auto flex items-center gap-4">
-              <Link
-                href="/obs"
-                className="font-mono text-[11px] text-ink-dim hover:text-accent"
-                title="serve fleet tracing — reads _obs/traces/ from the bucket"
-              >
-                observability
-              </Link>
-              <Link
-                href="/cache"
-                className="font-mono text-[11px] text-ink-dim hover:text-accent"
-                title="this replica's read cache — node-local, not cluster-wide"
-              >
-                node cache
-              </Link>
-            </nav>
-          </div>
-        </header>
-        <main className="flex-1 min-w-0">{children}</main>
+      <body className="h-full flex bg-bg text-ink">
+        <Sidebar />
+        <main className="flex-1 min-w-0 h-screen overflow-y-auto">{children}</main>
       </body>
     </html>
   );

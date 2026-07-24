@@ -1,9 +1,10 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { isAbort, getJson } from "@/lib/client";
 import { fmtBytes, fmtMs, groupDigits } from "@/lib/format";
+import { TraceDetail, type TraceRec } from "@/components/TraceDetail";
 import {
   Button,
   CopyableId,
@@ -41,14 +42,8 @@ interface NodeSummary {
   sizeBytes: number;
   fetchedMs: number;
 }
-interface TraceRecord {
-  op?: string;
-  namespace?: string;
-  total_ms?: number;
-  ts_ms?: number;
-  node_id?: string;
-  snapshot?: { action?: string; open_ms?: number; tail_entries?: number };
-}
+// The record shape is owned by TraceDetail (the drill-down renders every field).
+type TraceRecord = TraceRec;
 
 /** A record at/above this is "slow" — the tail the ring is biased to keep, flagged in the UI. */
 const SLOW_MS = 200;
@@ -141,15 +136,17 @@ export function ObservabilityView() {
     void loadRecords();
   }, [loadRecords]);
 
-  // Poll at the upload cadence so the fleet view tracks reality without hammering S3.
+  // Poll at the upload cadence so the fleet OVERVIEW tracks reality. We deliberately do NOT
+  // auto-reload the drilled-in records: once you're inspecting a node's or namespace's traces they
+  // must hold still (a reshuffle mid-investigation is useless). Records refresh on an explicit
+  // action — selecting a node/namespace, or the manual refresh button.
   useEffect(() => {
     if (!auto) return;
     const id = setInterval(() => {
       void loadNodes();
-      void loadRecords();
     }, REFRESH_MS);
     return () => clearInterval(id);
-  }, [auto, loadNodes, loadRecords]);
+  }, [auto, loadNodes]);
 
   const totalCalls = useMemo(
     () => (nodes ?? []).reduce((s, n) => s + (n.header.totals.count ?? 0), 0),
@@ -165,12 +162,13 @@ export function ObservabilityView() {
   return (
     <div className="p-4 max-w-6xl mx-auto flex flex-col gap-4">
       <Panel
-        title="observability — serve fleet"
+        title="services — serve fleet"
         subtitle={
           <>
             Read straight from <code>_obs/traces/</code> in the bucket — one bounded (slow-biased)
-            ring per serve node, uploaded every ~5s. No pod scraping. Cache/latency shown here are
-            per node; a cold node costs latency only, never correctness.
+            ring per serve node, uploaded every ~5s. No pod scraping. Click any trace to see where
+            its time went. Cache/latency are per node; a cold node costs latency only, never
+            correctness.
           </>
         }
         actions={
@@ -179,7 +177,13 @@ export function ObservabilityView() {
               {nodes ? `${nodes.length} nodes · ${groupDigits(String(totalCalls))} calls` : "—"}
             </span>
             <Toggle checked={auto} onChange={setAuto} label="auto" />
-            <Button onClick={() => void loadNodes()} disabled={loading}>
+            <Button
+              onClick={() => {
+                void loadNodes();
+                void loadRecords();
+              }}
+              disabled={loading}
+            >
               refresh
             </Button>
           </>
@@ -471,9 +475,12 @@ function RecordsTable({
   records: TraceRecord[];
   showNode: boolean;
 }) {
+  // Which row is drilled into. Keyed by index within this render's record list.
+  const [open, setOpen] = useState<number | null>(null);
   if (records.length === 0) {
     return <Empty title="no records retained" />;
   }
+  const cols = showNode ? 7 : 7; // time, [node|namespace], op, snapshot, total, open, tail
   return (
     <TableShell
       head={
@@ -493,33 +500,51 @@ function RecordsTable({
     >
       {records.map((r, i) => {
         const slow = (r.total_ms ?? 0) >= SLOW_MS;
+        const isOpen = open === i;
         return (
-          <tr key={`${r.ts_ms}-${i}`} className={slow ? "bg-warn/5" : undefined}>
-            <Td className="tnum text-ink-dim">{clock(r.ts_ms)}</Td>
-            {showNode && (
+          <Fragment key={`${r.ts_ms}-${i}`}>
+            <tr
+              onClick={() => setOpen(isOpen ? null : i)}
+              className={`cursor-pointer ${
+                isOpen ? "bg-accent/10" : slow ? "bg-warn/5 hover:bg-warn/10" : "hover:bg-panel-2"
+              }`}
+            >
+              <Td className="tnum text-ink-dim">
+                <span className="text-ink-faint mr-1">{isOpen ? "▾" : "▸"}</span>
+                {clock(r.ts_ms)}
+              </Td>
+              {showNode && (
+                <Td>
+                  <span className="font-mono text-[11px] text-ink-dim">{r.node_id ?? "—"}</span>
+                </Td>
+              )}
               <Td>
-                <span className="font-mono text-[11px] text-ink-dim">{r.node_id ?? "—"}</span>
+                <Tag>{r.op ?? "—"}</Tag>
               </Td>
-            )}
-            <Td>
-              <Tag>{r.op ?? "—"}</Tag>
-            </Td>
-            {!showNode && (
-              <Td className="font-mono text-[11px] text-ink-dim truncate max-w-[12rem]">
-                {r.namespace ?? "—"}
+              {!showNode && (
+                <Td className="font-mono text-[11px] text-ink-dim truncate max-w-[12rem]">
+                  {r.namespace ?? "—"}
+                </Td>
+              )}
+              <Td className="font-mono text-[11px] text-ink-dim">{r.snapshot?.action ?? "—"}</Td>
+              <Td className={`text-right tnum ${slow ? "text-warn" : "text-ink"}`}>
+                {fmtMs(r.total_ms)}
               </Td>
+              <Td className="text-right tnum text-ink-dim">{fmtMs(r.snapshot?.open_ms)}</Td>
+              <Td className="text-right tnum text-ink-dim">
+                {r.snapshot?.tail_entries != null
+                  ? groupDigits(String(r.snapshot.tail_entries))
+                  : "—"}
+              </Td>
+            </tr>
+            {isOpen && (
+              <tr>
+                <td colSpan={cols} className="p-0 border-b border-line">
+                  <TraceDetail rec={r} />
+                </td>
+              </tr>
             )}
-            <Td className="font-mono text-[11px] text-ink-dim">
-              {r.snapshot?.action ?? "—"}
-            </Td>
-            <Td className={`text-right tnum ${slow ? "text-warn" : "text-ink"}`}>
-              {fmtMs(r.total_ms)}
-            </Td>
-            <Td className="text-right tnum text-ink-dim">{fmtMs(r.snapshot?.open_ms)}</Td>
-            <Td className="text-right tnum text-ink-dim">
-              {r.snapshot?.tail_entries != null ? groupDigits(String(r.snapshot.tail_entries)) : "—"}
-            </Td>
-          </tr>
+          </Fragment>
         );
       })}
     </TableShell>
