@@ -17,6 +17,11 @@ pub const COLD_ROUNDTRIP_BUDGET: usize = 4;
 pub enum Phase {
     Probe,
     FetchClusters,
+    /// Stage one of the vector arm: the RaBitQ 1-bit scan over the probed clusters, producing an
+    /// error interval per candidate. This — NOT `Rerank` — is the dominant vector-arm CPU cost, and
+    /// the ONLY vector cost link derivation pays (it skips stage two). Split out from `Rerank` so a
+    /// trace does not misattribute the scan to reranking.
+    Scan,
     Rerank,
     Fts,
     GraphRadj,
@@ -27,9 +32,10 @@ pub enum Phase {
 }
 
 impl Phase {
-    pub const ALL: [Phase; 9] = [
+    pub const ALL: [Phase; 10] = [
         Phase::Probe,
         Phase::FetchClusters,
+        Phase::Scan,
         Phase::Rerank,
         Phase::Fts,
         Phase::GraphRadj,
@@ -42,6 +48,7 @@ impl Phase {
         match self {
             Phase::Probe => "probe",
             Phase::FetchClusters => "fetch_clusters",
+            Phase::Scan => "scan",
             Phase::Rerank => "rerank",
             Phase::Fts => "fts",
             Phase::GraphRadj => "graph_radj",
@@ -68,7 +75,7 @@ pub struct QueryMetrics {
     cache_hits: AtomicUsize,
     cache_misses: AtomicUsize,
     /// Accumulated wall-clock micros per phase — the diagnostics breakdown.
-    phase_micros: [AtomicU64; 9],
+    phase_micros: [AtomicU64; 10],
 }
 
 impl Default for QueryMetrics {

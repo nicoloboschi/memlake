@@ -42,7 +42,10 @@ helm upgrade --install "$RELEASE" "$REPO_ROOT/deploy/helm/memlake" \
   "$@"
 
 echo "==> rollout"
-kubectl -n "$NS" rollout status deploy/"$RELEASE"-serve   --timeout=180s
+# serve is a StatefulSet (stable pod identities for the consistent-hash proxy); the rest are
+# Deployments. Resolve serve's kind so the deploy works whichever it is.
+serve_kind="$(kubectl -n "$NS" get statefulset "$RELEASE"-serve >/dev/null 2>&1 && echo statefulset || echo deploy)"
+kubectl -n "$NS" rollout status "$serve_kind"/"$RELEASE"-serve --timeout=180s
 kubectl -n "$NS" rollout status deploy/"$RELEASE"-indexer --timeout=180s
 kubectl -n "$NS" rollout status deploy/"$RELEASE"-proxy   --timeout=180s || true
 

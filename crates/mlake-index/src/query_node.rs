@@ -1388,7 +1388,7 @@ impl QueryNode {
         let t = Instant::now();
         let mut cands: Vec<(MemoryId, f32, f32, f32)> = Vec::new(); // id, est, lo, hi
         self.scan_blocks(&blocks, state, q, tags, updated, &mut cands)?;
-        metrics.record_phase(Phase::Rerank, t.elapsed());
+        metrics.record_phase(Phase::Scan, t.elapsed());
 
         // Approximate mode (link derivation): skip stage two entirely — rank by the RaBitQ scan
         // estimate and return the top-`depth`. No rerank-tier fetch, no exact cosine. Links only

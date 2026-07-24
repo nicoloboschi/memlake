@@ -511,7 +511,11 @@ pub async fn derive_links_for_write(
         vector: MAX_SEMANTIC_OUT + 4,
         text: 0,
         graph: 0,
-        nprobe: 16,
+        // Only the top MAX_SEMANTIC_OUT (5) neighbours at cosine >= SEMANTIC_LINK_THRESHOLD (0.7)
+        // are kept, and a >=0.7 neighbour sits in the query's nearest clusters — so probing 8 (the
+        // proven user-query DEFAULT_NPROBE) finds them just as well as 16 did, at half the stage-one
+        // RaBitQ scan, which the write-path trace shows is ~3/4 of write CPU. See the `scan` phase.
+        nprobe: 8,
         graph_seed_min: crate::query_node::DEFAULT_GRAPH_SEED_MIN_SIMILARITY,
         // Links only need approximate neighbours: rank by the RaBitQ scan estimate and skip the
         // exact rerank (the dominant per-item cost at scale). See ArmDepths::exact_rerank.
