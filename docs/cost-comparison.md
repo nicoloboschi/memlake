@@ -1,8 +1,15 @@
 # COGS: memlake vs Postgres, for Hindsight
 
-The goal is to capture the *real* cost of goods sold, not to make memlake win — **at 10 k
-memories Postgres is cheaper, and at high QPS it is cheaper at 100 k too.** Both are stated
-plainly below.
+The goal is to capture the *real* cost of goods sold, not to make memlake win. Against a realistic
+**Multi-AZ + 2-read-replica** Postgres, the short version is:
+
+- **PG's only territory is small corpus + high QPS** (10 k @ 100 QPS, and 100 k @ 100 QPS against a
+  cheap PG). It is narrow, and coalescing one S3 GET would erase most of it.
+- **Wherever the corpus is large, memlake wins by one to two orders of magnitude** — and adding QPS
+  does not rescue PG: at 10 M memories, 1 → 100 QPS costs memlake **+$192/mo** and it is still
+  **48× cheaper** ($222 vs $10 655).
+- **Storage is never the deciding line** at any scale here; it is compute + S3 requests vs
+  provisioned RAM × replicas.
 
 Two parts:
 
