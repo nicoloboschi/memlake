@@ -3,10 +3,12 @@
 import { useState } from "react";
 
 import { fmtBytes, fmtMs, groupDigits } from "@/lib/format";
+import { CopyableId, Tag } from "@/components/ui";
 
 type Phase = [string, number]; // [name, microseconds]
 
 export interface TraceRec {
+  id?: string;
   op?: string;
   namespace?: string;
   node_id?: string;
@@ -86,45 +88,24 @@ function tailKey(k: string, max = 40): string {
 }
 
 /** The object-access waterfall: every mem/disk/S3 read+write on one request, positioned by time. */
-function SpanRow({ s, maxEnd }: { s: ObjSpan; maxEnd: number }) {
-  const dur = (s.end_us - s.start_us) / 1000;
-  const left = (s.start_us / maxEnd) * 100;
-  const width = Math.max(((s.end_us - s.start_us) / maxEnd) * 100, 0.4);
-  const compute = s.kind === "compute";
-  const bar = compute ? CPU_BAR : SRC_BAR[s.src ?? "s3"];
-  const text = compute ? CPU_TEXT : SRC_TEXT[s.src ?? "s3"];
-  const label = compute ? "cpu" : s.src;
-  return (
-    <div className="flex items-center gap-2 h-3.5 pl-2">
-      <span className={`w-7 shrink-0 font-mono text-[9px] ${text}`}>{label}</span>
-      <span
-        className={`w-48 shrink-0 font-mono text-[10px] truncate ${
-          compute ? "text-warn" : "text-ink-dim"
-        }`}
-        title={`${s.key} · ${s.op}`}
-        dir={compute ? "ltr" : "rtl"}
-      >
-        {compute ? s.key : tailKey(s.key)}
-      </span>
-      <div className="flex-1 relative h-2.5 bg-panel-2 rounded-sm">
-        <div
-          className={`absolute h-full rounded-sm ${bar}`}
-          style={{ left: `${left}%`, width: `${width}%` }}
-          title={`${s.op} · ${compute ? "cpu" : s.src} · ${fmtMs(dur)}${
-            compute ? "" : ` · ${fmtBytes(String(s.bytes))}`
-          }`}
-        />
-      </div>
-      <span className="w-14 shrink-0 text-right font-mono text-[10px] tnum text-ink-dim">
-        {fmtMs(dur)}
-      </span>
-    </div>
-  );
-}
+/** Phase strip/label colours (distinct from the source bar colours). Arbitrary hex so they render
+ * regardless of the theme palette. */
+const PHASE_COLOR: Record<string, string> = {
+  snapshot: "#38bdf8",
+  recall: "#34d399",
+  rerank: "#fb7185",
+  text: "#a78bfa",
+  graph: "#22d3ee",
+  commit: "#fbbf24",
+  other: "#94a3b8",
+};
+const phaseColor = (g: string) => PHASE_COLOR[g] ?? PHASE_COLOR.other;
 
-/** The unified sequence diagram: every I/O access AND compute phase on one timeline, bracketed by
- * main phase (snapshot → recall → rerank → …). Segments run concurrently, so their per-phase compute
- * spans overlap here — the parallelism is visible. */
+/** The unified sequence diagram: every I/O access AND compute span on ONE grid, on a shared time
+ * axis. Rows are ordered by phase (snapshot → recall → text → rerank → graph → commit) then by
+ * start, so each phase is a contiguous band identified by a coloured left strip + a label on its
+ * first row — no separate sub-sections. Segments run concurrently, so their per-phase compute spans
+ * overlap on the axis: the parallelism is visible. */
 function Waterfall({
   objects,
   totalMs,
@@ -154,16 +135,19 @@ function Waterfall({
     }
   }
 
-  // Bucket by phase group, in draw order.
-  const byGroup = new Map<string, ObjSpan[]>();
-  for (const s of items) {
-    const g = s.group || "other";
-    (byGroup.get(g) ?? byGroup.set(g, []).get(g)!).push(s);
-  }
-  const groups = [
-    ...GROUP_ORDER.filter((g) => byGroup.has(g)),
-    ...[...byGroup.keys()].filter((g) => !GROUP_ORDER.includes(g)),
-  ];
+  // One list, ordered by phase then start — keeps each phase a contiguous band while every bar sits
+  // at its true time on the shared axis.
+  const orderIdx = (g: string) => {
+    const i = GROUP_ORDER.indexOf(g);
+    return i < 0 ? GROUP_ORDER.length : i;
+  };
+  const rows = [...items].sort((a, b) => {
+    const d = orderIdx(a.group || "other") - orderIdx(b.group || "other");
+    return d !== 0 ? d : a.start_us - b.start_us;
+  });
+
+  // Axis ticks at 0/¼/½/¾/1 of the total.
+  const ticks = [0, 0.25, 0.5, 0.75, 1];
 
   return (
     <div>
@@ -191,34 +175,72 @@ function Waterfall({
         )}
       </div>
 
-      <div className="max-h-[28rem] overflow-y-auto flex flex-col gap-2 pr-1">
-        {groups.map((g) => {
-          const gs = byGroup.get(g)!.slice().sort((a, b) => a.start_us - b.start_us);
-          const gStart = Math.min(...gs.map((s) => s.start_us));
-          const gEnd = Math.max(...gs.map((s) => s.end_us));
+      {/* time axis over the timeline column (label + src + key columns are ~26.5rem) */}
+      <div className="flex items-center gap-2 mb-1">
+        <span className="w-[16.5rem] shrink-0" />
+        <div className="flex-1 relative h-3">
+          {ticks.map((t) => (
+            <span
+              key={t}
+              className="absolute top-0 font-mono text-[9px] text-ink-faint -translate-x-1/2"
+              style={{ left: `${t * 100}%` }}
+            >
+              {fmtMs((t * maxEnd) / 1000)}
+            </span>
+          ))}
+        </div>
+        <span className="w-14 shrink-0" />
+      </div>
+
+      <div className="max-h-[34rem] overflow-y-auto">
+        {rows.map((s, i) => {
+          const g = s.group || "other";
+          const firstOfPhase = i === 0 || (rows[i - 1].group || "other") !== g;
+          const col = phaseColor(g);
+          const dur = (s.end_us - s.start_us) / 1000;
+          const left = (s.start_us / maxEnd) * 100;
+          const width = Math.max(((s.end_us - s.start_us) / maxEnd) * 100, 0.4);
+          const compute = s.kind === "compute";
           return (
-            <div key={g}>
-              {/* group bracket: the phase's overall span across the timeline */}
-              <div className="flex items-center gap-2 mb-0.5">
-                <span className="w-[3.75rem] shrink-0 font-mono text-[10px] uppercase tracking-wide text-ink-dim">
-                  {g}
-                </span>
-                <div className="flex-1 relative h-1.5">
-                  <div
-                    className="absolute h-full bg-ink-faint/25 rounded-full"
-                    style={{
-                      left: `${(gStart / maxEnd) * 100}%`,
-                      width: `${Math.max(((gEnd - gStart) / maxEnd) * 100, 0.4)}%`,
-                    }}
-                  />
-                </div>
-                <span className="w-14 shrink-0 text-right font-mono text-[10px] text-ink-faint tnum">
-                  {fmtMs((gEnd - gStart) / 1000)}
-                </span>
+            <div
+              key={i}
+              className="flex items-center gap-2 h-4 hover:bg-panel-2/60"
+              style={{ borderLeft: `3px solid ${col}` }}
+            >
+              <span
+                className="w-[3.25rem] shrink-0 pl-1 font-mono text-[9px] uppercase tracking-wide truncate"
+                style={{ color: firstOfPhase ? col : "transparent" }}
+              >
+                {firstOfPhase ? g : ""}
+              </span>
+              <span
+                className={`w-7 shrink-0 font-mono text-[9px] ${
+                  compute ? CPU_TEXT : SRC_TEXT[s.src ?? "s3"]
+                }`}
+              >
+                {compute ? "cpu" : s.src}
+              </span>
+              <span
+                className={`w-[9.5rem] shrink-0 font-mono text-[10px] truncate ${
+                  compute ? "text-warn" : "text-ink-dim"
+                }`}
+                dir={compute ? "ltr" : "rtl"}
+                title={`${s.key} · ${s.op}`}
+              >
+                {compute ? s.key : tailKey(s.key)}
+              </span>
+              <div className="flex-1 relative h-2.5 bg-panel-2 rounded-sm">
+                <div
+                  className={`absolute h-full rounded-sm ${compute ? CPU_BAR : SRC_BAR[s.src ?? "s3"]}`}
+                  style={{ left: `${left}%`, width: `${width}%` }}
+                  title={`${s.op} · ${compute ? "cpu" : s.src} · ${fmtMs(dur)}${
+                    compute ? "" : ` · ${fmtBytes(String(s.bytes))}`
+                  }`}
+                />
               </div>
-              {gs.map((s, i) => (
-                <SpanRow key={i} s={s} maxEnd={maxEnd} />
-              ))}
+              <span className="w-14 shrink-0 text-right font-mono text-[10px] tnum text-ink-dim">
+                {fmtMs(dur)}
+              </span>
             </div>
           );
         })}
@@ -411,6 +433,22 @@ export function TraceDetail({ rec }: { rec: TraceRec }) {
 
   return (
     <div className="flex flex-col gap-3 p-3 bg-panel-2/40 border-l-2 border-accent/40">
+      {/* identity: op · namespace · node · time, and the copyable trace id to check it again later */}
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+        <Tag>{rec.op ?? "—"}</Tag>
+        <span className="font-mono text-[12px] text-ink">{rec.namespace ?? "—"}</span>
+        {rec.node_id && (
+          <span className="font-mono text-[11px] text-ink-dim">{rec.node_id}</span>
+        )}
+        <span className="font-mono text-[11px] text-ink-faint tnum">{fmtMs(rec.total_ms)}</span>
+        {rec.id && (
+          <span className="ml-auto flex items-center gap-1 font-mono text-[10px] text-ink-faint">
+            id
+            <CopyableId value={rec.id} />
+          </span>
+        )}
+      </div>
+
       <div className="text-[12px] text-ink leading-snug">
         <span className="text-ink-faint font-mono text-[10px] uppercase tracking-wide mr-2">
           why

@@ -214,6 +214,55 @@ export async function nodeRecords(nodeId: string, limit: number): Promise<TraceR
   return recs.slice(0, limit);
 }
 
+/** A light trace summary for the explorer list — no spans, so the list payload stays small. */
+export interface TraceSummary {
+  id: string;
+  node_id: string;
+  namespace: string;
+  op: string;
+  total_ms: number;
+  ts_ms: number;
+  snapshot?: { action?: string; open_ms?: number; tail_entries?: number };
+}
+
+/** Recent trace summaries across ALL nodes, newest first, capped. The Traces explorer filters these
+ * by namespace/service client-side; the full record (with spans) is fetched on selection by id. */
+export async function traceSummaries(limit: number): Promise<TraceSummary[]> {
+  const objs = await fetchNodeObjects();
+  const out: TraceSummary[] = [];
+  for (const o of objs) {
+    const header = parseHeader(o.body);
+    const nodeId = header?.node_id ?? o.key;
+    for (const r of parseRecords(o.body)) {
+      out.push({
+        id: String(r.id ?? ""),
+        node_id: nodeId,
+        namespace: r.namespace ?? "",
+        op: r.op ?? "",
+        total_ms: r.total_ms ?? 0,
+        ts_ms: r.ts_ms ?? 0,
+        snapshot: r.snapshot,
+      });
+    }
+  }
+  out.sort((a, b) => b.ts_ms - a.ts_ms);
+  return out.slice(0, limit);
+}
+
+/** The full record (with spans) for one trace id, searched across every node. `null` if it has aged
+ * out of every ring. Tagged with the node that served it. */
+export async function traceById(id: string): Promise<(TraceRecord & { node_id: string }) | null> {
+  const objs = await fetchNodeObjects();
+  for (const o of objs) {
+    const header = parseHeader(o.body);
+    const nodeId = header?.node_id ?? o.key;
+    for (const r of parseRecords(o.body)) {
+      if (String(r.id ?? "") === id) return { ...r, node_id: nodeId };
+    }
+  }
+  return null;
+}
+
 /** Records touching `namespace` across ALL nodes, merged newest-first, capped. Each record is
  * tagged with the node it came from so the debugger sees which pod served it. */
 export async function namespaceRecords(

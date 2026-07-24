@@ -8,8 +8,14 @@ const SECTIONS = [
   {
     href: "/services",
     label: "Services",
-    hint: "serve fleet · tracing",
+    hint: "serve fleet · health",
     match: (p: string) => p.startsWith("/services") || p.startsWith("/cache"),
+  },
+  {
+    href: "/traces",
+    label: "Traces",
+    hint: "request timelines",
+    match: (p: string) => p.startsWith("/traces"),
   },
   {
     href: "/",

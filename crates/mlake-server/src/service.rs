@@ -478,6 +478,7 @@ impl Memlake for MemlakeService {
 
         if self.tracer.enabled() {
             self.tracer.emit(serde_json::json!({
+                "id": uuid::Uuid::new_v4().to_string(),
                 "ts_ms": now_ms(),
                 "op": "write",
                 "namespace": req.namespace,
@@ -627,6 +628,7 @@ impl Memlake for MemlakeService {
             let (rt, ch, cm) = (metrics.roundtrips(), metrics.cache_hits(), metrics.cache_misses());
             let denom = (ch + cm).max(1) as f64;
             self.tracer.emit(serde_json::json!({
+                "id": uuid::Uuid::new_v4().to_string(),
                 "ts_ms": now_ms(),
                 "op": "query",
                 "namespace": req.namespace,

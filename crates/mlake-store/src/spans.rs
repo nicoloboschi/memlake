@@ -62,7 +62,15 @@ fn group_for(key: &str, op: &str) -> &'static str {
     if key.contains("rerank") {
         return "rerank";
     }
-    if key.contains("cluster-") || key.ends_with(".vec") || key.ends_with(".bin") {
+    if key.contains("radj") || key.ends_with(".pk") {
+        return "graph";
+    }
+    // Cluster reads + payload materialization (result hydration / derive corpus reads).
+    if key.contains("cluster-")
+        || key.ends_with(".vec")
+        || key.ends_with(".bin")
+        || key.contains("payload")
+    {
         return "recall";
     }
     // WAL head/tail + manifest + the per-segment metadata a snapshot open loads.

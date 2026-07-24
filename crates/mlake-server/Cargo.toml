@@ -10,6 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 dotenvy.workspace = true
+uuid.workspace = true
 mlake-core.workspace = true
 mlake-store.workspace = true
 mlake-wal.workspace = true

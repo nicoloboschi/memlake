@@ -1,7 +1,14 @@
 import { NextResponse } from "next/server";
 
 import { errorResponse } from "@/lib/http";
-import { listNodes, namespaceRecords, nodeRecords, ObsConfigError } from "@/lib/obs";
+import {
+  listNodes,
+  namespaceRecords,
+  nodeRecords,
+  ObsConfigError,
+  traceById,
+  traceSummaries,
+} from "@/lib/obs";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -25,12 +32,22 @@ export async function GET(req: Request): Promise<NextResponse> {
   const url = new URL(req.url);
   const node = url.searchParams.get("node");
   const namespace = url.searchParams.get("namespace");
+  const trace = url.searchParams.get("trace");
+  const summaries = url.searchParams.get("summaries");
   const limit = Math.min(
     Number(url.searchParams.get("limit")) || 500,
     MAX_RECORDS,
   );
 
   try {
+    if (trace) {
+      const record = await traceById(trace);
+      return NextResponse.json({ record, elapsedMs: Date.now() - started });
+    }
+    if (summaries) {
+      const traces = await traceSummaries(limit);
+      return NextResponse.json({ traces, elapsedMs: Date.now() - started });
+    }
     if (node) {
       const records = await nodeRecords(node, limit);
       return NextResponse.json({ records, elapsedMs: Date.now() - started });
