@@ -425,3 +425,108 @@ export async function listNamespaceNames(): Promise<string[]> {
   );
   return checked.filter((n): n is string => n !== null).sort();
 }
+
+/**
+ * A namespace manifest — the authoritative index state, and plain JSON in the bucket.
+ *
+ * Fields are optional because real buckets hold BOTH shapes: the current segmented manifest
+ * (`version` + `segments`) and legacy pre-segmentation ones (`generation` + `indexes`, never
+ * re-folded since). Readers must tolerate either rather than assuming the newest writer.
+ */
+export interface Manifest {
+  format_version: number;
+  /** Current manifests: monotonic manifest version. Legacy ones use `generation`. */
+  version?: number;
+  generation?: number;
+  wal_index_cursor: number;
+  wal_head: number;
+  prev_wal_index_cursor?: number;
+  tokenizer_config_hash: string;
+  indexed_metadata_keys?: string[];
+  /** Absent on legacy (pre-segmentation) manifests. */
+  segments?: ManifestSegment[];
+  prev_segments?: ManifestSegment[];
+}
+export interface ManifestSegment {
+  id: string;
+  level: number;
+  seq_lo: number;
+  seq_hi: number;
+  doc_count: number;
+  tombstones?: string;
+  indexes: Record<string, { train_count?: number; files?: { clusters?: string[] } }>;
+}
+
+/** Namespace state read from S3: the manifest plus the LIVE wal head pointer. */
+export interface NamespaceState {
+  namespace: string;
+  manifest: Manifest | null;
+  /** Live head from `{ns}/wal-head` — ahead of `manifest.wal_index_cursor` by the un-indexed tail. */
+  walHead: number | null;
+  elapsedMs: number;
+}
+
+export async function readNamespaceState(ns: string): Promise<NamespaceState> {
+  const started = Date.now();
+  const [manifest, walHead] = await Promise.all([
+    getText(`${ns}/manifest.json`)
+      .then((b) => JSON.parse(b) as Manifest)
+      .catch(() => null),
+    // The head pointer is a tiny object holding a decimal sequence number.
+    getText(`${ns}/wal-head`)
+      .then((b) => {
+        const n = Number(b.trim());
+        return Number.isFinite(n) ? n : null;
+      })
+      .catch(() => null),
+  ]);
+  return { namespace: ns, manifest, walHead, elapsedMs: Date.now() - started };
+}
+
+export interface ObjectRow {
+  key: string;
+  size: number;
+}
+
+/** Every object under a namespace, largest first. A plain LIST — no decoding. */
+export async function listNamespaceObjects(ns: string, limit: number): Promise<{
+  objects: ObjectRow[];
+  total: number;
+  totalBytes: number;
+}> {
+  const keys = await listKeys(`${ns}/`);
+  const totalBytes = keys.reduce((s, k) => s + k.size, 0);
+  const objects = keys
+    .map((k) => ({ key: k.key, size: k.size }))
+    .sort((a, b) => b.size - a.size)
+    .slice(0, limit);
+  return { objects, total: keys.length, totalBytes };
+}
+
+export interface WalRow {
+  seq: number;
+  key: string;
+  size: number;
+}
+
+/**
+ * The retained WAL window for a namespace, newest first. Sequence comes from the key and size from
+ * the listing, so this needs no decode — which is the whole point: entry payloads are binary.
+ */
+export async function listWalObjects(ns: string, limit: number): Promise<{
+  entries: WalRow[];
+  total: number;
+  totalBytes: number;
+}> {
+  const keys = await listKeys(`${ns}/wal/`);
+  const rows = keys
+    .map((k) => {
+      const file = k.key.slice(k.key.lastIndexOf("/") + 1);
+      const seq = Number(file.split(".")[0]);
+      return Number.isFinite(seq) ? { seq, key: k.key, size: k.size } : null;
+    })
+    .filter((r): r is WalRow => r !== null);
+  const totalBytes = rows.reduce((s, r) => s + r.size, 0);
+  rows.sort((a, b) => b.seq - a.seq);
+  return { entries: rows.slice(0, limit), total: rows.length, totalBytes };
+}

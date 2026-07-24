@@ -32,12 +32,8 @@ spec:
             # when MEMLAKE_OBS_S3_* is unset, so this grants read access with no extra secret.
             - secretRef:
                 name: {{ .Values.s3.existingSecret }}
-          env:
-            # Inspection console talks to the proxy (any serve pod can answer admin RPCs).
-            - name: MEMLAKE_ADDR
-              value: "{{ include "memlake.fullname" . }}-proxy:{{ .Values.proxy.service.port }}"
-            - name: MEMLAKE_PROTO_PATH
-              value: /app/proto/memlake/v1/memlake.proto
+          # No env beyond the S3 block above: the console reads object storage ONLY — no gRPC
+          # endpoint, no proxy dependency, no proto file. It works even when every serve pod is down.
           ports:
             - name: http
               containerPort: 3000

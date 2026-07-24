@@ -1,51 +1,27 @@
 import { NextResponse } from "next/server";
 
-import { listWalToJson } from "@/lib/convert";
-import {
-  coerceInt64,
-  coerceUint32,
-  errorResponse,
-  readJson,
-} from "@/lib/http";
-import { memlake } from "@/lib/memlake";
-import type { ListWalRequestBody } from "@/lib/types";
+import { errorResponse } from "@/lib/http";
+import { listWalObjects } from "@/lib/obs";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
 
-const MAX_LIMIT = 500;
+const MAX = 2000;
 
 /**
- * The write-ahead log as an operator view.
- *
- * POST rather than GET so `start_seq` (a u64 that must survive as a string) and
- * the include_ops flag travel in a body instead of being stringified through a
- * query param.
- *
- * Note this is a window on the LIVE log, not a history: entries at or below
- * `wal_index_cursor` are folded and may already have been reclaimed by GC.
+ * The retained WAL window, newest sequence first. Sequence comes from the key and size from the
+ * listing, so no entry payload is decoded — they are binary, and decoding is the engine's job.
  */
-export async function POST(
+export async function GET(
   req: Request,
   ctx: { params: Promise<{ namespace: string }> },
 ): Promise<NextResponse> {
-  const started = Date.now();
   try {
     const { namespace } = await ctx.params;
-    const body = await readJson<Partial<ListWalRequestBody>>(req);
-
-    const startSeq = coerceInt64(body.startSeq, "start_seq") ?? "0";
-    const limit = Math.min(coerceUint32(body.limit, "limit"), MAX_LIMIT);
-
-    const res = await memlake.listWal({
-      namespace: decodeURIComponent(namespace),
-      startSeq,
-      limit,
-      includeOps: Boolean(body.includeOps),
-    });
-
-    return NextResponse.json(listWalToJson(res, Date.now() - started));
+    const limit = Math.min(Number(new URL(req.url).searchParams.get("limit")) || 500, MAX);
+    const out = await listWalObjects(decodeURIComponent(namespace), limit);
+    return NextResponse.json(out);
   } catch (e) {
-    return errorResponse(e, "ListWal");
+    return errorResponse(e, "wal");
   }
 }

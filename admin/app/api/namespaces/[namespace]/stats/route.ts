@@ -1,29 +1,27 @@
 import { NextResponse } from "next/server";
-import type { NextRequest } from "next/server";
 
-import { statsToJson } from "@/lib/convert";
 import { errorResponse } from "@/lib/http";
-import { memlake } from "@/lib/memlake";
+import { readNamespaceState } from "@/lib/obs";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
 
 /**
- * Index state for one namespace. Reads the manifest and each type's metadata —
- * no cluster data — so its cost is independent of corpus size.
+ * A namespace's index state, read from S3: `manifest.json` plus the live `wal-head` pointer.
+ *
+ * Everything here is authoritative on-disk state, so it needs no serve node. What it deliberately
+ * does NOT report is a live document count — that requires replaying the un-indexed WAL tail, which
+ * is the engine's job. The indexed count and the backlog are reported separately instead.
  */
 export async function GET(
-  _req: NextRequest,
+  _req: Request,
   ctx: { params: Promise<{ namespace: string }> },
 ): Promise<NextResponse> {
-  const started = Date.now();
   try {
     const { namespace } = await ctx.params;
-    const res = await memlake.stats({
-      namespace: decodeURIComponent(namespace),
-    });
-    return NextResponse.json(statsToJson(res, Date.now() - started));
+    const state = await readNamespaceState(decodeURIComponent(namespace));
+    return NextResponse.json(state);
   } catch (e) {
-    return errorResponse(e, "Stats");
+    return errorResponse(e, "namespace state");
   }
 }

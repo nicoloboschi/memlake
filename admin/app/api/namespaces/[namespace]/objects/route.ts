@@ -1,44 +1,24 @@
 import { NextResponse } from "next/server";
 
-import { listObjectsToJson } from "@/lib/convert";
-import { coerceUint32, errorResponse, readJson } from "@/lib/http";
-import { memlake } from "@/lib/memlake";
-import type { ListObjectsRequestBody } from "@/lib/types";
+import { errorResponse } from "@/lib/http";
+import { listNamespaceObjects } from "@/lib/obs";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
 
-const MAX_LIMIT = 2000;
+const MAX = 2000;
 
-/**
- * Every object the namespace owns in object storage — the PHYSICAL view, as
- * against Stats, which is the logical one.
- *
- * POST rather than GET because the page token is opaque server state that has
- * no business being URL-encoded into a query string, and because the paging
- * pattern then matches Scan and ListWal exactly.
- */
-export async function POST(
+/** Every object under the namespace prefix, largest first. A LIST — nothing is decoded. */
+export async function GET(
   req: Request,
   ctx: { params: Promise<{ namespace: string }> },
 ): Promise<NextResponse> {
-  const started = Date.now();
   try {
     const { namespace } = await ctx.params;
-    const body = await readJson<Partial<ListObjectsRequestBody>>(req);
-
-    // 0 is meaningful: it asks the server for its own default.
-    const limit = Math.min(coerceUint32(body.limit, "limit"), MAX_LIMIT);
-    const pageToken = typeof body.pageToken === "string" ? body.pageToken : "";
-
-    const res = await memlake.listObjects({
-      namespace: decodeURIComponent(namespace),
-      limit,
-      pageToken,
-    });
-
-    return NextResponse.json(listObjectsToJson(res, Date.now() - started));
+    const limit = Math.min(Number(new URL(req.url).searchParams.get("limit")) || 500, MAX);
+    const out = await listNamespaceObjects(decodeURIComponent(namespace), limit);
+    return NextResponse.json(out);
   } catch (e) {
-    return errorResponse(e, "ListObjects");
+    return errorResponse(e, "objects");
   }
 }
