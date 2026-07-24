@@ -127,6 +127,29 @@ which only touches the write path.)
 becomes the constraint, the lever is the exact-rerank contender set (how many candidates the error
 bound leaves in play), not the scan.
 
+**F8 — Confirmed on real data: the "rerank is 90% of query CPU" result was a synthetic artifact.**
+F7 predicted, from a recall test through the RaBitQ path, that the stage-two hotspot only appears on
+*unstructured* queries: with genuine near-neighbours the `hi >= tau` bound prunes to ~k. The perf
+runner now drives load from a **real, pre-embedded dataset** (BEIR scifact — real passages and real
+questions, embedded offline; `perf/prepare_dataset.py` + `PERF_DATASET`), so this could be measured
+end-to-end instead of inferred. Same cluster, same build:
+
+| | synthetic random vectors | real scifact corpus |
+|---|---|---|
+| rerank share of query CPU | **90 %** (≈370 ms/query) | **32 %** (≈3.2 ms/query) |
+| rerank vector fetches / query | ~8 000 | **~0** |
+| query warm p50 | 88 ms | **32.6 ms** |
+
+A ~115× drop in absolute rerank cost — the two-stage narrowing works exactly as designed once the
+similarity distribution is realistic. It also surfaced a signal the synthetic runner could not: with
+real question *text* the **FTS arm is now 67.8 %** of query CPU (the old driver sent no text, so the
+text arm never ran). That is the next place to look if query CPU matters.
+
+*Caveat:* the real corpus is 5 183 docs vs 20 000 synthetic, so the absolute latencies are not a
+like-for-like scale comparison; the CPU **share** and the rerank fetch count are the meaningful
+numbers. Embedding is done offline and the artifact is fetched before timing, so no vector
+generation touches the hot path.
+
 ## Recommended next
 
 - **F5**: fixed (batched the fold-time doc-count pk probe); rerun the benchmark to capture the

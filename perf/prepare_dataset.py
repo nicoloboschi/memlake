@@ -14,8 +14,8 @@ engine reads), then packs a compact, self-describing artifact:
 Then upload the directory to S3 and point the perf Job at it (see perf/README.md):
 
     uv run --project bench python perf/prepare_dataset.py --dataset scifact \\
-        --model jinaai/jina-embeddings-v3 --out /tmp/perf-scifact-jina
-    aws s3 sync /tmp/perf-scifact-jina s3://$BUCKET/_perf/scifact-jina-v3/
+        --from-cache --out /tmp/perf-scifact
+    aws s3 sync /tmp/perf-scifact s3://$BUCKET/_perf/scifact-bge-small/
 
 Embedding runs HERE, once, on CPU/GPU — deliberately off the runner's write/query timing.
 """
@@ -53,7 +53,7 @@ def _embed(model_name: str, texts: list[str], batch_size: int, label: str) -> np
     for vec in model.embed(texts, batch_size=batch_size):
         out.append(np.asarray(vec, dtype=np.float32))
         done += 1
-        if done % 1000 == 0:
+        if done % 250 == 0:
             print(f"[prep] {label}: {done}/{len(texts)}", flush=True)
     a = np.ascontiguousarray(np.vstack(out), dtype=np.float32)
     norms = np.linalg.norm(a, axis=1, keepdims=True)
@@ -66,18 +66,52 @@ def main() -> int:
     ap.add_argument("--dataset", default="scifact", help="BEIR dataset name")
     ap.add_argument(
         "--model",
-        default="jinaai/jina-embeddings-v3",
-        help="fastembed model name (dim comes from the model; the runner is dim-agnostic)",
+        default="BAAI/bge-small-en-v1.5",
+        help=(
+            "fastembed model name (dim comes from the model; the runner is dim-agnostic). "
+            "Default matches the bench embedding cache, so --from-cache is free. Bigger models "
+            "are far slower to embed on CPU: measured on scifact (5183 docs), bge-large-en-v1.5 "
+            "(1024d) ran at ~0.2 docs/s and jina-embeddings-v3 (1024d, 8192 ctx) was worse — "
+            "hours either way. Use a GPU box if you want a 1024d artifact."
+        ),
     )
     ap.add_argument("--split", default=None, help="qrels split (default: dataset's default)")
     ap.add_argument("--out", required=True, help="output directory for the artifact")
     ap.add_argument("--batch-size", type=int, default=128)
     ap.add_argument("--max-docs", type=int, default=0, help="subset the corpus (0 = all)")
+    ap.add_argument(
+        "--from-cache",
+        action="store_true",
+        help=(
+            "reuse the existing testdata/embeddings/{dataset} cache instead of embedding "
+            "(read-only; --model/--max-docs are ignored, the cache's model wins)"
+        ),
+    )
     args = ap.parse_args()
 
     datasets.download(args.dataset)
     beir = datasets.load(args.dataset, args.split)
     print(f"[prep] {args.dataset}: {beir.n_docs} docs, {beir.n_queries} queries")
+
+    if args.from_cache:
+        # Read-only reuse of the shared cache (whatever model built it), so a perf artifact costs
+        # nothing when the vectors already exist. Texts are aligned to the cache's row order.
+        cached = embed.load(args.dataset)
+        text_by_id = dict(zip(beir.corpus_ids, beir.corpus_texts))
+        qtext_by_id = dict(zip(beir.query_ids, beir.query_texts))
+        corpus_ids = list(cached.corpus_ids)
+        corpus_texts = [text_by_id[i] for i in corpus_ids]
+        corpus_vecs = np.ascontiguousarray(cached.corpus, dtype=np.float32)
+        query_vecs = np.ascontiguousarray(cached.queries, dtype=np.float32)
+        query_texts = [qtext_by_id[i] for i in cached.query_ids]
+        model_name = cached.meta.get("model", "unknown")
+        prefix = cached.meta.get("query_prefix", "")
+        dim = int(corpus_vecs.shape[1])
+        print(f"[prep] reusing cache: model={model_name} dim={dim} ({len(corpus_ids)} docs)")
+        return _write(
+            Path(args.out), args.dataset, model_name, dim, corpus_ids, corpus_texts,
+            corpus_vecs, query_vecs, query_texts, prefix,
+        )
 
     corpus_ids, corpus_texts = beir.corpus_ids, beir.corpus_texts
     if args.max_docs and args.max_docs < len(corpus_ids):
@@ -98,7 +132,14 @@ def main() -> int:
     dim = int(corpus_vecs.shape[1])
     print(f"[prep] embedded with {args.model} (dim={dim})")
 
-    out = Path(args.out)
+    return _write(
+        Path(args.out), args.dataset, args.model, dim, corpus_ids, corpus_texts,
+        corpus_vecs, query_vecs, beir.query_texts, prefix,
+    )
+
+
+def _write(out, dataset, model, dim, corpus_ids, corpus_texts, corpus_vecs, query_vecs,
+           query_texts, prefix) -> int:
     out.mkdir(parents=True, exist_ok=True)
     with open(out / "corpus.npy", "wb") as f:
         np.save(f, corpus_vecs, allow_pickle=False)
@@ -106,23 +147,23 @@ def main() -> int:
         np.save(f, query_vecs, allow_pickle=False)
     (out / "corpus_ids.json").write_text(json.dumps(corpus_ids))
     (out / "corpus_texts.json").write_text(json.dumps(corpus_texts))
-    (out / "query_texts.json").write_text(json.dumps(beir.query_texts))
+    (out / "query_texts.json").write_text(json.dumps(query_texts))
     (out / "meta.json").write_text(
         json.dumps(
             {
-                "dataset": args.dataset,
-                "model": args.model,
+                "dataset": dataset,
+                "model": model,
                 "dim": dim,
                 "n_docs": len(corpus_ids),
-                "n_queries": len(beir.query_texts),
+                "n_queries": len(query_texts),
                 "normalized": True,
                 "query_prefix": prefix,
                 "row_order": "corpus.npy[i] <-> corpus_ids[i] <-> corpus_texts[i]; queries.npy[i] <-> query_texts[i]",
             }
         )
     )
-    print(f"[prep] wrote artifact to {out} ({len(corpus_ids)} docs, {len(beir.query_texts)} queries, dim {dim})")
-    print(f"[prep] upload: aws s3 sync {out} s3://$BUCKET/_perf/{args.dataset}-<model-slug>/")
+    print(f"[prep] wrote artifact to {out} ({len(corpus_ids)} docs, {len(query_texts)} queries, dim {dim})")
+    print(f"[prep] upload: aws s3 sync {out} s3://$BUCKET/_perf/{dataset}-<model-slug>/")
     return 0
 
 
