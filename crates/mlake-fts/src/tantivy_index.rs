@@ -400,6 +400,213 @@ mod tests {
         TantivyFts::build(items, Tokenizer::default()).unwrap()
     }
 
+    /// Where the FTS arm's per-query time actually goes.
+    ///
+    /// The fleet trace put the text arm at ~68% of query CPU once the load driver started sending
+    /// real question text. This splits one `search_filtered` into (a) executing the BooleanQuery
+    /// and (b) turning the resulting DocAddresses into `MemoryId`s — which today means a doc-store
+    /// fetch per hit (`searcher.doc()`, a compressed-block decompression) plus a `Uuid::parse_str`,
+    /// because `id` is a `STORED` text field with no fast/columnar field to read instead.
+    ///
+    /// Prints the split; not an assertion of a target, just the measurement that says which half to
+    /// fix. Run with `--nocapture`.
+    #[test]
+    fn where_fts_query_time_goes() {
+        use std::time::Instant;
+        const DOCS: usize = 5_000;
+        const QUERIES: usize = 100;
+        const K: usize = 10;
+
+        // Deterministic Zipf-ish corpus: common words plus a rare per-doc marker, so posting lists
+        // have a realistic skew rather than every term matching everything.
+        let vocab: Vec<String> = (0..800).map(|i| format!("term{i}")).collect();
+        let mut seed = 12345u64;
+        let mut next = || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 33) as usize
+        };
+        let texts: Vec<String> = (0..DOCS)
+            .map(|d| {
+                let mut w: Vec<&str> = Vec::with_capacity(200);
+                for _ in 0..200 {
+                    // Skewed pick: squaring biases toward the front of the vocab.
+                    let r = next() % vocab.len();
+                    w.push(&vocab[(r * r) / vocab.len()]);
+                }
+                format!("doc{d} {}", w.join(" "))
+            })
+            .collect();
+        let items: Vec<(MemoryId, &str)> = texts
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (MemoryId::from_key(&format!("doc-{i}")), t.as_str()))
+            .collect();
+        let idx = TantivyFts::build(items, Tokenizer::default()).unwrap();
+
+        // ~15-word questions, the shape a real query has.
+        let queries: Vec<String> = (0..QUERIES)
+            .map(|_| {
+                let mut w: Vec<&str> = Vec::with_capacity(15);
+                for _ in 0..15 {
+                    let r = next() % vocab.len();
+                    w.push(&vocab[(r * r) / vocab.len()]);
+                }
+                w.join(" ")
+            })
+            .collect();
+
+        let filter = mlake_core::TagFilter::new(Vec::new(), mlake_core::TagsMatch::Any);
+        for q in &queries {
+            let _ = idx.search_filtered(q, K, &filter); // warm mmap/caches
+        }
+
+        let t = Instant::now();
+        let mut got = 0usize;
+        for q in &queries {
+            got += idx.search_filtered(q, K, &filter).len();
+        }
+        let full = t.elapsed();
+
+        // (a) query execution only — no doc-store access.
+        let searcher = idx.reader.searcher();
+        let mut addrs = Vec::new();
+        let t = Instant::now();
+        for q in &queries {
+            let terms = idx.tokenizer.query_terms(q);
+            let clauses: Vec<(Occur, Box<dyn Query>)> = terms
+                .iter()
+                .map(|tk| {
+                    let field = match tk.field {
+                        Field::Words => idx.schema_fields.words,
+                        Field::Bigrams => idx.schema_fields.bigrams,
+                    };
+                    let q: Box<dyn Query> = Box::new(TermQuery::new(
+                        Term::from_field_text(field, &tk.text),
+                        IndexRecordOption::WithFreqs,
+                    ));
+                    (Occur::Should, q)
+                })
+                .collect();
+            let top = searcher.search(&BooleanQuery::new(clauses), &TopDocs::with_limit(K)).unwrap();
+            addrs.push(top);
+        }
+        let exec = t.elapsed();
+
+        // (b) hit -> MemoryId only: the doc-store fetch + uuid parse the arm does per hit.
+        let t = Instant::now();
+        let mut ids = 0usize;
+        for top in &addrs {
+            for (_score, addr) in top {
+                let doc = searcher.doc::<TantivyDocument>(*addr).unwrap();
+                if let Some(s) = doc.get_first(idx.schema_fields.id).and_then(|v| v.as_str()) {
+                    if Uuid::parse_str(s).is_ok() {
+                        ids += 1;
+                    }
+                }
+            }
+        }
+        let hydrate = t.elapsed();
+
+        // (c) the EMPTY-tail search the arm runs on every text query once a fold has drained the
+        // tail: tokenize + build the BooleanQuery + search an index with no documents.
+        let empty = TantivyFts::build(Vec::<(MemoryId, &str)>::new(), Tokenizer::default()).unwrap();
+        for q in &queries {
+            let _ = empty.search_filtered(q, K, &filter);
+        }
+        let t = Instant::now();
+        for q in &queries {
+            let _ = empty.search_filtered(q, K, &filter);
+        }
+        let empty_search = t.elapsed();
+
+        // (d) tokenization alone — paid once per index searched, so once per segment + the tail.
+        let t = Instant::now();
+        let mut terms_total = 0usize;
+        for q in &queries {
+            terms_total += idx.tokenizer.query_terms(q).len();
+        }
+        let tokenize = t.elapsed();
+
+        let per = |d: std::time::Duration| d.as_secs_f64() * 1000.0 / QUERIES as f64;
+        println!(
+            "fts {DOCS} docs, {QUERIES} queries, k={K}, {:.1} terms/query:\n  \
+             full          {:.3} ms/q\n  \
+             exec          {:.3} ms/q\n  \
+             id-hydrate    {:.3} ms/q  ({:.1}% of full)\n  \
+             EMPTY-tail    {:.3} ms/q  (paid every text query once the tail has folded)\n  \
+             tokenize      {:.3} ms/q  (paid per index searched: tail + each segment)\n  \
+             [{got} hits, {ids} ids]",
+            terms_total as f64 / QUERIES as f64,
+            per(full),
+            per(exec),
+            per(hydrate),
+            100.0 * hydrate.as_secs_f64() / full.as_secs_f64().max(1e-9),
+            per(empty_search),
+            per(tokenize),
+        );
+    }
+
+    /// Reading `words` only (instead of `words` + the duplicate `bigrams` posting list) must not
+    /// change what a Latin query returns, nor in what order.
+    ///
+    /// Indexing writes each Latin token to both fields with identical content, so both fields have
+    /// identical postings and lengths: every document's score is scaled by the same constant when
+    /// the duplicate clause is dropped, leaving the ranking fixed. This pins that against the
+    /// both-fields query the arm used to issue.
+    #[test]
+    fn dropping_the_duplicate_latin_field_preserves_ranking() {
+        let docs: Vec<(String, String)> = (0..200)
+            .map(|i| {
+                (
+                    format!("d{i}"),
+                    format!(
+                        "alpha beta gamma delta epsilon doc{i} {}",
+                        vec!["zeta eta theta"; (i % 7) + 1].join(" ")
+                    ),
+                )
+            })
+            .collect();
+        let items: Vec<(MemoryId, &str)> =
+            docs.iter().map(|(id, t)| (MemoryId::from_key(id), t.as_str())).collect();
+        let idx = TantivyFts::build(items, Tokenizer::default()).unwrap();
+        let filter = mlake_core::TagFilter::new(Vec::new(), mlake_core::TagsMatch::Any);
+
+        for q in ["alpha zeta", "beta theta eta", "gamma delta epsilon zeta"] {
+            // What the arm does now: `words` only.
+            let now: Vec<MemoryId> =
+                idx.search_filtered(q, 20, &filter).into_iter().map(|h| h.id).collect();
+
+            // What it used to do: the same terms against BOTH fields.
+            let searcher = idx.reader.searcher();
+            let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
+            for tk in idx.tokenizer.query_terms(q) {
+                for field in [idx.schema_fields.words, idx.schema_fields.bigrams] {
+                    clauses.push((
+                        Occur::Should,
+                        Box::new(TermQuery::new(
+                            Term::from_field_text(field, &tk.text),
+                            IndexRecordOption::WithFreqs,
+                        )) as Box<dyn Query>,
+                    ));
+                }
+            }
+            let top = searcher
+                .search(&BooleanQuery::new(clauses), &TopDocs::with_limit(20))
+                .unwrap();
+            let before: Vec<MemoryId> = top
+                .into_iter()
+                .filter_map(|(_, addr)| {
+                    let doc = searcher.doc::<TantivyDocument>(addr).ok()?;
+                    let s = doc.get_first(idx.schema_fields.id)?.as_str()?;
+                    Uuid::parse_str(s).ok().map(MemoryId::from)
+                })
+                .collect();
+
+            assert_eq!(now, before, "ranking changed for query {q:?}");
+            assert!(!now.is_empty(), "query {q:?} matched nothing");
+        }
+    }
+
     #[test]
     fn finds_documents_by_term() {
         let idx = build(&[

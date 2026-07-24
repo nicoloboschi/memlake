@@ -146,25 +146,40 @@ impl Tokenizer {
         converted.to_lowercase()
     }
 
-    /// Tokenize text into field-tagged tokens.
+    /// Tokenize text for **indexing**: a Latin token is written to both fields (see
+    /// [`Self::query_terms`] for why the query side does not read both back).
     pub fn tokenize(&self, text: &str) -> Vec<Token> {
-        let normalized = self.normalize(text);
-        let mut tokens = Vec::new();
-        for run in script_runs(&normalized) {
-            self.tokenize_run(run, &mut tokens);
-        }
-        tokens
+        self.tokenize_with(text, true)
     }
 
-    /// The distinct term set of a query, used to plan which postings to read.
+    /// The distinct term set of a **query**, used to plan which postings to read.
+    ///
+    /// Latin terms are emitted to `words` only. Indexing puts every Latin token in *both* fields,
+    /// so `words` alone already matches every document that could match — reading `bigrams` too
+    /// just scans a second, identical posting list per term. That doubled the query's term count
+    /// (measured: a 15-word question expanded to ~29 terms), and executing the term union is ~98%
+    /// of the FTS arm's cost. CJK is untouched: Han runs genuinely need both the dictionary words
+    /// (precision) and the character bigrams (OOV recall), and kana/hangul only have bigrams.
+    ///
+    /// Recall is identical; per-term scores drop by the constant factor that the duplicate field
+    /// was contributing, so ranking within a Latin corpus is unchanged.
     pub fn query_terms(&self, text: &str) -> Vec<Token> {
-        let mut tokens = self.tokenize(text);
+        let mut tokens = self.tokenize_with(text, false);
         tokens.sort_by(|a, b| (a.field as u8, &a.text).cmp(&(b.field as u8, &b.text)));
         tokens.dedup();
         tokens
     }
 
-    fn tokenize_run(&self, run: Run<'_>, out: &mut Vec<Token>) {
+    fn tokenize_with(&self, text: &str, latin_dual: bool) -> Vec<Token> {
+        let normalized = self.normalize(text);
+        let mut tokens = Vec::new();
+        for run in script_runs(&normalized) {
+            self.tokenize_run(run, &mut tokens, latin_dual);
+        }
+        tokens
+    }
+
+    fn tokenize_run(&self, run: Run<'_>, out: &mut Vec<Token>, latin_dual: bool) {
         match run.kind {
             RunKind::Han => {
                 // Dual emission: dictionary words for precision, bigrams for OOV recall.
@@ -196,10 +211,15 @@ impl Tokenizer {
                     } else {
                         word
                     };
-                    // Latin tokens hit both fields so a query term matches whichever field
-                    // a mixed-script document happened to place it in.
-                    out.push(Token::words(word.clone()));
-                    out.push(Token::bigrams(word));
+                    // Indexing writes a Latin token to both fields, so a mixed-script document
+                    // matches whichever field it landed in. A query reads `words` only — the
+                    // duplicate posting list adds cost, not recall. See `query_terms`.
+                    if latin_dual {
+                        out.push(Token::words(word.clone()));
+                        out.push(Token::bigrams(word));
+                    } else {
+                        out.push(Token::words(word));
+                    }
                 }
             }
         }
@@ -395,8 +415,20 @@ mod tests {
         let t = Tokenizer::default();
         let terms = t.query_terms("test test test");
         let count = terms.iter().filter(|t| t.text == "test").count();
-        // Once per field (words + bigrams), not once per occurrence.
-        assert_eq!(count, 2, "got {terms:?}");
+        // Once, not once per occurrence — and for Latin, only the `words` field: indexing puts the
+        // token in both fields, so reading `bigrams` back would scan an identical posting list.
+        assert_eq!(count, 1, "got {terms:?}");
+        assert!(terms.iter().all(|t| t.field == Field::Words), "got {terms:?}");
+    }
+
+    /// The query-side single emission is only safe because indexing still writes Latin tokens to
+    /// BOTH fields — that is what makes `words` alone sufficient to match any document.
+    #[test]
+    fn indexing_still_writes_latin_to_both_fields() {
+        let t = Tokenizer::default();
+        let tokens = t.tokenize("test");
+        assert!(tokens.iter().any(|t| t.field == Field::Words && t.text == "test"), "{tokens:?}");
+        assert!(tokens.iter().any(|t| t.field == Field::Bigrams && t.text == "test"), "{tokens:?}");
     }
 
     #[test]
