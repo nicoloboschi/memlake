@@ -55,6 +55,21 @@ mostly **operational and packaging**, not features. Grouped by how hard it block
 
 ### 0b. Correctness gaps that fail *silently* in production
 
+- [x] **Engine surfaces that bypassed the store — DONE.** An audit found ~13 sites
+      still issuing `memory_units` / `memory_links` SQL on paths that run for *any*
+      store, so under memlake they hit empty tables: the whole curation surface
+      (`delete_bank` — which orphaned the namespace entirely — `delete_document`,
+      `update_document`, `clear_observations{,_for_memory}`, `retry_failed_consolidation`,
+      delta-retain tag propagation and chunk deletes), recall context-expansion
+      (observation source-chunks, reflect's `expand`), and the residual stats
+      (consolidation freshness, per-document counts, per-bank `fact_count`). Each is
+      now gated on `writes_memory_rows_in_sql`: the SQL branch is byte-identical, the
+      other routes through the store. `find_failed_consolidation` was added to the
+      contract for the retry path. Verified 28/28 against *both* backends after
+      making the fixtures seed and assert through the store rather than raw SQL —
+      which is what caught the last bug (a fact-type-scoped `delete_bank` read its
+      sweep ids from `memory_units`, so the stale-observation sweep silently skipped).
+
 - [ ] **Cross-store atomicity — design decided, not yet built (see §7).** Postgres
       stays the single commit authority; memlake is a dumb idempotent target (no
       2PC). Sync retain disabled under memlake; async retain compensates a failed op
@@ -92,13 +107,14 @@ mostly **operational and packaging**, not features. Grouped by how hard it block
       reads** via `MetadataStats` (§5b, implemented); `get_memories_timeseries` and
       `list_observation_scopes` stay bounded scans (time buckets and tag sets are
       different primitives — TimeTable / a tag multiset). Bank-stats *link* counts
-      stay `{}` (memlake edges are not a countable relation — §2).
+      now return real numbers too, off `LinkStats` / `EntityStats` rather than a
+      queryable edge relation (§2).
 - [ ] **`list_tags` is O(corpus) per call → §5.** No `ListTags` RPC / tag-count
       histogram yet.
 - [ ] **Smaller parity gaps:** no scan ordering (curation list comes back in
       storage order, not `mentioned_at DESC` → §5); no key-*absence* predicate
-      (worked around with a positive `consolidated` flag → §5); nested tag groups
-      applied in Python, so they can trim below the limit → §4.
+      (worked around with a positive `consolidated` flag → §5). *(Nested tag groups
+      were the third gap here — now pushed down and applied inline, §4.)*
 
 ### 0e. Performance / polish
 
@@ -186,8 +202,13 @@ What is still missing is only the *stored* edge types:
       adjacency from the timestamps already on the payload. `causal_out` is already
       on the payload but Hindsight does not yet render it in the graph.
 
-- [ ] **Bank-stats link counts stay `{}`.** Countable only once edges are a
-      queryable relation rather than a per-memory list; low value on its own.
+- [x] **Bank-stats link counts — DONE.** Counted *without* first making edges a
+      queryable relation: `semantic` / `causal` from the fold-time per-segment
+      `LinkStats` tally plus the WAL tail, `entity` from the `EntityStats` posting
+      index (the same `SUM(LEAST(n-1, cap))` Postgres computes, so the two agree),
+      `temporal` derived by sweeping the time index. A metadata read, not a corpus
+      walk. Routed through the store's `link_counts`, so the stats page no longer
+      disagrees with the graph view about whether links exist.
 
 ---
 
@@ -282,9 +303,19 @@ Two behaviours worth knowing, neither blocking:
         times the caller never mentioned.
         Verified over gRPC: a partial patch keeps the other three and still stamps
         `updated_at`; `replace_timestamps=True` clears them and stamps too.
-- [ ] **No nested tag groups.** memlake has five flat modes; Hindsight also supports
-      AND/OR/NOT trees, applied in Python after the query — so they can trim below
-      the requested limit.
+- [x] **Nested tag groups — DONE, pushed down.** A recursive `TagPredicate`
+      (leaf / and / or / not) on `Query` and `Scan`, evaluated server-side; leaves
+      reuse the five flat modes, so every per-mode subtlety (including how each
+      treats untagged memories) is inherited rather than reimplemented.
+
+      They no longer trim below the limit, because each arm applies the predicate
+      *inline, before it truncates to depth* — the dense arm off the block's
+      per-member tag column (a bit decode, no payload read), the FTS arm off its
+      stored tags (it already over-fetches internally to fill `k` passing), the
+      graph/temporal arms off the hydrated record. An arm's top-k is therefore
+      already the top-k that *pass*, so a match ranked below the top-k non-matches
+      is still returned. `Scan` applies it per member over the whole walk, where
+      there is no truncation to race at all. The Python post-filter is gone.
 
 ---
 
