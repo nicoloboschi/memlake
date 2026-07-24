@@ -14,6 +14,9 @@ RUN pip install --no-cache-dir /app/clients/python
 
 COPY demo/writer.py /app/writer.py
 # Also carry the k8s load driver, so the same image doubles as the perf loadgen Job.
+# numpy + boto3 are for its real-dataset mode: it pulls a precomputed artifact of production-model
+# embeddings from S3 (see perf/prepare_dataset.py). Embedding happens offline, never in the Job.
+RUN pip install --no-cache-dir "numpy>=1.26" "boto3>=1.34"
 COPY perf/k8s_load.py /app/k8s_load.py
 
 # Config comes from the environment (see writer.py): MEMLAKE_ADDR, MEMLAKE_DEMO_NAMESPACE,

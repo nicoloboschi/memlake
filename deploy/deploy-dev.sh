@@ -31,8 +31,10 @@ kubectl -n "$NS" create secret docker-registry ghcr \
   --docker-password="$(gh auth token)" \
   --dry-run=client -o yaml | kubectl apply -f -
 
-echo "==> AWS S3 secret (memlake-s3) from .env (QUERY + INDEXER blocks, uncommented only)"
-grep -E '^MEMLAKE_(QUERY|INDEXER)_S3_' "$ENV_FILE" \
+echo "==> AWS S3 secret (memlake-s3) from .env (QUERY + INDEXER + PERF blocks, uncommented only)"
+# PERF_* is for the perf Job only: it pulls the precomputed embedding artifact from S3 (see
+# perf/prepare_dataset.py). Harmless for serve/indexer, which read their own prefixes.
+grep -E '^MEMLAKE_(QUERY|INDEXER|PERF)_S3_' "$ENV_FILE" \
   | kubectl -n "$NS" create secret generic memlake-s3 --from-env-file=/dev/stdin \
       --dry-run=client -o yaml | kubectl apply -f -
 

@@ -20,14 +20,22 @@ spec:
           image: ghcr.io/nicoloboschi/memlake-loadgen:dev
           imagePullPolicy: Always
           command: ["python", "/app/k8s_load.py"]
+          # The S3 credentials the runner uses to pull the precomputed embedding artifact.
+          # (Same secret the serve/indexer pods use; only the PERF_* keys are read here.)
+          envFrom:
+            - secretRef: { name: memlake-s3 }
           env:
             - { name: MEMLAKE_ADDR, value: "memlake-proxy:50050" }   # the Envoy proxy Service
             - { name: MEMLAKE_LOAD_NAMESPACE, value: "perf" }
-            - { name: N_DOCS, value: "50000" }
+            # Real-corpus mode: S3 key prefix (under MEMLAKE_PERF_S3_BUCKET) of the artifact built
+            # by perf/prepare_dataset.py — real passages + real questions, embedded offline with a
+            # production model. Unset it to fall back to the synthetic Gaussian corpus.
+            - { name: PERF_DATASET, value: "_perf/scifact-jina-v3" }
+            - { name: N_DOCS, value: "50000" }         # capped at the dataset's corpus size
             - { name: BATCH, value: "512" }
             - { name: CONCURRENCY, value: "8" }        # concurrent writer threads (aggregate throughput)
             - { name: N_QUERIES, value: "300" }
-            - { name: DIM, value: "384" }
+            - { name: DIM, value: "384" }              # synthetic mode only; real mode takes dim from the artifact
             - { name: FOLD_WAIT_SECS, value: "180" }   # poll stats until backlog drains, then query steady-state
           resources:
             requests: { cpu: "1", memory: "512Mi" }
