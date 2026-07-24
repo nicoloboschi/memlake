@@ -48,66 +48,82 @@ move, and reserved/savings plans cut the compute line ~40 % on *both* sides.
 ### The table (D=1536, real-text byte model, $/month)
 
 memlake = S3 storage + S3 requests + one always-on box (serve + indexer co-located, scaling with
-QPS). PG = one RDS instance sized so vectors **and** the ANN index copy stay RAM-resident, + gp3.
+QPS). PG is priced in **three topologies**, because replication is most of the answer:
+single-AZ (cheapest honest floor), Multi-AZ (primary + standby), and **Multi-AZ + 2 read replicas —
+the realistic Hindsight prod config**. Each replica carries its own instance *and* storage.
 
-| memories | QPS | ML storage | ML S3 req | ML compute | **memlake** | PG instance | **PG total** | cheaper |
-|---:|---:|---:|---:|---:|---:|---|---:|---|
-| 10 k | 1 | $0.00 | $1.05 | $25 | **$26** | db.t4g.micro | **$14** | **PG 1.8×** |
-| 10 k | 10 | $0.00 | $10.51 | $25 | **$35** | db.t4g.micro | **$14** | **PG 2.5×** |
-| 10 k | 100 | $0.00 | $105 | $112 | **$218** | db.t4g.micro | **$14** | **PG 15.6×** |
-| 100 k | 1 | $0.02 | $1.07 | $25 | **$26** | db.t4g.medium | $50 | memlake 1.9× |
-| 100 k | 10 | $0.02 | $10.53 | $25 | **$35** | db.t4g.medium | $50 | memlake 1.4× |
-| 100 k | 100 | $0.02 | $105 | $112 | $218 | db.t4g.medium | **$50** | **PG 4.4×** |
-| 1 M | 1 | $0.25 | $1.22 | $25 | **$26** | db.r6g.xlarge | $332 | memlake 12.8× |
-| 1 M | 10 | $0.25 | $10.68 | $25 | **$35** | db.r6g.xlarge | $332 | memlake 9.4× |
-| 1 M | 100 | $0.25 | $105 | $112 | **$218** | db.r6g.xlarge | $332 | memlake 1.5× |
-| 10 M | 1 | $2.46 | $2.75 | $25 | **$30** | db.r6g.8xlarge | $2 664 | memlake 90× |
-| 10 M | 10 | $2.46 | $12.21 | $25 | **$39** | db.r6g.8xlarge | $2 664 | memlake 68× |
-| 10 M | 100 | $2.46 | $107 | $112 | **$222** | db.r6g.8xlarge | $2 664 | memlake 12× |
+PG instance size is also sensitivity-tested on how much of the ANN index you insist stays resident:
+**all-RAM** (vectors + ivfflat's near-full copy in memory — what a latency SLA wants) vs **25 % hot**
+(only the probed lists resident, accepting disk reads — cheaper and slower).
 
-### There are two crossovers, and both matter
+| memories | memlake @1 / @10 / @100 QPS | PG all-RAM: 1AZ / MultiAZ / **+2RR** | PG 25 % hot: **+2RR** |
+|---:|---:|---:|---:|
+| **10 k** | **$26 / $35 / $218** | $14 / $28 / **$56** | **$56** |
+| **100 k** | **$26 / $35 / $218** | $50 / $100 / **$199** | **$56** |
+| **1 M** | **$26 / $35 / $218** | $332 / $665 / **$1 329** | **$509** |
+| **10 M** | **$30 / $39 / $222** | $2 664 / $5 327 / **$10 655** | **$2 736** |
 
-**1. Scale: PG wins below ~50–100 k memories.** memlake's floor is an always-on box (~$25/mo) plus
-per-query requests; PG's floor at 10 k is a `db.t4g.micro` at ~$14/mo, and 10 k vectors fit in its
-RAM trivially. **Storage is irrelevant on both sides at this scale** — $0.00 vs $2.30. Anyone
-arguing memlake on cost at 10 k is arguing the wrong thing; the argument there is operational
-(stateless pods, no vacuum/failover), not COGS.
+memlake vs the realistic **PG Multi-AZ + 2 RR**, as a multiple (>1 = memlake cheaper):
 
-**2. QPS: the S3 request line flips it back to PG.** At 100 QPS the uncacheable head GET alone is
-**$105/mo** — more than memlake's compute, and it grows strictly linearly with QPS while PG's
-instance cost is flat until the box saturates. That is why 100 k @ 100 QPS goes back to PG by 4.4×.
-memlake's cost curve is *per-query*; PG's is *per-resident-byte*. Which one wins is entirely a
-question of which axis your workload is long on.
+| memories | @1 QPS | @10 QPS | @100 QPS | (25 % hot PG, @100 QPS) |
+|---:|---:|---:|---:|---:|
+| 10 k | 2.2× | 1.6× | **0.3× — PG wins** | 0.3× — PG wins |
+| 100 k | 7.8× | 5.7× | 0.9× — parity | 0.3× — PG wins |
+| 1 M | 51× | 38× | **6.1×** | 2.3× |
+| 10 M | **358×** | **272×** | **48×** | **12×** |
 
-**Where memlake wins decisively: many memories, moderate QPS.** At 10 M the PG instance must hold
-~139 GB of vectors + index in RAM (a `db.r6g.8xlarge`, $2 664/mo) while memlake holds the corpus in
-S3 at $2.46/mo and pays only for the working set it touches. That is the actual shape of the
-argument — not "S3 is cheaper per GB".
+### What the shape actually is
 
-### The highest-leverage cost fix is the head GET
+**The two cost curves scale on different axes.** memlake = a small fixed floor + a line that is
+**linear in QPS** (one S3 GET per query) and nearly flat in corpus size. PG = a line that is
+**linear in resident bytes × replica count** and flat in QPS until the box saturates. So:
 
-At every scale above, memlake's marginal cost per query is *one S3 GET*. Coalescing **concurrent**
-in-flight head reads onto a single GET would cut that line by the in-flight factor at no consistency
-cost (simultaneous readers may legitimately share one head observation). A short TTL would cut it
-further but does weaken strong consistency, so it is a product decision rather than a free win. At
-100 QPS a 10× coalescing factor turns $105/mo into ~$10/mo and moves the 100 k @ 100 QPS row from
-"PG 4.4× cheaper" to roughly parity. **This is the single number to attack before quoting memlake
-as cheap at QPS.**
+- **PG only wins where the corpus is small and QPS is high** — 10 k @ 100 QPS, and 100 k @ 100 QPS
+  against a cheap PG. That is the whole of PG's territory, and it is narrow.
+- **Everywhere the corpus is large, memlake wins by one to two orders of magnitude**, and adding QPS
+  does not rescue PG: at 10 M, going from 1 → 100 QPS costs memlake **+$192/mo** and it is *still*
+  **48× cheaper** than PG Multi-AZ + 2 RR ($222 vs $10 655). The $105 request line is only
+  significant when it is compared against a $14–56 instance, i.e. only at toy corpus sizes.
 
-### What this table does NOT model
+**Why the 10 M gap is that large** (it is the number that looks implausible, so: ) at 10 M × D=1536,
+PG must keep ~139 GB — 61.5 GB of vectors, another ~61.5 GB because ivfflat stores a near-full second
+copy in its lists, ~16 GB of rows/links — on **provisioned** RAM, and then pay for it **four times**
+across primary + standby + 2 replicas. memlake keeps the same corpus in S3 for **$2.46/mo** and
+provisions RAM only for the `nprobe`-bounded working set it actually touches. Even forcing PG down to
+"25 % hot" (a real latency sacrifice) it is $2 736 vs $222. **This gap is the architecture, not a
+pricing trick** — it is the same reason the design is object-storage-native in the first place.
 
-- **memlake at 1 fact type.** All measurements are single-type; the design's stated worst case is
-  `FANOUT = 3`, which triples query CPU (so the compute column, not the request column).
-- **No scale-to-zero.** memlake's serve is stateless and *could* scale to zero between queries,
-  which would erase the $25 floor and win the 10 k row outright. Not implemented/measured, so not
-  credited.
-- **PG's index build cost and vacuum/bloat headroom** are only in the ×1.5 storage factor, and PG's
-  ANN recall at these instance sizes is assumed adequate, not measured. If the index does *not* stay
-  RAM-resident, PG gets much cheaper and much slower — a latency/COGS trade this table does not price.
-- **Multi-AZ / replicas.** PG here is **single-AZ, no replica** — the cheapest honest configuration.
-  Real prod PG is usually Multi-AZ (≈2×), which roughly doubles every PG number above and moves the
-  10 k crossover close to parity.
-- **Egress, backups, ops labour** — see "What this leaves out" at the end.
+### The head GET is the fix that widens the narrow case
+
+memlake's marginal cost per query is *one S3 GET* (the uncacheable WAL-head read). That line only
+decides anything in PG's narrow territory — small corpus, high QPS — but it is cheap to attack:
+coalescing **concurrent** in-flight head reads onto a single GET costs **nothing** in consistency
+(simultaneous readers may legitimately share one head observation) and cuts the line by the in-flight
+factor. A short TTL would cut it further but does weaken strong consistency, so that one is a product
+decision. At 100 QPS a 10× coalescing factor turns $105/mo into ~$10/mo, which flips **10 k @ 100 QPS
+and 100 k @ 100 QPS back to memlake** — i.e. it removes PG's remaining territory almost entirely.
+
+### What this table does NOT model — read before quoting the 10 M row
+
+- **memlake's 10 M column is extrapolated, and it is the optimistic direction.** `28 QPS/vCPU` was
+  measured at **100 k** on MinIO, and `compute-cost.md` explicitly warns against extrapolating it:
+  per-query CPU grows with corpus (more candidates per probe). The request line assumes **warm**
+  (1 GET/query); if a 10 M working set does not fit the 1 GB memory + 8 GB disk cache, queries go
+  cold at **4.3 GETs** — 4.3× that line ($450/mo at 100 QPS instead of $105). Both effects push
+  memlake up. Neither closes a 12–358× gap, but the 10 M row should be read as "one to two orders of
+  magnitude", not as three significant figures.
+- **memlake at 1 fact type.** All measurements are single-type; the stated worst case is
+  `FANOUT = 3`, which triples query **CPU** (the compute column, not the request column).
+- **No scale-to-zero credit.** memlake's serve is stateless and *could* scale to zero between
+  queries, erasing the $25 floor and winning 10 k outright. Not implemented, so not credited.
+- **PG's ANN recall is assumed adequate, not measured.** The "25 % hot" row is a cost/latency trade
+  this table prices only on the cost side; a disk-resident ivfflat is materially slower, and matching
+  memlake's recall may need HNSW, which is *more* memory-hungry than the ivfflat modelled here.
+- **PG's vacuum/bloat headroom** is only the ×1.5 storage factor; index rebuilds are not priced.
+- **Reserved instances / savings plans** cut the compute line ~40 % on both sides, so they compress
+  the ratios somewhat but do not change any winner.
+- **Egress, backups, ops labour** — see "What this leaves out" at the end. Backups notably favour
+  memlake (the bucket *is* the durable copy; RDS snapshots are a separate billed line ×4 copies).
 
 ## The two architectures, at the storage layer
 
@@ -265,8 +281,9 @@ tiering bends down.
 ## Honest summary
 
 > Superseded for decisions by [Measured total COGS](#measured-total-cogs-storage--requests--compute).
-> In one line: **PG is cheaper below ~50–100 k memories and at high QPS; memlake wins from ~1 M up at
-> moderate QPS, by ~10–90×.** The bullets below are the storage-only view.
+> In one line: against a realistic **Multi-AZ + 2-replica** PG, memlake is cheaper at every scale
+> except small-corpus-high-QPS, and is **48–358× cheaper at 10 M**. The bullets below are the
+> storage-only view.
 
 - **Per useful GB, memlake storage is ~6–30× cheaper** depending on the PG replication topology,
   driven by S3's medium price and free internal replication vs PG's per-copy block storage.
