@@ -180,10 +180,10 @@ export function FleetCacheView() {
                   }
                   actions={
                     <Link
-                      href={`/traces?node=${encodeURIComponent(h.node_id)}`}
+                      href={`/services/${encodeURIComponent(h.node_id)}/cache`}
                       className="font-mono text-[11px] text-ink-dim hover:text-accent border border-line rounded-sm px-2 py-1"
                     >
-                      traces →
+                      inspect →
                     </Link>
                   }
                   bodyClassName="p-3 flex flex-col gap-3"

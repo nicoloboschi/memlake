@@ -7,7 +7,6 @@ import { getJson, isAbort } from "@/lib/client";
 import { fmtMs, groupDigits } from "@/lib/format";
 import {
   Button,
-  CopyableId,
   Empty,
   ErrorBanner,
   Loading,
@@ -99,13 +98,13 @@ export function ObservabilityView() {
         title="services — serve fleet"
         subtitle={
           <>
-            Read straight from <code>_obs/traces/</code> in the bucket — one bounded ring per serve
-            node, uploaded every ~5s. No pod scraping. Per-node health; a cold node costs latency
-            only, never correctness. Open the{" "}
+            Each node publishes a small rollup to <code>_obs/rollup/</code>; this reads them straight
+            from the bucket, so there is no registry and no pod scraping — a node exists here because
+            it published. Click one to drill into its stats and cache, or open the{" "}
             <Link href="/traces" className="text-accent hover:underline">
               trace explorer
             </Link>{" "}
-            to drill into individual requests.
+            for individual requests.
           </>
         }
         actions={
@@ -123,7 +122,7 @@ export function ObservabilityView() {
       >
         {loading && !nodes && (
           <div className="p-3">
-            <Loading label="reading _obs/traces/" />
+            <Loading label="reading rollups" />
           </div>
         )}
         {Boolean(error) && (
@@ -133,10 +132,10 @@ export function ObservabilityView() {
         )}
         {nodes && nodes.length === 0 && !error && (
           <div className="p-3">
-            <Empty title="no trace objects yet">
+            <Empty title="no nodes reporting">
               <p>
-                No <code>_obs/traces/*.jsonl</code> in this bucket. A serve node publishes its ring
-                within a few seconds of starting, unless <code>MEMLAKE_TRACE_LOG=off</code>.
+                No rollups in <code>_obs/rollup/</code>. A serve node publishes one within a second
+                of starting, unless <code>MEMLAKE_TRACE_LOG=off</code>.
               </p>
             </Empty>
           </div>
@@ -167,7 +166,12 @@ function NodeCard({ node, now }: { node: NodeSummary; now: number }) {
             className={`inline-block w-1.5 h-1.5 rounded-full ${stale ? "bg-warn" : "bg-ok"}`}
             title={stale ? "stale heartbeat" : "live"}
           />
-          <CopyableId value={h.node_id} />
+          <Link
+            href={`/services/${encodeURIComponent(h.node_id)}`}
+            className="font-mono text-[11px] text-ink hover:text-accent"
+          >
+            {h.node_id}
+          </Link>
         </span>
       }
       subtitle={
@@ -184,10 +188,10 @@ function NodeCard({ node, now }: { node: NodeSummary; now: number }) {
       }
       actions={
         <Link
-          href={`/traces?node=${encodeURIComponent(h.node_id)}`}
+          href={`/services/${encodeURIComponent(h.node_id)}`}
           className="font-mono text-[11px] text-ink-dim hover:text-accent border border-line rounded-sm px-2 py-1"
         >
-          traces →
+          inspect →
         </Link>
       }
       bodyClassName="p-3 flex flex-col gap-3"
