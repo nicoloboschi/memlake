@@ -53,13 +53,24 @@ instead of re-queueing; the 5-min reconciliation sweep retries it. Verified: poi
 per sweep, real namespaces fold.* (This fix is deployed via the image; it lives in
 `service.rs::run_indexer` and is pending commit — see below.)
 
-**F5 — The deployed compaction path deterministically stalls (owner's in-flight work).** With the
-queue fixed, `k8sbench-a` still would not fully drain: the indexer folds one **partial** chunk
-(`docs=4608`, up to seq 13), publishes, then the *next* fold **hangs** — indexer at 27 m CPU (idle,
-an S3 await, not a busy-loop), holding the queue claim with a live heartbeat, no progress for
-minutes; a restart reproduces it exactly. This is in the size-tiered **partial-compaction** path
-that is being actively edited, so the deployed snapshot has a stuck state; it is *not* a queue
-issue (the queue behaves correctly throughout). It blocks a fully-drained steady-state query
+**F5 — The fold "stall" was O(tail × segments) serial single-key S3 GETs (fixed).** With the queue
+fixed, a namespace with existing segments plus a large un-indexed tail would fold one chunk, then
+the next fold appeared to *hang* — indexer idle on an S3 await (not a busy-loop), holding the queue
+claim with a live heartbeat, no progress for many minutes; a restart reproduced it exactly.
+
+*Root cause:* `QueryNode::open` (and `reopen_extending_tail`), which every fold opens for its
+pre-flush snapshot, computed the live doc count by probing **every segment's primary key once per
+tombstone and once per tail item** with a single-key `pk.lookup`. That is O((tombstones + tail) ×
+segments) reads, issued **serially, one range at a time**. An instrumented `index --once` over
+`k8sbench-b` (3 segments, ~14 k tail) showed the signature exactly: single-range `pk.data` GETs
+round-robining across the 3 segments, ~488 per segment in 240 s and still climbing — a ~42 k-read,
+~160 ms-each serial scan, i.e. hours. Not a hang; pathological serial slowness.
+
+*Fix (committed):* resolve which probe ids exist in a segment with **one coalesced `lookup_batch`
+per segment** (a single ranged GET over the covering pk blocks), then do the count adjustments as
+in-memory set membership — O(items × segments) round-trips → O(segments). Same semantics
+(present-in-any-segment); the 54 `mlake-index` tests still pass, and the `index --once` that
+timed out at 240 s now returns in ~2 s. This unblocks a fully-drained steady-state query
 measurement.
 
 ## Fixes landed
@@ -72,7 +83,8 @@ measurement.
 
 ## Recommended next
 
-- **F5**: fix the partial-compaction stall so a namespace fully drains (owner's area).
+- **F5**: fixed (batched the fold-time doc-count pk probe); rerun the benchmark to capture the
+  drained steady-state query latency the tail previously masked.
 - **F4 polish**: have the reconciliation sweep skip namespaces whose manifest is unreadable
   (`namespace_is_dirty` → false on manifest error), so poison namespaces are not re-enqueued every
   sweep and the indexer is not diluted across them. Or delete the old-format namespaces from the
