@@ -540,13 +540,17 @@ class MemlakeMemories(MemoriesExtension):
         sem_min = min_semantic if min_semantic is not None else config.semantic_min_similarity
         bm25_min = min_keyword if min_keyword is not None else config.bm25_min_score
 
-        # Over-fetch purely for ANN + fusion recall, matching the SQL path (dense recall is
-        # approximate, and the arms are fused then floored before the top `limit` is taken).
-        # It is NOT headroom for tag filtering: memlake applies both the flat tags and the
+        # The dense arm over-fetches purely for ANN + fusion recall, matching the SQL path (dense
+        # recall is approximate, and the arms are fused then floored before the top `limit` is
+        # taken). It is NOT headroom for tag filtering: memlake applies both the flat tags and the
         # compound `tag_groups` inside each arm, before it truncates to this depth, so the
-        # candidates that arrive are already the filtered top-k — a selective predicate no
-        # longer erodes the page. See `_to_tag_predicates` / the server's inline arm filtering.
-        depth = max(limit * 5, 100)
+        # candidates that arrive are already the filtered top-k — a selective predicate no longer
+        # erodes the page. See `_to_tag_predicates` / the server's inline arm filtering.
+        vector_depth = max(limit * 5, 100)
+        # The FTS arm needs no such over-fetch: exact BM25 has no approximation to compensate for,
+        # and `search_filtered` already over-fetches internally to fill `k` *passing* hits, so
+        # asking for `limit` returns `limit` filtered hits directly rather than 5x to be discarded.
+        text_depth = limit
         hits = await self._query(
             bank_id=bank_id,
             memory_types=memory_types,
@@ -555,8 +559,8 @@ class MemlakeMemories(MemoriesExtension):
             tags=tags,
             tags_match=tags_match,
             tag_groups=tag_groups,
-            vector_top_k=depth,
-            text_top_k=depth,
+            vector_top_k=vector_depth,
+            text_top_k=text_depth,
             # The dense and full-text arms are what this call is for; the graph arm
             # is retrieved separately, per fact_type, by MemlakeGraphRetriever.
             graph_top_k=0,
