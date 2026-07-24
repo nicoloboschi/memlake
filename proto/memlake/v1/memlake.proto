@@ -513,6 +513,9 @@ message LinkStatsRequest {
 message LinkStatsResponse {
   uint64 semantic_edge_count = 1;   // derived kNN links
   uint64 causal_edge_count = 2;     // intrinsic causal links (causes/caused_by/enables/prevents)
+  // Temporal links, derived from the time index (not stored): each memory's neighbours within
+  // ±24h, capped per unit — the count Hindsight's stored temporal rows would have.
+  uint64 temporal_edge_count = 3;
 }
 
 message ScanRequest {

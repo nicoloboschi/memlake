@@ -1,15 +1,17 @@
 # memlake
 
-An S3-native retrieval engine for small memory records. One storage layer serves three
-retrieval arms — **IVF vector search**, **BM25 full-text** (Chinese-capable), and **bounded
-graph link-expansion**. Each hit carries the raw per-arm scores; the client fuses. Object
-storage is the sole source of truth; query nodes are stateless caches that can be thrown away
-and rebuilt from S3.
+An S3-native retrieval engine for small memory records. One storage layer serves four
+retrieval arms — **IVF vector search**, **BM25 full-text** (Chinese-capable), **bounded graph
+link-expansion**, and **temporal** window search. Each hit carries the raw per-arm scores; the
+client fuses. Object storage is the sole source of truth; query nodes are stateless caches that
+can be thrown away and rebuilt from S3.
 
-Built as a prototype from [`docs/SPEC.md`](docs/SPEC.md). Each arm's write and read path is
-documented in detail: [`docs/arms/vector.md`](docs/arms/vector.md),
-[`docs/arms/text.md`](docs/arms/text.md), [`docs/arms/graph.md`](docs/arms/graph.md),
-[`docs/arms/temporal.md`](docs/arms/temporal.md).
+The full write / read / indexer / compaction design is
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md); each arm's mechanics, stored fields, and
+optimizations are documented in detail in [`docs/arms/vector.md`](docs/arms/vector.md),
+[`docs/arms/text.md`](docs/arms/text.md), [`docs/arms/graph.md`](docs/arms/graph.md), and
+[`docs/arms/temporal.md`](docs/arms/temporal.md). Configuration and deployment:
+[`docs/CONFIGURATION.md`](docs/CONFIGURATION.md), [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).
 
 ## Model & naming
 
@@ -42,8 +44,8 @@ fetching them, so filtering stays cheap at scale.
         write path                     index path                    query path
   client → any node               any node (idempotent)          any node (stateless)
      │ buffer + group commit         read WAL slice                 read manifest (RT1)
-     │ PUT wal/{seq}.bin             fold → build 3 arms            load per-type meta (RT2)
-     │  (If-None-Match: *)           write gen-{G}/ files           fetch probed clusters (RT3)
+     │ PUT wal/{seq}.bin             fold → build a segment           load per-type meta (RT2)
+     │  (If-None-Match: *)           write seg-{id}/ files            fetch probed clusters (RT3)
      ▼                               CAS-swap manifest              scan WAL tail (RT4)
    S3  ◀──────────── the only stateful dependency (INV-1) ────────────▶  fuse → results
 ```
@@ -54,7 +56,7 @@ The three paths are fully decoupled and each runs on any stateless node:
   `wal/{seq}.bin` object, claiming the sequence with `If-None-Match: *`. No node ever waits
   for the indexer.
 * **Index** — an idempotent pass reads the un-indexed WAL slice, folds it onto the previous
-  generation, rebuilds each `memory_type`'s arms, writes an immutable `gen-{G}/` tree, and
+  generation, rebuilds each `memory_type`'s arms, writes an immutable `seg-{id}/` segment, and
   publishes it by `If-Match`-swapping the manifest. Two nodes indexing the same generation
   write to disjoint prefixes and one CAS wins — no locks.
 * **Query** — `QueryNode::open` loads the manifest and each type's metadata; `query` probes
@@ -90,8 +92,8 @@ range)`, so a warm graph or cluster read costs zero roundtrips.
 | `mlake-store`  | instrumented object-store client, CAS, two-tier cache, op/phase metrics |
 | `mlake-wal`    | write path (group commit), tail scan, manifest read/swap |
 | `mlake-ivf`    | mini-batch k-means centroids, cluster files, probe-then-rerank |
-| `mlake-fts`    | tokenizer chain (NFKC/OpenCC/jieba dual-emission) + tantivy BM25 |
-| `mlake-graph`  | reverse-adjacency CSR, link-expansion retriever, scorer |
+| `mlake-fts`    | tokenizer chain (NFKC / traditional-to-simplified / jieba dual-emission) + tantivy BM25 |
+| `mlake-graph`  | reverse-adjacency SSTable, link-expansion retriever, scorer |
 | `mlake-index`  | indexer, generation IO, GC, RRF fusion, `QueryNode` |
 | `mlake-server` | gRPC API (`serve`) + indexer loop (`index`) over the crates above |
 | `mlake-perf`   | in-process micro-benchmark (library-level; the e2e suite is Python) |
@@ -117,7 +119,7 @@ with MemlakeClient("memlake:50051") as c:
                metadata={"document_id": "d-42", "chunk_id": "0"}),
     ])
 
-    # ONE query across memory_types (all, if omitted), always running the three arms —
+    # ONE query across memory_types (all, if omitted), always running the arms —
     # dense vector + BM25 full-text + graph. `vector` drives dense + graph, `text` drives
     # full-text. The server runs them concurrently over one snapshot, so the storage reads
     # coalesce into shared roundtrips.
@@ -230,11 +232,10 @@ uv run --project bench memlake-bench report        # renders bench/results/repor
 
 Full analysis is in [`docs/DECISIONS.md`](docs/DECISIONS.md).
 
-## What's a prototype here
+## Scope
 
-Deliberately deferred (recorded in [`docs/DECISIONS.md`](docs/DECISIONS.md)): the axum HTTP
-server over `QueryNode` (the retrieval substance is built; the wrapper is not); the full
-differential against live Hindsight Postgres; and quantization, sharding, multi-region, and
-auth — all v1 non-goals per the spec. The FTS arm **is tantivy** (SPEC §5.3), packaged the
-S3-native way: a whole index packed into one `split.bin` object and materialized into the
-local mmap tier to serve reads.
+The retrieval substance — all four arms, the segmented LSM index, compaction, the gRPC API —
+is built and verified at BEIR/LoComo parity. Deliberately out of scope (recorded in
+[`docs/DECISIONS.md`](docs/DECISIONS.md)): sharding a namespace, multi-region, and auth. The
+path from "verified in dev" to "running against real banks" — deployment wiring, cross-store
+atomicity, a Postgres backfill — is tracked in [`TODOS.md`](TODOS.md).

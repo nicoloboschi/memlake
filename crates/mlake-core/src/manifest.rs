@@ -274,15 +274,6 @@ pub fn manifest_path(namespace: &str) -> String {
     format!("{namespace}/manifest.json")
 }
 
-/// Object key for a namespace's index lease — a best-effort marker that one node is currently
-/// folding this namespace, so the other nodes' periodic indexers skip it and don't duplicate
-/// the compute and S3 PUTs. Lives under the namespace prefix so `delete_all` reclaims it. It
-/// is only an optimization: losing or ignoring it costs a wasted (but safe) duplicate fold,
-/// never correctness — the nonce'd generation prefixes already make concurrent folds safe.
-pub fn index_lease_path(namespace: &str) -> String {
-    format!("{namespace}/index-lease.json")
-}
-
 /// Object key for a namespace's WAL head pointer — a small, monotonic record of the highest
 /// sequence any writer has committed. Readers GET it (etag-cacheable) to learn the live head
 /// without a LIST, which on S3 is both slower and ~12× the per-request price of a GET. A writer

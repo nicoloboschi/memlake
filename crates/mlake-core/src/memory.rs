@@ -69,6 +69,10 @@ pub const MAX_SEMANTIC_OUT: usize = 5;
 /// ~24h temporal linking. The graph's temporal arm reads neighbours in `[t - W, t + W]`.
 pub const TEMPORAL_SPREAD_WINDOW_MS: i64 = 24 * 60 * 60 * 1000;
 
+/// Cap on temporal links counted per memory, matching Hindsight's `MAX_TEMPORAL_LINKS_PER_UNIT`.
+/// Bounds `LinkStats`'s temporal total the way the retain writer bounds stored temporal rows.
+pub const MAX_TEMPORAL_LINKS_PER_UNIT: u64 = 20;
+
 /// The time used to *window* a memory for temporal neighbouring: occurred-start, else the
 /// mention time, else occurred-end. Matches the `effective_ts` the time index is keyed on and
 /// the temporal arm's `eff` cascade. `None` means the memory carries no usable timestamp.

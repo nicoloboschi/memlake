@@ -179,6 +179,31 @@ The in-RAM vs streaming choice on the full-rebuild path is by size:
 external-memory fold, otherwise the in-RAM fold. Each fold reads the manifest, reads WAL
 entries `(wal_index_cursor, wal_head]`, produces new segment(s), and CAS-swaps the manifest.
 
+### Scheduling — the object-storage queue
+
+The indexer does **not** poll every namespace. A single CAS'd object at the bucket root,
+`_index-queue.json` (`mlake-wal::IndexQueue`), is a work queue of namespaces that have un-indexed
+WAL — turbopuffer's [object-storage queue](https://turbopuffer.com/blog/object-storage-queue)
+pattern:
+
+- **enqueue** — a serve pod, right after it commits a write, adds its namespace to the queue (a
+  read-modify-CAS; idempotent, so a namespace already queued or being folded is skipped). Inline
+  for a `wait_for_index` write; off the ack path otherwise.
+- **claim** — an indexer CAS-flips the first `pending` job to `claimed` with its id + a heartbeat.
+  The CAS makes it exclusive: two indexers never fold the same namespace at once. This replaces the
+  old per-namespace index lease.
+- **heartbeat / reclaim** — a background task refreshes the claim during a long compaction; a claim
+  whose heartbeat goes stale (a crashed worker) is stealable. At-least-once delivery over memlake's
+  idempotent folds (INV-6).
+- **complete** — after draining, the job is removed *only if* the namespace is truly drained
+  (`wal_head ≤ wal_index_cursor`); if a write landed during the fold it returns to `pending`. This
+  closes the completion/write race, so no write is ever stranded.
+
+A rare **reconciliation sweep** (default every 5 min) is the only remaining LIST-all: it enqueues
+any dirty namespace, covering the one hole in the fast path — a serve pod that died between commit
+and enqueue. Correctness never depends on the queue; it is a notification layer that lets `N`
+stateless indexer replicas share one queue and touch only namespaces that actually have work.
+
 ### What a build produces (per memory_type)
 
 1. **Centroid training** — `√N` centroids by k-means over a deterministic ≤50k sample
@@ -207,6 +232,16 @@ bounded-RAM workload the **streaming fold** solves, so streaming is the compacti
 the fast in-RAM path builds small L0 flushes. Idempotent and coordination-free (INV-6): a lost
 CAS just means a peer built an equivalent segment; GC drops unreferenced `seg-*` prefixes after
 a reader-grace TTL.
+
+### Reclaiming — GC
+
+Immutability means nothing is overwritten, so dead objects (folded WAL entries, compacted-away
+segments, CAS-race losers) accumulate until reclaimed. The indexer runs `gc` per namespace after it
+folds one, throttled to `MEMLAKE_INDEXER_GC_INTERVAL_SECS` (default 300). GC reads the manifest
+fresh and deletes only what the *current* manifest does not reference, keeping anything younger than
+`MEMLAKE_INDEXER_GC_MIN_AGE_SECS` (default 900) — the safety window that protects a concurrent
+fold's not-yet-published files and a slow reader still holding the previous manifest. So it is safe
+to run coordination-free alongside a peer that just published a new generation.
 
 ---
 

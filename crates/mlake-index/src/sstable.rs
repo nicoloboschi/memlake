@@ -783,6 +783,29 @@ impl TimeTable {
         }
         Ok(ids)
     }
+
+    /// Every distinct effective timestamp and how many memories carry it, ascending — one full
+    /// ranged scan of the (compact) time index. For the temporal-link count, which needs only
+    /// the time distribution, not the ids: a sweep over these buckets yields each memory's
+    /// windowed-neighbour count without reading a single memory record.
+    pub async fn timestamp_counts(
+        &self,
+        store: &Store,
+        ctx: Option<(&QueryMetrics, usize)>,
+    ) -> Result<Vec<(i64, u64)>> {
+        let lo = ts_key(i64::MIN);
+        let mut hi = ts_key(i64::MAX);
+        hi[8..].copy_from_slice(&[0xFF; 8]);
+        let records = self.index.scan_range(store, &self.data_path, &lo, &hi, ctx).await?;
+        Ok(records.into_iter().map(|(key, value)| (ts_from_key(&key), (value.len() / 16) as u64)).collect())
+    }
+}
+
+/// Inverse of [`ts_key`]: recover the `i64` timestamp from the first 8 bytes of a time-index key.
+fn ts_from_key(key: &[u8]) -> i64 {
+    let mut b = [0u8; 8];
+    b.copy_from_slice(&key[..8]);
+    (u64::from_be_bytes(b) ^ (1u64 << 63)) as i64
 }
 
 /// Edge wire format: `[source:16][kind:1][linktype:1][weight:f32]` = 22 bytes.
@@ -882,6 +905,28 @@ mod tests {
 
         // Empty window before everything.
         assert!(tt.in_window(&store, i64::MIN, -1000, usize::MAX, None).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn timestamp_counts_returns_sorted_buckets_with_multiplicity() {
+        let store = Store::in_memory();
+        // Three memories at ts=1000 (incl. a negative-epoch neighbour), two at 2000, one at -500.
+        let pairs: Vec<(i64, MemoryId)> = vec![
+            (1000, MemoryId::from_key("a")),
+            (1000, MemoryId::from_key("b")),
+            (1000, MemoryId::from_key("c")),
+            (2000, MemoryId::from_key("d")),
+            (2000, MemoryId::from_key("e")),
+            (-500, MemoryId::from_key("f")),
+        ];
+        let (idx, data) = TimeTable::build(pairs);
+        store.put("t/time.data", data).await.unwrap();
+        let tt = TimeTable::open(&idx, "t/time.data").unwrap();
+
+        // Ascending by timestamp (ts_from_key round-trips, including the negative), with the
+        // per-timestamp memory count — the input to the temporal sweep.
+        let got = tt.timestamp_counts(&store, None).await.unwrap();
+        assert_eq!(got, vec![(-500, 1), (1000, 3), (2000, 2)]);
     }
 
     #[tokio::test]
