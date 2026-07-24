@@ -41,17 +41,21 @@ mostly **operational and packaging**, not features. Grouped by how hard it block
       Until that merges and ships in a `hindsight-api-slim` release, the extension
       installs only from a source checkout (which is why the integration tests wire
       it in through `HINDSIGHT_API_SLIM_PATH`).
-- [ ] **protobuf runtime conflict.** `memlake_client`'s generated stubs call
-      `ValidateProtobufRuntimeVersion(...)` against protobuf-7 gencode; Hindsight
-      pins `protobuf>=6.33.5`. It is a floor, so 7.x *may* resolve, but OTel deps
-      have historically capped it — verify against the real Hindsight lockfile, and
-      if it does not resolve, regenerate the stubs against 6.x gencode. Otherwise
-      `import memlake_client` raises `VersionError` and the extension never loads.
-- [ ] **No deployment wiring, and the indexer is mandatory.** memlake needs two
-      processes against S3 — the `serve` gRPC API *and* a continuous
-      `mlake-server index` loop. Search returns nothing until a fold runs (the tests
-      call `index --once` by hand). There is no docker-compose/helm standing up
-      server + indexer + bucket next to Hindsight, and no operator config doc.
+- [x] **protobuf runtime conflict — RESOLVED.** The floor turned out to be a floor:
+      protobuf **7.35.1** resolves alongside Hindsight and `import memlake_client`
+      succeeds in the same environment that runs the integration suite. No 6.x
+      re-gen needed. (Worth re-checking if OTel deps ever cap it again.)
+- [x] **Deployment wiring — DONE.** `integrations/hindsight/docker-compose.yml`
+      stands up MinIO + bucket init + `serve` + `indexer`; `deploy/helm/memlake` is
+      a chart (`Chart.yaml` / `values.yaml` / templates) with envoy config and
+      `deploy-dev.sh` beside it; `docs/DEPLOYMENT.md`, `docs/CONFIGURATION.md` and
+      `docs/hindsight-integration.md` are the operator docs.
+
+      Note the old wording here was also wrong on a load-bearing point: **search
+      does not wait for a fold.** An acked write is queryable immediately off the
+      WAL tail — the dense arm scores tail items even with an empty index, and the
+      FTS arm builds a tail index on first text query. The indexer is required for
+      *compaction and derived links*, not for visibility.
 
 ### 0b. Correctness gaps that fail *silently* in production
 
