@@ -23,6 +23,30 @@ Two parts:
 
 ## Measured total COGS (storage + requests + compute)
 
+> ### ⚠️ Half of this is measured and half is modelled — read this first
+>
+> **The memlake side is measured** on the real AWS S3 deployment: bytes/memory from `aws s3 ls` over
+> folded namespaces, GETs/query and cold-vs-warm from the fleet traces.
+>
+> **The Postgres side is entirely modelled.** No PG instance was deployed, loaded or benchmarked.
+> Instance sizes are *derived* from a byte model (vectors + an assumed ivfflat near-full index copy +
+> rows), then priced from AWS list. That means the PG column carries every assumption in that model —
+> index type, RAM-residency, recall at a given instance size, and QPS capacity — none of which were
+> validated.
+>
+> Two specific ways this could be wrong, both of which would **favour PG**:
+> - **PG is modelled as flat in QPS.** A `db.t4g.micro` will not really serve 100 QPS of pgvector
+>   search. The rows where PG wins (10 k / 100 k @ 100 QPS) would in reality need a bigger instance,
+>   narrowing or erasing that win — but equally, PG's QPS ceiling is unmeasured everywhere else too.
+> - **HNSW vs ivfflat.** Matching memlake's recall may require HNSW, which is *more* memory-hungry
+>   than the ivfflat modelled here — pushing PG up — while a well-tuned disk-resident ivfflat could
+>   push it down.
+>
+> **Treat the ratios as a hypothesis to test, not a quote.** The honest next step is a side-by-side on
+> real infrastructure: the same corpus and the same query mix against a real RDS+pgvector deployment,
+> measuring recall, latency and cost together. Until that exists, the defensible claims are the
+> *shape* (PG's unit cost is flat per memory; memlake's amortises) and the memlake column.
+
 ### Measured inputs
 
 From the deployment in [`sla-model.md`](sla-model.md) (GKE → AWS S3 us-east-1, serve 2 vCPU/3 GiB,
@@ -99,6 +123,43 @@ across primary + standby + 2 replicas. memlake keeps the same corpus in S3 for *
 provisions RAM only for the `nprobe`-bounded working set it actually touches. Even forcing PG down to
 "25 % hot" (a real latency sacrifice) it is $2 736 vs $222. **This gap is the architecture, not a
 pricing trick** — it is the same reason the design is object-storage-native in the first place.
+
+### Unit cost: $/month per 1 000 memories
+
+The same model, normalised per 1 000 memories. This is the view that shows the *shape*, because the
+two systems' unit costs move in opposite directions.
+
+PG = Multi-AZ + 2 read replicas, ANN index RAM-resident. PG is modelled as flat in QPS (see caveat).
+
+| memories | memlake @1 QPS | @10 QPS | @100 QPS | **PG** (flat in QPS) | PG hardware | memlake@100 vs PG |
+|---:|---:|---:|---:|---:|---|---:|
+| 10 k | $2.558 | $3.504 | $21.754 | **$5.592** | 1× t4g.micro | 0.3× — PG wins |
+| 100 k | $0.256 | $0.351 | $2.176 | **$1.990** | 1× t4g.medium | 0.9× — parity |
+| 1 M | $0.026 | $0.035 | $0.218 | **$1.329** | 1× r6g.xlarge | **6.1×** |
+| 10 M | $0.003 | $0.004 | $0.022 | **$1.065** | 1× r6g.8xlarge | **48×** |
+| **100 M** | **$0.001** | **$0.001** | **$0.003** | **$1.065** | **5× r6g.16xlarge** | **411×** |
+
+With PG relaxed to "25 % hot" (cheaper, accepts disk reads, slower):
+
+| memories | memlake @100 QPS | PG /1k | ratio |
+|---:|---:|---:|---:|
+| 10 k | $21.754 | $5.592 | 0.3× — PG |
+| 100 k | $2.176 | $0.559 | 0.3× — PG |
+| 1 M | $0.218 | $0.509 | 2.3× |
+| 10 M | $0.022 | $0.274 | 12.3× |
+| **100 M** | **$0.003** | **$0.432** | **167×** |
+
+**PG's unit cost flattens at ~$1.07 per 1 000 memories and stays there** — its cost is linear in
+resident bytes × replicas, so cost-*per-memory* is a constant; doubling the corpus doubles the bill,
+forever. **memlake's unit cost falls ~2 500× from 10 k to 100 M** ($2.558 → $0.001), because its cost
+is a fixed floor plus a QPS term and neither scales with corpus (storage is $0.00025/1k).
+
+In one line: **PG charges per memory; memlake charges per query.** At 100 M @ 100 QPS that is ~$300/mo
+against ~$106 500/mo (20 instances: 5 shards × 4 copies).
+
+*Sensitivity — memlake fully cold (4.3 GETs/query, working set misses cache):* 1 M @100 QPS
+$0.565/1k, 10 M $0.057/1k, 100 M $0.006/1k. The request term is robust; the compute term is the
+fragile one (below).
 
 ### The head GET is the fix that widens the narrow case
 
