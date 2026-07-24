@@ -116,8 +116,8 @@ mostly **operational and packaging**, not features. Grouped by how hard it block
 - [ ] **`list_tags` is O(corpus) per call → §5.** No `ListTags` RPC / tag-count
       histogram yet.
 - [ ] **Smaller parity gaps:** the curation list still comes back in storage order
-      (write-time ordering is indexed now — §5 — but not `mentioned_at DESC`); no
-      key-*absence* predicate
+      (write-time ordering is indexed now — §5 — but `mentioned_at DESC` is a decided
+      won't-do: cosmetic, not semantic); no key-*absence* predicate
       (worked around with a positive `consolidated` flag → §5). *(Nested tag groups
       were the third gap here — now pushed down and applied inline, §4.)*
 
@@ -354,8 +354,13 @@ curation UI and export:
       ordered call, no client-side sort. Back-compatible — a generation folded before
       the index exists simply has none, and `serde(default)` leaves it empty.
 
-- [ ] **Ordering by other keys.** The curation list wants `mentioned_at DESC NULLS
-      LAST, created_at DESC`; only ascending write time is indexed so far.
+- [x] **Ordering by other keys — WON'T DO (decided).** The curation list wants
+      `mentioned_at DESC NULLS LAST, created_at DESC`, and only ascending write time
+      is indexed. Deliberately not indexing the rest: ordering earns a server-side
+      index where it is *semantically* load-bearing — the consolidation queue drains
+      oldest-first, and getting that wrong changes what gets consolidated. A browse
+      list coming back in storage order is cosmetic, and does not justify another
+      index to build, persist, GC and keep consistent on both fold paths.
 - [x] **Offset/skip paging — DONE.** `skip` discards N matching memories before
       filling the page; verified byte-identical to following the cursor. Hindsight
       uses it for offset in the curation list, falling back to the page walk only
