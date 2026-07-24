@@ -26,6 +26,12 @@ spec:
         - name: admin
           image: "{{ .Values.admin.repository }}:{{ .Values.admin.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          envFrom:
+            # Same S3 secret the serve pods mount (MEMLAKE_QUERY_S3_*). The Observability view reads
+            # the _obs/traces/ prefix directly from the bucket; obs.ts falls back to MEMLAKE_QUERY_S3_*
+            # when MEMLAKE_OBS_S3_* is unset, so this grants read access with no extra secret.
+            - secretRef:
+                name: {{ .Values.s3.existingSecret }}
           env:
             # Inspection console talks to the proxy (any serve pod can answer admin RPCs).
             - name: MEMLAKE_ADDR
