@@ -89,6 +89,21 @@ drained steady-state query numbers in the table above.
   because it shares `service.rs` with in-flight work — the change is: track `fold_errored` in the
   drain loop, skip GC when set, and set `still_dirty = !fold_errored && namespace_is_dirty(...)`.)*
 
+**F6 — Query fan-out (live segment count) halved by wiring in size-tiered minor compaction.** In an
+object store the per-query cost is the *number of objects touched* (round-trips), and every live
+segment adds a roughly fixed handful of GETs (centroids, `pk`, `radj`, `fts`, stats, tombstones)
+regardless of its byte size — so the metric to minimize is the live **segment count**. The fold only
+flushed (append L0) until the hard `COMPACT_FANOUT`=8 cap, so a query fanned out across up to 8
+segments; the 20 k-doc run above settled at **4** (`[512, 1056, 1536, 16896]`). Wiring the existing
+(correctness-tested) `minor_compact` into the fold via a size-tiered trigger — merge the longest
+newest run of segments whose combined docs still fit under the next larger segment, leaving the base
+untouched — collapses the recent flushes cheaply (O(recent), not O(corpus)). Re-running the same 20 k
+/ 8-writer benchmark settled at **2** segments (`[6176, 13824]`): cold `mean_roundtrips` **1.23 →
+0.58**, cold p90 **190 → 127 ms**. (Warm p50 85 → 92 ms is within noise — that path is CPU-bound at 0
+roundtrips.) Only affordable because the F5 fix made the fold-time snapshot open O(segments); the run
+length trigger (`MINOR_COMPACT_MIN_RUN`=2) balances fan-out against write amplification. *Fix
+committed.*
+
 ## Recommended next
 
 - **F5**: fixed (batched the fold-time doc-count pk probe); rerun the benchmark to capture the
