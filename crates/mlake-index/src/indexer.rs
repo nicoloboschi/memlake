@@ -947,6 +947,18 @@ async fn build_memory_type_index(
     }
     let time_tables = crate::sstable::TimeTable::build(time_pairs);
 
+    // Created index: write time (`updated_at`) -> id, the same TimeTable layout keyed on arrival
+    // rather than content time. An ordered scan walks this to return the globally oldest matches
+    // (the consolidation queue drains oldest-first); a cluster walk can only return the first it
+    // reaches. Memories with no write time are unindexed here and sort last in an ordered scan.
+    let mut created_pairs: Vec<(i64, MemoryId)> = Vec::new();
+    for item in &items {
+        if let Some(ts) = item.timestamps.updated_at {
+            created_pairs.push((ts, item.id));
+        }
+    }
+    let created_tables = crate::sstable::TimeTable::build(created_pairs);
+
     // Payload store: one addressable row per memory (embedding stripped), so a point read
     // (FTS/graph hit, `get`) fetches one memory instead of its whole cluster file.
     let payload_tables = crate::sstable::PayloadTable::build(&items);
@@ -1000,6 +1012,7 @@ async fn build_memory_type_index(
         pk_tables.into(),
         entity_tables.into(),
         time_tables.into(),
+        created_tables.into(),
         payload_tables.into(),
         rerank_tables.into(),
         &tag_summary,

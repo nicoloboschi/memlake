@@ -71,6 +71,12 @@ fn time_idx_key(prefix: &str) -> String {
 fn time_data_key(prefix: &str) -> String {
     format!("{prefix}/time.data")
 }
+fn created_idx_key(prefix: &str) -> String {
+    format!("{prefix}/created.idx")
+}
+fn created_data_key(prefix: &str) -> String {
+    format!("{prefix}/created.data")
+}
 fn payload_idx_key(prefix: &str) -> String {
     format!("{prefix}/payload.idx")
 }
@@ -271,6 +277,7 @@ pub async fn write_generation(
     pk_tables: SsTablePair,
     entity_tables: SsTablePair,
     time_tables: SsTablePair,
+    created_tables: SsTablePair,
     payload_tables: SsTablePair,
     rerank_tables: SsTablePair,
     tag_summary: &TagSummary,
@@ -304,6 +311,7 @@ pub async fn write_generation(
         entity_data_key(prefix),
     );
     let (kti, ktd) = (time_idx_key(prefix), time_data_key(prefix));
+    let (kci, kcd) = (created_idx_key(prefix), created_data_key(prefix));
     let (kpli, kpld) = (payload_idx_key(prefix), payload_data_key(prefix));
     let (kri2, krd2) = (rerank_idx_key(prefix), rerank_data_key(prefix));
     // All metadata objects are independent, immutable, and unique to this prefix, so write
@@ -321,6 +329,8 @@ pub async fn write_generation(
         store.put(&ked, entity_tables.data),
         store.put(&kti, time_tables.idx),
         store.put(&ktd, time_tables.data),
+        store.put(&kci, created_tables.idx),
+        store.put(&kcd, created_tables.data),
         store.put(&kpli, payload_tables.idx),
         store.put(&kpld, payload_tables.data),
         store.put(&kri2, rerank_tables.idx),
@@ -342,6 +352,8 @@ pub async fn write_generation(
         entity_data: entity_data_key(prefix),
         time_idx: time_idx_key(prefix),
         time_data: time_data_key(prefix),
+        created_idx: created_idx_key(prefix),
+        created_data: created_data_key(prefix),
         payload_idx: payload_idx_key(prefix),
         payload_data: payload_data_key(prefix),
         rerank_idx: rerank_idx_key(prefix),

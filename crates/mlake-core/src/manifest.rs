@@ -56,6 +56,16 @@ pub struct GenerationFiles {
     pub time_idx: String,
     #[serde(default)]
     pub time_data: String,
+    /// `created.idx` / `created.data`: a second time index, keyed by **write time**
+    /// (`Timestamps.updated_at`) rather than effective/content time, so a scan can walk the
+    /// corpus in arrival order. This is what lets an ordered scan return the *globally* oldest
+    /// matches instead of the first ones a cluster walk happens to reach — the consolidation
+    /// queue drains oldest-first off it. Same `TimeTable` layout as `time_*`; absent on
+    /// generations folded before it existed, which simply fall back to the unordered walk.
+    #[serde(default)]
+    pub created_idx: String,
+    #[serde(default)]
+    pub created_data: String,
     /// `payload.idx` / `payload.data`: the payload store (MemoryId -> memory bytes without the
     /// embedding), range-read to hydrate a hit or a `get` without deserializing its cluster.
     #[serde(default)]
@@ -91,6 +101,8 @@ impl GenerationFiles {
             self.entity_data.as_str(),
             self.time_idx.as_str(),
             self.time_data.as_str(),
+            self.created_idx.as_str(),
+            self.created_data.as_str(),
             self.payload_idx.as_str(),
             self.payload_data.as_str(),
             self.rerank_idx.as_str(),

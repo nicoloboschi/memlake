@@ -1002,6 +1002,29 @@ impl Memlake for MemlakeService {
         types.sort_unstable();
         types.dedup();
 
+        // Ordered walk: one merged pass over the write-time index across every requested type,
+        // so a page is the globally oldest matches rather than the first ones cluster order
+        // reaches. Handled up front because it shares nothing with the per-type cluster walk
+        // below — different cursor, different traversal, and no per-type spill.
+        if req.order == pb::ScanOrder::CreatedAsc as i32 {
+            let from_ts = parse_ordered_page_token(&req.page_token, node.generation)?.unwrap_or(i64::MIN);
+            let want = limit + skip;
+            let (items, next) = node
+                .scan_ordered(&types, from_ts, want, &filter, &groups)
+                .await
+                .map_err(internal)?;
+            let items: Vec<_> = items.into_iter().skip(skip).collect();
+            let memories = items
+                .into_iter()
+                .map(|m| convert::stored_record_with_edges(m, req.include_vector, req.include_edges))
+                .collect::<Vec<_>>();
+            let next_page_token = match next {
+                Some(ts) if memories.len() >= limit => ordered_page_token(node.generation, ts),
+                _ => String::new(),
+            };
+            return Ok(Response::new(pb::ScanResponse { memories, next_page_token }));
+        }
+
         // Resume where the last page stopped. A cursor is only meaningful against the
         // generation that issued it — cluster paths and ordering change when the indexer
         // publishes — so a stale token restarts the scan rather than silently skipping or
@@ -1418,6 +1441,29 @@ const MAX_SCAN_LIMIT: usize = 1000;
 /// against an older index is detected rather than silently misapplied.
 fn page_token(generation: u64, memory_type: u8, c: ScanCursor) -> String {
     format!("{generation}:{memory_type}:{}:{}", c.cluster, c.offset)
+}
+
+/// Cursor for an ordered scan: a write-time position rather than a cluster position, since the
+/// walk is over the `created` index. Same generation guard as the storage-order token.
+fn ordered_page_token(generation: u64, from_ts: i64) -> String {
+    format!("{generation}:t:{from_ts}")
+}
+
+/// Decode an ordered-scan token. `None` starts at the beginning of time; a token from a
+/// superseded generation restarts, exactly as the storage-order one does.
+fn parse_ordered_page_token(token: &str, generation: u64) -> Result<Option<i64>, Status> {
+    if token.is_empty() {
+        return Ok(None);
+    }
+    let parts: Vec<&str> = token.split(':').collect();
+    let [gen, "t", ts] = parts[..] else {
+        return Err(Status::invalid_argument("malformed page_token"));
+    };
+    let bad = |_| Status::invalid_argument("malformed page_token");
+    if gen.parse::<u64>().map_err(bad)? != generation {
+        return Ok(None);
+    }
+    Ok(Some(ts.parse::<i64>().map_err(bad)?))
 }
 
 /// Decode a page token, or `None` to start from the beginning. A token from a superseded

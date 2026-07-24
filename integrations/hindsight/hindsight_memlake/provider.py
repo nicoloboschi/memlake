@@ -115,13 +115,6 @@ CONSOLIDATED_FAILED = "2"
 #: per-document counts; the consolidated flag backs get_bank_freshness's pending/failed.
 _INDEXED_METADATA_KEYS = [META_DOCUMENT_ID, META_CONSOLIDATED_FLAG]
 
-#: How many scan pages one `find_unconsolidated` call will walk before it gives up on seeing
-#: the rest of the backlog. The whole matched set is collected and sorted so the oldest drain
-#: first (the SQL path's `ORDER BY created_at ASC`), and this bounds the worst case: a backlog
-#: deeper than cap*page still drains oldest-first *within the scanned prefix*, and the next
-#: cycle picks up where consolidation left it. Scan has no ordering of its own yet (TODOS §5),
-#: which is why this is a client-side sort rather than a server-side ORDER BY + LIMIT.
-_UNCONSOLIDATED_SCAN_PAGE_CAP = 100
 
 #: Per-entity cap when deriving the entity-link count, mirroring Postgres's writer cap
 #: (each memory bidirectionally linked to at most this many others sharing an entity). Keeps
@@ -887,6 +880,7 @@ class MemlakeMemories(MemoriesExtension):
         include_edges: bool = False,
         updated_from: int | None = None,
         updated_to: int | None = None,
+        order: int | None = None,
     ) -> ScanPage:
         """Scan with the push-downs the interface's :meth:`scan_memories` omits.
 
@@ -911,6 +905,7 @@ class MemlakeMemories(MemoriesExtension):
                     tags=tags,
                     tags_mode=_tags_mode(tags_match),
                     tag_groups=_to_tag_predicates(tag_groups),
+                    order=order if order is not None else mc.STORAGE,
                     skip=skip,
                     include_edges=include_edges,
                     updated_from=updated_from,
@@ -1254,44 +1249,27 @@ class MemlakeMemories(MemoriesExtension):
         limit: int,
         scope_tags: list[str] | None = None,
     ) -> list[StoredMemory]:
-        found: list[StoredMemory] = []
-        page_token = ""
-        pages = 0
-        # Collect the whole unconsolidated set before sorting, rather than stopping as soon as
-        # `limit` rows are in hand. Stopping early returned the first `limit` matches in *storage*
-        # (cluster) order and then sorted only those, so the queue drained in an arbitrary order
-        # instead of oldest-first — the SQL path's `ORDER BY created_at ASC`. Consolidation picks
-        # the next batch off this, so the order is behaviour, not cosmetics.
+        # One ordered scan: the server walks its write-time index and returns the GLOBALLY oldest
+        # matches, merged across the requested fact types — the SQL path's `ORDER BY created_at
+        # ASC LIMIT n`. Consolidation drains its backlog off this, so the order is behaviour.
         #
-        # This is close to free where it matters: `metadata_equals` narrows what the walk
-        # *returns*, not what it *reads*, so a steady-state bank (large corpus, small backlog)
-        # already had to touch every cluster to fill `limit`. The page cap below still bounds one
-        # cycle; a backlog deeper than the cap drains oldest-first within the scanned prefix.
-        while pages < _UNCONSOLIDATED_SCAN_PAGE_CAP:
-            page = await self.scan_memories(
-                conn=conn,
-                fq_table=fq_table,
-                bank_id=bank_id,
-                fact_types=fact_types,
-                limit=max(limit, 200),
-                page_token=page_token,
-                # Pushed down: the server drops consolidated memories rather than
-                # sending pages of them for us to discard. This is also what keeps
-                # a memory consolidation *failed* on out of the queue — the flag
-                # flips either way, see `mark_consolidated`.
-                metadata_equals={META_CONSOLIDATED_FLAG: CONSOLIDATED_NO},
-                # `all` is the containment the SQL `tags @> scope` expresses.
-                tags=scope_tags or None,
-                tags_match="all",
-            )
-            found.extend(page.memories)
-            pages += 1
-            page_token = page.next_page_token
-            if not page_token:
-                break
-        # The SQL path orders by created_at ASC so the oldest backlog drains first.
-        found.sort(key=lambda m: (m.created_at is None, m.created_at))
-        return found[:limit]
+        # This used to page a prefix and sort it client-side, which could only ever order what it
+        # had already been handed: with a backlog deeper than one page the rows themselves were
+        # the wrong ones, and no amount of sorting recovers that.
+        page = await self.scan_raw(
+            bank_id,
+            fact_types=fact_types,
+            limit=limit,
+            # Pushed down: the server drops consolidated memories rather than sending pages of
+            # them for us to discard. This is also what keeps a memory consolidation *failed* on
+            # out of the queue — the flag flips either way, see `mark_consolidated`.
+            metadata_equals={META_CONSOLIDATED_FLAG: CONSOLIDATED_NO},
+            # `all` is the containment the SQL `tags @> scope` expresses.
+            tags=scope_tags or None,
+            tags_match="all",
+            order=mc.CREATED_ASC,
+        )
+        return page.memories
 
     async def find_failed_consolidation(self, *, conn, fq_table, bank_id: str) -> list[StoredMemory]:
         """Experience/world memories flagged consolidation-failed — the retry-failed requeue set.

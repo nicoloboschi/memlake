@@ -12,6 +12,8 @@
 """
 
 from .client import (
+    CREATED_ASC,
+    STORAGE,
     ALL,
     ALL_STRICT,
     ANY,
@@ -36,5 +38,7 @@ __all__ = [
     "ALL",
     "ANY_STRICT",
     "ALL_STRICT",
+    "STORAGE",
+    "CREATED_ASC",
     "EXACT",
 ]

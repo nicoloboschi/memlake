@@ -152,6 +152,9 @@ struct SegmentState {
     pk: PkTable,
     entity: EntityTable,
     time: TimeTable,
+    /// Arrival-order index (write time -> ids), the ordered-scan counterpart of `time`.
+    /// Empty on generations folded before it existed — the caller falls back to a cluster walk.
+    created: TimeTable,
     payload: PayloadTable,
     rerank: RerankTable,
     doc_count: usize,
@@ -410,6 +413,16 @@ impl QueryNode {
                                 .map_err(crate::Error::from)
                         }
                     };
+                    let created_f = async {
+                        if files.created_idx.is_empty() {
+                            Ok(bytes::Bytes::new())
+                        } else {
+                            ns.store
+                                .get_immutable(&files.created_idx, Some((&metrics, 2)))
+                                .await
+                                .map_err(crate::Error::from)
+                        }
+                    };
                     let payload_f = async {
                         if files.payload_idx.is_empty() {
                             Ok(bytes::Bytes::new())
@@ -421,8 +434,8 @@ impl QueryNode {
                         }
                     };
                     let fts_f = read_fts_split(&ns.store, files, tokenizer.clone(), Some(&metrics));
-                    let (centroids_bytes, tag_bytes, radj_idx, pk_idx, entity_idx, time_idx, payload_idx, gen_fts) =
-                        futures::try_join!(centroids_f, tag_f, radj_f, pk_f, entity_f, time_f, payload_f, fts_f)?;
+                    let (centroids_bytes, tag_bytes, radj_idx, pk_idx, entity_idx, time_idx, created_idx, payload_idx, gen_fts) =
+                        futures::try_join!(centroids_f, tag_f, radj_f, pk_f, entity_f, time_f, created_f, payload_f, fts_f)?;
 
                     let tag_summary: TagSummary = if tag_bytes.is_empty() {
                         Vec::new()
@@ -440,6 +453,11 @@ impl QueryNode {
                         TimeTable::open(&[0u8; 16], String::new())?
                     } else {
                         TimeTable::open(&time_idx, files.time_data.clone())?
+                    };
+                    let created = if created_idx.is_empty() {
+                        TimeTable::open(&[0u8; 16], String::new())?
+                    } else {
+                        TimeTable::open(&created_idx, files.created_data.clone())?
                     };
                     // Old generations have no payload store: an empty table forces the fallback
                     // (materialize from clusters), so a v2 generation still reads correctly.
@@ -472,6 +490,7 @@ impl QueryNode {
                         pk,
                         entity,
                         time,
+                        created,
                         payload,
                         rerank,
                     }));
@@ -1047,6 +1066,125 @@ impl QueryNode {
         }
 
         let next = (cluster <= tail_cluster).then_some(ScanCursor { cluster, offset });
+        Ok((out, next))
+    }
+
+    /// A scan that walks in **arrival order** (write time ascending) instead of cluster order,
+    /// returning the globally oldest matches at or after `from_ts`.
+    ///
+    /// The plain [`scan`] walks clusters, so "the first `limit` matches" is whatever storage
+    /// order reaches first — fine for browsing, wrong for a queue. The consolidation backlog
+    /// drains oldest-first (Postgres does `ORDER BY created_at ASC`), and a client cannot
+    /// recover that by sorting a page it was already handed the wrong rows for.
+    ///
+    /// Bounded: it pulls a candidate window off the `created` index (which is the write-time
+    /// index — see `GenerationFiles::created_idx`), hydrates only those ids, and filters. If the
+    /// window runs out before `limit` matches are found, the returned cursor is where to resume,
+    /// so a selective filter costs more round trips rather than an unbounded read.
+    ///
+    /// Returns `(matches, next_from_ts)`. A `None` cursor means the walk reached the end.
+    pub async fn scan_ordered(
+        &self,
+        memory_types: &[u8],
+        from_ts: i64,
+        limit: usize,
+        filter: &Predicate,
+        groups: &[TagPredicate],
+    ) -> Result<(Vec<StoredMemory>, Option<i64>)> {
+        if limit == 0 {
+            return Ok((Vec::new(), None));
+        }
+        let metrics = QueryMetrics::new();
+        // Over-pull candidates so a filter that rejects most of them still fills a page in one
+        // round; anything left over is picked up by the cursor rather than read speculatively.
+        let cap = limit.saturating_mul(4).max(256);
+
+        // Candidates from every requested type's segments, plus their un-indexed tails. The types
+        // are merged into ONE order rather than walked one after another: a caller asking for
+        // experience+world wants the oldest of both, not all of one and then all of the other.
+        let mut cands: Vec<(i64, MemoryId, u8)> = Vec::new();
+        let mut tail_by_id: HashMap<MemoryId, StoredMemory> = HashMap::new();
+        let mut tail_ids: HashSet<MemoryId> = HashSet::new();
+        for &mt in memory_types {
+            let Some(ft) = self.per_type.get(&mt) else { continue };
+            for seg in ft.segments.iter() {
+                for (ts, id) in seg.created.after(&self.ns.store, from_ts, cap, Some((&metrics, 3))).await? {
+                    cands.push((ts, id, mt));
+                }
+            }
+            for m in ft.tail_items.iter() {
+                tail_ids.insert(m.id);
+                if let Some(ts) = m.timestamps.updated_at {
+                    if ts >= from_ts {
+                        cands.push((ts, m.id, mt));
+                        tail_by_id.insert(m.id, m.clone());
+                    }
+                }
+            }
+        }
+        // One global order, and one entry per id — an id present in several segments is the
+        // same memory, and the newest copy is the one the other filters resolve.
+        cands.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+        cands.dedup_by_key(|(_, id, _)| *id);
+
+        let mut out: Vec<StoredMemory> = Vec::new();
+        let mut consumed = 0usize;
+        for chunk in cands.chunks(256) {
+            if out.len() >= limit {
+                break;
+            }
+            // Hydrate only the ids this chunk needs: tail items are already resident, the rest
+            // come from the payload store by id (no cluster reads). Grouped by type because each
+            // type has its own segments.
+            let mut by_id: HashMap<MemoryId, StoredMemory> = HashMap::new();
+            for &mt in memory_types {
+                let Some(ft) = self.per_type.get(&mt) else { continue };
+                let want: Vec<MemoryId> = chunk
+                    .iter()
+                    .filter(|(_, id, t)| *t == mt && !tail_by_id.contains_key(id))
+                    .map(|(_, id, _)| *id)
+                    .collect();
+                if want.is_empty() {
+                    continue;
+                }
+                for seg in ft.segments.iter() {
+                    for (id, item) in
+                        seg.payload.lookup_batch(&self.ns.store, &want, Some((&metrics, 3))).await?
+                    {
+                        by_id.entry(id).or_insert(item);
+                    }
+                }
+            }
+            for (_, id, _) in chunk {
+                consumed += 1;
+                if out.len() >= limit {
+                    break;
+                }
+                let m = match tail_by_id.get(id) {
+                    Some(m) => m.clone(),
+                    // An indexed id the tail also carries is stale; the tail copy above wins.
+                    None if tail_ids.contains(id) => continue,
+                    None => match by_id.remove(id) {
+                        Some(m) => m,
+                        None => continue,
+                    },
+                };
+                if self.hidden(&m) {
+                    continue;
+                }
+                if filter.matches(&m) && groups.iter().all(|g| g.matches(&m.tags)) {
+                    out.push(m);
+                }
+            }
+        }
+
+        // Resume just past the last candidate we looked at. Ties on the same instant are safe to
+        // re-examine (the filter is deterministic); stopping short of them would drop rows.
+        let next = if consumed >= cands.len() && cands.len() < cap {
+            None
+        } else {
+            cands.get(consumed.saturating_sub(1)).map(|(ts, _, _)| *ts)
+        };
         Ok((out, next))
     }
 

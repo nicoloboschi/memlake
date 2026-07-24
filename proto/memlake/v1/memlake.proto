@@ -577,6 +577,20 @@ message ScanRequest {
   // every entry. A scan walks every member, so this is an exact filter on what a page returns —
   // no truncation, no over-fetch.
   repeated TagPredicate tag_groups = 13;
+  // Which order to walk in. Default (STORAGE) is the cluster walk — cheapest, and right for
+  // browsing. CREATED_ASC walks the write-time index instead, so a page is the globally oldest
+  // matches rather than whichever ones storage order reached first; that is what a queue needs
+  // (draining a backlog oldest-first) and what a client cannot reconstruct by sorting a page.
+  // `page_token` carries the corresponding cursor for whichever order is in effect.
+  ScanOrder order = 14;
+}
+
+// How `Scan` walks the corpus.
+enum ScanOrder {
+  // Cluster/storage order: the cheap browse walk, and the only one older generations support.
+  STORAGE = 0;
+  // Ascending write time, off the `created` index — the oldest matching memories first.
+  CREATED_ASC = 1;
 }
 
 message ScanResponse {

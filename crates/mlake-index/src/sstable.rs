@@ -275,6 +275,64 @@ impl SsTableIndex {
         }
         Ok(out)
     }
+
+    /// The first `cap` records at or after `lo`, ascending — a forward walk bounded by a
+    /// **count**, not a key.
+    ///
+    /// [`scan_range`] cannot express this: it needs an upper key, and reads every block covering
+    /// it, so "the oldest N" would mean scanning to the end of the table. This reads blocks
+    /// forward in small batches and stops as soon as it has enough, so a bounded request does
+    /// bounded I/O regardless of how much table lies beyond it.
+    pub async fn scan_forward(
+        &self,
+        store: &Store,
+        data_path: &str,
+        lo: &[u8; 16],
+        cap: usize,
+        ctx: Option<(&QueryMetrics, usize)>,
+    ) -> Result<Vec<([u8; 16], Vec<u8>)>> {
+        if self.blocks.is_empty() || cap == 0 {
+            return Ok(Vec::new());
+        }
+        // Blocks per round trip: enough to amortize the request, small enough that a tiny
+        // `cap` does not pull a large prefix of the table.
+        const BLOCK_BATCH: usize = 4;
+        let mut i = self.blocks.partition_point(|b| &b.first_key <= lo).saturating_sub(1);
+        let mut out = Vec::new();
+        while i < self.blocks.len() && out.len() < cap {
+            let end = (i + BLOCK_BATCH).min(self.blocks.len());
+            let ranges: Vec<std::ops::Range<usize>> = self.blocks[i..end]
+                .iter()
+                .map(|b| b.offset as usize..b.offset as usize + b.len as usize)
+                .collect();
+            for block_bytes in &store.get_ranges(data_path, &ranges, ctx).await? {
+                scan_block_from(block_bytes, lo, &mut out);
+            }
+            i = end;
+        }
+        out.truncate(cap);
+        Ok(out)
+    }
+}
+
+/// Collect every record in `block` whose key is `>= lo`, with no upper bound. The forward-scan
+/// counterpart of [`scan_block_range`], for a walk that stops on a *count* rather than a key.
+fn scan_block_from(block: &[u8], lo: &[u8; 16], out: &mut Vec<([u8; 16], Vec<u8>)>) {
+    let mut p = 0;
+    while p + 20 <= block.len() {
+        let mut rec_key = [0u8; 16];
+        rec_key.copy_from_slice(&block[p..p + 16]);
+        let vlen = u32::from_le_bytes(block[p + 16..p + 20].try_into().unwrap()) as usize;
+        let vstart = p + 20;
+        let vend = vstart + vlen;
+        if vend > block.len() {
+            break;
+        }
+        if &rec_key >= lo {
+            out.push((rec_key, block[vstart..vend].to_vec()));
+        }
+        p = vend;
+    }
 }
 
 /// Collect every record in `block` whose key is in `[lo, hi]`. Records are sorted, so the
@@ -782,6 +840,37 @@ impl TimeTable {
             ids = ids.into_iter().step_by(stride).take(cap).collect();
         }
         Ok(ids)
+    }
+
+    /// The oldest `cap` memories at or after `from`, ascending, as `(ts, id)` pairs.
+    ///
+    /// This is the ordered-scan primitive, and deliberately *not* [`in_window`]: that one caps by
+    /// striding a spread sample across a window (what the temporal arm's entry-point coverage
+    /// wants), whereas an ordered scan needs the contiguous oldest prefix. Bounded I/O — it reads
+    /// blocks forward only until `cap` ids are in hand. Asking the underlying scan for `cap`
+    /// *records* is always enough, since every record carries at least one id.
+    pub async fn after(
+        &self,
+        store: &Store,
+        from: i64,
+        cap: usize,
+        ctx: Option<(&QueryMetrics, usize)>,
+    ) -> Result<Vec<(i64, MemoryId)>> {
+        if cap == 0 || self.index.is_empty() {
+            return Ok(Vec::new());
+        }
+        let records = self.index.scan_forward(store, &self.data_path, &ts_key(from), cap, ctx).await?;
+        let mut out = Vec::with_capacity(cap);
+        for (key, value) in records {
+            let ts = ts_from_key(&key);
+            for id in decode_ids(&value, usize::MAX) {
+                out.push((ts, id));
+                if out.len() >= cap {
+                    return Ok(out);
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Every distinct effective timestamp and how many memories carry it, ascending — one full

@@ -24,6 +24,9 @@ ANY = pb.ANY
 ALL = pb.ALL
 ANY_STRICT = pb.ANY_STRICT
 ALL_STRICT = pb.ALL_STRICT
+#: Scan walk order — storage (cluster) order, or ascending write time (oldest first).
+STORAGE = pb.STORAGE
+CREATED_ASC = pb.CREATED_ASC
 EXACT = pb.EXACT
 
 
@@ -556,6 +559,7 @@ class MemlakeClient:
         tags: Optional[Sequence[str]] = None,
         tags_mode: int = ANY,
         tag_groups: Optional[Sequence["pb.TagPredicate"]] = None,
+        order: int = STORAGE,
         skip: int = 0,
         updated_from: Optional[int] = None,
         updated_to: Optional[int] = None,
@@ -572,6 +576,7 @@ class MemlakeClient:
             include_edges=include_edges,
             metadata_equals=dict(metadata_equals or {}),
             skip=skip,
+            order=order,
         )
         if tags:
             req.tags.CopyFrom(pb.TagFilter(tags=list(tags), mode=tags_mode))

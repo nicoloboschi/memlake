@@ -452,6 +452,10 @@ async fn run_workload(
                 graph: if config.graph_weight > 0.0 { config.arm_depth } else { 0 },
                 nprobe: config.nprobe,
                 graph_seed_min: config.graph_seed_min_similarity,
+                // The benchmark must measure what a real query costs, and a real retrieval query
+                // reranks exactly. (Only link derivation opts out, to skip the dominant per-item
+                // cost — measuring that here would flatter the numbers.)
+                exact_rerank: true,
             };
             let t = Instant::now();
             node.query_raw_metered(

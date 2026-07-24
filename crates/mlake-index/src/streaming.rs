@@ -493,6 +493,8 @@ async fn build_type_streaming(
     let mut pk_sort = ExternalSort::new(per_index);
     let mut entity_sort = ExternalSort::new(per_index);
     let mut time_sort = ExternalSort::new(per_index);
+    // Arrival-order index (write time), the ordered-scan counterpart of `time_sort`.
+    let mut created_sort = ExternalSort::new(per_index);
     let mut radj_sort = ExternalSort::new(FoldBudget::bytes(budget.radj_mb));
     let mut fts = TantivyFtsBuilder::new(tokenizer.clone(), FoldBudget::bytes(budget.fts_mb))
         .map_err(|e| crate::Error::Fts(e.to_string()))?;
@@ -559,6 +561,9 @@ async fn build_type_streaming(
             let t = &item.timestamps;
             if let Some(ts) = t.occurred_start.or(t.mentioned_at).or(t.occurred_end) {
                 time_sort.add(ts_key(ts), item.id.0.to_vec())?;
+            }
+            if let Some(ts) = t.updated_at {
+                created_sort.add(ts_key(ts), item.id.0.to_vec())?;
             }
             fts.add(item.id, item.fts_text(), &item.tags).map_err(|e| crate::Error::Fts(e.to_string()))?;
             semantic_edge_count += item.semantic_out.len();
@@ -658,6 +663,7 @@ async fn build_type_streaming(
     let rerank = build_sstable_from_merge(rerank_sort.finish()?)?;
     let entity = build_sstable_from_merge(entity_sort.finish()?)?;
     let time = build_sstable_from_merge(time_sort.finish()?)?;
+    let created = build_sstable_from_merge(created_sort.finish()?)?;
     let radj = build_sstable_from_merge(radj_sort.finish()?)?;
     let fts_split = fts.finish().map_err(|e| crate::Error::Fts(e.to_string()))?.split_bytes().to_vec();
     let tag_summary: TagSummary = cluster_tags
@@ -683,6 +689,7 @@ async fn build_type_streaming(
         pk.into(),
         entity.into(),
         time.into(),
+        created.into(),
         payload.into(),
         rerank.into(),
         &tag_summary,

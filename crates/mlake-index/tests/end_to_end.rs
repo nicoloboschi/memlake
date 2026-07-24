@@ -605,6 +605,7 @@ async fn crash_before_manifest_swap_leaves_the_old_generation_serving() {
         mlake_index::PkTable::build(vec![]).into(),
         mlake_index::EntityTable::build(vec![]).into(),
         mlake_index::TimeTable::build(vec![]).into(),
+        mlake_index::TimeTable::build(vec![]).into(),
         mlake_index::PayloadTable::build(&[]).into(),
         mlake_index::RerankTable::build(&[]).into(),
         &Vec::new(),
@@ -777,6 +778,7 @@ async fn concurrent_generation_builds_write_disjoint_files() {
         mlake_index::PkTable::build(vec![(MemoryId::from_key("a"), 0)]).into(),
         mlake_index::EntityTable::build(vec![]).into(),
         mlake_index::TimeTable::build(vec![]).into(),
+        mlake_index::TimeTable::build(vec![]).into(),
         mlake_index::PayloadTable::build(&[]).into(),
         mlake_index::RerankTable::build(&[]).into(),
         &Vec::new(),
@@ -797,6 +799,7 @@ async fn concurrent_generation_builds_write_disjoint_files() {
         mlake_index::RadjTable::build(vec![]).into(),
         mlake_index::PkTable::build(vec![(MemoryId::from_key("b"), 0)]).into(),
         mlake_index::EntityTable::build(vec![]).into(),
+        mlake_index::TimeTable::build(vec![]).into(),
         mlake_index::TimeTable::build(vec![]).into(),
         mlake_index::PayloadTable::build(&[]).into(),
         mlake_index::RerankTable::build(&[]).into(),
@@ -1129,6 +1132,47 @@ async fn tags_filter_the_query_in_all_five_modes() {
         .await
         .unwrap();
     assert_eq!(ids(&r), std::iter::once(MemoryId::from_key("none")).collect::<std::collections::HashSet<_>>());
+}
+
+/// An ordered scan returns the globally oldest matches by write time, not whatever the cluster
+/// walk reaches first. This is what the consolidation queue drains on, so "first found" and
+/// "oldest" being different is the whole point — the memories are written in one order and
+/// stamped in the reverse, so a storage-order walk cannot accidentally satisfy it.
+#[tokio::test]
+async fn scan_ordered_walks_write_time_oldest_first() {
+    const N: usize = 40;
+    let store = Store::in_memory();
+    let ns = namespace(store, "bank").await;
+    let mut writer = Writer::new(ns.clone());
+    let ops: Vec<Op> = (0..N)
+        .map(|i| {
+            // Spread the vectors so the fold clusters them apart from insertion order.
+            let theta = i as f32 * 0.31;
+            let mut m = item(&format!("m{i:02}"), vec![theta.cos(), theta.sin(), 0.0], &format!("memory {i}"));
+            // Written first => stamped newest, so write order is the reverse of arrival order.
+            m.timestamps.updated_at = Some((N - i) as i64 * 1_000);
+            Op::Upsert(m)
+        })
+        .collect();
+    writer.commit(ops).await.unwrap();
+    index(&ns, &Tokenizer::default(), IndexOptions::default()).await.unwrap();
+    let node = QueryNode::open(&ns, Tokenizer::default()).await.unwrap();
+
+    // Oldest first => the LAST-written ids, descending index: m39, m38, m37 ...
+    let (page, cursor) = node.scan_ordered(&[1], i64::MIN, 5, &pred(), &[]).await.unwrap();
+    let got: Vec<String> = page.iter().map(|m| m.text.clone()).collect();
+    let want: Vec<String> = (0..5).map(|k| format!("memory {}", N - 1 - k)).collect();
+    assert_eq!(got, want, "the five oldest by write time, in order");
+    assert!(cursor.is_some(), "more remains, so the walk hands back a resume point");
+
+    // Resuming from the cursor continues in order rather than restarting.
+    let (page2, _) = node.scan_ordered(&[1], cursor.unwrap(), 5, &pred(), &[]).await.unwrap();
+    let first_ts = page[0].timestamps.updated_at.unwrap();
+    assert!(
+        page2.iter().all(|m| m.timestamps.updated_at.unwrap() >= first_ts),
+        "the second page never goes backwards in time"
+    );
+    assert!(page2.iter().all(|m| m.timestamps.updated_at.unwrap() > page[3].timestamps.updated_at.unwrap()));
 }
 
 /// Compound `tag_groups` are applied server-side at the materialization pass — a boolean tree
