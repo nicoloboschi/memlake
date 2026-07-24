@@ -39,9 +39,9 @@ struct Snapshot {
 
 /// What `snapshot_traced` did, for the per-call trace.
 struct SnapshotOutcome {
-    /// `reuse` (cached, head unchanged), `reopen_tail` (a write; segments reused), `reopen_defer`
-    /// (a fold, but still in the grace window — serve warm segments + extended tail), `reopen_fold`
-    /// (adopt a new generation, ≥2 folds behind), or `full_open` (no cache).
+    /// `reuse` (cached, head unchanged), `reopen_tail` (a write; segments reused), `reopen_fold`
+    /// (a fold changed the manifest — adopt the new generation, warming its cold clusters off the
+    /// request path), or `full_open` (no cache).
     action: &'static str,
     /// Time spent in the snapshot step (head check + any reopen/open).
     open_ms: f64,
@@ -181,47 +181,13 @@ impl MemlakeService {
                         let out = SnapshotOutcome::new("reopen_tail", started, node.tail_len());
                         return Ok((self.install_snapshot(&ns.name, node), out));
                     }
-                    Ok(Some(versioned)) => {
-                        // A fold changed the manifest. If the new generation's grace window still
-                        // covers our snapshot's WAL cursor — GC keeps WAL entries (and the previous
-                        // generation's segment objects) above `prev_wal_index_cursor`, so
-                        // `prev_wal_index_cursor <= our cursor` means everything our segments+tail
-                        // read is still present — we can keep serving from the ALREADY-WARM segments
-                        // plus an extended tail instead of adopting the fold's cold new generation on
-                        // the request path. Correctness is identical (old segments + tail(cursor,
-                        // head] = the live set); manifest.rs documents this previous-generation
-                        // reopen. We adopt the new generation (and warm it) only once a further fold
-                        // pushes the watermark past our cursor — the grace window is one generation.
-                        // Deferred adoption is OPT-IN (`MEMLAKE_DEFER_FOLD=on`). It is provably
-                        // correct (old segments + retained tail = the live set; see the e2e test
-                        // `deferred_reopen_across_a_fold_matches_a_fresh_open`) and avoids the cold
-                        // new-generation fetch on the request path — a clear win for read-heavy /
-                        // low-fold namespaces. But under write-heavy load it keeps the WAL tail
-                        // growing (each reopen re-scans a longer `(cursor, head]`), which offset the
-                        // cold-fold savings in A/B, so it is not on by default. warm-on-fold (always
-                        // on) already removes most of the cold tail. See docs/concurrency-findings.md.
-                        let defer_enabled =
-                            std::env::var("MEMLAKE_DEFER_FOLD").as_deref() == Ok("on");
-                        let can_defer = defer_enabled
-                            && mlake_core::manifest::Manifest::from_bytes(&versioned.bytes)
-                                .map(|m| m.prev_wal_index_cursor <= cached.node.wal_index_cursor())
-                                .unwrap_or(false);
-                        if can_defer {
-                            let node = Arc::new(
-                                cached
-                                    .node
-                                    .reopen_extending_tail(head, self.tokenizer.clone())
-                                    .await
-                                    .map_err(internal)?,
-                            );
-                            let out =
-                                SnapshotOutcome::new("reopen_defer", started, node.tail_len());
-                            return Ok((self.install_snapshot(&ns.name, node), out));
-                        }
-                        // Grace window exhausted (≥ 2 generations behind) — adopt now. Reopen
-                        // reusing the segments whose id persisted across the fold (a flush adds one
-                        // L0, a compaction replaces a few with one — most persist), reloading only
-                        // the new ones, and warm those cold clusters off the request path.
+                    Ok(Some(_)) => {
+                        // A fold changed the manifest. Reopen reusing the segments whose id persisted
+                        // across the fold (a flush adds one L0, a compaction replaces a few with one —
+                        // most persist), reloading only the new ones, and warm those cold clusters
+                        // into the read cache off the request path so the next query/derive to probe
+                        // them isn't the one that eats the cold object-store fetch (the dominant tail;
+                        // see docs/concurrency-findings.md).
                         let node = Arc::new(
                             cached
                                 .node
@@ -264,11 +230,7 @@ impl MemlakeService {
     /// blobs the fold actually changed.
     fn install_and_warm(&self, name: &str, node: Arc<QueryNode>) -> Arc<Snapshot> {
         let snap = self.install_snapshot(name, node.clone());
-        // `MEMLAKE_WARM_ON_FOLD=off` disables the prefetch (for A/B measurement / a node that would
-        // rather pay cold on demand than spend background I/O). On by default.
-        if std::env::var("MEMLAKE_WARM_ON_FOLD").as_deref() != Ok("off") {
-            tokio::spawn(async move { node.warm().await });
-        }
+        tokio::spawn(async move { node.warm().await });
         snap
     }
 

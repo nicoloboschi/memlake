@@ -593,15 +593,6 @@ impl QueryNode {
         self.manifest_etag.as_ref()
     }
 
-    /// The WAL cursor this snapshot's segments were folded up to — its tail scans
-    /// `(wal_index_cursor, head]`. A reopen across a fold may keep serving from this snapshot's
-    /// (warm) segments + an extended tail only while the new manifest's `prev_wal_index_cursor`
-    /// still sits at or below this cursor (GC keeps the WAL above that watermark — the one-
-    /// generation grace window).
-    pub fn wal_index_cursor(&self) -> u64 {
-        self.wal_index_cursor
-    }
-
     /// Total live items across all fact types.
     pub fn doc_count(&self) -> usize {
         self.per_type.values().map(|s| s.doc_count).sum()

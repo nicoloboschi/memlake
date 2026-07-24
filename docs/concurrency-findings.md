@@ -254,7 +254,7 @@ pulls a generation's cluster+vector blobs into the read cache, warming **only th
 freshly decoded** (`newly_loaded`) — after a fold that's just the new segment(s); persisted ones are
 already cached — so warming never re-pulls warm blobs (warming *everything* thrashed the 512MB mem
 tier and raised the median). The serve node kicks it as a detached task the moment it adopts a new
-generation (`reopen_fold`/`full_open`). Toggle `MEMLAKE_WARM_ON_FOLD=off`.
+generation (`reopen_fold`/`full_open`) — always on, no flag.
 
 Clean A/B on a fresh bucket (only variable = warm on/off):
 
@@ -265,17 +265,18 @@ Clean A/B on a fresh bucket (only variable = warm on/off):
 | WRITE p99 | 7898ms | **5944ms** (−25%) |
 | p50 (read/write) | 21 / 235ms | 20 / 225ms (flat) |
 
-**Deferred adoption (`reopen_defer`) — correct, tested, but OPT-IN (default off).** The GC grace
-window (gc.rs keeps WAL + previous-generation segment objects above `prev_wal_index_cursor`) makes it
-provably safe for a serve node to keep serving from its *already-warm* old segments + an extended
-tail after a fold, instead of adopting the cold new generation on the request path — as long as
-`new_manifest.prev_wal_index_cursor <= node.wal_index_cursor()` (exactly one generation of lag).
-Proven identical to a fresh open by `deferred_reopen_across_a_fold_matches_a_fresh_open`. **But** it
-keeps the WAL tail growing (each reopen re-scans a longer `(cursor, head]`), and under the write-heavy
-mixed load the A/B was neutral-to-slightly-worse — the growing tail-scan offset the cold-fold savings,
-and warm-on-fold already removes most of the cold tail. So it ships **off by default**
-(`MEMLAKE_DEFER_FOLD=on` to enable) — a real win for read-heavy / low-fold namespaces, not for
-write-heavy ones. **Caveat: the mixed benchmark has high run-to-run variance** (READ p99 ranged
+**Deferred adoption — prototyped, measured, then removed.** The GC grace window (gc.rs keeps WAL +
+previous-generation segment objects above `prev_wal_index_cursor`) makes it provably safe for a serve
+node to keep serving from its *already-warm* old segments + an extended tail after a fold — as long as
+`new_manifest.prev_wal_index_cursor <= node's cursor` (one generation of lag). It was correct (an e2e
+test proved it identical to a fresh open across a fold). **But** it keeps the WAL tail growing (each
+reopen re-scans a longer `(cursor, head]`), and under the write-heavy mixed load the A/B was
+neutral-to-slightly-worse — the growing tail-scan offset the cold-fold savings, and warm-on-fold
+already removes most of the cold tail. It would only help read-heavy / low-fold namespaces, i.e. it
+would have to be enabled *based on a namespace's traffic* — a knob we won't tune per deployment — so
+it was **removed** rather than shipped behind a flag. Recorded here so the grace-window reasoning
+isn't re-derived from scratch if a read-heavy workload ever justifies an *automatic* (tail-bounded,
+no-flag) version. **Caveat: the mixed benchmark has high run-to-run variance** (READ p99 ranged
 251ms–2.4s across near-identical configs), so treat single-run deltas skeptically; the warm-on-fold
 number above is the one clean, order-controlled signal.
 
