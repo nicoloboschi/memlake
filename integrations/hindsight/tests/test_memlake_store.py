@@ -723,6 +723,53 @@ async def test_unconsolidated_then_marked(store, bank_id, index_pass):
     assert unit_ids[0] not in {m.unit_id for m in pending_after}
 
 
+async def test_unconsolidated_drains_oldest_first(store, bank_id, index_pass):
+    """`find_unconsolidated` returns the GLOBALLY oldest candidates, not the first ones found.
+
+    Consolidation picks its next batch off this, and the SQL path drains the queue in arrival
+    order (`ORDER BY created_at ASC`). A scan walks in cluster order, so returning the first
+    `limit` matches it happens to see — which is what stopping early did — drains the backlog
+    in an arbitrary order. Asking for fewer than the backlog is what exposes that.
+    """
+    base = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    # Two things make the contract observable, and both are required:
+    #   * the backlog must span more than one scan page (page size is max(limit, 200)), because
+    #     within a single page a sort of "everything seen" and a sort of "everything" agree;
+    #   * storage order must disagree with arrival order, so created_at descends as we write —
+    #     the OLDEST records are written last, landing on the second page.
+    # Left unfolded on purpose: the WAL tail preserves write order, so storage order is exact
+    # rather than at the mercy of how the fold happens to cluster.
+    total = 250
+    records = [
+        FactRecord(
+            unit_id=store.allocate_unit_ids(1)[0],
+            text=f"fact number {i}",
+            embedding=_vec(0.05 + (i % 7) * 0.12),
+            fact_type="world",
+            created_at=base + timedelta(days=total - i),
+        )
+        for i in range(total)
+    ]
+    await store._write_records(bank_id, records)
+
+    written = [(r.unit_id, r.created_at) for r in records]
+    oldest_first = [uid for uid, _ in sorted(written, key=lambda p: p[1])]
+
+    # Ask for half the backlog: the answer must be the oldest half, in order.
+    got = await store.find_unconsolidated(
+        conn=None, fq_table=_fq_table, bank_id=bank_id, fact_types=["world"], limit=3
+    )
+    assert [m.unit_id for m in got] == oldest_first[:3], (
+        f"expected the three oldest by created_at, got {[m.unit_id for m in got]}"
+    )
+
+    # A deeper request is still the oldest prefix, in order — not just the first page's oldest.
+    every = await store.find_unconsolidated(
+        conn=None, fq_table=_fq_table, bank_id=bank_id, fact_types=["world"], limit=50
+    )
+    assert [m.unit_id for m in every] == oldest_first[:50], "the queue drains oldest-first"
+
+
 async def test_consolidation_failure_also_leaves_the_queue(store, bank_id, index_pass):
     """A fact the LLM could not summarise must stop being a candidate too."""
     ns = store._namespace(bank_id)

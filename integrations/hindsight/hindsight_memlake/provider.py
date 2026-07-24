@@ -115,6 +115,14 @@ CONSOLIDATED_FAILED = "2"
 #: per-document counts; the consolidated flag backs get_bank_freshness's pending/failed.
 _INDEXED_METADATA_KEYS = [META_DOCUMENT_ID, META_CONSOLIDATED_FLAG]
 
+#: How many scan pages one `find_unconsolidated` call will walk before it gives up on seeing
+#: the rest of the backlog. The whole matched set is collected and sorted so the oldest drain
+#: first (the SQL path's `ORDER BY created_at ASC`), and this bounds the worst case: a backlog
+#: deeper than cap*page still drains oldest-first *within the scanned prefix*, and the next
+#: cycle picks up where consolidation left it. Scan has no ordering of its own yet (TODOS §5),
+#: which is why this is a client-side sort rather than a server-side ORDER BY + LIMIT.
+_UNCONSOLIDATED_SCAN_PAGE_CAP = 100
+
 #: Per-entity cap when deriving the entity-link count, mirroring Postgres's writer cap
 #: (each memory bidirectionally linked to at most this many others sharing an entity). Keeps
 #: `link_counts`'s entity total identical to the SQL path's `SUM(LEAST(n-1, cap))`.
@@ -1249,8 +1257,17 @@ class MemlakeMemories(MemoriesExtension):
         found: list[StoredMemory] = []
         page_token = ""
         pages = 0
-        # Bounded so one consolidation cycle cannot walk an entire large corpus.
-        while len(found) < limit and pages < 100:
+        # Collect the whole unconsolidated set before sorting, rather than stopping as soon as
+        # `limit` rows are in hand. Stopping early returned the first `limit` matches in *storage*
+        # (cluster) order and then sorted only those, so the queue drained in an arbitrary order
+        # instead of oldest-first — the SQL path's `ORDER BY created_at ASC`. Consolidation picks
+        # the next batch off this, so the order is behaviour, not cosmetics.
+        #
+        # This is close to free where it matters: `metadata_equals` narrows what the walk
+        # *returns*, not what it *reads*, so a steady-state bank (large corpus, small backlog)
+        # already had to touch every cluster to fill `limit`. The page cap below still bounds one
+        # cycle; a backlog deeper than the cap drains oldest-first within the scanned prefix.
+        while pages < _UNCONSOLIDATED_SCAN_PAGE_CAP:
             page = await self.scan_memories(
                 conn=conn,
                 fq_table=fq_table,
