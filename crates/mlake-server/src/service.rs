@@ -178,11 +178,34 @@ impl MemlakeService {
                 }
 
                 // The overwritten rollup powers the fleet overview (heartbeat + cumulative stats).
-                let rollup = match buffer.lock() {
-                    Ok(b) => b.rollup_json(&node_id),
+                let mut rollup = match buffer.lock() {
+                    Ok(b) => b.rollup_value(&node_id),
                     Err(_) => continue,
                 };
-                if let Err(e) = store.put(&rollup_path, rollup).await {
+                // Attach this node's cache occupancy. CacheStats over gRPC is node-LOCAL, so behind
+                // a load-balanced Service it answers for a random pod and can't introspect a chosen
+                // one. Publishing the summary here makes every node's cache readable from object
+                // storage instead — same push/pull shape as the traces, no pod addressing needed.
+                if let Some(obj) = rollup.as_object_mut() {
+                    obj.insert(
+                        "cache".into(),
+                        match store.cache() {
+                            Some(c) => serde_json::json!({
+                                "enabled": true,
+                                "mem_bytes": c.bytes(),
+                                "mem_budget": c.mem_budget(),
+                                "mem_entries": c.len(),
+                                "disk_bytes": c.disk_bytes(),
+                                "disk_budget": c.disk_budget(),
+                                "disk_entries": c.disk_len(),
+                                "hits": c.hits(),
+                                "misses": c.misses(),
+                            }),
+                            None => serde_json::json!({ "enabled": false }),
+                        },
+                    );
+                }
+                if let Err(e) = store.put(&rollup_path, rollup.to_string().into_bytes()).await {
                     tracing::warn!(%node_id, error = %e, "trace rollup upload failed");
                 }
             }

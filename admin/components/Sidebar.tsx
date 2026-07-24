@@ -18,6 +18,12 @@ const SECTIONS = [
     match: (p: string) => p.startsWith("/traces"),
   },
   {
+    href: "/indexer",
+    label: "Indexer",
+    hint: "work queue · folds",
+    match: (p: string) => p.startsWith("/indexer"),
+  },
+  {
     href: "/",
     label: "Namespaces",
     hint: "data · indexes · WAL",
@@ -57,7 +63,7 @@ export function Sidebar() {
           );
         })}
 
-        {/* Node-local read cache — a serve-node internal, so it nests under Services. */}
+        {/* Read-cache occupancy for the whole fleet (from the rollups, not a node-local RPC). */}
         <Link
           href="/cache"
           className={`ml-3 mt-0.5 px-3 py-1 rounded-sm font-mono text-[11px] ${
@@ -66,7 +72,7 @@ export function Sidebar() {
               : "text-ink-faint hover:text-ink"
           }`}
         >
-          node cache
+          cache
         </Link>
       </nav>
 

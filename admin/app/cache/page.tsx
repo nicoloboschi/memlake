@@ -1,8 +1,8 @@
-import { CacheView } from "@/components/CacheView";
+import { FleetCacheView } from "@/components/FleetCacheView";
 
 export const dynamic = "force-dynamic";
 
-/** The unfiltered view: every namespace this node happens to be holding. */
+/** Every serve node's cache occupancy, read from the rollups (not a node-local RPC). */
 export default function Page() {
-  return <CacheView namespace={null} />;
+  return <FleetCacheView />;
 }

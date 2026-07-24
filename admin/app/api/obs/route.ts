@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 
 import { errorResponse } from "@/lib/http";
 import {
+  indexQueue,
   listNodes,
   namespaceRecords,
   nodeRecords,
@@ -40,6 +41,11 @@ export async function GET(req: Request): Promise<NextResponse> {
   );
 
   try {
+    if (url.searchParams.get("queue")) {
+      const queue = await indexQueue();
+      const nodes = await listNodes();
+      return NextResponse.json({ queue, nodes, elapsedMs: Date.now() - started });
+    }
     if (trace) {
       const record = await traceById(trace);
       return NextResponse.json({ record, elapsedMs: Date.now() - started });

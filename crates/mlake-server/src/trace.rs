@@ -159,9 +159,10 @@ impl TraceBuffer {
         Some(out.into_bytes())
     }
 
-    /// The rollup object for the fleet overview: heartbeat, cumulative totals, action mix, and the
-    /// per-namespace rollup. Shape matches what the admin's Services view expects (`kind:"header"`).
-    pub fn rollup_json(&self, node_id: &str) -> Vec<u8> {
+    /// The rollup for the fleet overview: heartbeat, cumulative totals, action mix, and the
+    /// per-namespace rollup. Returned as a `Value` so the uploader can attach node-local state the
+    /// buffer doesn't own (e.g. cache occupancy) before serializing.
+    pub fn rollup_value(&self, node_id: &str) -> serde_json::Value {
         let now = now_ms();
         let uptime_ms = now.saturating_sub(self.started_ms);
         let mut lat: Vec<f32> = self.recent_lat.iter().copied().collect();
@@ -203,8 +204,6 @@ impl TraceBuffer {
             "pending": self.pending.len(),
             "dropped": self.dropped,
         })
-        .to_string()
-        .into_bytes()
     }
 }
 
@@ -312,7 +311,7 @@ mod tests {
         }
         // The rollup reflects every record (nothing dropped under the hard cap).
         let rollup: serde_json::Value =
-            serde_json::from_slice(&b.rollup_json("memlake-serve-0")).unwrap();
+            b.rollup_value("memlake-serve-0");
         assert_eq!(rollup["totals"]["count"], 2000);
         assert_eq!(rollup["dropped"], 0);
         assert_eq!(rollup["by_action"]["reuse"], 2000);

@@ -48,6 +48,19 @@ export interface NsRollup {
   p99_ms: number;
 }
 
+/** A node's two-tier read cache occupancy, published in its rollup. */
+export interface NodeCache {
+  enabled: boolean;
+  mem_bytes?: number;
+  mem_budget?: number;
+  mem_entries?: number;
+  disk_bytes?: number;
+  disk_budget?: number;
+  disk_entries?: number;
+  hits?: number;
+  misses?: number;
+}
+
 export interface NodeHeader {
   kind: "header";
   node_id: string;
@@ -59,6 +72,22 @@ export interface NodeHeader {
   /** Records still buffered in memory, and records dropped because S3 wasn't draining. */
   pending?: number;
   dropped?: number;
+  /** Node-local cache occupancy — published here because CacheStats over gRPC is node-local and
+   * unaddressable behind a load-balanced Service. */
+  cache?: NodeCache;
+}
+
+/** The indexer work queue: one job per namespace that might need folding. */
+export interface IndexJob {
+  state: string;
+  claimed_by?: string | null;
+  heartbeat_ms?: number;
+  enqueued_ms?: number;
+}
+export interface IndexQueue {
+  jobs: Record<string, IndexJob>;
+  /** When the admin read it, so the UI can age heartbeats consistently. */
+  fetchedMs: number;
 }
 
 export type TraceRecord = {
@@ -341,4 +370,25 @@ export async function namespaceRecords(
 ): Promise<(TraceRecord & { node_id: string })[]> {
   const recs = await readRecent(SCAN_BATCH_OBJECTS);
   return recs.filter((r) => r.namespace === namespace).slice(0, limit);
+}
+
+/** Path of the indexer work queue — a single CAS'd JSON object at the bucket root. */
+export const INDEX_QUEUE_PATH = "_index-queue.json";
+
+/**
+ * The indexer work queue, read straight from object storage.
+ *
+ * Same shape as everything else here: the indexer coordinates through S3, so the admin can show
+ * what's queued/claimed with no indexer endpoint to call and no discovery. Missing object == the
+ * queue has never been written, which is an empty queue.
+ */
+export async function indexQueue(): Promise<IndexQueue> {
+  const fetchedMs = Date.now();
+  try {
+    const body = await getText(INDEX_QUEUE_PATH);
+    const parsed = JSON.parse(body) as { jobs?: Record<string, IndexJob> };
+    return { jobs: parsed.jobs ?? {}, fetchedMs };
+  } catch {
+    return { jobs: {}, fetchedMs };
+  }
 }
