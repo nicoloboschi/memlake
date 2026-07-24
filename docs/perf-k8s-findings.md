@@ -104,6 +104,29 @@ roundtrips.) Only affordable because the F5 fix made the fold-time snapshot open
 length trigger (`MINOR_COMPACT_MIN_RUN`=2) balances fan-out against write amplification. *Fix
 committed.*
 
+**F7 — The write path is bound by the vector-arm stage-one scan (mislabeled "rerank"); halving
+derivation nprobe ~doubled write throughput.** Per-request tracing (fleet traces in `_obs/traces/`)
+showed writes, not queries, were the bottleneck: a 512-doc batch took p50 **12 s**, max **56 s**,
+dominated by link derivation (`derive_links_for_write` runs one vector query per new doc). The trace
+attributed ~77% of write CPU to a "rerank" phase — but derivation runs `exact_rerank=false` and never
+reaches stage two. The `Phase::Rerank` timer was wrapping BOTH stage one (the RaBitQ 1-bit scan,
+`scan_blocks`) and stage two (exact rescoring). Splitting stage one into its own `Phase::Scan`
+revealed the truth: the write hotspot is the **stage-one scan**, the only vector cost derivation
+pays.
+
+Derivation keeps only the top `MAX_SEMANTIC_OUT` (5) neighbours at cosine ≥ 0.7, yet scanned
+`nprobe=16` clusters — double the proven user-query `DEFAULT_NPROBE` (8). A ≥0.7 neighbour sits in the
+query's nearest clusters, so `nprobe=8` finds the same links at half the scan. Result on the same 20 k
+/ 8-writer benchmark: **write throughput 196 → 354/s (+80%)**, write wall-time 102 → 56 s, fold still
+drains. *Fix committed.* (Query latency in that run rose slightly, but this image also carries the new
+per-request object-access span instrumentation — an unrelated tracing overhead, not the nprobe change,
+which only touches the write path.)
+
+*Corollary (now visible from the split):* for **user queries** the dominant CPU is the stage-two
+**exact rerank** (~90% of query CPU vs ~9% scan) — the opposite balance from writes. If query CPU
+becomes the constraint, the lever is the exact-rerank contender set (how many candidates the error
+bound leaves in play), not the scan.
+
 ## Recommended next
 
 - **F5**: fixed (batched the fold-time doc-count pk probe); rerun the benchmark to capture the
