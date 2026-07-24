@@ -72,11 +72,20 @@ impl TagFilter {
         self.groups.iter().all(|g| g.matches(memory_tags))
     }
 
-    /// True when this filter admits every memory, so callers can skip the work entirely.
-    /// An empty request is a no-op for all modes except `Exact` (where it means the
-    /// untagged scope).
+    /// True when the *flat* condition admits every memory, so cluster/block pruning can be
+    /// skipped. An empty request is a no-op for all modes except `Exact` (the untagged scope).
+    /// Deliberately ignores `groups`: the compound predicate cannot prune clusters/blocks, so
+    /// pruning decisions stay pure-flat. Use [`admits_all`] to ask whether there is *any* filter.
     pub fn is_noop(&self) -> bool {
         self.tags.is_empty() && self.mode != TagsMatch::Exact
+    }
+
+    /// True when NOTHING filters — neither the flat condition nor the compound `groups`. This is
+    /// the "is any per-memory filtering needed at all" question, distinct from [`is_noop`], which
+    /// is only about the flat half (and drives pruning). A per-memory filter site that must honour
+    /// `groups` gates on this; a cluster/block pruning site gates on [`is_noop`].
+    pub fn admits_all(&self) -> bool {
+        self.is_noop() && self.groups.is_empty()
     }
 
     /// Whether a *cluster* could contain a memory that passes this filter, given the union

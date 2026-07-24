@@ -572,6 +572,11 @@ message ScanRequest {
   // Same `updated_at` window as Query, AND-ed with the tag and metadata conditions.
   optional int64 updated_from = 11;
   optional int64 updated_to = 12;
+  // Compound tag filtering, AND-ed with `tags` and `metadata_equals`. Each entry is a boolean
+  // tree over the memory's tag set (see TagPredicate); a memory is returned only if it satisfies
+  // every entry. A scan walks every member, so this is an exact filter on what a page returns —
+  // no truncation, no over-fetch.
+  repeated TagPredicate tag_groups = 13;
 }
 
 message ScanResponse {

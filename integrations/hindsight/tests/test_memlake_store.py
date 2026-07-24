@@ -233,6 +233,51 @@ async def test_scan_pages_and_counts(store, bank_id, index_pass):
     assert counts.get("experience") == 1
 
 
+async def test_scan_pushes_down_compound_tag_groups(store, bank_id, index_pass):
+    """Scan filters on a compound tag_groups tree server-side, per-member over the whole walk.
+
+    A scan visits every member, so there is no truncation and no over-fetch — the page is an
+    exact filter on what matches "(team:a AND env:prod) OR team:b".
+    """
+    from hindsight_api.engine.search.tags import TagGroupAnd, TagGroupLeaf, TagGroupOr
+
+    ns = store._namespace(bank_id)
+    await store.insert_facts(
+        conn=None,
+        ops=None,
+        bank_id=bank_id,
+        facts=[
+            make_fact("alpha", seed=0.10, tags=["team:a", "env:prod"]),
+            make_fact("beta", seed=0.11, tags=["team:a"]),
+            make_fact("gamma", seed=0.12, tags=["team:b"]),
+            make_fact("delta", seed=0.13, tags=["team:c"]),
+        ],
+    )
+    index_pass(ns)
+
+    def leaf(*t: str) -> TagGroupLeaf:
+        return TagGroupLeaf(tags=list(t), match="any_strict")
+
+    tag_groups = [
+        TagGroupOr(**{"or": [
+            TagGroupAnd(**{"and": [leaf("team:a"), leaf("env:prod")]}),
+            leaf("team:b"),
+        ]})
+    ]
+
+    seen: set[str] = set()
+    page_token = ""
+    while True:
+        page = await store.scan_memories(
+            conn=None, fq_table=_fq_table, bank_id=bank_id, limit=2, page_token=page_token, tag_groups=tag_groups
+        )
+        seen.update(m.text for m in page.memories)
+        page_token = page.next_page_token
+        if not page_token:
+            break
+    assert seen == {"alpha", "gamma"}, f"only (team:a AND env:prod) OR team:b — got {seen}"
+
+
 async def test_delete_facts_removes_them(store, bank_id):
     unit_ids = await store.insert_facts(conn=None, ops=None, bank_id=bank_id, facts=[make_fact("ephemeral", seed=0.3)])
     await store.delete_facts(bank_id, unit_ids)

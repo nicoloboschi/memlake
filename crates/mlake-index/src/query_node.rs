@@ -15,7 +15,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
-use mlake_core::{EntityId, MemoryId, Predicate, StoredMemory, TagFilter};
+use mlake_core::{EntityId, MemoryId, Predicate, StoredMemory, TagFilter, TagPredicate};
 use mlake_fts::{TantivyFts, Tokenizer};
 use mlake_graph::radj::InEdge;
 use mlake_graph::{GraphParams, GraphSource};
@@ -986,6 +986,7 @@ impl QueryNode {
         cursor: ScanCursor,
         limit: usize,
         filter: &Predicate,
+        groups: &[TagPredicate],
     ) -> Result<(Vec<StoredMemory>, Option<ScanCursor>)> {
         let Some(ft) = self.per_type.get(&memory_type) else {
             return Ok((Vec::new(), None));
@@ -1017,9 +1018,14 @@ impl QueryNode {
                     .collect()
             };
             // Filtering is deterministic for a fixed generation, so `offset` indexes the
-            // filtered list stably across calls — the cursor stays valid between pages.
-            let matching: Vec<StoredMemory> =
-                items.into_iter().filter(|m| filter.matches(m)).collect();
+            // filtered list stably across calls — the cursor stays valid between pages. The
+            // compound `groups` (a boolean tag tree the flat `Predicate` cannot express) is
+            // AND-ed on here, over each memory's full tags — a scan walks every member anyway, so
+            // there is no truncation to race and no over-fetch to compensate for.
+            let matching: Vec<StoredMemory> = items
+                .into_iter()
+                .filter(|m| filter.matches(m) && groups.iter().all(|g| g.matches(&m.tags)))
+                .collect();
 
             let take = (limit - out.len()).min(matching.len().saturating_sub(offset));
             out.extend(matching.iter().skip(offset).take(take).cloned());
@@ -1209,11 +1215,14 @@ impl QueryNode {
         // tombstoned or predicate-deleted (the split predates the delete); `fetch_clusters`
         // filtered it out, so drop it — a deleted memory must never surface via any arm.
         by_id.retain(|_, hit| hit.memory.is_some());
-        // Compound tag groups run here, once every surviving hit carries its full record — and
-        // thus its complete tag set. The flat `tags` filter already ran inside each arm via the
-        // block/cluster tag masks; a boolean tree over the whole tag set is the part those
-        // compact masks cannot express, so it is a single post-scoring pass, uniform across
-        // arms. No-op when `tags.groups` is empty.
+        // Compound tag_groups backstop. Every arm already filters groups inline, at the point it
+        // has each candidate's tags with no extra I/O — the dense arm off the block's per-member
+        // tag column, the FTS arm off its stored tags, the graph/temporal arms off the hydrated
+        // record — so an arm's top-k is already the top-k that pass, and the caller needs no
+        // tag-groups over-fetch. This final pass is the idempotent safety net for the one case
+        // inline filtering cannot reach: a vector block carrying no tag column (has_tags == false),
+        // where the dense arm defers to the hydrated record here. A no-op when groups is empty or
+        // when every hit already passed inline.
         if !tags.groups.is_empty() {
             by_id.retain(|_, hit| {
                 hit.memory.as_ref().is_some_and(|m| tags.groups_match(&m.tags))
@@ -1260,6 +1269,7 @@ impl QueryNode {
                 let t = Instant::now();
                 for m in &state.tail_items {
                     if tags.matches(&m.tags)
+                        && tags.groups_match(&m.tags)
                         && updated.admits(m.timestamps.updated_at)
                         && !self.hidden(m)
                     {
@@ -1307,7 +1317,7 @@ impl QueryNode {
             }
             _ => {
                 let mut items = state.tail_items.clone();
-                items.retain(|m| tags.matches(&m.tags));
+                items.retain(|m| tags.matches(&m.tags) && tags.groups_match(&m.tags));
                 (items, Vec::new())
             }
         };
@@ -1449,6 +1459,13 @@ impl QueryNode {
                     continue;
                 }
                 if !tags.is_noop() && block.has_tags() && !block.passes(i, &mask, tags.mode) {
+                    continue;
+                }
+                // Compound tag_groups, evaluated inline against the block's own per-member tag
+                // column (decoded from bits — no payload read), so the arm's top-k is already
+                // the top-k that pass. This is what lets the caller drop the tag-groups
+                // over-fetch. Only groups queries pay the decode; a flat query skips it.
+                if !tags.groups.is_empty() && block.has_tags() && !tags.groups_match(&block.member_tags(i)) {
                     continue;
                 }
                 if !block.passes_updated(i, updated.from, updated.to) {
@@ -1817,7 +1834,7 @@ impl QueryNode {
         let mut pool: Vec<tmp::Candidate> = window_ids
             .iter()
             .filter_map(|id| materialized.get(id).map(|m| (id, m)))
-            .filter(|(_, m)| tags.matches(&m.tags))
+            .filter(|(_, m)| tags.matches(&m.tags) && tags.groups_match(&m.tags))
             .map(|(id, m)| tmp::Candidate {
                 id: *id,
                 similarity: mlake_core::cosine_opt(query, &m.vector),
@@ -1879,7 +1896,7 @@ impl QueryNode {
                 continue; // an entry point, or already scored via another seed's max below
             }
             let Some(m) = materialized.get(&nid) else { continue };
-            if !tags.matches(&m.tags) {
+            if !tags.matches(&m.tags) || !tags.groups_match(&m.tags) {
                 continue;
             }
             // Parent propagation score is 1.0 for entry-point seeds (one hop).
@@ -2053,9 +2070,9 @@ impl QueryNode {
         metrics.record_phase(Phase::GraphExpand, te.elapsed());
 
         // Only the ranked results (≤ budget) are hydrated, and only when a tag filter needs
-        // their tags. Without a filter, nothing is fetched here — the final materialization
-        // pass hydrates the surviving hits once, shared across all arms.
-        if tags.is_noop() {
+        // their tags. Without ANY filter (flat or compound groups), nothing is fetched here —
+        // the final materialization pass hydrates the surviving hits once, shared across arms.
+        if tags.admits_all() {
             return Ok(ranked.into_iter().map(|r| (r.id, r.activation)).collect());
         }
         let tf = Instant::now();
@@ -2071,7 +2088,9 @@ impl QueryNode {
         metrics.record_phase(Phase::GraphFetch, tf.elapsed());
         let out = ranked
             .into_iter()
-            .filter(|r| by_id.get(&r.id).map(|m| tags.matches(&m.tags)).unwrap_or(false))
+            .filter(|r| {
+                by_id.get(&r.id).map(|m| tags.matches(&m.tags) && tags.groups_match(&m.tags)).unwrap_or(false)
+            })
             .map(|r| (r.id, r.activation))
             .collect();
         Ok(out)

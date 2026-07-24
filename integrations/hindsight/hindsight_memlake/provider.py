@@ -540,10 +540,12 @@ class MemlakeMemories(MemoriesExtension):
         sem_min = min_semantic if min_semantic is not None else config.semantic_min_similarity
         bm25_min = min_keyword if min_keyword is not None else config.bm25_min_score
 
-        # Over-fetch to match the SQL path's ANN compensation and to leave room for the
-        # compound `tag_groups` filter: memlake applies it server-side, but after an arm has
-        # scored its candidates, so — like a selective flat filter — it can trim an arm below
-        # its depth. The extra depth keeps enough survivors to fill `limit`.
+        # Over-fetch purely for ANN + fusion recall, matching the SQL path (dense recall is
+        # approximate, and the arms are fused then floored before the top `limit` is taken).
+        # It is NOT headroom for tag filtering: memlake applies both the flat tags and the
+        # compound `tag_groups` inside each arm, before it truncates to this depth, so the
+        # candidates that arrive are already the filtered top-k — a selective predicate no
+        # longer erodes the page. See `_to_tag_predicates` / the server's inline arm filtering.
         depth = max(limit * 5, 100)
         hits = await self._query(
             bank_id=bank_id,
@@ -834,6 +836,7 @@ class MemlakeMemories(MemoriesExtension):
         page_token: str = "",
         tags: list[str] | None = None,
         tags_match: str = "any",
+        tag_groups: list | None = None,
         document_id: str | None = None,
         metadata_equals: dict[str, str] | None = None,
         skip: int = 0,
@@ -851,6 +854,7 @@ class MemlakeMemories(MemoriesExtension):
             page_token=page_token,
             tags=tags,
             tags_match=tags_match,
+            tag_groups=tag_groups,
             metadata_equals=metadata_equals,
             skip=skip,
             include_edges=include_edges,
@@ -865,6 +869,7 @@ class MemlakeMemories(MemoriesExtension):
         page_token: str = "",
         tags: list[str] | None = None,
         tags_match: str = "any",
+        tag_groups: list | None = None,
         metadata_equals: dict[str, str] | None = None,
         skip: int = 0,
         include_edges: bool = False,
@@ -893,6 +898,7 @@ class MemlakeMemories(MemoriesExtension):
                     metadata_equals=metadata_equals,
                     tags=tags,
                     tags_mode=_tags_mode(tags_match),
+                    tag_groups=_to_tag_predicates(tag_groups),
                     skip=skip,
                     include_edges=include_edges,
                     updated_from=updated_from,

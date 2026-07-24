@@ -295,9 +295,11 @@ impl TantivyFts {
             .collect();
         let query = BooleanQuery::new(clauses);
 
-        // With a filter, over-fetch so post-filtering still yields ~k. Capped so a huge
-        // corpus doesn't pull an unbounded result set.
-        let limit = if filter.is_noop() {
+        // With any filter (flat tags OR a compound tag_groups predicate), over-fetch so
+        // post-filtering still yields ~k. Capped so a huge corpus doesn't pull an unbounded
+        // result set. This internal over-fetch is why the FTS arm needs no caller-side headroom
+        // for tag filtering: it fills k *passing* hits itself.
+        let limit = if filter.admits_all() {
             k
         } else {
             (k.saturating_mul(50)).clamp(k, 10_000)
@@ -313,13 +315,15 @@ impl TantivyFts {
             let Ok(doc) = searcher.doc::<TantivyDocument>(addr) else {
                 continue;
             };
-            if !filter.is_noop() {
+            if !filter.admits_all() {
                 let tags = doc
                     .get_first(self.schema_fields.tags)
                     .and_then(|v| v.as_str())
                     .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok())
                     .unwrap_or_default();
-                if !filter.matches(&tags) {
+                // The flat condition and the compound tag_groups predicate both apply here,
+                // AND-ed, over the hit's own stored tags — the same tags every arm filters on.
+                if !filter.matches(&tags) || !filter.groups_match(&tags) {
                     continue;
                 }
             }

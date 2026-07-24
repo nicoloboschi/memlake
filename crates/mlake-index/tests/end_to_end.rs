@@ -1206,6 +1206,47 @@ async fn tag_groups_push_down_filters_the_query() {
     assert_eq!(ids(&r).len(), 4, "empty tag_groups filters nothing");
 }
 
+/// The over-fetch fix: tag_groups is applied INSIDE each arm, before it truncates to depth, so
+/// a matching memory ranked *below* many non-matching ones is still returned. A post-filter that
+/// truncated first (top-`depth` by score, then drop non-matching) would return nothing here — the
+/// closest `depth` are all non-matching. This is why the caller needs no tag-groups over-fetch.
+#[tokio::test]
+async fn tag_groups_filter_before_the_arm_truncates_to_depth() {
+    use mlake_core::{TagFilter, TagPredicate};
+
+    let store = Store::in_memory();
+    let ns = namespace(store, "bank").await;
+    let mut writer = Writer::new(ns.clone());
+    let q = vec![1.0f32, 0.0, 0.0];
+
+    let mut ops = Vec::new();
+    // 15 "drop" facts hugging the query vector — by pure similarity they own the top of the ranking.
+    for i in 0..15 {
+        let v = vec![1.0 - (i as f32) * 0.001, (i as f32) * 0.001, 0.0];
+        ops.push(Op::Upsert(item_tags(&format!("drop{i}"), v, "signal", &["drop"])));
+    }
+    // 5 "keep" facts sitting farther away — they only surface if the filter runs before truncation.
+    for j in 0..5 {
+        let v = vec![0.6, 0.8 - (j as f32) * 0.001, 0.0];
+        ops.push(Op::Upsert(item_tags(&format!("keep{j}"), v, "signal", &["keep"])));
+    }
+    writer.commit(ops).await.unwrap();
+    index(&ns, &Tokenizer::default(), IndexOptions::default()).await.unwrap();
+    let node = QueryNode::open(&ns, Tokenizer::default()).await.unwrap();
+
+    let mut f = TagFilter::none();
+    f.groups = vec![TagPredicate::Leaf(TagFilter::new(vec!["keep".into()], TagsMatch::AnyStrict))];
+
+    // arm_depth = 5: the five closest are ALL "drop". A post-filter would keep 0. Inline filtering
+    // skips the drops as it scans and returns the five "keep" facts.
+    let cfg = QueryConfig { graph_weight: 0.0, arm_depth: 5, nprobe: 64, ..QueryConfig::default() };
+    let r = node.query(1, Some(&q), None, &f, 10, cfg).await.unwrap();
+    let keep: std::collections::HashSet<MemoryId> =
+        (0..5).map(|j| MemoryId::from_key(&format!("keep{j}"))).collect();
+    let got: std::collections::HashSet<MemoryId> = r.iter().map(|h| h.id).collect();
+    assert_eq!(got, keep, "all five 'keep' facts returned despite ranking below the 'drop' facts");
+}
+
 /// The FTS arm also honours the tag filter (via stored tags + the shared primitive).
 #[tokio::test]
 async fn tags_filter_the_fts_arm() {
@@ -1363,7 +1404,7 @@ async fn scan_pages_over_every_memory_exactly_once() {
     let mut cursor = Some(ScanCursor::default());
     let mut pages = 0;
     while let Some(c) = cursor {
-        let (items, next) = node.scan(1, c, 7, &pred()).await.unwrap();
+        let (items, next) = node.scan(1, c, 7, &pred(), &[]).await.unwrap();
         for m in items {
             assert!(seen.insert(m.id), "scan must not return a memory twice");
             texts.insert(m.id, m.text);
@@ -1409,7 +1450,7 @@ async fn scan_hides_tombstoned_indexed_memories() {
     let mut seen = std::collections::HashSet::new();
     let mut cursor = ScanCursor::default();
     loop {
-        let (items, next) = node.scan(1, cursor, 10, &pred()).await.unwrap();
+        let (items, next) = node.scan(1, cursor, 10, &pred(), &[]).await.unwrap();
         seen.extend(items.iter().map(|m| m.id));
         match next {
             Some(c) => cursor = c,
@@ -1464,7 +1505,7 @@ async fn get_and_scan_hide_predicate_deleted_memories() {
     let mut seen = std::collections::HashSet::new();
     let mut cursor = ScanCursor::default();
     loop {
-        let (items, next) = node.scan(1, cursor, 10, &pred()).await.unwrap();
+        let (items, next) = node.scan(1, cursor, 10, &pred(), &[]).await.unwrap();
         seen.extend(items.iter().map(|m| m.id));
         match next {
             Some(c) => cursor = c,
@@ -1502,7 +1543,7 @@ async fn scan_respects_the_tag_filter() {
     let mut seen = std::collections::HashSet::new();
     let mut cursor = Some(ScanCursor::default());
     while let Some(c) = cursor {
-        let (items, next) = node.scan(1, c, 3, &scan_filter).await.unwrap();
+        let (items, next) = node.scan(1, c, 3, &scan_filter, &[]).await.unwrap();
         for m in items {
             assert!(m.tags.contains(&"keep".to_string()), "scan must honour the filter");
             seen.insert(m.id);
@@ -1767,7 +1808,7 @@ async fn scan_ids(node: &QueryNode, mt: u8) -> std::collections::BTreeSet<Memory
     let mut out = std::collections::BTreeSet::new();
     let mut cursor = mlake_index::ScanCursor::default();
     loop {
-        let (items, next) = node.scan(mt, cursor, 64, &pred()).await.unwrap();
+        let (items, next) = node.scan(mt, cursor, 64, &pred(), &[]).await.unwrap();
         out.extend(items.iter().map(|m| m.id));
         match next {
             Some(c) => cursor = c,

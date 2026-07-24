@@ -892,6 +892,10 @@ impl Memlake for MemlakeService {
             updated_from: req.updated_from,
             updated_to: req.updated_to,
         };
+        // Compound tag_groups ride alongside the flat `Predicate` — kept separate because the
+        // Predicate is WAL-serializable (it is also the delete-by-predicate shape) and groups are
+        // a read-only filter. Applied per-member during the walk, AND-ed with `filter`.
+        let groups = convert::tag_predicates(req.tag_groups)?;
         let mut skip = req.skip as usize;
 
         let ns = self.namespace(&req.namespace);
@@ -933,7 +937,7 @@ impl Memlake for MemlakeService {
             // caller just does not pay the round trips.
             let want = if skip > 0 { limit } else { limit - out.len() };
             let (items, next) = node
-                .scan(ty, cursor, want, &filter)
+                .scan(ty, cursor, want, &filter, &groups)
                 .await
                 .map_err(internal)?;
             let mut items = items;

@@ -555,6 +555,7 @@ class MemlakeClient:
         metadata_equals: Optional[dict[str, str]] = None,
         tags: Optional[Sequence[str]] = None,
         tags_mode: int = ANY,
+        tag_groups: Optional[Sequence["pb.TagPredicate"]] = None,
         skip: int = 0,
         updated_from: Optional[int] = None,
         updated_to: Optional[int] = None,
@@ -574,6 +575,10 @@ class MemlakeClient:
         )
         if tags:
             req.tags.CopyFrom(pb.TagFilter(tags=list(tags), mode=tags_mode))
+        if tag_groups:
+            # Compound tag filtering, AND-ed with `tags`; a scan walks every member, so the
+            # server applies it exactly with no truncation (see pb.TagPredicate).
+            req.tag_groups.extend(tag_groups)
         if updated_from is not None:
             req.updated_from = updated_from
         if updated_to is not None:
