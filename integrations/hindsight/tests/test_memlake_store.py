@@ -309,6 +309,38 @@ async def test_delete_where_removes_only_matching_fact_types(store, bank_id, ind
     assert "experience" not in surviving, f"experience deleted: {surviving}"
 
 
+async def test_find_and_requeue_failed_consolidation(store, bank_id, index_pass):
+    """find_failed_consolidation surfaces failure-flagged sources; mark_consolidated(when=None)
+    requeues them — the retry-failed-consolidation path routes through exactly these two calls."""
+    from datetime import datetime, timezone
+
+    ns = store._namespace(bank_id)
+    unit_ids = await store.insert_facts(
+        conn=None,
+        ops=None,
+        bank_id=bank_id,
+        facts=[make_fact("fact one", seed=0.2, fact_type="world"), make_fact("fact two", seed=0.3, fact_type="world")],
+    )
+    index_pass(ns)
+
+    # Flag both as consolidation-failed, then fold so the indexed flag filter sees it.
+    await store.mark_consolidated(
+        conn=None, fq_table=_fq_table, bank_id=bank_id, unit_ids=unit_ids, when=datetime.now(timezone.utc), failed=True
+    )
+    index_pass(ns)
+    failed = await store.find_failed_consolidation(conn=None, fq_table=_fq_table, bank_id=bank_id)
+    assert {m.unit_id for m in failed} == set(unit_ids), f"both flagged failed: {[m.unit_id for m in failed]}"
+
+    # Requeue: mark_consolidated(when=None) clears the failed marker and returns them to not-yet.
+    await store.mark_consolidated(conn=None, fq_table=_fq_table, bank_id=bank_id, unit_ids=unit_ids, when=None)
+    index_pass(ns)
+    assert await store.find_failed_consolidation(conn=None, fq_table=_fq_table, bank_id=bank_id) == []
+    requeued = await store.find_unconsolidated(
+        conn=None, fq_table=_fq_table, bank_id=bank_id, fact_types=["world"], limit=10
+    )
+    assert {m.unit_id for m in requeued} == set(unit_ids), "requeued sources are unconsolidated again"
+
+
 async def test_delete_namespace_drops_the_whole_bank(store, bank_id, index_pass):
     """Dropping the namespace clears all of a bank's memlake data — what delete_bank routes a
     full bank delete to. A read against a dropped namespace is empty, not an error."""

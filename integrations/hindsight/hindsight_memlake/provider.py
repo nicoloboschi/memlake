@@ -1276,6 +1276,32 @@ class MemlakeMemories(MemoriesExtension):
         found.sort(key=lambda m: (m.created_at is None, m.created_at))
         return found[:limit]
 
+    async def find_failed_consolidation(self, *, conn, fq_table, bank_id: str) -> list[StoredMemory]:
+        """Experience/world memories flagged consolidation-failed — the retry-failed requeue set.
+
+        Same push-down as find_unconsolidated, on the other terminal flag value: the server drops
+        every memory whose consolidated flag is not FAILED, so we page only the failed ones.
+        """
+        found: list[StoredMemory] = []
+        page_token = ""
+        pages = 0
+        while pages < 1000:
+            page = await self.scan_memories(
+                conn=conn,
+                fq_table=fq_table,
+                bank_id=bank_id,
+                fact_types=["experience", "world"],
+                limit=500,
+                page_token=page_token,
+                metadata_equals={META_CONSOLIDATED_FLAG: CONSOLIDATED_FAILED},
+            )
+            found.extend(page.memories)
+            pages += 1
+            page_token = page.next_page_token
+            if not page_token:
+                break
+        return found
+
     async def mark_consolidated(
         self,
         *,
