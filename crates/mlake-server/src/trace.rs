@@ -1,28 +1,17 @@
-//! Per-call tracing: an append-only JSONL audit log of every client call, with the
-//! phase/timing/cache breakdown needed to explain why one read was instant and the next took
-//! seconds.
+//! Per-call tracing: a per-node JSONL view of every client call, with the phase/timing/cache
+//! breakdown needed to explain why one read was instant and the next took seconds.
 //!
-//! **On by default.** Every record feeds a bounded in-memory ring ([`TraceRing`]) that the serve
-//! node periodically uploads to `_obs/traces/{node_id}.jsonl` in object storage — a fixed-footprint,
-//! admin-visible, per-node view that needs no log scraping and is safe on an ephemeral pod. A local
-//! JSONL file is written IN ADDITION only when `MEMLAKE_TRACE_LOG` is set to an explicit path (local
-//! debugging / `kubectl exec`); the unset default does NOT write an unbounded working-dir file.
-//! `MEMLAKE_TRACE_LOG=off` (or `0`/`false`/`none`) disables everything, ring included.
-//!
-//! The request path only builds a small JSON value: the ring push is an in-memory update under a
-//! short lock, and the (optional) file write is handed to a background thread over an unbounded
-//! channel — so tracing never adds latency to, or backpressures, the very call it is measuring.
+//! **On by default.** Every record feeds a bounded, slow-biased in-memory ring ([`TraceRing`]) that
+//! the serve node periodically uploads to `_obs/traces/{node_id}.jsonl` in object storage — the ONE
+//! sink: fixed-footprint, admin-visible without log scraping, and safe on an ephemeral pod (no local
+//! files). `MEMLAKE_TRACE_LOG=off` (or `0`/`false`/`none`) disables it; any other value (or unset)
+//! leaves it on. The request path only builds a small JSON value and folds it into the ring under a
+//! short-held lock — no I/O — so tracing never adds latency to, or backpressures, the call it
+//! measures. The upload happens on a separate timer (see the service's `spawn_trace_uploader`).
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::io::Write;
-use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
-
-/// Where traces go when `MEMLAKE_TRACE_LOG` is unset — a file in the process's working directory.
-/// In the perf docker stack the compose file points `MEMLAKE_TRACE_LOG` at the mounted `/traces`
-/// instead, so the log is readable on the host.
-pub const DEFAULT_TRACE_LOG: &str = "memlake-trace.jsonl";
 
 /// Reserved object-store root for observability data — one bounded trace object per serve node lives
 /// under it (`{OBS_TRACES_PREFIX}{node_id}.jsonl`). It sits OUTSIDE any namespace prefix, so
@@ -226,73 +215,32 @@ fn pct(sorted: &[f32], p: f64) -> f64 {
     sorted[idx.min(sorted.len() - 1)] as f64
 }
 
-/// A tracer sink. `emit` is a no-op unless `MEMLAKE_TRACE_LOG` was set at startup.
+/// A tracer sink. `emit` folds each record into the bounded ring; a background timer uploads the
+/// ring to object storage. `emit` is a no-op when tracing is disabled.
 #[derive(Clone)]
 pub struct Tracer {
-    tx: Option<Sender<serde_json::Value>>,
     /// In-memory bounded window uploaded to object storage for the admin UI (fleet-wide view without
     /// scraping individual pods). `Some` exactly when tracing is enabled.
     ring: Option<Arc<Mutex<TraceRing>>>,
 }
 
 impl Tracer {
-    /// Build from the environment. Tracing is ON by default, feeding the bounded in-memory ring that
-    /// is uploaded to `_obs/traces/` — a fixed-footprint, admin-visible view that is safe on an
-    /// ephemeral pod. A local JSONL file is written ONLY when `MEMLAKE_TRACE_LOG` is an explicit path
-    /// (for `kubectl exec` / local debugging); the default no longer writes an unbounded file to the
-    /// working directory, which on k8s would grow without limit. `MEMLAKE_TRACE_LOG=off` (or
-    /// `0`/`false`/`none`) turns everything off, including the ring upload.
+    /// Build from the environment. Tracing is ON by default, feeding the bounded ring uploaded to
+    /// `_obs/traces/` — the only sink (no local files). `MEMLAKE_TRACE_LOG=off` (or `0`/`false`/
+    /// `none`) turns it off; any other value, or unset, leaves it on.
     pub fn from_env() -> Self {
-        let path = match std::env::var("MEMLAKE_TRACE_LOG") {
-            // Explicit opt-out — no ring, no file, no upload.
-            Ok(v)
-                if matches!(
-                    v.trim().to_ascii_lowercase().as_str(),
-                    "off" | "0" | "false" | "none" | "disabled"
-                ) =>
-            {
-                return Self { tx: None, ring: None }
-            }
-            // Explicit path: ring + a local file at that path.
-            Ok(v) if !v.trim().is_empty() => v,
-            // Unset or empty: default ON, ring-only (bounded, uploaded to object storage) — no
-            // unbounded local file.
-            _ => return Self { tx: None, ring: Some(Arc::new(Mutex::new(TraceRing::new()))) },
-        };
-        let (tx, rx) = mpsc::channel::<serde_json::Value>();
-        let spawned = std::thread::Builder::new()
-            .name("memlake-trace".into())
-            .spawn(move || {
-                let mut file = match std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&path)
-                {
-                    Ok(f) => f,
-                    Err(e) => {
-                        eprintln!("[trace] cannot open {path}: {e}; tracing disabled");
-                        return;
-                    }
-                };
-                // Ends when the last `Sender` (held by the service) drops.
-                for rec in rx {
-                    if let Ok(line) = serde_json::to_string(&rec) {
-                        let _ = writeln!(file, "{line}");
-                        let _ = file.flush();
-                    }
-                }
-            });
-        match spawned {
-            Ok(_) => Self { tx: Some(tx), ring: Some(Arc::new(Mutex::new(TraceRing::new()))) },
-            Err(e) => {
-                eprintln!("[trace] cannot start writer thread: {e}; tracing disabled");
-                Self { tx: None, ring: None }
-            }
+        let disabled = matches!(
+            std::env::var("MEMLAKE_TRACE_LOG").ok().as_deref().map(str::trim).map(str::to_ascii_lowercase).as_deref(),
+            Some("off") | Some("0") | Some("false") | Some("none") | Some("disabled")
+        );
+        if disabled {
+            Self { ring: None }
+        } else {
+            Self { ring: Some(Arc::new(Mutex::new(TraceRing::new()))) }
         }
     }
 
-    /// Whether tracing is on (ring and/or local file) — gate record-building behind this so a
-    /// disabled tracer costs nothing.
+    /// Whether tracing is on — gate record-building behind this so a disabled tracer costs nothing.
     pub fn enabled(&self) -> bool {
         self.ring.is_some()
     }
@@ -302,17 +250,13 @@ impl Tracer {
         self.ring.clone()
     }
 
-    /// Hand a record to the background file writer AND fold it into the object-storage ring.
-    /// Non-blocking: the file path never waits on I/O (channel send); the ring push is an in-memory
-    /// update under a short-held lock (no I/O), so the request path is never blocked on the network.
+    /// Fold a record into the object-storage ring. Non-blocking: an in-memory update under a
+    /// short-held lock (no I/O), so the request path is never blocked on the network.
     pub fn emit(&self, record: serde_json::Value) {
         if let Some(ring) = &self.ring {
             if let Ok(mut r) = ring.lock() {
                 r.push(&record);
             }
-        }
-        if let Some(tx) = &self.tx {
-            let _ = tx.send(record);
         }
     }
 }
@@ -336,10 +280,31 @@ mod tests {
 
     #[test]
     fn disabled_tracer_is_a_noop() {
-        let t = Tracer { tx: None, ring: None };
+        let t = Tracer { ring: None };
         assert!(!t.enabled());
         assert!(t.ring().is_none());
         t.emit(serde_json::json!({"op": "query"})); // must not panic
+    }
+
+    #[test]
+    fn disabled_via_env() {
+        std::env::set_var("MEMLAKE_TRACE_LOG", "off");
+        let t = Tracer::from_env();
+        std::env::remove_var("MEMLAKE_TRACE_LOG");
+        assert!(!t.enabled());
+    }
+
+    #[test]
+    fn enabled_by_default_feeds_the_ring() {
+        std::env::remove_var("MEMLAKE_TRACE_LOG");
+        let t = Tracer::from_env();
+        assert!(t.enabled());
+        t.emit(serde_json::json!({"op": "query", "namespace": "n", "total_ms": 1.0, "ts_ms": 1}));
+        let body = t.ring().unwrap().lock().unwrap().render("node-x");
+        let header: serde_json::Value =
+            serde_json::from_str(String::from_utf8(body).unwrap().lines().next().unwrap()).unwrap();
+        assert_eq!(header["node_id"], "node-x");
+        assert_eq!(header["totals"]["count"], 1);
     }
 
     #[test]
@@ -376,29 +341,5 @@ mod tests {
         let by_ns = header["by_namespace"].as_array().unwrap();
         assert!(by_ns.iter().any(|n| n["ns"] == "ns-a"));
         assert!(by_ns.iter().any(|n| n["ns"] == "ns-b"));
-    }
-
-    #[test]
-    fn enabled_tracer_appends_one_json_line_per_record() {
-        let dir = std::env::temp_dir();
-        let path = dir.join(format!("memlake-trace-test-{}.jsonl", std::process::id()));
-        let _ = std::fs::remove_file(&path);
-        std::env::set_var("MEMLAKE_TRACE_LOG", &path);
-        let t = Tracer::from_env();
-        std::env::remove_var("MEMLAKE_TRACE_LOG");
-        assert!(t.enabled());
-
-        t.emit(serde_json::json!({"op": "query", "total_ms": 1.5}));
-        t.emit(serde_json::json!({"op": "write", "total_ms": 2.0}));
-        drop(t); // close the channel so the writer thread finishes and flushes
-
-        // Give the background writer a moment to drain (it flushes per line).
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        let body = std::fs::read_to_string(&path).unwrap();
-        let lines: Vec<&str> = body.lines().collect();
-        assert_eq!(lines.len(), 2, "one JSON line per record");
-        let first: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
-        assert_eq!(first["op"], "query");
-        let _ = std::fs::remove_file(&path);
     }
 }
