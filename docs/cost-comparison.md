@@ -1,14 +1,115 @@
-# Storage COGS: memlake vs Postgres, for Hindsight
+# COGS: memlake vs Postgres, for Hindsight
 
-Napkin math. The goal is to capture the *real* cost of goods sold at storage, not to make
-memlake win — where Postgres is cheaper (and at small scale it is), that is stated plainly.
-Every number here is order-of-magnitude and carries its assumptions; treat it as a model to
-argue with, not a quote.
+The goal is to capture the *real* cost of goods sold, not to make memlake win — **at 10 k
+memories Postgres is cheaper, and at high QPS it is cheaper at 100 k too.** Both are stated
+plainly below.
 
-Scope: **storage only.** Compute (the query nodes / the PG instance CPU+RAM) is a separate,
-often larger line and is discussed but not priced — see "What this leaves out". Request costs
-(S3 GET/PUT) *are* storage-adjacent COGS and are called out, because for memlake they are real
-and for PG they are ~zero.
+Two parts:
+
+1. **[Measured total COGS](#measured-total-cogs-storage--requests--compute)** — the headline.
+   Storage bytes, S3 request counts and query costs are **measured on the real AWS S3 k8s
+   deployment** (not modelled); instance prices are AWS list. This supersedes the napkin math for
+   decision-making.
+2. **[The storage model](#the-two-architectures-at-the-storage-layer)** (everything from "The two
+   architectures" down) — the original order-of-magnitude byte analysis. Still useful for *why*
+   the bytes differ; its `$/month` table is storage-only and at much larger scales.
+
+## Measured total COGS (storage + requests + compute)
+
+### Measured inputs
+
+From the deployment in [`sla-model.md`](sla-model.md) (GKE → AWS S3 us-east-1, serve 2 vCPU/3 GiB,
+`--mem-mb 1024`), measured by `aws s3 ls --recursive` on real folded namespaces and by the fleet
+traces:
+
+| input | measured | how |
+|---|---|---|
+| durable index bytes/memory, D=384, **real text** (scifact abstracts) | **5 950 B** | 30.8 MB of segments+manifest ÷ 5 183 docs |
+| durable index bytes/memory, D=384, tiny text (synthetic) | **2 895 B** | 57.9 MB ÷ 20 000 docs |
+| same, **projected to D=1536** (4·D rerank + D/8 codes, rest fixed) | **10 702 B** / 7 647 B | scaling the measured split |
+| WAL bytes/memory (transient — GC reclaims after the fold) | 3 304 B | not counted in steady state |
+| PUTs for a full build | **0.034 / memory** | 173 objects ÷ 5 183 docs |
+| **S3 GETs per warm query** | **1** | the `resolve_head` WAL-head pointer — *uncacheable* |
+| S3 GETs per cold query | 4.3 | 1 head + 3.34 measured data waves |
+| QPS per serve vCPU | 28 | `compute-cost.md` (MinIO; CPU-valid, realistic top-k query) |
+
+The single most important line is **1 GET per query, always**. Reads are strongly consistent, so
+every query re-reads the WAL head — one small, mutable, *uncacheable* object. It is a GET, not a
+LIST (`resolve_head` deliberately avoids the 12.5×-priced LIST), but it does not go away when the
+cache is warm.
+
+### Prices used
+
+AWS **us-east-1 on-demand list**: S3 Standard $0.023/GB-mo, GET $0.0004/1k, PUT $0.005/1k; RDS
+PostgreSQL single-AZ $0.016/hr (t4g.micro) → $3.616/hr (r6g.8xlarge); gp3 $0.115/GB-mo (20 GB min);
+EC2 Graviton $0.0336/hr (t4g.medium) → $0.308/hr (m6g.2xlarge). **Verify before quoting** — these
+move, and reserved/savings plans cut the compute line ~40 % on *both* sides.
+
+### The table (D=1536, real-text byte model, $/month)
+
+memlake = S3 storage + S3 requests + one always-on box (serve + indexer co-located, scaling with
+QPS). PG = one RDS instance sized so vectors **and** the ANN index copy stay RAM-resident, + gp3.
+
+| memories | QPS | ML storage | ML S3 req | ML compute | **memlake** | PG instance | **PG total** | cheaper |
+|---:|---:|---:|---:|---:|---:|---|---:|---|
+| 10 k | 1 | $0.00 | $1.05 | $25 | **$26** | db.t4g.micro | **$14** | **PG 1.8×** |
+| 10 k | 10 | $0.00 | $10.51 | $25 | **$35** | db.t4g.micro | **$14** | **PG 2.5×** |
+| 10 k | 100 | $0.00 | $105 | $112 | **$218** | db.t4g.micro | **$14** | **PG 15.6×** |
+| 100 k | 1 | $0.02 | $1.07 | $25 | **$26** | db.t4g.medium | $50 | memlake 1.9× |
+| 100 k | 10 | $0.02 | $10.53 | $25 | **$35** | db.t4g.medium | $50 | memlake 1.4× |
+| 100 k | 100 | $0.02 | $105 | $112 | $218 | db.t4g.medium | **$50** | **PG 4.4×** |
+| 1 M | 1 | $0.25 | $1.22 | $25 | **$26** | db.r6g.xlarge | $332 | memlake 12.8× |
+| 1 M | 10 | $0.25 | $10.68 | $25 | **$35** | db.r6g.xlarge | $332 | memlake 9.4× |
+| 1 M | 100 | $0.25 | $105 | $112 | **$218** | db.r6g.xlarge | $332 | memlake 1.5× |
+| 10 M | 1 | $2.46 | $2.75 | $25 | **$30** | db.r6g.8xlarge | $2 664 | memlake 90× |
+| 10 M | 10 | $2.46 | $12.21 | $25 | **$39** | db.r6g.8xlarge | $2 664 | memlake 68× |
+| 10 M | 100 | $2.46 | $107 | $112 | **$222** | db.r6g.8xlarge | $2 664 | memlake 12× |
+
+### There are two crossovers, and both matter
+
+**1. Scale: PG wins below ~50–100 k memories.** memlake's floor is an always-on box (~$25/mo) plus
+per-query requests; PG's floor at 10 k is a `db.t4g.micro` at ~$14/mo, and 10 k vectors fit in its
+RAM trivially. **Storage is irrelevant on both sides at this scale** — $0.00 vs $2.30. Anyone
+arguing memlake on cost at 10 k is arguing the wrong thing; the argument there is operational
+(stateless pods, no vacuum/failover), not COGS.
+
+**2. QPS: the S3 request line flips it back to PG.** At 100 QPS the uncacheable head GET alone is
+**$105/mo** — more than memlake's compute, and it grows strictly linearly with QPS while PG's
+instance cost is flat until the box saturates. That is why 100 k @ 100 QPS goes back to PG by 4.4×.
+memlake's cost curve is *per-query*; PG's is *per-resident-byte*. Which one wins is entirely a
+question of which axis your workload is long on.
+
+**Where memlake wins decisively: many memories, moderate QPS.** At 10 M the PG instance must hold
+~139 GB of vectors + index in RAM (a `db.r6g.8xlarge`, $2 664/mo) while memlake holds the corpus in
+S3 at $2.46/mo and pays only for the working set it touches. That is the actual shape of the
+argument — not "S3 is cheaper per GB".
+
+### The highest-leverage cost fix is the head GET
+
+At every scale above, memlake's marginal cost per query is *one S3 GET*. Coalescing **concurrent**
+in-flight head reads onto a single GET would cut that line by the in-flight factor at no consistency
+cost (simultaneous readers may legitimately share one head observation). A short TTL would cut it
+further but does weaken strong consistency, so it is a product decision rather than a free win. At
+100 QPS a 10× coalescing factor turns $105/mo into ~$10/mo and moves the 100 k @ 100 QPS row from
+"PG 4.4× cheaper" to roughly parity. **This is the single number to attack before quoting memlake
+as cheap at QPS.**
+
+### What this table does NOT model
+
+- **memlake at 1 fact type.** All measurements are single-type; the design's stated worst case is
+  `FANOUT = 3`, which triples query CPU (so the compute column, not the request column).
+- **No scale-to-zero.** memlake's serve is stateless and *could* scale to zero between queries,
+  which would erase the $25 floor and win the 10 k row outright. Not implemented/measured, so not
+  credited.
+- **PG's index build cost and vacuum/bloat headroom** are only in the ×1.5 storage factor, and PG's
+  ANN recall at these instance sizes is assumed adequate, not measured. If the index does *not* stay
+  RAM-resident, PG gets much cheaper and much slower — a latency/COGS trade this table does not price.
+- **Multi-AZ / replicas.** PG here is **single-AZ, no replica** — the cheapest honest configuration.
+  Real prod PG is usually Multi-AZ (≈2×), which roughly doubles every PG number above and moves the
+  10 k crossover close to parity.
+- **Egress, backups, ops labour** — see "What this leaves out" at the end.
+
+## The two architectures, at the storage layer
 
 ## The two architectures, at the storage layer
 
@@ -107,6 +208,14 @@ storing ~half the bytes/memory.
 
 ## Putting it together: `$/month` by scale
 
+> **Storage line only — not a total.** The table below prices storage in isolation, which is why it
+> shows large ratios. At every scale Hindsight actually cares about, storage is a rounding error and
+> the total is decided by compute + S3 requests — see
+> [Measured total COGS](#measured-total-cogs-storage--requests--compute), which is the number to use.
+> Note also that the 7.2 KB/memory modelled here is close to the **measured** 7.6 KB for a tiny-text
+> corpus, but real text (scifact abstracts) measured **10.7 KB** at D=1536 — the non-embedding part
+> is workload-dependent and this model's 700 B assumption is low for prose.
+
 Total storage $/month = (memories × bytes-per-memory-per-copy × copies × provisioned) × `$/GB`.
 
 memlake: 7.2 KB/memory, ×1 copy, ×1.0, × $0.023/GB.
@@ -154,6 +263,10 @@ tiering bends down.
    not a pure saving.
 
 ## Honest summary
+
+> Superseded for decisions by [Measured total COGS](#measured-total-cogs-storage--requests--compute).
+> In one line: **PG is cheaper below ~50–100 k memories and at high QPS; memlake wins from ~1 M up at
+> moderate QPS, by ~10–90×.** The bullets below are the storage-only view.
 
 - **Per useful GB, memlake storage is ~6–30× cheaper** depending on the PG replication topology,
   driven by S3's medium price and free internal replication vs PG's per-copy block storage.
