@@ -188,6 +188,28 @@ impl StoredMemory {
     /// Serialize this memory's payload for the payload store — its rkyv bytes with the
     /// embedding stripped (the vector is ~4× the rest of a memory and is never returned from a
     /// point read; the cluster file keeps it for rerank and `get --include_vector`).
+    /// Approximate heap bytes this memory holds while resident.
+    ///
+    /// Used to size the WAL tail a snapshot carries, so the resident-snapshot budget can be
+    /// enforced (see `mlake-index`'s `QueryNode::resident_bytes`). An estimate, not an
+    /// allocator-exact figure: it counts each owned buffer's payload plus its element overhead,
+    /// which is what actually scales with corpus, and ignores per-allocation slack.
+    pub fn heap_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self.vector.len() * std::mem::size_of::<f32>()
+            + self.text.len()
+            + self.index_text.len()
+            + self.tags.iter().map(|t| t.len() + std::mem::size_of::<String>()).sum::<usize>()
+            + self.entity_ids.len() * std::mem::size_of::<EntityId>()
+            + self.semantic_out.len() * std::mem::size_of::<SemanticEdge>()
+            + self.causal_out.len() * std::mem::size_of::<CausalEdge>()
+            + self
+                .metadata
+                .iter()
+                .map(|(k, v)| k.len() + v.len() + 2 * std::mem::size_of::<String>())
+                .sum::<usize>()
+    }
+
     pub fn to_payload_bytes(&self) -> Vec<u8> {
         let stripped = StoredMemory { vector: Vec::new(), ..self.clone() };
         crate::rkyv_write(&stripped)

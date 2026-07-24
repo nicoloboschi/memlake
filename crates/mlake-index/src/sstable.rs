@@ -129,6 +129,15 @@ pub struct SsTableIndex {
 }
 
 impl SsTableIndex {
+    /// Approximate heap bytes the sparse index occupies while resident. Only the block directory
+    /// lives in RAM — the data blocks themselves are fetched (and cached) per read — so this is
+    /// `blocks × sizeof(BlockRef)`, which is what scales with segment size.
+    pub fn resident_bytes(&self) -> usize {
+        std::mem::size_of::<Self>() + self.blocks.len() * std::mem::size_of::<BlockRef>()
+    }
+}
+
+impl SsTableIndex {
     /// Parse a `.idx` object.
     pub fn parse(bytes: &[u8]) -> Result<Self> {
         if bytes.len() < 16 {
@@ -392,6 +401,11 @@ pub struct PkTable {
 }
 
 impl PkTable {
+    /// Approximate resident heap bytes (sparse index + path). See [`SsTableIndex::resident_bytes`].
+    pub fn resident_bytes(&self) -> usize {
+        self.index.resident_bytes() + self.data_path.len()
+    }
+
     /// Build the two objects from id→cluster entries (any order; sorted here).
     pub fn build(mut entries: Vec<(MemoryId, u32)>) -> (Vec<u8>, Vec<u8>) {
         entries.sort_by(|a, b| a.0.cmp(&b.0));
@@ -457,6 +471,11 @@ pub struct PayloadTable {
 }
 
 impl PayloadTable {
+    /// Approximate resident heap bytes (sparse index + path). See [`SsTableIndex::resident_bytes`].
+    pub fn resident_bytes(&self) -> usize {
+        self.index.resident_bytes() + self.data_path.len()
+    }
+
     /// Build from the generation's items (any order; sorted here). Each value is the item's
     /// rkyv bytes with the embedding stripped.
     pub fn build(items: &[StoredMemory]) -> (Vec<u8>, Vec<u8>) {
@@ -515,6 +534,11 @@ pub struct RerankTable {
 }
 
 impl RerankTable {
+    /// Approximate resident heap bytes (sparse index + path). See [`SsTableIndex::resident_bytes`].
+    pub fn resident_bytes(&self) -> usize {
+        self.index.resident_bytes() + self.data_path.len()
+    }
+
     /// Build from the generation's items. A memory with no embedding contributes no row —
     /// there is nothing to rescore, and it can never surface on the vector arm anyway.
     pub fn build(items: &[StoredMemory]) -> (Vec<u8>, Vec<u8>) {
@@ -585,6 +609,11 @@ pub struct RadjTable {
 }
 
 impl RadjTable {
+    /// Approximate resident heap bytes (sparse index + path). See [`SsTableIndex::resident_bytes`].
+    pub fn resident_bytes(&self) -> usize {
+        self.index.resident_bytes() + self.data_path.len()
+    }
+
     /// Build from `(target, edge)` pairs (any order; grouped and sorted here).
     pub fn build(mut pairs: Vec<(MemoryId, InEdge)>) -> (Vec<u8>, Vec<u8>) {
         pairs.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.source.cmp(&b.1.source)));
@@ -660,6 +689,11 @@ pub struct EntityTable {
 }
 
 impl EntityTable {
+    /// Approximate resident heap bytes (sparse index + path). See [`SsTableIndex::resident_bytes`].
+    pub fn resident_bytes(&self) -> usize {
+        self.index.resident_bytes() + self.data_path.len()
+    }
+
     /// Build from `(entity, memory)` pairs (any order; grouped and sorted here).
     pub fn build(mut pairs: Vec<(EntityId, MemoryId)>) -> (Vec<u8>, Vec<u8>) {
         pairs.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
@@ -782,6 +816,11 @@ pub(crate) fn ts_key(ts: i64) -> [u8; 16] {
 }
 
 impl TimeTable {
+    /// Approximate resident heap bytes (sparse index + path). See [`SsTableIndex::resident_bytes`].
+    pub fn resident_bytes(&self) -> usize {
+        self.index.resident_bytes() + self.data_path.len()
+    }
+
     /// Build from `(effective_ts, memory)` pairs. Memories with no effective timestamp are
     /// simply not indexed (the caller filters `None`).
     pub fn build(mut pairs: Vec<(i64, MemoryId)>) -> (Vec<u8>, Vec<u8>) {

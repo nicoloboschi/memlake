@@ -709,20 +709,23 @@ and [`docs/cost-comparison.md`](docs/cost-comparison.md).
       but weakens strong consistency, so that part is a product decision. This is the single biggest
       lever on both warm latency and cost.
 
-- [ ] **The cache budgets do not bound peak RAM or disk.** `--mem-mb` / `--disk-mb` bound the
-      *block cache* only. Outside them, and unbounded:
-      * `snapshots: Mutex<HashMap<String, Arc<Snapshot>>>` — one resident snapshot **per namespace**
-        (centroids, sparse indexes, FTS readers, tail items), never evicted by size.
-      * every `TantivyFts` materializes its split into its own `tempfile::tempdir()` — disk, per
-        segment per fact type per snapshot.
-      * the trace ring's own caps (`BUFFER_HARD_BYTES`).
-      So actual RAM = `mem_budget + Σ resident snapshots + tail + trace`, which is why a 1 GB cache
-      needs a 3 GiB pod limit, and why `SNAPSHOT_BYTES_PER_NS` is still TBD in the SLA model — the
-      tier formula cannot be computed without it.
-      *Fix:* make `--mem-mb` / `--disk-mb` the **process total** for each tier and split them by
-      declared ratio (e.g. mem = block cache / resident snapshots / trace; disk = block cache / FTS
-      splits), with the snapshot map evicting by its own sub-budget. One knob per tier, ratios
-      internal — no new per-component flags.
+- [x] **The cache budgets now bound the memory tier.** `--mem-mb` / `--disk-mb` bounded only the
+      *block cache*; the per-namespace resident-snapshot map and the per-namespace `Writer` map sat
+      outside them and grew with the number of namespaces a node had ever touched (each snapshot
+      pins its segments' centroids, sparse indexes and FTS splits plus the un-indexed WAL tail),
+      which is why a 1 GB cache needed a 3 GiB pod.
+      **Fixed:** `--mem-mb` is now the **total** for the memory tier, split by a declared ratio —
+      `SNAPSHOT_MEM_FRACTION` (25 %) for resident snapshots, the remainder for the block cache — so
+      one flag per tier bounds everything and the parts cannot silently sum past the pod limit. Both
+      maps are byte-budgeted LRU (`ResidentMap`); eviction only drops the map's `Arc`, so an
+      in-flight query keeps its snapshot alive and eviction costs a re-open, never a failure.
+      Sizing comes from `QueryNode::resident_bytes` (FTS splits, centroids, sparse block
+      directories, tail items). Disk is bounded transitively: every FTS split's temp dir is pinned
+      by a resident snapshot, so capping snapshots caps them. `snapshot_residency()` exposes
+      budget/usage/count — **this is what makes `SNAPSHOT_BYTES_PER_NS` measurable**, closing the
+      TBD that blocks the SLA tier model. Remaining: re-tune the 25 % once that is measured per
+      workload, and account FTS temp-dir bytes against the disk tier explicitly rather than
+      transitively.
 
 - [ ] **Verify: is each memory's payload stored twice in the durable index?** `ClusterFile` holds
       `Vec<StoredMemory>` (vector *and* text), while `rerank.data` holds the vector again and

@@ -251,6 +251,13 @@ impl TantivyFts {
     }
 
     /// The packed split bytes, for writing to object storage.
+    /// Approximate bytes this index occupies while resident — the packed split, which is held
+    /// in RAM **and** materialized into the temp dir the reader mmaps, so it counts against both
+    /// the memory and the disk budget.
+    pub fn resident_bytes(&self) -> usize {
+        self.split_bytes.len()
+    }
+
     pub fn split_bytes(&self) -> &[u8] {
         &self.split_bytes
     }

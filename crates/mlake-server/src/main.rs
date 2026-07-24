@@ -187,8 +187,14 @@ async fn serve(args: &[String], node: String) -> Result<()> {
     let cache_dir = flag(args, "--cache-dir")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::env::temp_dir().join("memlake-cache"));
+    // `--mem-mb` / `--disk-mb` are the TOTAL for each tier; the parts inside are split by a
+    // declared ratio rather than by separate flags. The memory tier is block cache +
+    // resident snapshots (`SNAPSHOT_MEM_FRACTION`); before this split, snapshots sat outside the
+    // budget entirely and peak RAM grew with the number of namespaces touched.
+    let mem_tier = mem_mb * 1_000_000;
+    let block_cache_bytes = MemlakeService::block_cache_bytes(mem_tier);
     let cache = Arc::new(
-        DiskCache::with_budgets(cache_dir, mem_mb * 1_000_000, disk_mb * 1_000_000)
+        DiskCache::with_budgets(cache_dir, block_cache_bytes, disk_mb * 1_000_000)
             .context("opening read cache")?,
     );
     store = store.with_cache(cache);
@@ -199,10 +205,14 @@ async fn serve(args: &[String], node: String) -> Result<()> {
         .or_else(|| std::env::var("MEMLAKE_QUERY_MAX_CONCURRENT").ok())
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(service::DEFAULT_MAX_CONCURRENT_QUERIES);
-    let svc = MemlakeService::new(store, Tokenizer::default()).with_max_concurrent_queries(max_queries);
+    let svc = MemlakeService::new(store, Tokenizer::default())
+        .with_max_concurrent_queries(max_queries)
+        .with_memory_budget(mem_tier);
 
     tracing::info!(
         %addr, mem_mb, disk_mb, max_queries = svc.max_concurrent_queries(),
+        block_cache_mb = block_cache_bytes / 1_000_000,
+        snapshot_budget_mb = svc.snapshot_residency().0 / 1_000_000,
         trace_log = svc.tracing_enabled(), node = %node,
         "memlake serving gRPC"
     );

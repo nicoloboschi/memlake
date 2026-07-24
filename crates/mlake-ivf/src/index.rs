@@ -57,6 +57,11 @@ pub struct Centroids {
 }
 
 impl Centroids {
+    /// Approximate resident heap bytes: every centroid vector is held in RAM for the probe.
+    pub fn resident_bytes(&self) -> usize {
+        self.vectors.iter().map(|v| v.len() * std::mem::size_of::<f32>() + std::mem::size_of::<Vec<f32>>()).sum()
+    }
+
     pub fn len(&self) -> usize {
         self.vectors.len()
     }

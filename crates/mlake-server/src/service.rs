@@ -66,15 +66,48 @@ impl SnapshotOutcome {
 /// / `MEMLAKE_MAX_CONCURRENT_QUERIES` to trade throughput for a tighter memory ceiling.
 pub const DEFAULT_MAX_CONCURRENT_QUERIES: usize = 32;
 
+/// Share of the `--mem-mb` memory budget reserved for **resident snapshots**; the remainder is the
+/// block cache.
+///
+/// One flag per tier, split by ratio, so `--mem-mb` bounds the whole memory tier rather than just
+/// the block cache. A snapshot pins its segments' centroids, sparse indexes and FTS splits plus the
+/// un-indexed WAL tail; before this, that grew with the number of namespaces touched and was
+/// invisible to the cache budget — which is why a 1 GB cache needed a 3 GiB pod.
+///
+/// 25 % is a starting point, not a measured optimum: it should be re-tuned once
+/// `SNAPSHOT_BYTES_PER_NS` is measured per workload (`docs/sla-model.md` leaves it TBD, and the
+/// `snapshot_resident_bytes` gauge below is what closes it).
+pub const SNAPSHOT_MEM_FRACTION: f64 = 0.25;
+
+/// Fallback snapshot budget when the server is constructed without an explicit memory budget
+/// (tests, the in-process harness). Generous enough not to evict in a single-namespace test.
+pub const DEFAULT_SNAPSHOT_BUDGET_BYTES: u64 = 256 * 1_000_000;
+
+/// How many per-namespace `Writer`s stay resident (unit-cost entries in the same LRU map). They are
+/// small; this exists so the map cannot grow without bound on a long-lived multi-tenant node.
+pub const MAX_RESIDENT_WRITERS: u64 = 1_024;
+
 pub struct MemlakeService {
     store: Store,
     tokenizer: Tokenizer,
     /// One `Writer` per namespace. The Writer caches the next WAL sequence, so serializing
     /// a namespace's writes through it avoids every request re-reading the head and racing
     /// on the same slot. Cross-namespace writes stay fully concurrent.
-    writers: Mutex<HashMap<String, Arc<AsyncMutex<Writer>>>>,
+    /// Bounded by count (unit cost per entry), LRU. A `Writer` is tiny — a cached next-sequence
+    /// and head etag — but the map grew forever on a node that touched many namespaces. Evicting an
+    /// idle one is safe: a fresh `Writer` just re-reads the head, which the type already treats as
+    /// the cold path ("a wrong value costs a conflict and a re-read, never correctness"). LRU never
+    /// evicts an actively-written namespace, which is what preserves the per-namespace claim
+    /// serialization that keeps writers off each other's sequence slots.
+    writers: Mutex<ResidentMap<Arc<AsyncMutex<Writer>>>>,
     /// Last opened snapshot per namespace, reused across queries when still current.
-    snapshots: Mutex<HashMap<String, Arc<Snapshot>>>,
+    ///
+    /// **Bounded by bytes, LRU.** A resident snapshot pins its segments' centroids, sparse indexes
+    /// and FTS splits plus the un-indexed WAL tail — RAM the block-cache budget cannot see — so an
+    /// unbounded map made peak process memory a function of how many namespaces were touched.
+    /// Eviction only drops this map's `Arc`; an in-flight query holding one keeps its snapshot
+    /// alive until it finishes, so eviction is never disruptive, just a lost reuse.
+    snapshots: Mutex<ResidentMap>,
     /// Admission control for the memory-heavy retrieval paths (`query`, `get`), so peak working
     /// memory is bounded by the permit count instead of by request concurrency.
     query_limiter: QueryLimiter,
@@ -84,6 +117,67 @@ pub struct MemlakeService {
     /// latency is the signature of CPU contention (per-query rerank parallelism oversubscribing
     /// the cores under concurrent load) rather than a slow snapshot or cold cache.
     in_flight: std::sync::atomic::AtomicUsize,
+}
+
+/// The resident-snapshot map, bounded by estimated bytes with LRU eviction.
+///
+/// Sized from a share of `--mem-mb` (see `SNAPSHOT_MEM_FRACTION`), so one flag bounds the whole
+/// memory tier: block cache + resident snapshots. Byte sizes come from
+/// [`QueryNode::resident_bytes`] — an estimate of the terms that scale (FTS splits, centroids,
+/// sparse indexes, the WAL tail), not an allocator-exact figure.
+struct ResidentMap<V = Arc<Snapshot>> {
+    entries: HashMap<String, Entry<V>>,
+    budget: u64,
+    bytes: u64,
+    clock: u64,
+}
+
+struct Entry<V> {
+    value: V,
+    last_used: u64,
+    bytes: usize,
+}
+
+impl<V: Clone> ResidentMap<V> {
+    fn new(budget: u64) -> Self {
+        Self { entries: HashMap::new(), budget, bytes: 0, clock: 0 }
+    }
+
+    fn get(&mut self, name: &str) -> Option<V> {
+        self.clock += 1;
+        let now = self.clock;
+        let e = self.entries.get_mut(name)?;
+        e.last_used = now;
+        Some(e.value.clone())
+    }
+
+    /// Install `value`, sized at `bytes`, then evict LRU until under budget. The entry just
+    /// installed is never the victim — evicting it would force a re-open on the very next query.
+    fn insert(&mut self, name: &str, value: V, bytes: usize) {
+        self.clock += 1;
+        self.remove(name);
+        let last_used = self.clock;
+        self.entries.insert(name.to_string(), Entry { value, last_used, bytes });
+        self.bytes += bytes as u64;
+        while self.bytes > self.budget && self.entries.len() > 1 {
+            let victim = self
+                .entries
+                .iter()
+                .filter(|(n, _)| n.as_str() != name)
+                .min_by_key(|(_, e)| e.last_used)
+                .map(|(n, _)| n.clone());
+            match victim {
+                Some(v) => self.remove(&v),
+                None => break,
+            }
+        }
+    }
+
+    fn remove(&mut self, name: &str) {
+        if let Some(e) = self.entries.remove(name) {
+            self.bytes = self.bytes.saturating_sub(e.bytes as u64);
+        }
+    }
 }
 
 /// Decrements the in-flight gauge on drop, so it is correct across every return path.
@@ -99,8 +193,8 @@ impl MemlakeService {
         Self {
             store,
             tokenizer,
-            writers: Mutex::new(HashMap::new()),
-            snapshots: Mutex::new(HashMap::new()),
+            writers: Mutex::new(ResidentMap::new(MAX_RESIDENT_WRITERS)),
+            snapshots: Mutex::new(ResidentMap::new(DEFAULT_SNAPSHOT_BUDGET_BYTES)),
             query_limiter: QueryLimiter::new(DEFAULT_MAX_CONCURRENT_QUERIES),
             tracer: Tracer::from_env(),
             in_flight: std::sync::atomic::AtomicUsize::new(0),
@@ -224,20 +318,45 @@ impl MemlakeService {
         self.query_limiter.permits()
     }
 
+    /// Split the memory tier's total (`--mem-mb`) into block cache and resident snapshots.
+    ///
+    /// Takes the **whole** tier budget and keeps `SNAPSHOT_MEM_FRACTION` of it for snapshots; the
+    /// caller gives the remainder to the block cache (see [`Self::block_cache_bytes`]), so one flag
+    /// bounds both and they cannot silently sum past the pod's limit.
+    pub fn with_memory_budget(mut self, mem_tier_bytes: u64) -> Self {
+        let budget = (mem_tier_bytes as f64 * SNAPSHOT_MEM_FRACTION) as u64;
+        self.snapshots = Mutex::new(ResidentMap::new(budget.max(16 * 1_000_000)));
+        self
+    }
+
+    /// The block-cache share of a memory-tier total — the complement of the snapshot share.
+    pub fn block_cache_bytes(mem_tier_bytes: u64) -> u64 {
+        mem_tier_bytes - (mem_tier_bytes as f64 * SNAPSHOT_MEM_FRACTION) as u64
+    }
+
+    /// Resident-snapshot budget and current usage, for the startup log and `/stats`. Usage is what
+    /// `docs/sla-model.md` calls `SNAPSHOT_BYTES_PER_NS` once divided by the resident count.
+    pub fn snapshot_residency(&self) -> (u64, u64, usize) {
+        let c = self.snapshots.lock().unwrap();
+        (c.budget, c.bytes, c.entries.len())
+    }
+
     fn namespace(&self, name: &str) -> Namespace {
         Namespace::new(name, self.store.clone())
     }
 
     fn writer_for(&self, name: &str) -> Arc<AsyncMutex<Writer>> {
         let mut writers = self.writers.lock().unwrap();
-        writers
-            .entry(name.to_string())
-            .or_insert_with(|| Arc::new(AsyncMutex::new(Writer::new(self.namespace(name)))))
-            .clone()
+        if let Some(w) = writers.get(name) {
+            return w;
+        }
+        let w = Arc::new(AsyncMutex::new(Writer::new(self.namespace(name))));
+        writers.insert(name, w.clone(), 1);
+        w
     }
 
     fn cached_snapshot(&self, name: &str) -> Option<Arc<Snapshot>> {
-        self.snapshots.lock().unwrap().get(name).cloned()
+        self.snapshots.lock().unwrap().get(name)
     }
 
     /// Get a current snapshot for `ns`, reusing work while no fold has landed since it was opened.
@@ -323,7 +442,8 @@ impl MemlakeService {
             through_seq: node.through_seq,
             node,
         });
-        self.snapshots.lock().unwrap().insert(name.to_string(), snap.clone());
+        let bytes = snap.node.resident_bytes();
+        self.snapshots.lock().unwrap().insert(name, snap.clone(), bytes);
         snap
     }
 
@@ -1699,4 +1819,48 @@ pub async fn discover_namespaces(store: &Store) -> anyhow::Result<Vec<String>> {
     names.sort();
     names.dedup();
     Ok(names)
+}
+
+#[cfg(test)]
+mod resident_map_tests {
+    use super::ResidentMap;
+
+    /// The resident-snapshot map is bounded by bytes, evicting least-recently-used first, so peak
+    /// RAM no longer grows with the number of namespaces a node has touched.
+    #[test]
+    fn evicts_least_recently_used_to_stay_under_budget() {
+        let mut c: ResidentMap<u32> = ResidentMap::new(100);
+        c.insert("a", 1, 40);
+        c.insert("b", 2, 40);
+        assert_eq!(c.bytes, 80);
+
+        // Touch "a" so "b" becomes the least-recently-used.
+        assert_eq!(c.get("a"), Some(1));
+        c.insert("c", 3, 40); // 120 > 100 -> evict one
+        assert!(c.entries.contains_key("c"), "the just-installed entry is never the victim");
+        assert!(c.entries.contains_key("a"), "recently used survives");
+        assert!(!c.entries.contains_key("b"), "LRU evicted");
+        assert_eq!(c.bytes, 80);
+    }
+
+    /// Re-inserting a namespace replaces its accounting rather than double-counting it — a snapshot
+    /// is reopened on most writes, so leaking here would drift the budget upward forever.
+    #[test]
+    fn reinsert_replaces_rather_than_accumulates() {
+        let mut c: ResidentMap<u32> = ResidentMap::new(1_000);
+        c.insert("a", 1, 40);
+        c.insert("a", 2, 70);
+        assert_eq!(c.entries.len(), 1);
+        assert_eq!(c.bytes, 70);
+        assert_eq!(c.get("a"), Some(2));
+    }
+
+    /// An entry larger than the whole budget is kept rather than evicted into a re-open loop:
+    /// one namespace must always be servable.
+    #[test]
+    fn an_oversized_lone_entry_is_kept() {
+        let mut c: ResidentMap<u32> = ResidentMap::new(10);
+        c.insert("big", 1, 999);
+        assert!(c.entries.contains_key("big"));
+    }
 }

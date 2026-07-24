@@ -266,7 +266,57 @@ async fn ids_in_segments(
     Ok(found)
 }
 
+impl SegmentState {
+    /// Approximate heap bytes this loaded segment holds. The dominant terms are the packed FTS
+    /// split (held in RAM *and* mmapped from a temp dir) and the centroid table; the SSTable
+    /// wrappers contribute only their sparse block directories, since data blocks are fetched
+    /// through the block cache rather than held here.
+    fn resident_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self.id.len()
+            + self.stats_path.len()
+            + self.centroids.resident_bytes()
+            + self.gen_fts.resident_bytes()
+            + self.radj.resident_bytes()
+            + self.pk.resident_bytes()
+            + self.entity.resident_bytes()
+            + self.time.resident_bytes()
+            + self.created.resident_bytes()
+            + self.payload.resident_bytes()
+            + self.rerank.resident_bytes()
+            + self.cluster_paths.iter().map(|p| p.len() + std::mem::size_of::<String>()).sum::<usize>()
+            + self.vector_paths.iter().map(|p| p.len() + std::mem::size_of::<String>()).sum::<usize>()
+    }
+}
+
 impl QueryNode {
+    /// Approximate heap bytes this snapshot holds resident, for the snapshot budget.
+    ///
+    /// This is the per-namespace RAM the `--mem-mb` budget could not previously see: a snapshot
+    /// pins its segments' centroids, sparse indexes and FTS splits plus the un-indexed WAL tail,
+    /// none of which live in the block cache. An estimate of the terms that scale with corpus and
+    /// tail — not allocator-exact.
+    ///
+    /// Segments are `Arc`-shared, so two snapshots of the *same* namespace that share segments
+    /// would each count them; the resident map holds one snapshot per namespace, so in practice
+    /// each segment is counted once.
+    pub fn resident_bytes(&self) -> usize {
+        let per_type: usize = self
+            .per_type
+            .values()
+            .map(|ft| {
+                ft.segments.iter().map(|s| s.resident_bytes()).sum::<usize>()
+                    + ft.tail_items.iter().map(|i| i.heap_bytes()).sum::<usize>()
+                    + ft.tail_fts.get().map_or(0, |f| f.resident_bytes())
+            })
+            .sum();
+        std::mem::size_of::<Self>()
+            + per_type
+            + self.tombstones.len() * std::mem::size_of::<MemoryId>()
+            + self.seg_superseded.len() * (std::mem::size_of::<MemoryId>() + std::mem::size_of::<u64>())
+            + self.newly_loaded.iter().map(|(_, id)| id.len() + std::mem::size_of::<String>()).sum::<usize>()
+    }
+
     /// Open a snapshot of a bank: read the manifest, load each fact type's metadata, scan
     /// and partition the tail. Cluster and pk/radj data blocks are not fetched here.
     ///
