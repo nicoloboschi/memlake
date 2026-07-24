@@ -54,7 +54,9 @@ export interface TraceRec {
 type ObjSource = "mem" | "disk" | "s3";
 interface ObjSpan {
   key: string;
-  src: ObjSource;
+  src: ObjSource | null;
+  kind: "io" | "compute";
+  group: string;
   op: string;
   start_us: number;
   end_us: number;
@@ -71,6 +73,12 @@ const SRC_TEXT: Record<ObjSource, string> = {
   disk: "text-accent",
   s3: "text-danger",
 };
+// Compute (CPU) spans get their own colour, distinct from the three I/O tiers.
+const CPU_BAR = "bg-warn/70";
+const CPU_TEXT = "text-warn";
+
+/** Draw order for the phase groups; unknown groups fall to the end. */
+const GROUP_ORDER = ["snapshot", "recall", "text", "rerank", "graph", "commit", "other"];
 
 /** Keep the tail of a long object key (the informative part — cluster-52.vec — is the end). */
 function tailKey(k: string, max = 40): string {
@@ -78,6 +86,45 @@ function tailKey(k: string, max = 40): string {
 }
 
 /** The object-access waterfall: every mem/disk/S3 read+write on one request, positioned by time. */
+function SpanRow({ s, maxEnd }: { s: ObjSpan; maxEnd: number }) {
+  const dur = (s.end_us - s.start_us) / 1000;
+  const left = (s.start_us / maxEnd) * 100;
+  const width = Math.max(((s.end_us - s.start_us) / maxEnd) * 100, 0.4);
+  const compute = s.kind === "compute";
+  const bar = compute ? CPU_BAR : SRC_BAR[s.src ?? "s3"];
+  const text = compute ? CPU_TEXT : SRC_TEXT[s.src ?? "s3"];
+  const label = compute ? "cpu" : s.src;
+  return (
+    <div className="flex items-center gap-2 h-3.5 pl-2">
+      <span className={`w-7 shrink-0 font-mono text-[9px] ${text}`}>{label}</span>
+      <span
+        className={`w-48 shrink-0 font-mono text-[10px] truncate ${
+          compute ? "text-warn" : "text-ink-dim"
+        }`}
+        title={`${s.key} · ${s.op}`}
+        dir={compute ? "ltr" : "rtl"}
+      >
+        {compute ? s.key : tailKey(s.key)}
+      </span>
+      <div className="flex-1 relative h-2.5 bg-panel-2 rounded-sm">
+        <div
+          className={`absolute h-full rounded-sm ${bar}`}
+          style={{ left: `${left}%`, width: `${width}%` }}
+          title={`${s.op} · ${compute ? "cpu" : s.src} · ${fmtMs(dur)}${
+            compute ? "" : ` · ${fmtBytes(String(s.bytes))}`
+          }`}
+        />
+      </div>
+      <span className="w-14 shrink-0 text-right font-mono text-[10px] tnum text-ink-dim">
+        {fmtMs(dur)}
+      </span>
+    </div>
+  );
+}
+
+/** The unified sequence diagram: every I/O access AND compute phase on one timeline, bracketed by
+ * main phase (snapshot → recall → rerank → …). Segments run concurrently, so their per-phase compute
+ * spans overlap here — the parallelism is visible. */
 function Waterfall({
   objects,
   totalMs,
@@ -85,57 +132,93 @@ function Waterfall({
   objects: NonNullable<TraceRec["objects"]>;
   totalMs: number;
 }) {
-  const items = [...objects.items].sort((a, b) => a.start_us - b.start_us);
+  const items = objects.items;
   const maxEnd = Math.max(totalMs * 1000, ...items.map((s) => s.end_us), 1);
-  const counts: Record<ObjSource, number> = { mem: 0, disk: 0, s3: 0 };
-  const time: Record<ObjSource, number> = { mem: 0, disk: 0, s3: 0 };
+
+  // Legend: I/O by tier + compute.
+  const io: Record<ObjSource, { n: number; ms: number }> = {
+    mem: { n: 0, ms: 0 },
+    disk: { n: 0, ms: 0 },
+    s3: { n: 0, ms: 0 },
+  };
+  let cpuN = 0;
+  let cpuMs = 0;
   for (const s of items) {
-    counts[s.src] += 1;
-    time[s.src] += (s.end_us - s.start_us) / 1000;
+    const d = (s.end_us - s.start_us) / 1000;
+    if (s.kind === "compute") {
+      cpuN += 1;
+      cpuMs += d;
+    } else if (s.src) {
+      io[s.src].n += 1;
+      io[s.src].ms += d;
+    }
   }
+
+  // Bucket by phase group, in draw order.
+  const byGroup = new Map<string, ObjSpan[]>();
+  for (const s of items) {
+    const g = s.group || "other";
+    (byGroup.get(g) ?? byGroup.set(g, []).get(g)!).push(s);
+  }
+  const groups = [
+    ...GROUP_ORDER.filter((g) => byGroup.has(g)),
+    ...[...byGroup.keys()].filter((g) => !GROUP_ORDER.includes(g)),
+  ];
+
   return (
     <div>
-      <div className="flex flex-wrap items-center gap-x-4 gap-y-1 mb-1.5">
+      <div className="flex flex-wrap items-center gap-x-4 gap-y-1 mb-2">
         {(["s3", "disk", "mem"] as ObjSource[]).map((src) => (
           <span key={src} className="flex items-center gap-1.5 font-mono text-[10px]">
             <span className={`inline-block w-2 h-2 rounded-sm ${SRC_BAR[src]}`} />
             <span className={SRC_TEXT[src]}>{src}</span>
             <span className="text-ink-faint">
-              ×{counts[src]} · {fmtMs(time[src])}
+              ×{io[src].n} · {fmtMs(io[src].ms)}
             </span>
           </span>
         ))}
+        <span className="flex items-center gap-1.5 font-mono text-[10px]">
+          <span className={`inline-block w-2 h-2 rounded-sm ${CPU_BAR}`} />
+          <span className={CPU_TEXT}>cpu</span>
+          <span className="text-ink-faint">
+            ×{cpuN} · {fmtMs(cpuMs)}
+          </span>
+        </span>
         {objects.dropped > 0 && (
           <span className="font-mono text-[10px] text-ink-faint">
             +{groupDigits(String(objects.dropped))} more (capped)
           </span>
         )}
       </div>
-      <div className="max-h-[22rem] overflow-y-auto flex flex-col gap-px pr-1">
-        {items.map((s, i) => {
-          const dur = (s.end_us - s.start_us) / 1000;
-          const left = (s.start_us / maxEnd) * 100;
-          const width = Math.max(((s.end_us - s.start_us) / maxEnd) * 100, 0.4);
+
+      <div className="max-h-[28rem] overflow-y-auto flex flex-col gap-2 pr-1">
+        {groups.map((g) => {
+          const gs = byGroup.get(g)!.slice().sort((a, b) => a.start_us - b.start_us);
+          const gStart = Math.min(...gs.map((s) => s.start_us));
+          const gEnd = Math.max(...gs.map((s) => s.end_us));
           return (
-            <div key={i} className="flex items-center gap-2 h-3.5">
-              <span className={`w-6 shrink-0 font-mono text-[9px] ${SRC_TEXT[s.src]}`}>{s.src}</span>
-              <span
-                className="w-52 shrink-0 font-mono text-[10px] text-ink-dim truncate"
-                title={`${s.key} · ${s.op}`}
-                dir="rtl"
-              >
-                {tailKey(s.key)}
-              </span>
-              <div className="flex-1 relative h-2.5 bg-panel-2 rounded-sm">
-                <div
-                  className={`absolute h-full rounded-sm ${SRC_BAR[s.src]}`}
-                  style={{ left: `${left}%`, width: `${width}%` }}
-                  title={`${s.op} · ${s.src} · ${fmtMs(dur)} · ${fmtBytes(String(s.bytes))}`}
-                />
+            <div key={g}>
+              {/* group bracket: the phase's overall span across the timeline */}
+              <div className="flex items-center gap-2 mb-0.5">
+                <span className="w-[3.75rem] shrink-0 font-mono text-[10px] uppercase tracking-wide text-ink-dim">
+                  {g}
+                </span>
+                <div className="flex-1 relative h-1.5">
+                  <div
+                    className="absolute h-full bg-ink-faint/25 rounded-full"
+                    style={{
+                      left: `${(gStart / maxEnd) * 100}%`,
+                      width: `${Math.max(((gEnd - gStart) / maxEnd) * 100, 0.4)}%`,
+                    }}
+                  />
+                </div>
+                <span className="w-14 shrink-0 text-right font-mono text-[10px] text-ink-faint tnum">
+                  {fmtMs((gEnd - gStart) / 1000)}
+                </span>
               </div>
-              <span className="w-16 shrink-0 text-right font-mono text-[10px] tnum text-ink-dim">
-                {fmtMs(dur)}
-              </span>
+              {gs.map((s, i) => (
+                <SpanRow key={i} s={s} maxEnd={maxEnd} />
+              ))}
             </div>
           );
         })}
@@ -350,41 +433,32 @@ export function TraceDetail({ rec }: { rec: TraceRec }) {
         </div>
       </Section>
 
-      {rec.objects && rec.objects.items.length > 0 && (
-        <Section title={`object accesses · ${rec.objects.count} spans, by time`}>
+      {rec.objects && rec.objects.items.length > 0 ? (
+        <Section
+          title={`sequence · ${rec.objects.count} spans (I/O + compute), by phase`}
+        >
           <Waterfall objects={rec.objects} totalMs={total} />
         </Section>
-      )}
-
-      {nonzero.length > 0 && (
-        <Section
-          title={
-            rec.op === "write"
-              ? "derive phase profile · accumulated, arms run in parallel"
-              : "phase profile · accumulated, arms run in parallel"
-          }
-        >
-          <div className="flex flex-col gap-1">
-            {nonzero
-              .slice()
-              .sort((a, b) => b[1] - a[1])
-              .map(([name, us]) => (
-                <Bar
-                  key={name}
-                  label={name}
-                  ms={MS(us)}
-                  frac={us / profMax}
-                  tone={PHASE_TONE[name] ?? "bg-ink-faint/40"}
-                />
-              ))}
-          </div>
-          {rec.op === "write" && rec.link_io?.corpus_query_ms != null && (
-            <div className="mt-1.5 font-mono text-[10px] text-ink-faint">
-              corpus queries wall {fmtMs(rec.link_io.corpus_query_ms)} · the profile above is summed
-              across all {rec.link_io.queries ?? "?"} of them
+      ) : (
+        // Fallback for records captured before per-object spans existed: the accumulated profile.
+        nonzero.length > 0 && (
+          <Section title="phase profile · accumulated, arms run in parallel">
+            <div className="flex flex-col gap-1">
+              {nonzero
+                .slice()
+                .sort((a, b) => b[1] - a[1])
+                .map(([name, us]) => (
+                  <Bar
+                    key={name}
+                    label={name}
+                    ms={MS(us)}
+                    frac={us / profMax}
+                    tone={PHASE_TONE[name] ?? "bg-ink-faint/40"}
+                  />
+                ))}
             </div>
-          )}
-        </Section>
+          </Section>
+        )
       )}
 
       <Section title="stats">

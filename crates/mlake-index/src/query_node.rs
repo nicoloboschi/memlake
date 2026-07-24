@@ -1300,7 +1300,9 @@ impl QueryNode {
                     b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal).then(a.0.cmp(&b.0))
                 });
                 scored.truncate(depths.vector);
-                metrics.record_phase(Phase::Rerank, t.elapsed());
+                let e = Instant::now();
+                metrics.record_phase(Phase::Rerank, e.saturating_duration_since(t));
+                mlake_store::spans::compute("merge", "rerank", t, e);
 
                 // Hydrate the survivors across segments + tail. Tail winners are resident and not
                 // in any pk index yet (INV-5 visibility), so seed them directly.
@@ -1327,7 +1329,9 @@ impl QueryNode {
             .filter(|t| !t.is_empty() && depths.text > 0)
             .map(|t| self.fts_arm(state, t, depths.text, tags))
             .unwrap_or_default();
-        metrics.record_phase(Phase::Fts, tf.elapsed());
+        let e = Instant::now();
+        metrics.record_phase(Phase::Fts, e.saturating_duration_since(tf));
+        mlake_store::spans::compute("fts", "text", tf, e);
 
         // The graph arm needs dense seeds; it does ranged pk/radj reads, so it is skipped
         // when disabled (top_k 0) or when there is nothing to seed from. Only vector hits at or
@@ -1378,7 +1382,9 @@ impl QueryNode {
         }
         let t = Instant::now();
         let probed = self.select_clusters(state, q, nprobe, tags, updated);
-        metrics.record_phase(Phase::Probe, t.elapsed());
+        let e = Instant::now();
+        metrics.record_phase(Phase::Probe, e.saturating_duration_since(t));
+        mlake_store::spans::compute("probe", "recall", t, e);
 
         let t = Instant::now();
         let blocks = self.fetch_vector_blocks(state, &probed, metrics, 3).await?;
@@ -1388,7 +1394,9 @@ impl QueryNode {
         let t = Instant::now();
         let mut cands: Vec<(MemoryId, f32, f32, f32)> = Vec::new(); // id, est, lo, hi
         self.scan_blocks(&blocks, state, q, tags, updated, &mut cands)?;
-        metrics.record_phase(Phase::Scan, t.elapsed());
+        let e = Instant::now();
+        metrics.record_phase(Phase::Scan, e.saturating_duration_since(t));
+        mlake_store::spans::compute("scan", "recall", t, e);
 
         // Approximate mode (link derivation): skip stage two entirely — rank by the RaBitQ scan
         // estimate and return the top-`depth`. No rerank-tier fetch, no exact cosine. Links only
@@ -1425,8 +1433,9 @@ impl QueryNode {
         scored.sort_by(|a, b| {
             b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal).then(a.0.cmp(&b.0))
         });
-        scored.truncate(depth);
-        metrics.record_phase(Phase::Rerank, t.elapsed());
+        let e = Instant::now();
+        metrics.record_phase(Phase::Rerank, e.saturating_duration_since(t));
+        mlake_store::spans::compute("rerank", "rerank", t, e);
         Ok(scored)
     }
 
@@ -2003,7 +2012,9 @@ impl QueryNode {
                 entity_candidates.entry(e).or_default().extend(cands);
             }
         }
-        metrics.record_phase(Phase::GraphRadj, tr.elapsed());
+        let ge = Instant::now();
+        metrics.record_phase(Phase::GraphRadj, ge.saturating_duration_since(tr));
+        mlake_store::spans::compute("graph_radj", "graph", tr, ge);
 
         // Temporal neighbours per seed: a ranged time-index scan over `[t ± window]` for each
         // seed with an effective time, issued concurrently across seeds (each walks its
@@ -2045,7 +2056,9 @@ impl QueryNode {
                 temporal.insert(sid, ids);
             }
         }
-        metrics.record_phase(Phase::GraphRadj, tt.elapsed());
+        let ge = Instant::now();
+        metrics.record_phase(Phase::GraphRadj, ge.saturating_duration_since(tt));
+        mlake_store::spans::compute("graph_temporal", "graph", tt, ge);
 
         // Score structurally — NO candidate hydration. Activation comes entirely from the
         // graph structure already in hand: seed edges, incoming edges (radj), how many
@@ -2067,7 +2080,9 @@ impl QueryNode {
             &seeds,
             GraphParams { budget: depth, ..GraphParams::default() },
         );
-        metrics.record_phase(Phase::GraphExpand, te.elapsed());
+        let ge = Instant::now();
+        metrics.record_phase(Phase::GraphExpand, ge.saturating_duration_since(te));
+        mlake_store::spans::compute("graph_expand", "graph", te, ge);
 
         // Only the ranked results (≤ budget) are hydrated, and only when a tag filter needs
         // their tags. Without ANY filter (flat or compound groups), nothing is fetched here —
@@ -2085,7 +2100,9 @@ impl QueryNode {
                 by_id.entry(id).or_insert(item);
             }
         }
-        metrics.record_phase(Phase::GraphFetch, tf.elapsed());
+        let ge = Instant::now();
+        metrics.record_phase(Phase::GraphFetch, ge.saturating_duration_since(tf));
+        mlake_store::spans::compute("graph_fetch", "graph", tf, ge);
         let out = ranked
             .into_iter()
             .filter(|r| {
