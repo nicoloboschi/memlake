@@ -507,9 +507,13 @@ mod tests {
         }
         let hydrate = t.elapsed();
 
-        // (c) the EMPTY-tail search the arm runs on every text query once a fold has drained the
-        // tail: tokenize + build the BooleanQuery + search an index with no documents.
+        // (c0) BUILDING an index for an empty tail. `FactType::tail_fts` is a fresh OnceLock on
+        // every snapshot, so before the arm learned to skip an empty tail this was paid on the
+        // first text query after every fold — a temp dir, a 50 MB writer arena with indexing
+        // threads, a commit and a split pack, all to index zero documents.
+        let t = Instant::now();
         let empty = TantivyFts::build(Vec::<(MemoryId, &str)>::new(), Tokenizer::default()).unwrap();
+        let empty_build = t.elapsed();
         for q in &queries {
             let _ = empty.search_filtered(q, K, &filter);
         }
@@ -533,8 +537,9 @@ mod tests {
              full          {:.3} ms/q\n  \
              exec          {:.3} ms/q\n  \
              id-hydrate    {:.3} ms/q  ({:.1}% of full)\n  \
-             EMPTY-tail    {:.3} ms/q  (paid every text query once the tail has folded)\n  \
+             EMPTY-tail    {:.3} ms/q  (search only; the arm now skips an empty tail entirely)\n  \
              tokenize      {:.3} ms/q  (paid per index searched: tail + each segment)\n  \
+             EMPTY BUILD   {:.1} ms ONE-OFF  (per snapshot, before the empty-tail skip)\n  \
              [{got} hits, {ids} ids]",
             terms_total as f64 / QUERIES as f64,
             per(full),
@@ -543,6 +548,7 @@ mod tests {
             100.0 * hydrate.as_secs_f64() / full.as_secs_f64().max(1e-9),
             per(empty_search),
             per(tokenize),
+            empty_build.as_secs_f64() * 1000.0,
         );
     }
 

@@ -1947,22 +1947,29 @@ impl QueryNode {
     /// deduped keeping the first occurrence — see the note).
     fn fts_arm(&self, state: &FactType, text: &str, depth: usize, tags: &TagFilter) -> Vec<(MemoryId, f32)> {
         let mut hits: Vec<mlake_fts::FtsHit> = Vec::new();
-        // Build the tail's BM25 index on first text query and cache it — a vector-only query never
-        // reaches here, so it never pays the tantivy build (the reopen fast-path).
-        let tail_fts = state.tail_fts.get_or_init(|| {
-            TantivyFts::build_with_tags(
-                state.tail_items.iter().map(|i| (i.id, i.fts_text(), i.tags.as_slice())),
-                self.tokenizer.clone(),
-            )
-            .expect("build tail FTS")
-        });
-        // Tail first so a re-upserted id's tail hit wins the dedup over an older segment's.
-        hits.extend(
-            tail_fts
-                .search_filtered(text, depth, tags)
-                .into_iter()
-                .filter(|h| !self.tombstones.contains(&h.id)),
-        );
+        // An empty tail can match nothing, and building a tantivy index for it is far from free:
+        // a temp dir, a 50 MB writer arena with indexing threads, a commit and a split pack —
+        // measured at ~1.7 s. `tail_fts` is a fresh OnceLock on every snapshot, so that would be
+        // paid again on the first text query after EVERY fold, which is exactly the state a drained
+        // namespace sits in. Skip the build and the search.
+        if !state.tail_items.is_empty() {
+            // Built on first text query and cached — a vector-only query never reaches here, so it
+            // never pays the tantivy build (the reopen fast-path).
+            let tail_fts = state.tail_fts.get_or_init(|| {
+                TantivyFts::build_with_tags(
+                    state.tail_items.iter().map(|i| (i.id, i.fts_text(), i.tags.as_slice())),
+                    self.tokenizer.clone(),
+                )
+                .expect("build tail FTS")
+            });
+            // Tail first so a re-upserted id's tail hit wins the dedup over an older segment's.
+            hits.extend(
+                tail_fts
+                    .search_filtered(text, depth, tags)
+                    .into_iter()
+                    .filter(|h| !self.tombstones.contains(&h.id)),
+            );
+        }
         for seg in state.segments.iter() {
             hits.extend(
                 seg.gen_fts
