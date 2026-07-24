@@ -13,10 +13,16 @@ Findings from running memlake on the `hindsight-dev` GKE cluster over the real
 | fix build, 1 GB cache | 1 | 95 | 51 ms | indexer folding concurrently; still large tail |
 | queue build, 1 GB cache | 8 (1 ns) | — | — | **failed**: writes timed out (F2, F3) |
 | fix build, **6 namespaces** | 6×1 | **~828 agg** | — | scales across pods (F2 upside); per-ns 106–231/s |
+| **F5 fix, drained index** | 8 (1 ns) | **206** | **85 ms** | 20 k docs, `folded=true` in 6.6 s, gen=12, backlog=0 |
 
-Query p50 stays ~50 ms because in every run a large share of the corpus is still in the
-**un-indexed WAL tail** (brute-force-scanned in-memory: 0 S3 roundtrips but CPU-heavy). A truly
-drained steady-state number could not be captured — see F5.
+The first four runs' query p50 ~50 ms was measured while a large share of the corpus was still in
+the **un-indexed WAL tail** (brute-force-scanned in-memory: 0 S3 roundtrips but CPU-heavy) — the
+fold stalled (F5) so a truly drained number could not be captured. With F5 fixed the fold fully
+drains and the honest steady-state emerges: over a fully-indexed 20 k-doc corpus, **warm p50 85 ms
+/ p90 91 ms / p99 113 ms (0 roundtrips, all served from cache)**; cold p50 88 / p99 590 ms. The p50
+is higher than the tail-scan number because a drained query fans out across all of the namespace's
+segments (gen=12 here) and merges — reducing that fan-out is a compaction-tuning follow-up, not an
+F5 concern.
 
 ## Findings
 
@@ -70,8 +76,10 @@ round-robining across the 3 segments, ~488 per segment in 240 s and still climbi
 per segment** (a single ranged GET over the covering pk blocks), then do the count adjustments as
 in-memory set membership — O(items × segments) round-trips → O(segments). Same semantics
 (present-in-any-segment); the 54 `mlake-index` tests still pass, and the `index --once` that
-timed out at 240 s now returns in ~2 s. This unblocks a fully-drained steady-state query
-measurement.
+timed out at 240 s now returns in ~2 s. *Verified end-to-end on the cluster:* a fresh 20 k-doc
+namespace under 8 concurrent writers reached `folded=true` (gen=12, backlog=0) within 6.6 s of the
+writes finishing — where the old build left `folded=false` with a growing backlog — and gave the
+drained steady-state query numbers in the table above.
 
 ## Fixes landed
 
