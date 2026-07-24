@@ -285,6 +285,43 @@ async def test_delete_facts_removes_them(store, bank_id):
     assert got == []
 
 
+async def test_delete_where_removes_only_matching_fact_types(store, bank_id, index_pass):
+    """Predicate delete scoped by fact_type — what delete_bank routes a fact_type-scoped clear to."""
+    from hindsight_api.engine.memories import DeletePredicate
+
+    ns = store._namespace(bank_id)
+    unit_ids = await store.insert_facts(
+        conn=None,
+        ops=None,
+        bank_id=bank_id,
+        facts=[
+            make_fact("a world fact", seed=0.2, fact_type="world"),
+            make_fact("an experience", seed=0.4, fact_type="experience"),
+        ],
+    )
+    index_pass(ns)
+    await store.delete_where(bank_id, DeletePredicate(fact_types=["experience"]))
+    # get_memories is immediately consistent (a by-id read sees the tombstone at once, unlike the
+    # stats-based count which lags a fold), so it tells us exactly what survived.
+    got = await store.get_memories(conn=None, fq_table=_fq_table, bank_id=bank_id, unit_ids=unit_ids)
+    surviving = {m.fact_type for m in got}
+    assert "world" in surviving, f"world survives: {surviving}"
+    assert "experience" not in surviving, f"experience deleted: {surviving}"
+
+
+async def test_delete_namespace_drops_the_whole_bank(store, bank_id, index_pass):
+    """Dropping the namespace clears all of a bank's memlake data — what delete_bank routes a
+    full bank delete to. A read against a dropped namespace is empty, not an error."""
+    ns = store._namespace(bank_id)
+    await store.insert_facts(
+        conn=None, ops=None, bank_id=bank_id, facts=[make_fact("gone soon", seed=0.2, fact_type="world")]
+    )
+    index_pass(ns)
+    await store.delete_namespace(bank_id)
+    counts = await store.count_memories(conn=None, fq_table=_fq_table, bank_id=bank_id)
+    assert sum(counts.values()) == 0, f"namespace dropped → no memories: {counts}"
+
+
 # --------------------------------------------------------------------------- count surfaces
 
 
