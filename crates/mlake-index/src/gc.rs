@@ -99,27 +99,71 @@ pub async fn gc_with_min_age(ns: &Namespace, min_age: Duration) -> Result<GcOutc
 /// Default retention for observability trace batches: keep the last 24h, drop older.
 pub const DEFAULT_TRACE_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
 
-/// Reclaim observability trace batches older than `retention`.
+/// How long a node's rollup may go un-refreshed before it is considered gone and reaped. Live nodes
+/// rewrite their rollup every flush (sub-second), so an hour of silence is unambiguous; a node that
+/// comes back republishes immediately.
+pub const DEFAULT_ROLLUP_STALE: Duration = Duration::from_secs(60 * 60);
+
+/// What an observability sweep reclaimed.
+#[derive(Default, Debug, PartialEq, Eq)]
+pub struct ObsGcOutcome {
+    pub trace_objects_deleted: usize,
+    pub hour_buckets_deleted: usize,
+    pub rollups_deleted: usize,
+}
+
+/// Expire observability data: whole trace hour-buckets past `retention`, and rollups of nodes that
+/// have gone silent for `rollup_stale`.
 ///
-/// Trace objects are append-only and immutable (`_obs/traces/{node}/{ms}-{seq}.jsonl`), so unlike
-/// generation GC there is nothing to reference-check: retention is purely by TIME. This is the one
-/// thing keeping `_obs/` from growing without bound, and it is global (not per-namespace) — the
-/// indexer runs it on its periodic sweep.
+/// Trace batches are append-only and immutable, partitioned as
+/// `_obs/traces/{node}/{YYYYMMDDHH}/{ms}-{seq}.jsonl`. That partition is the point: expiry is
+/// decided from the bucket NAME (lexicographic == chronological), so this lists objects ONLY inside
+/// buckets it is about to delete — live data is never enumerated, which is what keeps the sweep O(
+/// expired) instead of O(retention window).
+///
+/// Rollups are small overwritten objects (`_obs/rollup/{node}.json`); nothing else reaps them, so a
+/// scaled-down or renamed node would otherwise linger forever as a stale card in the admin.
 ///
 /// Idempotent and safe to run concurrently on any node: deleting an already-deleted object is a
-/// no-op. Deletion uses the object's own last-modified time, so it needs no key parsing.
+/// no-op. Global (not per-namespace) — the indexer runs it on its GC cadence.
 pub async fn gc_traces(
     store: &mlake_store::Store,
     retention: Duration,
-) -> Result<usize> {
-    let cutoff = chrono::Utc::now() - chrono::Duration::from_std(retention).unwrap_or_default();
-    let mut deleted = 0usize;
-    for (path, modified) in store.list_with_age(mlake_core::OBS_TRACES_PREFIX).await? {
-        if modified > cutoff {
+    rollup_stale: Duration,
+) -> Result<ObsGcOutcome> {
+    let mut outcome = ObsGcOutcome::default();
+    let now = chrono::Utc::now();
+
+    // Buckets strictly older than this one are entirely expired. Comparing bucket names means we
+    // never look at an object's metadata, and never touch a live bucket.
+    let cutoff_bucket = (now - chrono::Duration::from_std(retention).unwrap_or_default())
+        .format("%Y%m%d%H")
+        .to_string();
+
+    for node_prefix in store.list_prefixes(mlake_core::OBS_TRACES_PREFIX).await? {
+        for hour_prefix in store.list_prefixes(&node_prefix).await? {
+            // `.../{node}/{YYYYMMDDHH}/` -> the bucket name.
+            let bucket = hour_prefix.trim_end_matches('/').rsplit('/').next().unwrap_or("");
+            if bucket.len() != 10 || bucket >= cutoff_bucket.as_str() {
+                continue; // still inside the retention window (or not a bucket we wrote)
+            }
+            for path in store.list(&hour_prefix).await? {
+                store.delete(&path).await?;
+                outcome.trace_objects_deleted += 1;
+            }
+            outcome.hour_buckets_deleted += 1;
+        }
+    }
+
+    // Reap rollups of nodes that stopped publishing.
+    let rollup_cutoff = now - chrono::Duration::from_std(rollup_stale).unwrap_or_default();
+    for (path, modified) in store.list_with_age(mlake_core::OBS_ROLLUP_PREFIX).await? {
+        if modified > rollup_cutoff {
             continue;
         }
         store.delete(&path).await?;
-        deleted += 1;
+        outcome.rollups_deleted += 1;
     }
-    Ok(deleted)
+
+    Ok(outcome)
 }

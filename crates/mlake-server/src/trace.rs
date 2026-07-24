@@ -23,10 +23,24 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 /// `reject_reserved_namespace`). The admin reads these prefixes directly from S3.
 pub use mlake_core::{OBS_ROLLUP_PREFIX, OBS_TRACES_PREFIX};
 
-/// The key for one immutable trace batch. `ms`+`seq` sort lexicographically by time (13-digit ms is
-/// good past year 2286), so a LIST is time-ordered and time-retention is a key/age comparison.
+/// The hour bucket (`YYYYMMDDHH`) a timestamp belongs to. Lexicographic order == chronological, so
+/// retention is a string compare against the cutoff's bucket — no per-object metadata needed.
+pub fn hour_bucket(ms: u64) -> String {
+    chrono::DateTime::from_timestamp_millis(ms as i64)
+        .unwrap_or_default()
+        .format("%Y%m%d%H")
+        .to_string()
+}
+
+/// The key for one immutable trace batch, partitioned by hour:
+/// `_obs/traces/{node}/{YYYYMMDDHH}/{ms}-{seq}.jsonl`.
+///
+/// The hour partition is what makes retention and reads cheap at scale: expiry is decided from the
+/// bucket NAME (so the sweep lists only buckets it is about to delete, never live data), and the
+/// admin reads just the newest bucket(s) instead of the whole retention window. Within a bucket,
+/// `ms`+`seq` sort lexicographically by time (13-digit ms is good past year 2286).
 pub fn obs_batch_path(node_id: &str, ms: u64, seq: u64) -> String {
-    format!("{OBS_TRACES_PREFIX}{node_id}/{ms:013}-{seq:012}.jsonl")
+    format!("{OBS_TRACES_PREFIX}{node_id}/{}/{ms:013}-{seq:012}.jsonl", hour_bucket(ms))
 }
 
 /// The (overwritten) rollup object for one node — the fleet-overview heartbeat + stats.
@@ -320,8 +334,23 @@ mod tests {
     }
 
     #[test]
-    fn batch_and_rollup_paths_sort_by_time() {
-        assert!(obs_batch_path("n", 100, 1) < obs_batch_path("n", 200, 0));
+    fn batch_paths_are_hour_partitioned_and_time_ordered() {
+        // 2024-01-01T00:00:00Z and +90min land in different hour buckets, ordered chronologically.
+        let t0 = 1_704_067_200_000u64;
+        let a = obs_batch_path("n", t0, 0);
+        let b = obs_batch_path("n", t0 + 90 * 60 * 1000, 0);
+        assert!(a.contains("/2024010100/"), "hour bucket in key: {a}");
+        assert!(b.contains("/2024010101/"), "next hour bucket: {b}");
+        assert!(a < b, "buckets sort chronologically");
+        // Within one bucket, later flushes sort after earlier ones.
+        assert!(obs_batch_path("n", t0, 0) < obs_batch_path("n", t0 + 1, 0));
         assert_eq!(obs_rollup_path("serve-0"), "_obs/rollup/serve-0.json");
+    }
+
+    #[test]
+    fn hour_buckets_compare_lexicographically() {
+        let older = hour_bucket(1_704_067_200_000);
+        let newer = hour_bucket(1_704_067_200_000 + 3_600_000);
+        assert!(older < newer, "{older} < {newer}");
     }
 }

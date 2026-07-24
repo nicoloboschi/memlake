@@ -472,6 +472,25 @@ impl Store {
         Ok(paths)
     }
 
+    /// List the immediate *sub-prefixes* ("directories") under `prefix`, sorted ascending — a
+    /// delimiter listing, so it returns the common prefixes WITHOUT enumerating their objects.
+    ///
+    /// This is what makes time-partitioned retention cheap: the trace sweep can walk
+    /// `_obs/traces/{node}/{hour}/` buckets and decide expiry from the bucket NAME, listing objects
+    /// only inside the buckets it is about to delete — live data is never listed at all.
+    ///
+    /// Returned prefixes keep their trailing `/`-less form as the store reports them.
+    pub async fn list_prefixes(&self, prefix: &str) -> Result<Vec<String>> {
+        if let Some(m) = &self.store_metrics {
+            m.record_list();
+        }
+        let res = self.inner.list_with_delimiter(Some(&Path::from(prefix))).await?;
+        let mut out: Vec<String> =
+            res.common_prefixes.into_iter().map(|p| p.to_string()).collect();
+        out.sort();
+        Ok(out)
+    }
+
     /// List object paths under a prefix together with each object's size, sorted ascending.
     ///
     /// The size comes from the listing itself, so surfacing it costs the same one LIST as

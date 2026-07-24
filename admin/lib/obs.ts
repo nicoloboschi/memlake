@@ -30,6 +30,8 @@ export const OBS_ROLLUP_PREFIX = "_obs/rollup/";
 const LIST_BATCH_OBJECTS = 80;
 /** Newest batch objects scanned when hunting a specific trace id / namespace. */
 const SCAN_BATCH_OBJECTS = 400;
+/** Hour buckets covering the retention window (24h + boundary), for an id lookup with no timestamp. */
+const RETENTION_HOUR_BUCKETS = 26;
 
 export interface NodeTotals {
   count: number;
@@ -168,34 +170,77 @@ async function getText(key: string): Promise<string> {
   return (await res.Body?.transformToString()) ?? "";
 }
 
-/** `_obs/traces/{node}/{ms}-{seq}.jsonl` → the node id and the flush timestamp. */
+/** `_obs/traces/{node}/{YYYYMMDDHH}/{ms}-{seq}.jsonl` → the node id and the flush timestamp. */
 function parseBatchKey(key: string): { node: string; ms: number } | null {
   const rest = key.slice(OBS_TRACES_PREFIX.length);
-  const slash = rest.lastIndexOf("/");
-  if (slash < 0) return null;
-  const node = rest.slice(0, slash);
-  const file = rest.slice(slash + 1);
-  const ms = Number(file.split("-")[0]);
+  const parts = rest.split("/");
+  if (parts.length < 3) return null; // node / hour / file
+  const node = parts[0];
+  const ms = Number(parts[parts.length - 1].split("-")[0]);
   if (!Number.isFinite(ms)) return null;
   return { node, ms };
 }
 
-/** The newest batch objects, newest-first. Bounded so we never read the whole retention window. */
+/** Immediate sub-"directories" of a prefix, via a delimiter listing (no object enumeration). */
+async function listPrefixes(prefix: string): Promise<string[]> {
+  const { client: s3, bucket } = client();
+  const out: string[] = [];
+  let token: string | undefined;
+  do {
+    const page = await s3.send(
+      new ListObjectsV2Command({
+        Bucket: bucket,
+        Prefix: prefix,
+        Delimiter: "/",
+        ContinuationToken: token,
+      }),
+    );
+    for (const p of page.CommonPrefixes ?? []) {
+      if (p.Prefix) out.push(p.Prefix);
+    }
+    token = page.IsTruncated ? page.NextContinuationToken : undefined;
+  } while (token);
+  out.sort();
+  return out;
+}
+
+/** How many newest hour buckets per node to look inside. Traces are hour-partitioned, so reading the
+ * newest bucket (plus one for the boundary) is enough for "recent" without touching the window. */
+const HOUR_BUCKETS_TO_SCAN = 2;
+
+/**
+ * The newest batch objects, newest-first — bounded so we never read the whole retention window.
+ *
+ * Walks `{node}/` then its newest hour buckets via delimiter listings, and only enumerates objects
+ * inside those buckets. That is the payoff of hour partitioning: cost is O(recent), not O(retained).
+ */
 async function newestBatches(
   maxObjects: number,
   nodeFilter?: string,
+  hourBuckets = HOUR_BUCKETS_TO_SCAN,
 ): Promise<{ key: string; node: string; ms: number }[]> {
-  const prefix = nodeFilter ? `${OBS_TRACES_PREFIX}${nodeFilter}/` : OBS_TRACES_PREFIX;
-  const keys = await listKeys(prefix);
-  const parsed = keys
-    .filter((k) => k.key.endsWith(".jsonl"))
-    .map((k) => {
-      const p = parseBatchKey(k.key);
-      return p ? { key: k.key, node: p.node, ms: p.ms } : null;
-    })
-    .filter((x): x is { key: string; node: string; ms: number } => x !== null);
-  parsed.sort((a, b) => b.ms - a.ms);
-  return parsed.slice(0, maxObjects);
+  const nodePrefixes = nodeFilter
+    ? [`${OBS_TRACES_PREFIX}${nodeFilter}/`]
+    : await listPrefixes(OBS_TRACES_PREFIX);
+
+  const perNode = await Promise.all(
+    nodePrefixes.map(async (nodePrefix) => {
+      // Hour buckets sort lexicographically == chronologically; take the newest few.
+      const hours = (await listPrefixes(nodePrefix)).slice(-hourBuckets);
+      const keys = (await Promise.all(hours.map((h) => listKeys(h)))).flat();
+      return keys
+        .filter((k) => k.key.endsWith(".jsonl"))
+        .map((k) => {
+          const p = parseBatchKey(k.key);
+          return p ? { key: k.key, node: p.node, ms: p.ms } : null;
+        })
+        .filter((x): x is { key: string; node: string; ms: number } => x !== null);
+    }),
+  );
+
+  const all = perNode.flat();
+  all.sort((a, b) => b.ms - a.ms);
+  return all.slice(0, maxObjects);
 }
 
 function parseLines(body: string): TraceRecord[] {
@@ -265,9 +310,15 @@ export async function traceSummaries(limit: number): Promise<TraceSummary[]> {
   }));
 }
 
-/** The full record (with spans) for one trace id, scanning newest batches first. */
+/**
+ * The full record (with spans) for one trace id.
+ *
+ * An id carries no timestamp, so this walks batches newest-first across the whole retention window
+ * and returns on the first match — a recent trace is found almost immediately; an old one costs more
+ * but the scan always terminates.
+ */
 export async function traceById(id: string): Promise<(TraceRecord & { node_id: string }) | null> {
-  const batches = await newestBatches(SCAN_BATCH_OBJECTS);
+  const batches = await newestBatches(SCAN_BATCH_OBJECTS, undefined, RETENTION_HOUR_BUCKETS);
   for (const b of batches) {
     const body = await getText(b.key).catch(() => "");
     for (const r of parseLines(body)) {

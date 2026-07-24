@@ -1503,10 +1503,25 @@ pub async fn run_indexer(
         // Expire observability trace batches past the retention window. This is the only thing
         // bounding `_obs/traces/` — the serve nodes only ever append to it.
         if last_trace_gc.elapsed() >= gc_interval {
-            match mlake_index::gc_traces(&store, trace_retention).await {
-                Ok(n) if n > 0 => tracing::info!(deleted = n, "expired trace batches"),
+            match mlake_index::gc_traces(
+                &store,
+                trace_retention,
+                mlake_index::DEFAULT_ROLLUP_STALE,
+            )
+            .await
+            {
+                Ok(o)
+                    if o.hour_buckets_deleted > 0 || o.rollups_deleted > 0 =>
+                {
+                    tracing::info!(
+                        buckets = o.hour_buckets_deleted,
+                        objects = o.trace_objects_deleted,
+                        rollups = o.rollups_deleted,
+                        "expired observability data"
+                    );
+                }
                 Ok(_) => {}
-                Err(e) => tracing::warn!(error = %e, "trace retention sweep failed"),
+                Err(e) => tracing::warn!(error = %e, "observability retention sweep failed"),
             }
             last_trace_gc = std::time::Instant::now();
         }

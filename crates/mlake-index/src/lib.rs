@@ -17,7 +17,8 @@ pub mod temporal;
 pub use engine::{Engine, QueryConfig};
 pub use fusion::{rrf, weighted_rrf, FusedHit, RankedArm, DEFAULT_RRF_K};
 pub use gc::{
-    gc, gc_traces, gc_with_min_age, GcOutcome, DEFAULT_MIN_AGE, DEFAULT_TRACE_RETENTION,
+    gc, gc_traces, gc_with_min_age, GcOutcome, ObsGcOutcome, DEFAULT_MIN_AGE,
+    DEFAULT_ROLLUP_STALE, DEFAULT_TRACE_RETENTION,
 };
 pub use generation::{read_fts_split, read_generation, write_generation, ClusterTagSummary, Generation, SsTablePair, TagSummary};
 pub use indexer::{
