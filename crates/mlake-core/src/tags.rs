@@ -32,11 +32,22 @@ impl Default for TagsMatch {
     }
 }
 
-/// A tag filter: the request tags plus the match mode.
+/// A tag filter: the request tags plus the match mode, and an optional compound predicate.
+///
+/// `tags`/`mode` are the flat condition the retrieval arms push down efficiently (via the
+/// per-cluster/-block tag masks). `groups` is the compound form — a list of boolean trees
+/// AND-ed together and AND-ed onto the flat condition — for queries a single flat filter
+/// cannot express. Because a boolean tree over a memory's *full* tag set cannot be evaluated
+/// from the compact block masks, `groups` is NOT consulted by [`matches`], [`is_noop`], or
+/// [`cluster_admits`] — those stay pure-flat so cluster/block pruning is unchanged. The
+/// compound predicate is applied once, per-memory, after a hit's full record is hydrated (see
+/// the query node's materialization pass). Empty `groups` is a no-op.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct TagFilter {
     pub tags: Vec<String>,
     pub mode: TagsMatch,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<TagPredicate>,
 }
 
 impl TagFilter {
@@ -45,11 +56,20 @@ impl TagFilter {
         Self {
             tags: Vec::new(),
             mode: TagsMatch::Any,
+            groups: Vec::new(),
         }
     }
 
     pub fn new(tags: Vec<String>, mode: TagsMatch) -> Self {
-        Self { tags, mode }
+        Self { tags, mode, groups: Vec::new() }
+    }
+
+    /// Whether every top-level `groups` predicate accepts a memory with `memory_tags`. Empty
+    /// `groups` accepts everything (a top-level AND of nothing). This is the compound half of
+    /// the filter, evaluated separately from the flat [`matches`] because it needs the memory's
+    /// complete tag set, not the pushed-down masks.
+    pub fn groups_match(&self, memory_tags: &[String]) -> bool {
+        self.groups.iter().all(|g| g.matches(memory_tags))
     }
 
     /// True when this filter admits every memory, so callers can skip the work entirely.
@@ -82,6 +102,27 @@ impl TagFilter {
             TagsMatch::All => untagged_ok || contains_all(cluster_tags, req),
             TagsMatch::AnyStrict => overlaps(cluster_tags, req),
             TagsMatch::AllStrict | TagsMatch::Exact => contains_all(cluster_tags, req),
+        }
+    }
+
+    /// Leaf-of-a-predicate matching: like [`matches`] but WITHOUT the flat "empty request = no
+    /// filter" convention. Inside a boolean [`TagPredicate`] tree an empty leaf is a literal set
+    /// condition, not a no-op — e.g. an empty `AnyStrict` leaf matches nothing, an empty `All`
+    /// leaf matches everything, an empty `Exact` leaf is the untagged scope. Mirrors Hindsight's
+    /// `_match_group` leaf so a pushed-down predicate agrees with the Python post-filter
+    /// memory-for-memory. For a non-empty request this is identical to [`matches`].
+    pub fn leaf_matches(&self, memory_tags: &[String]) -> bool {
+        let req = &self.tags;
+        let untagged = memory_tags.is_empty();
+        if self.mode == TagsMatch::Exact && req.is_empty() {
+            return untagged; // the empty Exact scope selects only untagged memories
+        }
+        match self.mode {
+            TagsMatch::Any => untagged || overlaps(memory_tags, req),
+            TagsMatch::All => untagged || contains_all(memory_tags, req),
+            TagsMatch::AnyStrict => !untagged && overlaps(memory_tags, req),
+            TagsMatch::AllStrict => !untagged && contains_all(memory_tags, req),
+            TagsMatch::Exact => !untagged && set_eq(memory_tags, req),
         }
     }
 
@@ -122,6 +163,35 @@ fn set_eq(memory_tags: &[String], req: &[String]) -> bool {
     let a: BTreeSet<&String> = memory_tags.iter().collect();
     let b: BTreeSet<&String> = req.iter().collect();
     a == b
+}
+
+/// A boolean tree over a memory's tags — the compound form of [`TagFilter`]. Leaves are flat
+/// [`TagFilter`]s (evaluated by [`TagFilter::matches`], so every per-mode subtlety — including
+/// how each mode treats untagged memories — is inherited unchanged); interior nodes combine
+/// children with AND / OR / NOT. Mirrors Hindsight's recursive `TagGroup`, so a pushed-down
+/// predicate and Hindsight's own Python `filter_results_by_tag_groups` agree memory-for-memory.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub enum TagPredicate {
+    /// A flat tag condition.
+    Leaf(TagFilter),
+    /// AND: every child must match. An empty `All` matches every memory (AND identity).
+    All(Vec<TagPredicate>),
+    /// OR: at least one child must match. An empty `Any` matches no memory (OR identity).
+    Any(Vec<TagPredicate>),
+    /// NOT: the child must not match.
+    Not(Box<TagPredicate>),
+}
+
+impl TagPredicate {
+    /// Whether a memory with `memory_tags` satisfies this predicate.
+    pub fn matches(&self, memory_tags: &[String]) -> bool {
+        match self {
+            TagPredicate::Leaf(f) => f.leaf_matches(memory_tags),
+            TagPredicate::All(children) => children.iter().all(|c| c.matches(memory_tags)),
+            TagPredicate::Any(children) => children.iter().any(|c| c.matches(memory_tags)),
+            TagPredicate::Not(child) => !child.matches(memory_tags),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -186,5 +256,81 @@ mod tests {
         assert!(!f.matches(&tags(&["a", "b", "c"])), "superset is not exact");
         assert!(!f.matches(&tags(&["a"])), "subset is not exact");
         assert!(!f.matches(&[]), "untagged is not exact for a non-empty request");
+    }
+
+    fn leaf(t: &[&str], mode: TagsMatch) -> TagPredicate {
+        TagPredicate::Leaf(TagFilter::new(tags(t), mode))
+    }
+
+    #[test]
+    fn predicate_leaf_delegates_to_flat_matches() {
+        let p = leaf(&["a"], TagsMatch::AnyStrict);
+        assert!(p.matches(&tags(&["a", "b"])));
+        assert!(!p.matches(&tags(&["b"])));
+        assert!(!p.matches(&[]), "any_strict excludes untagged");
+    }
+
+    #[test]
+    fn predicate_and_or_not_compose() {
+        // (a AND b)  — all_strict on each leaf, combined by All.
+        let and = TagPredicate::All(vec![leaf(&["a"], TagsMatch::AnyStrict), leaf(&["b"], TagsMatch::AnyStrict)]);
+        assert!(and.matches(&tags(&["a", "b", "c"])));
+        assert!(!and.matches(&tags(&["a"])), "missing b");
+
+        // (a OR b)
+        let or = TagPredicate::Any(vec![leaf(&["a"], TagsMatch::AnyStrict), leaf(&["b"], TagsMatch::AnyStrict)]);
+        assert!(or.matches(&tags(&["b"])));
+        assert!(!or.matches(&tags(&["c"])));
+
+        // NOT (a)
+        let not = TagPredicate::Not(Box::new(leaf(&["a"], TagsMatch::AnyStrict)));
+        assert!(not.matches(&tags(&["b"])));
+        assert!(!not.matches(&tags(&["a", "b"])));
+
+        // (a AND b) OR (NOT c) — a nested tree
+        let not_c = TagPredicate::Not(Box::new(leaf(&["c"], TagsMatch::AnyStrict)));
+        let tree = TagPredicate::Any(vec![and.clone(), not_c]);
+        assert!(tree.matches(&tags(&["a", "b"])), "left branch: has a and b");
+        assert!(tree.matches(&tags(&["x"])), "right branch: no c");
+        assert!(!tree.matches(&tags(&["c"])), "neither: c present, and a&b absent");
+    }
+
+    #[test]
+    fn empty_leaf_matches_hindsight_match_group() {
+        // An empty leaf is a literal set condition inside a tree — NOT a no-op (unlike a flat
+        // filter). Mirrors Hindsight's _match_group for empty group.tags.
+        let mem = tags(&["a"]);
+        // any: untagged only
+        assert!(!leaf(&[], TagsMatch::Any).matches(&mem));
+        assert!(leaf(&[], TagsMatch::Any).matches(&[]));
+        // all: everything
+        assert!(leaf(&[], TagsMatch::All).matches(&mem));
+        assert!(leaf(&[], TagsMatch::All).matches(&[]));
+        // any_strict: nothing
+        assert!(!leaf(&[], TagsMatch::AnyStrict).matches(&mem));
+        assert!(!leaf(&[], TagsMatch::AnyStrict).matches(&[]));
+        // all_strict: tagged only
+        assert!(leaf(&[], TagsMatch::AllStrict).matches(&mem));
+        assert!(!leaf(&[], TagsMatch::AllStrict).matches(&[]));
+        // exact-empty: the untagged scope
+        assert!(!leaf(&[], TagsMatch::Exact).matches(&mem));
+        assert!(leaf(&[], TagsMatch::Exact).matches(&[]));
+    }
+
+    #[test]
+    fn empty_and_is_true_empty_or_is_false() {
+        assert!(TagPredicate::All(vec![]).matches(&tags(&["a"])), "AND identity");
+        assert!(!TagPredicate::Any(vec![]).matches(&tags(&["a"])), "OR identity");
+    }
+
+    #[test]
+    fn groups_match_is_top_level_conjunction() {
+        let mut f = TagFilter::new(tags(&["x"]), TagsMatch::Any);
+        f.groups = vec![leaf(&["a"], TagsMatch::AnyStrict), leaf(&["b"], TagsMatch::AnyStrict)];
+        assert!(f.groups_match(&tags(&["a", "b"])), "both groups satisfied");
+        assert!(!f.groups_match(&tags(&["a"])), "one group unsatisfied");
+        // groups do not touch the flat matches / is_noop paths
+        assert!(!f.is_noop(), "flat filter is non-empty");
+        assert!(TagFilter::none().groups_match(&tags(&["a"])), "no groups = always true");
     }
 }

@@ -1131,6 +1131,81 @@ async fn tags_filter_the_query_in_all_five_modes() {
     assert_eq!(ids(&r), std::iter::once(MemoryId::from_key("none")).collect::<std::collections::HashSet<_>>());
 }
 
+/// Compound `tag_groups` are applied server-side at the materialization pass — a boolean tree
+/// over each hit's full tag set, expressing conditions a single flat filter cannot. Verifies
+/// the push-down reaches the vector + FTS arms uniformly and composes AND / OR / NOT.
+#[tokio::test]
+async fn tag_groups_push_down_filters_the_query() {
+    use mlake_core::{TagFilter, TagPredicate};
+
+    let store = Store::in_memory();
+    let ns = namespace(store, "bank").await;
+    let mut writer = Writer::new(ns.clone());
+    // Same vector neighbourhood so every candidate reaches the arms; tags decide survival.
+    writer
+        .commit(vec![
+            Op::Upsert(item_tags("ab", vec![1.0, 0.0, 0.0], "alpha apple", &["a", "b"])),
+            Op::Upsert(item_tags("a", vec![0.99, 0.01, 0.0], "alpha apricot", &["a"])),
+            Op::Upsert(item_tags("bc", vec![0.98, 0.0, 0.02], "alpha cherry", &["b", "c"])),
+            Op::Upsert(item_tags("none", vec![0.97, 0.0, 0.03], "alpha nothing", &[])),
+        ])
+        .await
+        .unwrap();
+    index(&ns, &Tokenizer::default(), IndexOptions::default()).await.unwrap();
+    let node = QueryNode::open(&ns, Tokenizer::default()).await.unwrap();
+
+    let q = vec![1.0f32, 0.0, 0.0];
+    let cfg = QueryConfig { graph_weight: 0.0, ..QueryConfig::default() };
+    let ids = |hits: &[mlake_index::FusedHit]| -> std::collections::HashSet<MemoryId> {
+        hits.iter().map(|h| h.id).collect()
+    };
+    let leaf = |t: &[&str], m: TagsMatch| {
+        TagPredicate::Leaf(TagFilter::new(t.iter().map(|s| s.to_string()).collect(), m))
+    };
+    // A filter whose only condition is the compound tree (flat tags empty).
+    let with_groups = |groups: Vec<TagPredicate>| {
+        let mut f = TagFilter::none();
+        f.groups = groups;
+        f
+    };
+
+    // (a AND b): all_strict over each leaf -> {ab} only.
+    let r = node
+        .query(1, Some(&q), None, &with_groups(vec![TagPredicate::All(vec![
+            leaf(&["a"], TagsMatch::AnyStrict),
+            leaf(&["b"], TagsMatch::AnyStrict),
+        ])]), 10, cfg)
+        .await
+        .unwrap();
+    assert_eq!(ids(&r), std::iter::once(MemoryId::from_key("ab")).collect::<std::collections::HashSet<_>>());
+
+    // (a OR c) strict -> {ab, a, bc}, never untagged.
+    let r = node
+        .query(1, Some(&q), None, &with_groups(vec![TagPredicate::Any(vec![
+            leaf(&["a"], TagsMatch::AnyStrict),
+            leaf(&["c"], TagsMatch::AnyStrict),
+        ])]), 10, cfg)
+        .await
+        .unwrap();
+    let s = ids(&r);
+    assert!(s.contains(&MemoryId::from_key("ab")) && s.contains(&MemoryId::from_key("a")) && s.contains(&MemoryId::from_key("bc")));
+    assert!(!s.contains(&MemoryId::from_key("none")), "strict leaves exclude untagged");
+
+    // b AND NOT a -> {bc} (ab has a; a/none lack b).
+    let r = node
+        .query(1, Some(&q), None, &with_groups(vec![
+            leaf(&["b"], TagsMatch::AnyStrict),
+            TagPredicate::Not(Box::new(leaf(&["a"], TagsMatch::AnyStrict))),
+        ]), 10, cfg)
+        .await
+        .unwrap();
+    assert_eq!(ids(&r), std::iter::once(MemoryId::from_key("bc")).collect::<std::collections::HashSet<_>>());
+
+    // Empty groups = no filter: every candidate in the neighbourhood survives.
+    let r = node.query(1, Some(&q), None, &with_groups(vec![]), 10, cfg).await.unwrap();
+    assert_eq!(ids(&r).len(), 4, "empty tag_groups filters nothing");
+}
+
 /// The FTS arm also honours the tag filter (via stored tags + the shared primitive).
 #[tokio::test]
 async fn tags_filter_the_fts_arm() {

@@ -265,6 +265,24 @@ message TagFilter {
   TagsMatch mode = 2;
 }
 
+// A boolean tree over a memory's tags — the compound form of TagFilter, for conditions a
+// single flat filter cannot express (e.g. "(team:a AND env:prod) OR owner:me"). Each leaf is
+// an ordinary TagFilter (tags + mode); interior nodes combine children with AND / OR / NOT.
+// Mirrors Hindsight's recursive TagGroup. A request's `tag_groups` list is the top-level
+// conjunction — every entry must match.
+message TagPredicate {
+  oneof node {
+    TagFilter leaf = 1;         // a flat tag condition (tags + mode)
+    TagPredicateList all = 2;   // AND: every child must match (empty list matches everything)
+    TagPredicateList any = 3;   // OR: at least one child must match (empty list matches nothing)
+    TagPredicate negate = 4;    // NOT: the child must not match
+  }
+}
+
+message TagPredicateList {
+  repeated TagPredicate predicates = 1;
+}
+
 message QueryRequest {
   string namespace = 1;
   // memory_types to query. Empty means every type present in the snapshot. Each type is an
@@ -297,6 +315,11 @@ message QueryRequest {
   // expansion. Unset uses the server default (0.3); 0 seeds the expansion from every dense hit.
   // A hit below the floor still ranks in the dense arm — it just does not spawn an expansion.
   optional float graph_seed_min_similarity = 15;
+  // Compound tag filtering, AND-ed with `tags`. Each entry is a boolean tree over the
+  // memory's tag set; a memory is kept only if it satisfies every entry (top-level AND).
+  // Expresses conditions a flat `tags` filter cannot. Applied server-side after an arm
+  // scores a candidate — so, like a selective `tags`, it can trim an arm below its depth.
+  repeated TagPredicate tag_groups = 16;
 }
 
 // One arm's raw contribution to a hit. `present` says whether the arm surfaced this id;

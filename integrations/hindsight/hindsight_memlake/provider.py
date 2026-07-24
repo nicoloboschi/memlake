@@ -75,9 +75,9 @@ logger = logging.getLogger(__name__)
 #: namespaces across them and fails over on its own.
 DEFAULT_TARGET = "localhost:50051"
 
-# TagsMatch spellings Hindsight uses -> memlake's enum names. Hindsight also
-# supports nested tag *groups* (AND/OR/NOT trees); memlake has only these five
-# flat modes, so groups are applied in Python after the query.
+# TagsMatch spellings Hindsight uses -> memlake's enum names. These five flat modes are the
+# leaves; Hindsight's nested tag *groups* (AND/OR/NOT trees) are pushed down as compound
+# `TagPredicate`s and evaluated server-side (see `_to_tag_predicate`).
 _TAGS_MATCH = {
     "any": "ANY",
     "all": "ALL",
@@ -171,6 +171,33 @@ def _parse_embedding(query_embedding: str | list[float]) -> list[float]:
 
 def _tags_mode(tags_match: str) -> int:
     return getattr(mc, _TAGS_MATCH.get(tags_match, "ANY"))
+
+
+def _to_tag_predicate(group: Any) -> "pb.TagPredicate":
+    """A Hindsight ``TagGroup`` (recursive leaf/and/or/not tree) -> memlake's ``TagPredicate``.
+
+    memlake evaluates the tree server-side against each hit's full tag set (see
+    ``pb.TagPredicate``), so this mirrors Hindsight's own ``_match_group`` node-for-node — a
+    leaf becomes a flat ``TagFilter`` (tags + mode), and the AND/OR/NOT nodes map to
+    ``all``/``any``/``negate``. Kept faithful so the push-down and Hindsight's Python
+    ``filter_results_by_tag_groups`` agree memory-for-memory.
+    """
+    from hindsight_api.engine.search.tags import TagGroupAnd, TagGroupLeaf, TagGroupNot, TagGroupOr
+
+    if isinstance(group, TagGroupLeaf):
+        return pb.TagPredicate(leaf=pb.TagFilter(tags=list(group.tags), mode=_tags_mode(group.match)))
+    if isinstance(group, TagGroupAnd):
+        return pb.TagPredicate(**{"all": pb.TagPredicateList(predicates=[_to_tag_predicate(c) for c in group.filters])})
+    if isinstance(group, TagGroupOr):
+        return pb.TagPredicate(**{"any": pb.TagPredicateList(predicates=[_to_tag_predicate(c) for c in group.filters])})
+    if isinstance(group, TagGroupNot):
+        return pb.TagPredicate(negate=_to_tag_predicate(group.filter))
+    raise TypeError(f"unrecognized tag group node: {type(group).__name__}")
+
+
+def _to_tag_predicates(tag_groups: list | None) -> list["pb.TagPredicate"]:
+    """The top-level ``tag_groups`` conjunction -> a list of wire predicates (empty if none)."""
+    return [_to_tag_predicate(g) for g in tag_groups] if tag_groups else []
 
 
 class MemlakeMemories(MemoriesExtension):
@@ -503,7 +530,6 @@ class MemlakeMemories(MemoriesExtension):
         min_keyword: float | None = None,
     ) -> dict[str, tuple[list, list]]:
         from hindsight_api.config import get_config
-        from hindsight_api.engine.search.tags import filter_results_by_tag_groups
 
         result: dict[str, tuple[list, list]] = {ft: ([], []) for ft in fact_types}
         memory_types = [FACT_TYPE_TO_MEMORY_TYPE[ft] for ft in fact_types if ft in FACT_TYPE_TO_MEMORY_TYPE]
@@ -514,8 +540,10 @@ class MemlakeMemories(MemoriesExtension):
         sem_min = min_semantic if min_semantic is not None else config.semantic_min_similarity
         bm25_min = min_keyword if min_keyword is not None else config.bm25_min_score
 
-        # Over-fetch to match the SQL path's ANN compensation and to leave room for
-        # the filters memlake cannot push down (tag groups).
+        # Over-fetch to match the SQL path's ANN compensation and to leave room for the
+        # compound `tag_groups` filter: memlake applies it server-side, but after an arm has
+        # scored its candidates, so — like a selective flat filter — it can trim an arm below
+        # its depth. The extra depth keeps enough survivors to fill `limit`.
         depth = max(limit * 5, 100)
         hits = await self._query(
             bank_id=bank_id,
@@ -524,6 +552,7 @@ class MemlakeMemories(MemoriesExtension):
             text=query_text,
             tags=tags,
             tags_match=tags_match,
+            tag_groups=tag_groups,
             vector_top_k=depth,
             text_top_k=depth,
             # The dense and full-text arms are what this call is for; the graph arm
@@ -555,12 +584,11 @@ class MemlakeMemories(MemoriesExtension):
             fact_type = MEMORY_TYPE_TO_FACT_TYPE.get(memory_type)
             if fact_type not in result:
                 continue
-            # Hits come back unordered; each arm's own rank restores its ordering.
+            # Hits come back unordered; each arm's own rank restores its ordering. The
+            # `tag_groups` predicate was already applied server-side (pushed down into the
+            # Query RPC), so the rows here are the compound-filtered survivors.
             sem = [r for _, r in sorted(semantic, key=lambda p: p[0])]
             keys = [r for _, r in sorted(keyword, key=lambda p: p[0])]
-            if tag_groups:
-                sem = filter_results_by_tag_groups(sem, tag_groups)
-                keys = filter_results_by_tag_groups(keys, tag_groups)
             result[fact_type] = (sem[:limit], keys[:limit])
 
         return result
@@ -582,8 +610,6 @@ class MemlakeMemories(MemoriesExtension):
         created_after: datetime | None = None,
         created_before: datetime | None = None,
     ) -> dict[str, list]:
-        from hindsight_api.engine.search.tags import filter_results_by_tag_groups
-
         results: dict[str, list] = {ft: [] for ft in fact_types}
         memory_types = [FACT_TYPE_TO_MEMORY_TYPE[ft] for ft in fact_types if ft in FACT_TYPE_TO_MEMORY_TYPE]
         if not memory_types:
@@ -596,6 +622,7 @@ class MemlakeMemories(MemoriesExtension):
             text=None,
             tags=tags,
             tags_match=tags_match,
+            tag_groups=tag_groups,
             # The arm ranks entry points by similarity before spreading, so the
             # dense arm has to run; only temporal-surfaced candidates are kept.
             vector_top_k=limit,
@@ -627,12 +654,10 @@ class MemlakeMemories(MemoriesExtension):
 
         for fact_type, scored in ranked.items():
             scored.sort(key=lambda p: p[0])
-            hits_for_type = [r for _, r in scored]
-            # Tag groups are a boolean tree memlake's flat tag modes cannot express,
-            # so they run here and can trim below `limit`.
-            if tag_groups:
-                hits_for_type = filter_results_by_tag_groups(hits_for_type, tag_groups)
-            results[fact_type] = hits_for_type[:limit]
+            # `tag_groups` — a boolean tree memlake's flat tag modes cannot express — is pushed
+            # down into the Query RPC and applied server-side, so these rows are already the
+            # compound-filtered survivors.
+            results[fact_type] = [r for _, r in scored][:limit]
         return results
 
     async def graph_search(
@@ -712,6 +737,7 @@ class MemlakeMemories(MemoriesExtension):
         vector_top_k: int,
         text_top_k: int,
         graph_top_k: int,
+        tag_groups: list | None = None,
         temporal_from: int | None = None,
         temporal_to: int | None = None,
         updated_from: int | None = None,
@@ -735,6 +761,7 @@ class MemlakeMemories(MemoriesExtension):
                     memory_types=memory_types,
                     tags=tags,
                     tags_mode=_tags_mode(tags_match),
+                    tag_groups=_to_tag_predicates(tag_groups),
                     vector_top_k=vector_top_k,
                     text_top_k=text_top_k,
                     graph_top_k=graph_top_k,

@@ -22,7 +22,7 @@ pub use memory::{
     MAX_SEMANTIC_OUT, SEMANTIC_LINK_THRESHOLD,
 };
 pub use predicate::Predicate;
-pub use tags::{TagFilter, TagsMatch};
+pub use tags::{TagFilter, TagPredicate, TagsMatch};
 pub use manifest::{FactTypeIndex, GenerationFiles, Manifest, Segment};
 pub use wal::{apply_delta, apply_deltas, Delta, Op, WalEntry};
 

@@ -1209,6 +1209,16 @@ impl QueryNode {
         // tombstoned or predicate-deleted (the split predates the delete); `fetch_clusters`
         // filtered it out, so drop it — a deleted memory must never surface via any arm.
         by_id.retain(|_, hit| hit.memory.is_some());
+        // Compound tag groups run here, once every surviving hit carries its full record — and
+        // thus its complete tag set. The flat `tags` filter already ran inside each arm via the
+        // block/cluster tag masks; a boolean tree over the whole tag set is the part those
+        // compact masks cannot express, so it is a single post-scoring pass, uniform across
+        // arms. No-op when `tags.groups` is empty.
+        if !tags.groups.is_empty() {
+            by_id.retain(|_, hit| {
+                hit.memory.as_ref().is_some_and(|m| tags.groups_match(&m.tags))
+            });
+        }
         Ok(by_id.into_values().collect())
     }
 

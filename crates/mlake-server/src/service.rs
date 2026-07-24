@@ -469,7 +469,11 @@ impl Memlake for MemlakeService {
         }
         let t0 = std::time::Instant::now();
         let vector = req.vector.as_ref().map(convert::decode_vector).transpose()?;
-        let tags = convert::tag_filter(req.tags);
+        // The flat filter carries the compound `tag_groups` alongside it — the arms push down
+        // the flat tags via the block/cluster masks, and the materialization pass applies the
+        // groups per-memory once full tags are in hand (see `TagFilter::groups`).
+        let mut tags = convert::tag_filter(req.tags);
+        tags.groups = convert::tag_predicates(req.tag_groups)?;
         let depths = convert::arm_depths(
             req.vector_top_k,
             req.text_top_k,

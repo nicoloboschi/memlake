@@ -451,6 +451,7 @@ class MemlakeClient:
         memory_types: Optional[Sequence[int]] = None,
         tags: Optional[Sequence[str]] = None,
         tags_mode: int = ANY,
+        tag_groups: Optional[Sequence["pb.TagPredicate"]] = None,
         vector_top_k: int = 0,
         text_top_k: int = 0,
         graph_top_k: int = 0,
@@ -485,6 +486,11 @@ class MemlakeClient:
         )
         if tags:
             req.tags.CopyFrom(pb.TagFilter(tags=list(tags), mode=tags_mode))
+        if tag_groups:
+            # Compound tag filtering (a boolean tree over each memory's tags), AND-ed with
+            # `tags` and applied server-side — see pb.TagPredicate. Each entry is a top-level
+            # conjunct the memory must satisfy.
+            req.tag_groups.extend(tag_groups)
         if graph_seed_min_similarity is not None:
             req.graph_seed_min_similarity = graph_seed_min_similarity
         if temporal_from is not None:

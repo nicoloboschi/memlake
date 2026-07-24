@@ -153,6 +153,58 @@ async def test_search_finds_by_vector_and_text(store, bank_id, index_pass):
     assert any("retriever" in r.text for r in keyword), "the BM25 arm should surface the text match"
 
 
+async def test_search_pushes_down_compound_tag_groups(store, bank_id, index_pass):
+    """A boolean tag_groups tree — "(team:a AND env:prod) OR team:b" — filters server-side.
+
+    The three facts share a vector neighbourhood and a text token, so every one reaches both
+    arms; only the compound tag predicate decides which survive. Proves the push-down (no
+    Python post-filter) and that AND / OR compose across leaves.
+    """
+    from hindsight_api.engine.search.tags import TagGroupAnd, TagGroupLeaf, TagGroupOr
+
+    ns = store._namespace(bank_id)
+    await store.insert_facts(
+        conn=None,
+        ops=None,
+        bank_id=bank_id,
+        facts=[
+            make_fact("signal from alpha", seed=0.20, tags=["team:a", "env:prod"]),
+            make_fact("signal from beta", seed=0.21, tags=["team:a"]),
+            make_fact("signal from gamma", seed=0.22, tags=["team:b", "env:prod"]),
+        ],
+    )
+    index_pass(ns)
+
+    def leaf(*t: str) -> TagGroupLeaf:
+        return TagGroupLeaf(tags=list(t), match="any_strict")
+
+    # (team:a AND env:prod) OR team:b
+    tag_groups = [
+        TagGroupOr(**{"or": [
+            TagGroupAnd(**{"and": [leaf("team:a"), leaf("env:prod")]}),
+            leaf("team:b"),
+        ]})
+    ]
+
+    results = await store.search(
+        conn=None,
+        bank_id=bank_id,
+        fact_types=["world"],
+        query_embedding=_vec(0.21),
+        query_text="signal",
+        limit=10,
+        tag_groups=tag_groups,
+        min_semantic=0.0,
+        min_keyword=0.0,
+    )
+    semantic, keyword = results["world"]
+    for arm, rows in (("dense", semantic), ("bm25", keyword)):
+        texts = {r.text for r in rows}
+        assert "signal from alpha" in texts, f"{arm}: alpha matches (team:a AND env:prod)"
+        assert "signal from gamma" in texts, f"{arm}: gamma matches team:b"
+        assert "signal from beta" not in texts, f"{arm}: beta has team:a only — filtered out"
+
+
 async def test_scan_pages_and_counts(store, bank_id, index_pass):
     """Scan walks the whole bank in pages; count is per fact_type."""
     ns = store._namespace(bank_id)

@@ -4,7 +4,9 @@
 
 use mlake_core::memory::{CausalEdge, LinkType, Timestamps, Weight};
 use mlake_core::predicate::tags_mode_to_u8;
-use mlake_core::{Delta, EntityId, Memory, MemoryId, Op, Predicate, StoredMemory, TagFilter, TagsMatch};
+use mlake_core::{
+    Delta, EntityId, Memory, MemoryId, Op, Predicate, StoredMemory, TagFilter, TagPredicate, TagsMatch,
+};
 use mlake_index::{ArmDepths, ArmScore, RawHit};
 use tonic::Status;
 
@@ -488,19 +490,48 @@ pub fn predicate(p: pb::Predicate) -> Result<Predicate, Status> {
     })
 }
 
-pub fn tag_filter(f: Option<pb::TagFilter>) -> TagFilter {
-    let Some(f) = f else { return TagFilter::none() };
-    if f.tags.is_empty() {
-        return TagFilter::none();
-    }
-    let mode = match pb::TagsMatch::try_from(f.mode).unwrap_or(pb::TagsMatch::Any) {
+/// A wire `TagsMatch` discriminant -> the core enum (unknown values fall back to `Any`).
+fn tags_match_from_pb(mode: i32) -> TagsMatch {
+    match pb::TagsMatch::try_from(mode).unwrap_or(pb::TagsMatch::Any) {
         pb::TagsMatch::Any => TagsMatch::Any,
         pb::TagsMatch::All => TagsMatch::All,
         pb::TagsMatch::AnyStrict => TagsMatch::AnyStrict,
         pb::TagsMatch::AllStrict => TagsMatch::AllStrict,
         pb::TagsMatch::Exact => TagsMatch::Exact,
-    };
-    TagFilter::new(f.tags, mode)
+    }
+}
+
+pub fn tag_filter(f: Option<pb::TagFilter>) -> TagFilter {
+    let Some(f) = f else { return TagFilter::none() };
+    if f.tags.is_empty() {
+        return TagFilter::none();
+    }
+    TagFilter::new(f.tags, tags_match_from_pb(f.mode))
+}
+
+/// A wire `TagFilter` -> a core one preserving tags+mode verbatim, WITHOUT the "empty tags = no
+/// filter" collapse `tag_filter` applies. A predicate leaf's emptiness is meaningful (an empty
+/// `Exact` leaf is the untagged scope; an empty `AnyStrict` leaf matches nothing), so leaves are
+/// converted faithfully and matched via `TagFilter::leaf_matches`.
+fn tag_filter_leaf(f: pb::TagFilter) -> TagFilter {
+    TagFilter::new(f.tags, tags_match_from_pb(f.mode))
+}
+
+/// The top-level `tag_groups` conjunction: a wire predicate list -> core predicates.
+pub fn tag_predicates(ps: Vec<pb::TagPredicate>) -> Result<Vec<TagPredicate>, Status> {
+    ps.into_iter().map(tag_predicate).collect()
+}
+
+/// A single wire `TagPredicate` (a recursive leaf/and/or/not tree) -> the core predicate.
+fn tag_predicate(p: pb::TagPredicate) -> Result<TagPredicate, Status> {
+    use pb::tag_predicate::Node;
+    let node = p.node.ok_or_else(|| Status::invalid_argument("tag predicate has no node set"))?;
+    Ok(match node {
+        Node::Leaf(f) => TagPredicate::Leaf(tag_filter_leaf(f)),
+        Node::All(list) => TagPredicate::All(tag_predicates(list.predicates)?),
+        Node::Any(list) => TagPredicate::Any(tag_predicates(list.predicates)?),
+        Node::Negate(inner) => TagPredicate::Not(Box::new(tag_predicate(*inner)?)),
+    })
 }
 
 /// Default per-arm candidate depth when the client sends 0.
