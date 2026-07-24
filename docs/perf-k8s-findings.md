@@ -155,12 +155,24 @@ posting list.** F8 surfaced the text arm at ~68% once the runner sent real quest
 the arm (`where_fts_query_time_goes`) split it into two unrelated problems, and neither was the one
 that looked obvious (turning hits into ids — the `STORED` doc-store fetch + uuid parse — is 0.1%):
 
-1. *A ~1.7 s one-off, per snapshot.* The first text query against a snapshot spent 1.7 s in `fts`;
-   every later query was sub-millisecond. That is `fts_arm` building a tantivy index for an **empty
-   tail** — temp dir, a 50 MB writer arena with indexing threads, a commit, a split pack — to index
-   zero documents. `FactType::tail_fts` is a fresh `OnceLock` per snapshot and a fold installs a new
-   snapshot, so a *drained* namespace pays it again after every fold. Standalone: 82 ms on a laptop,
-   ~1.7 s on a 2-vCPU pod. *Fix: skip the build and the search when the tail is empty.*
+1. *A ~1.6 s one-off, per snapshot — a tail FTS build over a tail the fold had already indexed.*
+   The first text query against a snapshot spent 1.6 s in `fts`; every later query was
+   sub-millisecond. That is `fts_arm` building the tail's tantivy index (`FactType::tail_fts`, a
+   fresh `OnceLock` per snapshot). The trace shows why it is expensive *and* redundant:
+   `snapshot={action: reuse, tail_entries: 5183}` — the node is serving a **fully drained** namespace
+   from a cached snapshot whose tail still holds all 5183 docs, every one of which is also in the
+   folded segment. So the build indexes 5183 documents a second time, and every query then scans
+   both copies and dedups.
+
+   Root cause is the snapshot fast path, not FTS: `snapshot_traced` returns the cached snapshot
+   wholesale when `head == cached.through_seq` (one head-pointer GET, no LIST) **without checking
+   whether the manifest advanced**. A fold does not change the head, so a quiescent namespace never
+   adopts the new generation and keeps the redundant tail until the next write. Correctness is fine
+   (tail and segment agree, hits dedup); the cost is a duplicated FTS build plus a permanently
+   brute-force-scanned tail. *Not fixed here — it is snapshot-lifecycle behaviour, and the reuse path
+   is deliberately cheap; flagged below.* A guard was added so an *empty* tail skips the build and
+   search outright (82 ms on a laptop / ~1.7 s on a 2-vCPU pod for a zero-document index), but that
+   guard does not fire in this scenario.
 2. *Every Latin term scanned twice.* The tokenizer emitted each Latin token to both the `words` and
    `bigrams` fields at index **and** query time, so a 15-word question expanded to ~29 terms — and
    executing that term union is ~98% of the arm's steady-state cost. Indexing already puts the token
@@ -170,11 +182,21 @@ that looked obvious (turning hits into ids — the `STORED` doc-store fetch + uu
    content, so dropping one scales every score by the same constant (pinned by
    `dropping_the_duplicate_latin_field_preserves_ranking`; RRF fuses on rank regardless).
 
-On the cluster, the text arm went from **6.7 ms/query (67.8%)** to **~0.35 ms/query (~8%)**.
-End-to-end query p50 is unchanged (~33 ms) because the arms run concurrently, so this is throughput
-headroom rather than latency — but it removes a multi-second first-query spike after every fold.
+On the cluster, steady-state text-arm cost went from **~0.95 ms/query to ~0.36 ms/query** (2.6×,
+matching the 2.4× micro-benchmark) — the earlier headline "6.7 ms/query, 67.8%" was that per-snapshot
+build amortized over only 294 queries, not steady state. End-to-end query p50 is unchanged (~33 ms)
+because the arms run concurrently, so this is throughput headroom, not latency. The 1.6 s
+first-query spike **remains** and needs the snapshot fix in (1).
 
 ## Recommended next
+
+- **F9 follow-up (owner's area):** make the snapshot reuse path adopt a new generation. Today
+  `head == cached.through_seq` short-circuits before the manifest check, so a namespace that has been
+  folded but not written to keeps serving a snapshot whose tail duplicates the segment — paying a
+  tail FTS build (1.6 s for 5183 docs) and brute-force-scanning the tail on every query, forever. A
+  cheap fix is to also compare the manifest etag on that path (a conditional GET) and `reopen_fold`
+  when it moved; the expensive part (re-decoding segments) is already avoided by the reuse of
+  `SegmentState`.
 
 - **F5**: fixed (batched the fold-time doc-count pk probe); rerun the benchmark to capture the
   drained steady-state query latency the tail previously masked.
