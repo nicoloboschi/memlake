@@ -25,15 +25,24 @@ export default function RootLayout({
             <span className="text-ink-faint font-mono text-[11px]">
               S3-native retrieval engine
             </span>
-            {/* The one view that is per-node rather than per-namespace, so it
-                hangs off the global header rather than the namespace tabs. */}
-            <Link
-              href="/cache"
-              className="ml-auto font-mono text-[11px] text-ink-dim hover:text-accent"
-              title="this replica's read cache — node-local, not cluster-wide"
-            >
-              node cache
-            </Link>
+            {/* Fleet-wide / per-node views hang off the global header rather than
+                the per-namespace tabs. */}
+            <nav className="ml-auto flex items-center gap-4">
+              <Link
+                href="/obs"
+                className="font-mono text-[11px] text-ink-dim hover:text-accent"
+                title="serve fleet tracing — reads _obs/traces/ from the bucket"
+              >
+                observability
+              </Link>
+              <Link
+                href="/cache"
+                className="font-mono text-[11px] text-ink-dim hover:text-accent"
+                title="this replica's read cache — node-local, not cluster-wide"
+              >
+                node cache
+              </Link>
+            </nav>
           </div>
         </header>
         <main className="flex-1 min-w-0">{children}</main>
