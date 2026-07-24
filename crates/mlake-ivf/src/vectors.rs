@@ -3260,6 +3260,98 @@ mod tests {
         st
     }
 
+    /// Why stage two dominates query CPU only on *unstructured* queries, and that a top-`k*refine`
+    /// contender cap by scan estimate is a safe worst-case bound on it.
+    ///
+    /// The bound filter reranks every candidate whose upper bound `hi >= tau` (the k-th best lower
+    /// bound). With real, clustered embeddings a query has genuine near-neighbours, `tau` is high,
+    /// and the filter prunes to ~k — rerank is cheap. With *random* queries (no near-neighbours,
+    /// e.g. a synthetic load generator) every candidate scores alike, `tau` is unselective, and the
+    /// filter necessarily reranks nearly the whole scanned set — the fleet trace's ~8k rescorings
+    /// per query. So the "rerank is 90% of query CPU" figure is an artifact of unstructured queries,
+    /// not a property of real workloads.
+    ///
+    /// Capping the contender set to the top `k*refine` by estimate is a no-op on the structured case
+    /// (the bound already returns < cap) and, on the unstructured case, bounds rerank to O(k) while
+    /// recall degrades gracefully — an oversampled rerank, which the `RABITQ_EPSILON` doc calls the
+    /// intended model. This pins both regimes.
+    #[test]
+    fn a_contender_cap_bounds_worst_case_rerank_without_hurting_structured_recall() {
+        const N: usize = 4000;
+        const K: usize = 100; // the vector arm's over-fetch (DEFAULT_ARM_DEPTH)
+        let idv = ids(N);
+        let cos = |vs: &[Vec<f32>], q: &[f32], i: usize| -> f32 {
+            vs[i].iter().zip(q).map(|(a, b)| a * b).sum()
+        };
+        // Returns (mean bound-filter contenders, mean bound recall@10, per-refine (contenders, recall@10)).
+        let run = |topics: usize, refines: &[usize]| {
+            let (vectors, qs) = corpus(N, DIM, topics, 0.4, 99);
+            let exact = VectorBlock::encode(VectorCodec::F32, DIM, &idv, &vectors).unwrap();
+            let approx = VectorBlock::encode(VectorCodec::Binary, DIM, &idv, &vectors).unwrap();
+            let recall = |q: &[f32], set: &[usize], truth: &std::collections::HashSet<MemoryId>| {
+                let mut s: Vec<(usize, f32)> = set.iter().map(|&i| (i, cos(&vectors, q, i))).collect();
+                s.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+                let got: std::collections::HashSet<MemoryId> =
+                    s.iter().take(10).map(|(i, _)| idv[*i]).collect();
+                truth.iter().filter(|t| got.contains(t)).count() as f32 / 10.0
+            };
+            let (mut bct, mut brc) = (0.0f32, 0.0f32);
+            let mut cct = vec![0.0f32; refines.len()];
+            let mut crc = vec![0.0f32; refines.len()];
+            for q in &qs {
+                let pe = exact.prepare(q).unwrap();
+                let truth: std::collections::HashSet<MemoryId> =
+                    exact.top_k(&pe, 10).into_iter().map(|(i, _)| idv[i]).collect();
+                let pa = approx.prepare(q).unwrap();
+                let mut cands: Vec<(usize, f32, f32, f32)> = (0..N)
+                    .map(|i| {
+                        let (lo, hi) = approx.score_bounds(&pa, i);
+                        (i, approx.score(&pa, i), lo, hi)
+                    })
+                    .collect();
+                let mut los: Vec<f32> = cands.iter().map(|c| c.2).collect();
+                los.sort_by(|a, b| b.partial_cmp(a).unwrap());
+                let tau = los.get(K - 1).copied().unwrap_or(f32::NEG_INFINITY);
+                let bound: Vec<usize> = cands.iter().filter(|c| c.3 >= tau).map(|c| c.0).collect();
+                bct += bound.len() as f32;
+                brc += recall(q, &bound, &truth);
+                cands.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+                for (ri, &r) in refines.iter().enumerate() {
+                    let capped: Vec<usize> =
+                        cands.iter().take((K * r).min(N)).map(|c| c.0).collect();
+                    cct[ri] += capped.len() as f32;
+                    crc[ri] += recall(q, &capped, &truth);
+                }
+            }
+            let nq = qs.len() as f32;
+            let per: Vec<(f32, f32)> =
+                (0..refines.len()).map(|i| (cct[i] / nq, crc[i] / nq)).collect();
+            (bct / nq, brc / nq, per)
+        };
+
+        let refines = [3usize, 8, 16];
+        // Structured (real-embedding-like): bound already prunes to ~k, cap is a no-op.
+        let (sb_ct, sb_rc, sper) = run(40, &refines);
+        println!("structured : bound contenders {:.0}/{} recall {:.4}", sb_ct, N, sb_rc);
+        for (i, &r) in refines.iter().enumerate() {
+            println!("  cap x{:<2} contenders {:.0} recall {:.4}", r, sper[i].0, sper[i].1);
+        }
+        assert!(sb_ct < 3.0 * K as f32, "structured: bound should prune to ~k, got {sb_ct:.0}");
+        assert!(sper[0].1 >= sb_rc - 0.001, "structured: cap must not cost recall");
+
+        // Unstructured (random-query worst case): bound reranks ~everything; cap bounds it.
+        let (ub_ct, ub_rc, uper) = run(1, &refines);
+        println!("unstructured: bound contenders {:.0}/{} recall {:.4}", ub_ct, N, ub_rc);
+        for (i, &r) in refines.iter().enumerate() {
+            println!("  cap x{:<2} contenders {:.0} recall {:.4}", r, uper[i].0, uper[i].1);
+        }
+        assert!(ub_ct > 0.9 * N as f32, "unstructured: bound should rerank ~everything");
+        // Cap x16 bounds rerank to <= 16k while keeping high recall even in this worst case.
+        let i16 = refines.iter().position(|&r| r == 16).unwrap();
+        assert!(uper[i16].0 <= 16.0 * K as f32 + 1.0, "cap must bound contenders");
+        assert!(uper[i16].1 >= 0.99, "cap x16 recall {:.4} in worst case", uper[i16].1);
+    }
+
     /// The number the query path is being wired to trust. If this interval does not hold, a
     /// caller narrowing on it drops real results silently — the worst failure mode in the
     /// module.

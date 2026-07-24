@@ -35,6 +35,16 @@ use crate::{QueryConfig, Result};
 /// (equally off-query) neighbours into fusion, so weak seeds are dropped before the one-hop spread.
 pub const DEFAULT_GRAPH_SEED_MIN_SIMILARITY: f32 = 0.3;
 
+/// Worst-case bound on stage-two rerank: never exactly-rescore more than `depth * RERANK_REFINE`
+/// candidates, chosen by the stage-one estimate. The `hi >= tau` bound filter is exact but, with the
+/// wide probabilistic 1-bit interval (`RABITQ_EPSILON`), prunes almost nothing on *unstructured*
+/// queries (random/near-uniform similarity), where it would rerank ~the whole scanned set — the
+/// query-path CPU hotspot the fleet trace showed. On real, clustered embeddings the bound already
+/// returns ~`depth`, far below this cap, so the cap is a no-op there; it only bites the pathological
+/// case, bounding rerank to O(depth). 16 keeps recall@10 = 1.0 even on the isotropic worst case — see
+/// `mlake_ivf`'s `a_contender_cap_bounds_worst_case_rerank_without_hurting_structured_recall`.
+const RERANK_REFINE: usize = 16;
+
 /// One arm's contribution to a hit: its 0-based rank within that arm and its raw score
 /// (dense cosine similarity, BM25 score, or graph activation).
 #[derive(Clone, Copy, Debug)]
@@ -1417,7 +1427,18 @@ impl QueryNode {
         let mut los: Vec<f32> = cands.iter().map(|c| c.2).collect();
         los.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
         let tau = los.get(k - 1).copied().unwrap_or(f32::NEG_INFINITY);
-        let contenders: Vec<&(MemoryId, f32, f32, f32)> = cands.iter().filter(|c| c.3 >= tau).collect();
+        let mut contenders: Vec<&(MemoryId, f32, f32, f32)> =
+            cands.iter().filter(|c| c.3 >= tau).collect();
+        // Bound the rerank: on unstructured queries the wide 1-bit interval leaves ~everything in
+        // `contenders`, so keep only the top `k * RERANK_REFINE` by stage-one estimate (`.1`). A
+        // no-op on real queries (the bound already returns < cap); see RERANK_REFINE.
+        let cap = k.saturating_mul(RERANK_REFINE);
+        if contenders.len() > cap {
+            contenders.select_nth_unstable_by(cap, |a, b| {
+                b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            contenders.truncate(cap);
+        }
 
         let t = Instant::now();
         let ids: Vec<MemoryId> = contenders.iter().map(|c| c.0).collect();
