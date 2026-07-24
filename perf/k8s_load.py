@@ -117,14 +117,22 @@ def main() -> int:
         print(f"[load] cannot reach {addr}", flush=True)
         return 1
 
+    # N_DOCS=0 measures reads against an ALREADY populated namespace: skip the write and fold
+    # phases entirely. With a freshly restarted serve pod (empty caches) the first query pass is a
+    # genuine COLD-tier measurement — which is what the SLA model needs from real S3.
+    query_only = n_docs == 0
+
     # -- write phase: `concurrency` threads, each its own client + rng --------
-    starts = list(range(0, n_docs, batch))
+    starts = [] if query_only else list(range(0, n_docs, batch))
     corpus_kind = f"{ds[5].get('dataset')}/{ds[5].get('model')}" if ds else "synthetic"
-    print(
-        f"[load] writing {n_docs} docs (batch {batch}, {concurrency} writers, dim {dim}, "
-        f"corpus={corpus_kind}) to '{ns}'",
-        flush=True,
-    )
+    if query_only:
+        print(f"[load] query-only against existing '{ns}' (N_DOCS=0)", flush=True)
+    else:
+        print(
+            f"[load] writing {n_docs} docs (batch {batch}, {concurrency} writers, dim {dim}, "
+            f"corpus={corpus_kind}) to '{ns}'",
+            flush=True,
+        )
 
     def write_chunk(worker_i, my_starts):
         client = MemlakeClient(addr)
@@ -164,13 +172,14 @@ def main() -> int:
         for f in as_completed(futs):
             written += f.result()
     write_secs = time.perf_counter() - t0
-    print(f"[load] wrote {written} in {write_secs:.1f}s = {written / max(write_secs, 1e-6):,.0f}/s (aggregate)", flush=True)
+    if not query_only:
+        print(f"[load] wrote {written} in {write_secs:.1f}s = {written / max(write_secs, 1e-6):,.0f}/s (aggregate)", flush=True)
 
     # -- wait for the indexer to fold (steady state) --------------------------
     fold_t = time.perf_counter()
     folded = False
     last = None
-    while time.perf_counter() - fold_t < fold_wait:
+    while not query_only and time.perf_counter() - fold_t < fold_wait:
         try:
             s = ctrl.stats(ns)
             backlog = s.wal_head - s.wal_index_cursor

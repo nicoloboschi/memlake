@@ -7,11 +7,15 @@ perf harness), **[ARCH]** (a fixed property of the design), or **[DECIDE]** (a n
 and must agree on).
 
 Status: **warm/CPU constants filled from a real MinIO run** (4 vCPU, 100k corpus, D=384, 3 fact
-types) — the worked card at the bottom is measured, not derived. Still needs real S3 (not MinIO)
-for the COLD-tier latency and the write `commit` floor, plus `SNAPSHOT_BYTES_PER_NS` for the
-multi-namespace working-set math. Two caveats gate a *per-namespace, multi-tenant* SLA: the cache
-has no inter-namespace isolation and the indexer folds namespaces sequentially (both in TODOS) —
-so today's numbers are a single-busy-namespace SLA.
+types) — the worked card at the bottom is measured, not derived. The COLD-tier latency, `S3_RTT`,
+`READ_WAVES`, `BYTES_READ_COLD_1T` and the write `commit` floor are now **measured on real AWS S3**
+(see "Real-S3 measurements" below) — but on a *different* shape (2 vCPU, 5k corpus, **1** fact type),
+so they sit alongside the MinIO figures rather than replacing them. Still missing:
+`SNAPSHOT_BYTES_PER_NS`, a saturated read **QPS ceiling** on real S3 (the driver queries
+sequentially, so only latency is measured), and any real-S3 3-fact-type or `wait_for_index=true`
+run. Two caveats gate a *per-namespace, multi-tenant* SLA: the cache has no inter-namespace
+isolation and the indexer folds namespaces sequentially (both in TODOS) — so today's numbers are a
+single-busy-namespace SLA.
 
 ## Inputs
 
@@ -48,9 +52,10 @@ so today's numbers are a single-busy-namespace SLA.
 | `AVG_MEM_BYTES` | avg stored size of one memory (embedding + text + metadata), on the wire for a write | **2 048 B** (384-dim f32 ≈ 1.5 KB embedding + ~0.5 KB text/meta) | `[DECIDE]` — prod at 1536-dim ≈ 6.8 KB; pick per workload |
 | `CPU_S_PER_QUERY_1T` | CPU-seconds for one query, single type, top-k 20, warm | **~0.056 s @ 100k corpus** (was 0.035 s at a smaller corpus — see note) | `[MEASURED]` (65 QPS @ 4 vCPU, 91% util, MinIO, 100k/D=384) |
 | `FANOUT` | fact-type multiplier on per-query and per-write CPU | 3 | `[ARCH]` |
-| `BYTES_READ_COLD_1T` | S3 bytes a single-type query reads on a full cache miss (nprobe `.vec` blocks + rerank point-fetches + payload for winners) | TBD | `[MEASURED]` |
-| `S3_RTT` | one object-storage round-trip latency | 0 (MinIO) / ~20 ms (real S3) | `[MEASURED]`/param |
-| `READ_WAVES` | coalesced round-trip waves per cold query (INV-7 bounds this to a constant) | ≤ 4 | `[ARCH]` |
+| `BYTES_READ_COLD_1T` | S3 bytes a single-type query reads on a full cache miss (nprobe `.vec` blocks + rerank point-fetches + payload for winners) | **~100 KB** mean (max 1.17 MB) @ 5k corpus, D=384, k=10, nprobe 8 | `[MEASURED]` real S3 |
+| `S3_RTT` | one object-storage round-trip latency | 0 (MinIO) / **~27 ms** (GCP us-east4 → AWS S3 us-east-1, cross-cloud) | `[MEASURED]` real S3 |
+| `READ_WAVES` | coalesced round-trip waves per cold query (INV-7 bounds this to a constant) | ≤ 4 — **measured 3.34 mean, 4 max** | `[ARCH]`, confirmed `[MEASURED]` |
+| `HEAD_GET` | the strong-consistency WAL-head read every query does, **even on a cached snapshot** | **~27 ms** (= 1 `S3_RTT`) | `[MEASURED]` real S3 — see below |
 | `CPU_S_PER_FOLDED_MEM_1T` | CPU-seconds to fold one memory into a segment, single type (assign + cluster/vec write + pk/radj/fts + rerank/payload + link derivation) | ~0.45 ms (valid ≤100k; super-linear beyond, see below) | `[MEASURED]` (MinIO, 100k @ 4 vCPU, 34 s) |
 | `BYTES_WRITTEN_PER_MEM_1T` | S3 bytes written per folded memory, single type (its share of the segment objects) | ~0.8 KB/type (~2.4 KB across 3 types; f32 rerank dominates) | `[MEASURED]` (MinIO, 32k folded @ D=384 Binary) |
 | `SNAPSHOT_BYTES_PER_NS` | resident RAM to hold one namespace's open snapshot (centroids + sparse indexes + FTS split + tail), 3 types | TBD | `[MEASURED]` |
@@ -111,7 +116,9 @@ cpu_qps  = vcpu / (CPU_S_PER_QUERY_1T × FANOUT)          # CPU ceiling
 nic_qps  = (tier == COLD) ? nic / (BYTES_READ_COLD_1T × FANOUT) : ∞   # NIC only bites when cold
 QPS      = min(cpu_qps, nic_qps)
 
-service  = CPU_S_PER_QUERY_1T × FANOUT                   # warm service time (CPU)
+service  = HEAD_GET                                      # ALWAYS: the strong-consistency WAL-head
+                                                         # read, one S3 RTT, even on a warm snapshot
+          + CPU_S_PER_QUERY_1T × FANOUT                  # warm service time (CPU)
           + (tier == DISK)  ? disk_read_latency          # small, NVMe
           + (tier == COLD)  ? S3_RTT × READ_WAVES        # the S3 tail
 
@@ -130,6 +137,18 @@ p99  = service × P99_FACTOR                              # tail multiplier, [ME
 
 So `P99_FACTOR ≈ 2.3` warm, and the ×3 fan-out tax is real: worst-case 3-type recall is ~4.4
 QPS/vcpu, not the single-type ~16.
+
+**The MEMORY tier is not free — it costs one S3 round-trip.** The model above used to treat a warm
+read as pure CPU. Real-S3 traces say otherwise: `snapshot.open_ms ≈ 27 ms` on **every** query,
+including the 999-of-1000 that hit `action: reuse`. That is the strongly-consistent WAL-head read
+(`[ARCH]`: reads always re-derive the tail against the live head) — one mutable object that cannot be
+cached. On a warm query totalling ~36 ms server-side, **~27 ms is that head GET and only ~4 ms is arm
+CPU**. So on real object storage the warm read SLA is RTT-bound, not CPU-bound, and the floor for any
+single query is one `S3_RTT` no matter how warm the cache is. (On MinIO `S3_RTT ≈ 0`, which is why
+the MinIO-derived model never surfaced this term.) It also means read *latency* and read *throughput*
+decouple: the head GET is I/O wait, not CPU, so a node can serve many concurrent queries within that
+27 ms — which is exactly why the QPS ceiling needs its own concurrent measurement (not yet done on
+real S3).
 
 **Important — the per-query cost grows with corpus size.** These are ~2× the numbers measured on
 a smaller corpus (single-type was ~28 QPS/vcpu / 33 ms), because `nprobe` is index-derived (a
@@ -227,10 +246,89 @@ single biggest write-latency lever (B=1 is pessimal, a real document's chunks am
 - **Write-path derivation re-check needed ≫1M/namespace** — link derivation is O(new·tail) on the
   write path (fine when the indexer keeps the tail small; degrades toward O(tail) if it lags).
 
+## Real-S3 measurements (the rows this file was waiting for)
+
+**Setup.** GKE `us-east4` → AWS S3 `us-east-1` (cross-cloud, public internet — so `S3_RTT` here is a
+*pessimistic* stand-in for same-region prod). `serve` StatefulSet ×3, each **2 vCPU / 3 GiB** limit,
+`--mem-mb 1024 --disk-mb 8192`, behind the Envoy consistent-hash proxy; indexer ×1. Corpus: BEIR
+**scifact, 5 183 docs, D=384, 1 fact type**, real question embeddings (`perf/prepare_dataset.py`),
+top-k 10. Driver: in-cluster `perf/k8s_load.py`. Numbers below are client-side (through Envoy) unless
+marked *server*; server figures come from the `_obs/traces/` fleet traces.
+
+**Read, by cache tier.** COLD is a genuinely cold pod: `rollout restart` (dropping the memory cache
+and the emptyDir disk cache) then query immediately; WARM is the second pass on the same pod.
+
+| tier | p50 | p90 | p99 | roundtrips/query | bytes/query |
+|---|---|---|---|---|---|
+| **COLD** (empty caches) | **87 ms** | 201 ms | 292 ms | **3.34 mean, 4 max** | ~100 KB mean (1.17 MB max) |
+| **WARM** (MEMORY tier) | **43 ms** | 46 ms | 64 ms | **0** | 0 |
+
+*server-side means:* COLD total 125.7 ms, WARM total 36.0 ms, `snapshot.open_ms` ~27–28 ms in **both**
+(the head GET — see above). Derived: `S3_RTT ≈ (125.7 − 36.0) / 3.34 ≈ 27 ms`, agreeing with the
+independently-measured head GET. `P99_FACTOR` = **1.48 warm**, **3.35 cold** (MinIO gave ~2.3).
+
+**Write.** Single writer, batch 512, no contention, `wait_for_index=false`:
+
+| | value |
+|---|---|
+| `commit` (durable WAL PUT of the batch, the ack floor) | **165–255 ms** (mean 210) for 512 memories ≈ 1.8 MB |
+| link derivation (`link_ms`) | 78–230 ms per 512-batch, of which snapshot open 53–88 ms |
+| throughput, 1 writer | **1 269 docs/s** (1 024-doc corpus) |
+| throughput, 8 writers | **2 463–3 459 docs/s** (5 183-doc corpus) |
+
+The `commit` floor is **transfer-bound, not RTT-bound, at this batch size**: 1.8 MB at ~210 ms is
+~9 MB/s cross-cloud, well above one 27 ms RTT. So `commit = S3_RTT × commit_waves` only holds for
+small batches; past ~1 MB it is `batch_bytes / upload_bandwidth`.
+
+**Write throughput is dominated by corpus size, not the write path.** The same 8-writer driver gives
+196 docs/s against a 20 k synthetic corpus but 3 459 docs/s against the 5 k scifact corpus — because
+write-time link derivation scans the corpus per document. Quote write throughput *with* the corpus
+size it was measured at; the 20 k figure is the more conservative one.
+
+### Real-S3 SLA card (measured, single fact type)
+
+```
+node: 2 vCPU, 3 GiB, 1 GB mem cache + 8 GB disk cache, cross-cloud S3 (RTT ~27 ms)
+corpus: 5 183 docs, D=384, 1 fact type, top-k 10
+
+READ:
+   WARM (MEMORY tier)   p50  43 ms   p99  64 ms    0 roundtrips
+   COLD (empty cache)   p50  87 ms   p99 292 ms    3.3 roundtrips, ~100 KB
+   floor: one S3_RTT (~27 ms) per query for the WAL-head read, at every tier
+   QPS ceiling: NOT MEASURED on real S3 (driver is sequential) — see gaps
+
+WRITE (wait_for_index = false):
+   commit floor  ~210 ms per 512-memory batch (~1.8 MB WAL PUT, transfer-bound)
+   throughput    1 269 docs/s (1 writer) · 2 463–3 459 docs/s (8 writers) @ 5 k corpus
+                 196–354 docs/s (8 writers) @ 20 k corpus  ← derivation scales with corpus
+```
+
+**What this card does NOT cover** (do not extrapolate):
+- **1 fact type, not 3.** The `FANOUT = 3` worst case is untested on real S3; the MinIO run says the
+  tax is real (~4× on CPU), so a 3-type real-S3 read is expected to be materially slower than 43 ms.
+- **`wait_for_index = false`.** The write SLA the model treats as worst case (ack after a synchronous
+  fold) was not exercised; these writes ack after commit only.
+- **No saturated read QPS.** Latency only — the driver issues queries sequentially.
+- **5 k docs is small.** `CPU_S_PER_QUERY_1T` grows with corpus (the MinIO note); at 100 k expect the
+  CPU term to dominate the 27 ms head GET rather than hide behind it.
+
 ## What still needs real S3 (not MinIO)
 
-MinIO gives the CPU and byte constants honestly but `S3_RTT ≈ 0`, so the **COLD-tier read
-latency** (`S3_RTT × READ_WAVES`) and the write `commit` floor must be re-measured against real
-S3 before those rows are quoted. `SNAPSHOT_BYTES_PER_NS` (for the cache-tier working-set math) and
-`P99_FACTOR` still need a dedicated pass. Warm/MEMORY-tier READ and CPU-bound WRITE numbers above
-are valid from MinIO.
+MinIO gives the CPU and byte constants honestly but `S3_RTT ≈ 0`. That gap is now closed for the
+read path: **COLD-tier latency, `S3_RTT`, `READ_WAVES`, `BYTES_READ_COLD_1T`, `P99_FACTOR` and the
+write `commit` floor are measured on real AWS S3** (previous section) — and doing so surfaced a term
+the MinIO model could not see, the per-query `HEAD_GET`.
+
+Still open, in rough priority order:
+
+1. **Saturated read QPS on real S3.** Only latency is measured (`k8s_load.py` queries sequentially).
+   This matters more than usual here: the head GET is I/O wait, not CPU, so throughput does *not*
+   follow from latency — a concurrent driver is needed to find the knee.
+2. **3 fact types on real S3.** Every card above is single-type; `FANOUT = 3` is the stated worst
+   case and is only characterized on MinIO.
+3. **`wait_for_index = true`.** The model calls this the heavy path and treats it as worst case, but
+   no real-S3 run has exercised it. Needed before quoting a write-latency SLA.
+4. **`SNAPSHOT_BYTES_PER_NS`** — still TBD, and it gates the whole multi-namespace working-set /
+   cache-tier calculation.
+5. **A larger corpus.** 5 k docs is small enough that the 27 ms head GET dominates; the corpus-scaling
+   of `CPU_S_PER_QUERY_1T` (and of write-time link derivation) needs a 100 k+ real-S3 point.
