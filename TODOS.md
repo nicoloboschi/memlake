@@ -661,291 +661,157 @@ always-true or always-violated in provider mode, and both read as success.
 - [ ] **No `grpc.aio` client.** Hindsight is fully async and wraps every call in
       `asyncio.to_thread` — a thread hop per retain batch and per recall.
 
-## Vector storage — decided, measured, not yet shipped
+## Performance
 
-Context and numbers in [`docs/vector-storage.md`](docs/vector-storage.md). The
-two-stage search (1-bit scan → error bound → exact f32 rerank) is built and
-green; what follows is what is left.
+Everything measured on the real AWS S3 k8s deployment unless noted. Numbers and method in
+[`docs/sla-model.md`](docs/sla-model.md), [`docs/perf-k8s-findings.md`](docs/perf-k8s-findings.md)
+and [`docs/cost-comparison.md`](docs/cost-comparison.md).
 
-- [ ] **Make `Binary` the default codec again.** It was set to `Binary` in
-      `8ce2617`, then back to `Int8` in `477b620` (a WIP commit). BEIR now says
-      the choice is free: on scifact, Binary and Int8 give **identical**
-      `ann_recall@10` on a clean rebuild, because the rerank stage makes the
-      scan codec's error irrelevant to the final ranking. Binary is ~6.5× smaller
-      in the scan tier, so there is no reason to pay for Int8 codes.
-- [x] **A codec change does not re-encode existing clusters.** ~~Copy-forward
-      reuses `.vec` blocks by reference, so flipping the codec silently leaves
-      old generations in the old encoding.~~ **FIXED.** `read_generation` now
-      records each cluster's stored codec from its (self-describing) block header
-      (`Generation::codecs`), and the copy-forward gate requires that codec to
-      equal `IndexOptions::vector_codec` — a mismatch forces a re-encode, so a
-      codec change migrates. Copy-forward still fires in the common (same-codec)
-      case: paths are reused, asserted by
-      `unchanged_codec_copies_clusters_forward`; the migration by
-      `codec_change_reencodes_copied_forward_clusters`. Migration is incremental
-      (each fold/compaction re-encodes only what it visits; mixed state is safe
-      because reads are per-block codec-aware) — no forced whole-corpus fold. See
-      docs/vector-storage.md §"The codec is per-block". The compounding-quantization
-      worry (each fold decodes then re-encodes) is pinned as one-shot, not
-      accumulating, by `codecs_are_stable_under_repeated_decode_reencode`: F32 is
-      byte-idempotent, Int8/Binary drift is immaterial (recall holds flat over 8
-      generations). Remaining gap: a fully static corpus never folds, so it needs
-      a codec-mismatch compaction trigger to migrate — left for the segmented-index
-      work.
-- [ ] **The rerank SSTable spends ~3117 B to hold a 1536 B vector** — roughly 2×
-      overhead, unexplained. Worth understanding before this scales.
-- [x] **`nprobe` is resolved by the index, not the client.** `nprobe = 0` now means
-      "the index decides" and the snapshot picks a quarter of its clusters
-      (floor 8, cap 64). A fixed constant made recall depend on corpus size:
-      8 clusters is 11% of a small index and a rounding error on a large one. On
-      scifact this moved `ann_recall@10` from 0.8590 to **0.9627**. The wire field
-      remains as an escape hatch; it should eventually be removed from the client
-      API entirely.
-- [x] ~~**Adaptive probing via the error bounds.**~~ **DONE AND REJECTED — do not
-      re-attempt without re-measuring the two numbers below first.** Built, proved
-      sound against brute force, measured on BEIR, and then **removed from the tree**
-      (not left behind an env flag — unexercised code rots, and the reasoning is the
-      part worth keeping).
-      *What was built:* each centroid carried a radius `R = max ‖v̂ − c‖`, recomputed
-      every fold on both build paths, bounding the best score any unprobed cluster
-      could hold at `min(⟨q̂,c⟩ + R, 1 − max(0, ‖q̂−c‖ − R)²/2)`. Bounded at two fetch
-      waves so INV-7 held, and the probed set was a subset of the fixed-fraction one,
-      so recall could not fall below baseline. The rule is correct; that was never the
-      problem.
-      *The measurement is a clean negative.* On BEIR at nprobe=half it retired **0
-      clusters across 623 queries**: scifact 36.0 → 36.0 probed, `ann_recall@10` 0.9893
-      either way; nfcorpus 30.0 → 30.0, 0.9625 either way. Mean `tau` is 0.55–0.65 while
-      the *tightest* bound anywhere in the unprobed tail is 0.96–0.98 — a ~0.3 gap, not a
-      near miss. Nor is it outliers inflating `R`: mean max radius 0.62 vs mean p95 radius
-      0.58, so a p90 radius (which would cost soundness) moves the bound ~0.04 and still
-      retires 0.00%.
-      *The cause is dimensional, not statistical.* At 384-d the cluster radius (~0.62) is
-      below the query's own k-th nearest-neighbour distance (~0.77) by less than the bound
-      needs, so every ball reaches into the query's neighbourhood and nothing can be
-      retired. A larger corpus at the same dimensionality fails identically. **The gate for
-      any retry: measure mean cluster radius vs. mean k-th-NN distance first; if the radius
-      is not comfortably smaller, stop.** Full write-up in docs/arms/vector.md; the
-      implementation is in git history (`git log -S adaptive_probe`).
-- [ ] **The binary bound is probabilistic, not absolute.** Measured containment
-      is 1.000000 over 120k samples with a 0.999 gate and a worst-miss cap, but
-      one rotation serves a whole block, so misses are correlated across members
-      of the same block rather than independent. `Int8` and `F32` bounds are
-      absolute. If a caller ever needs a hard guarantee, Binary is not it.
-- [ ] **On isotropic data the bound narrows nothing** (99.95% of the block enters
-      rerank). Correct, and useless — a caller must not assume the rerank set is
-      always small.
+### Open — ranked by leverage
 
-## Read path: the zero-copy claim, and the cache
+- [ ] **Snapshot reuse never adopts a new generation.** `snapshot_traced` returns the cached
+      snapshot wholesale when `head == cached.through_seq` (one head GET, no LIST) **without
+      checking whether the manifest advanced** — and a fold does not move the head. So a namespace
+      that has been folded but not written to keeps serving a snapshot whose tail duplicates the
+      segment, *forever*: it pays a tail-FTS build (measured **1.6 s** for 5 183 docs) and
+      brute-force-scans that tail on every query. Trace evidence:
+      `snapshot={action: reuse, tail_entries: 5183}` with the corpus already folded to one segment.
+      Correctness is fine (tail and segment agree, hits dedup) — it is pure waste.
+      *Fix:* also compare the manifest etag on that path and `reopen_fold` when it moved; the
+      expensive part (re-decoding segments) is already avoided by `Arc<SegmentState>` reuse.
 
-- [ ] **We deserialize; we do not read zero-copy — but the value is now small,
-      and the invasive fix should wait for the segmented index to settle.**
-      `rkyv_read` validates with `check_archived_root` (yielding a usable
-      `&Archived<T>`) and then throws it away by `Deserialize`ing into an owned
-      graph. Two things learned while scoping this:
+- [ ] **Coalesce the per-query WAL-head GET.** Strongly-consistent reads re-read the WAL head every
+      query — one small, mutable, *uncacheable* object. Measured: `snapshot.open_ms ≈ 27 ms` on
+      **every** query including the 999-of-1000 that hit `action: reuse`, i.e. **~27 ms of a 36 ms
+      warm query is this GET and only ~4 ms is arm CPU**. It is also memlake's entire marginal COGS:
+      **$105/mo per 100 QPS**, growing linearly (`cost-comparison.md`).
+      *Fix:* coalesce **concurrent in-flight** head reads onto a single GET — free, since
+      simultaneous readers may legitimately share one head observation. A short TTL would cut more
+      but weakens strong consistency, so that part is a product decision. This is the single biggest
+      lever on both warm latency and cost.
 
-      1. **The 6-byte envelope header makes the aligned fast path DEAD.** Every
-         format wraps its payload behind `envelope::HEADER_LEN = 6`, so
-         `&bytes[6..]` is never 8-aligned and *every* rkyv read takes the copy
-         branch, unconditionally — the in-place branch in `rkyv_read` never runs
-         for an enveloped object. Padding the header 6->8 makes a cold read from
-         mmap (page-aligned, so 8-aligned) skip that copy. It is a format change
-         (version bump + re-ingest) and removes only one of three copies; the
-         deserialize allocations, the dominant cost, remain.
-      2. **After the vector/payload split the deserialize is off the hot path.**
-         The scan reads flat `VectorBlock` bytes and never deserializes. A whole
-         `ClusterFile::from_bytes` now happens only in the fold (`read_generation`,
-         not latency-critical) and winner-hydration is bounded by arm depth through
-         the payload store. So the allocation storm that motivated this is already
-         mostly gone.
+- [ ] **The cache budgets do not bound peak RAM or disk.** `--mem-mb` / `--disk-mb` bound the
+      *block cache* only. Outside them, and unbounded:
+      * `snapshots: Mutex<HashMap<String, Arc<Snapshot>>>` — one resident snapshot **per namespace**
+        (centroids, sparse indexes, FTS readers, tail items), never evicted by size.
+      * every `TantivyFts` materializes its split into its own `tempfile::tempdir()` — disk, per
+        segment per fact type per snapshot.
+      * the trace ring's own caps (`BUFFER_HARD_BYTES`).
+      So actual RAM = `mem_budget + Σ resident snapshots + tail + trace`, which is why a 1 GB cache
+      needs a 3 GiB pod limit, and why `SNAPSHOT_BYTES_PER_NS` is still TBD in the SLA model — the
+      tier formula cannot be computed without it.
+      *Fix:* make `--mem-mb` / `--disk-mb` the **process total** for each tier and split them by
+      declared ratio (e.g. mem = block cache / resident snapshots / trace; disk = block cache / FTS
+      splits), with the snapshot map evicting by its own sub-budget. One knob per tier, ratios
+      internal — no new per-component flags.
 
-      The real prize (operating on `&Archived<StoredMemory>` at the call sites,
-      the accessors already exist) threads borrow lifetimes through the query and
-      fold path — which is exactly the code the segmented/LSM refactor is
-      restructuring. Doing a large lifetime refactor concurrently with a
-      structural one is high-risk for low post-split payoff; sequence it *after*
-      the segmented work lands, and gate it on a measured allocation/latency
-      number rather than the principle. The header-alignment sub-fix is
-      independent and smaller, but is still a core format break and should ride
-      the next deliberate format bump, not a solo one.
-- [x] **The disk cache now mmaps instead of `fs::read`** (`cache.rs`). A warm hit
-      maps the blob and hands the mapping to `Bytes::from_owner`, so the blob is
-      never copied onto the heap and a re-read of a resident file does no I/O at
-      all. Sound because blobs are content-addressed and written once, published
-      by rename (so a concurrent re-`put` installs a new inode instead of
-      truncating a mapped one — truncation under a mapping is SIGBUS, not an
-      error), and removed only by unlink, which on Unix leaves an existing mapping
-      valid; a covering test evicts a blob while a reader holds it.
-      **This removes one copy, not all of them** — see the item above: consumers
-      still `Deserialize` into an owned graph, so the read path is not zero-copy.
-- [ ] **Blobs are still not written 8-byte aligned**, so `rkyv_read` may realign
-      before validating and the mmap gives that copy straight back. mmap returns
-      page-aligned addresses, so a blob whose archive starts at offset 0 is already
-      fine; a *ranged* block cached as `path#start-end` is not. Worth confirming
-      which of the two the hot paths actually hit before doing anything.
-- [x] **The disk cache is a CLOCK ring, not LRU and no longer plain FIFO**
-      (`cache.rs`). Both tiers stay admission-ordered rings — a read never reorders
-      them, so a memory hit takes the state lock only *shared* and a disk hit takes
-      it shared too — but a hit now sets an atomic **reference bit**, and eviction
-      walks a hand that clears a set bit and skips that entry (second chance) before
-      taking the first entry whose bit is already clear. A memory eviction still
-      demotes to disk; a disk hit still does not promote back into memory (that
-      promotion *was* the per-hit write-lock mutation, and with mmap the page cache
-      already backs the bytes). Measured with
-      `crates/mlake-store/tests/cache_skew.rs`, which now runs all three policies
-      over the byte-identical trace (256 clusters, 16 distinct Zipf-skewed probes per
-      query plus three always-hot small objects; `--ignored --nocapture`, ~5 min):
+- [ ] **Verify: is each memory's payload stored twice in the durable index?** `ClusterFile` holds
+      `Vec<StoredMemory>` (vector *and* text), while `rerank.data` holds the vector again and
+      `payload.data` holds the text again. Measured on one folded 5 183-doc segment: cluster `.bin`
+      12.0 MB + `payload.data` 9.3 MB + `rerank.data` 8.1 MB = 29.4 MB of a 30.8 MB segment.
+      **Not proven** — the byte math does not fully reconcile (2 315 B/doc in cluster files is less
+      than vector + text would need), so confirm what a cluster item actually serializes before
+      acting. If the duplication is real it is ~30–45 % of stored bytes, the largest storage lever
+      left. (The related "rerank SSTable has ~2× overhead" item is **closed** — measured 1 556 B for
+      a 1 536 B vector = 1.013×; the payload/rerank split fixed it.)
 
-      | cache/corpus | 5% | 10% | 25% | 50% |
-      |---|---|---|---|---|
-      | LRU, Zipf s=1.1   | 0.0780 | 0.4493 | 0.6769 | 0.8442 |
-      | FIFO, Zipf s=1.1  | 0.0895 | 0.3327 | 0.5937 | 0.7940 |
-      | CLOCK, Zipf s=1.1 | 0.0889 | **0.4708** | **0.6898** | **0.8500** |
-      | LRU, Zipf s=1.5   | 0.0994 | 0.5948 | 0.8137 | 0.9226 |
-      | FIFO, Zipf s=1.5  | 0.1450 | 0.4479 | 0.7344 | 0.8839 |
-      | CLOCK, Zipf s=1.5 | 0.1047 | **0.6172** | **0.8218** | **0.9269** |
-      | LRU, uniform      | 0.0165 | 0.2154 | 0.3465 | 0.5657 |
-      | FIFO, uniform     | 0.0170 | 0.1379 | 0.3193 | 0.5546 |
-      | CLOCK, uniform    | 0.0164 | **0.2157** | **0.3470** | **0.5666** |
+- [ ] **Cache: per-namespace isolation.** Global CLOCK is scan-resistant but not isolated: one
+      namespace's scan or write burst evicts another's hot set, dropping it from MEMORY to COLD and
+      breaking the per-namespace SLA. *Recommendation:* do **not** make namespace a hard first-level
+      partition — namespace count is unbounded and mostly idle, so static reservation wastes the
+      cache and a newly-hot namespace starts cold. Prefer **frequency-aware admission**
+      (TinyLFU / S3-FIFO), which gets isolation emergently, plus an **optional reserved floor** for
+      named tenants — mirroring how compute already works (shared consistent-hash pool by default,
+      `proxy.pins` for tenants needing isolation). **First step is per-namespace cache accounting**
+      (`CacheKey` already carries the namespace): you cannot run the noisy-neighbour load test, or
+      promise anything, without per-namespace hit-rate metrics.
 
-      CLOCK does not just recover FIFO's 3–15 point loss: outside the 5% column it is
-      0.4–2.2 points *ahead of LRU*, because an admission arrives with its bit clear
-      and a one-shot cluster read dies at its FIFO position, where LRU promotes every
-      cold cluster it touches to most-recently-used and evicts hot entries for it.
-      (Admitting with the bit set was tried and is worse everywhere — 0.4133 vs
-      0.4708 at s=1.1/10% — so the scan resistance is doing the work, not the second
-      chance alone.) The 5% column is the thrash regime: 16 distinct probes per query
-      already exceed the cache, every policy laps itself once per query, and no
-      reference bit survives to the hand's next pass; FIFO's edge there is position,
-      not policy, and everything is under 0.15.
-      **The uniform-control regression is fixed** — 0.1379 → 0.2157 against LRU's
-      0.2154, i.e. within noise, which is what a flat access distribution should
-      show. The always-hot objects' own hit ratio says it directly: 0.999 under CLOCK
-      and LRU, 0.503 under FIFO. So SPEC §6.2's in-RAM tier for
-      centroids/footers/`pk.idx` goes back to being an optimisation rather than
-      load-bearing.
-      Caveat on the baseline: the LRU column is `EvictionPolicy::Lru`, a
-      re-measurement that refreshes both rings on a hit; the LRU actually replaced
-      only refreshed the memory tier on a memory hit and scored 0.8314 in the
-      s=1.1/50% cell. Every other cell reproduces the old table to ±0.001, so CLOCK
-      is being judged against a slightly *stronger* LRU than the one that existed.
+- [ ] **Write-path link derivation is the write ceiling.** Links are derived per document against the
+      current snapshot before the commit — O(new · corpus), so write throughput falls as the corpus
+      grows: measured **3 459 docs/s** at a 5 k corpus vs **196 docs/s** at 20 k synthetic, same
+      driver. Halving derivation `nprobe` 16 → 8 bought **+80 %** (196 → 354/s) with no link-quality
+      change (only the top-5 neighbours at cosine ≥ 0.7 are kept, and those sit in the nearest
+      clusters). Remaining levers if it bites: amortize derivation off the synchronous path (costs
+      edge freshness), bound the kNN to the new items' own clusters, or make it per-namespace opt-in.
 
-- [ ] **Nothing calls `Store::put_admitting` yet.** The mechanism landed
-      (`store.rs`): an opt-in write that admits its own bytes under exactly the key
-      `get_immutable` looks up, so a `serve` replica folding a generation inline no
-      longer has to re-fetch what it just wrote. `Store::put` stays read-through on
-      purpose — a fold writes the whole generation, most of which no imminent query
-      probes, and on a ring that laps the cache and leaves only the fold's own tail.
-      What is left is the decision it was scoped to leave open: **which** inline-fold
-      writes opt in. The plausible answer given the measurement above is the small
-      certain-to-be-read objects (centroids, footers, `pk.idx`) and not the cluster
-      or vector-block bulk, but that is untested — it could not be measured from
-      inside `mlake-store`, which has no fold to run.
+- [ ] **Indexer is single-threaded FIFO with no per-namespace time slice.** The object-storage queue
+      fixed the original starvation (demand-driven enqueue-on-commit replaced discover-all
+      round-robin, and a fold error now drops the job instead of tight-looping), so one busy
+      namespace no longer starves behind idle ones. What remains: a *long* fold still blocks every
+      other namespace's turn. Needs a per-namespace slice or fold concurrency before a
+      multi-namespace **write** SLA can be quoted.
 
-## WAL read path: caching + the hot-path LIST (high-QPS reads)
+- [ ] **SLA measurement gaps, in priority order.** (1) **Saturated read QPS on real S3** — only
+      latency is measured; the driver queries sequentially, and because the head GET is I/O wait not
+      CPU, throughput does *not* follow from latency. (2) **3 fact types** — every measurement is
+      single-type; `FANOUT = 3` is the stated worst case. (3) **`wait_for_index = true`** — the path
+      the model calls worst case has never been exercised on real S3. (4) A **100 k+ corpus** point,
+      since 5 k is small enough that the 27 ms head GET hides the CPU term.
 
-Strongly-consistent reads re-scan the WAL tail every query. Two costs per query: a LIST to
-enumerate the tail, and a GET per tail entry. Progress and what's left:
+- [ ] **Nothing calls `Store::put_admitting`.** The mechanism exists (an opt-in write that admits its
+      own bytes under the key `get_immutable` looks up). Open decision: which fold writes opt in —
+      plausibly the small certain-to-be-read objects (centroids, footers, `pk.idx`) and not the
+      cluster/vector bulk, but untested.
 
-- [x] **Tail entry bodies are now cached.** `WalTail::scan` and `read_wal_entry` read through
-      `get_immutable` (the NVMe cache), not the uncached `get`. A `{ns}/wal/{seq}` object is
-      write-once and — after the fix below — its sequence never repeats, so its path names one
-      immutable body forever; caching by path is sound. An unchanged tail re-read across queries
-      is now local hits instead of N S3 GETs. Only the enumerating LIST still hits S3.
-- [x] **Sequences are monotonic for the namespace's life (correctness fix).**
-      `Writer::cold_next_seq` now resumes at `max(live head, manifest.wal_head) + 1`. Before, a
-      fully-folded-and-GC'd namespace had an empty `/wal/` (live head 0) and a cold writer
-      restarted at seq 1 — which is **at or below `wal_index_cursor`, so the write was invisible
-      to readers (`(cursor, head]` is empty) and never folded (`head <= cursor` short-circuits):
-      a silently lost write.** The manifest's `wal_head` survives GC as a high-water mark, so the
-      resume is always past it. Also the precondition for the caching above (no path reuse → no
-      stale-body aliasing). Covered by `a_reset_wal_resumes_past_the_manifest_high_water_mark`.
-- [x] **Per-query LIST eliminated via a head pointer.** `snapshot()`'s validity check and
-      `QueryNode::open`'s consistency point now call `Namespace::resolve_head` — one GET of a
-      monotonic `{ns}/wal-head` pointer — instead of `wal_head()`'s LIST. A writer CAS-bumps the
-      pointer after durably appending and **before** acking (`Writer::bump_head_pointer`, cached
-      etag → one CAS on the single-writer path), so it is `>=` every acked write; a reader trusting
-      it never misses one. A missing/malformed pointer falls back to the authoritative LIST, so
-      correctness never depends on it. The indexer keeps LISTing (background) and reconciles a
-      crashed writer's un-acked entry. Tests: `commit_publishes_the_head_pointer`,
-      `resolve_head_falls_back_to_list_when_pointer_absent`,
-      `concurrent_writers_leave_the_head_pointer_at_the_max`.
-- [x] **Tail-enumeration LIST eliminated too — the read path is now LIST-free.**
-      `WalTail::scan_up_to(after_seq, head)` enumerates the tail by construction —
-      `seq_path(after_seq+1..=head)`, `head` from the pointer — and GETs each through the immutable
-      cache, tolerating a `NotFound` as a `commit_many` gap. Safe because GC reclaims only
-      `seq <= prev_wal_index_cursor`, so entries in `(cursor, head]` are never GC'd — a miss there
-      is only a genuine gap. `QueryNode::open` and `reopen_extending_tail` use it; the **indexer
-      keeps `scan` (LIST)** on the background fold, which is also the authority that reconciles
-      gaps. Validated by the full 52-test end-to-end suite (all exercise `open` → `scan_up_to`).
-      So a read now touches S3 with: one pointer GET (staleness) + on reopen, constructed tail
-      GETs (cached) + a conditional manifest GET — **no LIST anywhere on the read path.**
-- [ ] **WAL naming: incremental seq vs random UUID — keep incremental.** Random-UUID WAL objects
-      would remove the `put_if_absent` claim contention and be reset-proof, *but* they make the
-      hot-path LIST **mandatory** (you cannot probe or enumerate an unpredictable name) and lose
-      the total order the fold and supersede logic rely on (you'd need an explicit `write_seq`
-      key). Since "avoid LIST" is the higher-value goal and incremental seq is what enables it,
-      UUID naming is the wrong trade. The clash it targets is already absent within a replica
-      (one `Writer` per namespace serializes claims) and is best handled across replicas by
-      per-namespace ownership, not by giving up ordering and probeability.
+### Deliberately deferred (a decision, not a doubt)
 
-## Snapshot reopen: reuse segment metadata across a write (etag fast-path)
+- [ ] **Zero-copy reads / 8-byte envelope alignment.** We validate with `check_archived_root` then
+      `Deserialize` into an owned graph. Two facts make this low-value now: the 6-byte envelope header
+      makes the aligned fast path dead for *every* enveloped object, and after the vector/payload
+      split the deserialize is off the hot path (the scan reads flat `VectorBlock` bytes; whole
+      `ClusterFile::from_bytes` happens only in the fold). The real prize threads borrow lifetimes
+      through query and fold — sequence it after the segmented work settles, gate it on a measured
+      allocation number, and let the header change ride a deliberate format bump.
 
-- [x] **On a write (not a fold), reopen rebuilds only the tail and reuses the segments — gated on
-      the manifest etag.** `snapshot()` now, when the head advanced, does a conditional GET of the
-      manifest (`Store::get_if_modified`, `If-None-Match`): a **304** (a write, segments unchanged)
-      → `QueryNode::reopen_extending_tail`, which reuses each fact type's `Arc<Vec<SegmentState>>`
-      (no re-decoding of centroids/tables/FTS) plus the segment-derived tombstone overlay, and
-      re-scans only `(wal_index_cursor, head]`; a **200** (a fold) → full `open`. The tail is
-      correctly re-scanned (not reused), so no acked write is missed. `FactType.segments` became
-      `Arc`-shared; the segment vs tail predicate-tombstones were split so the segment half is
-      reused verbatim. Proven equivalent to a fresh open (incl. a tail delete of an already-folded
-      item) by `reopen_extending_tail_matches_a_fresh_open`.
+### Closed — tried and rejected (do not re-attempt without the stated gate)
 
-## Cache: namespace isolation (surfaced by the SLA model)
+- **Adaptive probing via the error bounds.** Built, proved sound, measured, then removed from the
+  tree. On BEIR at nprobe=half it retired **0 clusters across 623 queries** (mean `tau` 0.55–0.65 vs
+  a tightest unprobed bound of 0.96–0.98 — a ~0.3 gap, not a near miss). Cause is dimensional: at
+  384-d the cluster radius (~0.62) is not comfortably below the query's k-th-NN distance (~0.77), so
+  every ball reaches the neighbourhood. A larger corpus at the same dimensionality fails identically.
+  **Gate for any retry: measure mean cluster radius vs mean k-th-NN distance first; if the radius is
+  not comfortably smaller, stop.** Implementation in `git log -S adaptive_probe`.
+- **Random-UUID WAL object names.** Would remove claim contention, but makes the hot-path LIST
+  *mandatory* (an unpredictable name cannot be constructed or probed) and loses the total order the
+  fold and supersede logic need. The read path is now LIST-free precisely because names are
+  constructible, so this is settled harder than when first written.
+- **Admitting cache entries with the reference bit set.** Measured worse everywhere (0.4133 vs
+  0.4708 at Zipf s=1.1 / 10 %) — the scan resistance comes from admitting *cold*, not from the
+  second chance alone.
 
-- [ ] **The read cache needs per-namespace isolation or frequency-awareness; global CLOCK
-      gives neither.** CLOCK (the current policy) is scan-resistant but not isolated: under
-      concurrent namespaces, one namespace's large `Scan` or write burst floods the single
-      shared cache and evicts a *different* busy namespace's hot working set — a noisy
-      neighbour that drops that namespace from the MEMORY tier to COLD and spikes its p99.
-      The SLA model (`docs/sla-model.md`) can only promise a *per-namespace* SLA if a busy
-      namespace's working set is protected. Two fixes, both stronger than CLOCK:
-      **per-namespace reservation** (cache divided among active namespaces, weighted by
-      traffic — simplest, makes the SLA `mem_cache / active_namespaces`), or
-      **frequency-aware admission** (TinyLFU / S3-FIFO — a one-shot scan block never
-      displaces a repeatedly-hit one, no per-namespace bookkeeping). Decide behind a
-      multi-namespace load test that reproduces the noisy-neighbour eviction first.
+### Closed — done
 
-## Indexer fold throughput and fairness (surfaced by the SLA model)
-
-**The "indexer hang" is starvation, not fold cost — corrected after a clean measurement.** An
-earlier draft of this section blamed `derive_links` O(N); a controlled MinIO run disproved that.
-
-- [ ] **Single indexer folds all namespaces sequentially → starvation (the real "hang").**
-      The `index` loop with empty `--namespaces` discovers *every* namespace and folds them
-      round-robin in one thread. **Measured:** a 100k-memory namespace **isolated** (its own
-      bucket, no other namespaces) folds to completion in **~34 s (~2 900 docs/s @ 4 vCPU)**. The
-      *same* 100k in a bucket the parallel Hindsight test suite had polluted with 18 `ext-test-*`
-      corpse namespaces **crawled to ~35 docs/s and never converged** — the target published its
-      first 8k docs, then the indexer spent every cycle re-folding the 18 others and never came
-      back. That is the "hang": per-namespace fold latency is inflated by the sum of all other
-      namespaces, and a namespace under steady ingest can starve indefinitely.
-      The built image's `index` subcommand also **ignored `--namespaces`/`--once`** (the flag was
-      a no-op; it just ran discover-all) — verify these flags actually reach the loop, since §0a
-      lists them as the operational scoping mechanism. Fix direction: per-namespace fold
-      concurrency/fairness (round-robin with a per-namespace time slice, or a work queue), or one
-      indexer per (group of) namespace(s). This is what blocks a *multi-namespace* write SLA.
-
-- [ ] **`derive_links` is O(new·N) — a scaling watch-item, NOT the current bottleneck.**
-      Every fold derives semantic kNN links: `IndexOptions::default()` has `derive_links: true`
-      (`indexer.rs:48`), used by both the indexer loop (`service.rs:1007`) and the CLI
-      (`main.rs:235`); `derive_corpus_links` runs one full-corpus vector query per new memory per
-      fact type (`indexer.rs:234`, comment: "the accepted incremental O(new · N) link-derivation
-      cost"). This is genuinely super-linear and *will* dominate fold cost at much larger `N`.
-      **But at 100k it is already included in the 34 s bulk fold above**, so it is not what caps
-      throughput today — the isolated fold is fast. Re-measure before quoting a fold SLA at
-      ≫1M memories/namespace; if it bites there, the levers are: amortize link derivation off the
-      synchronous path (async pass after ack — costs edge freshness), bound the kNN to the new
-      items' own clusters (O(new), slightly worse graph), or make `derive_links` opt-in per
-      namespace (Hindsight uses edges §2, so per-workload not a global flip). No action needed for
-      the current SLA card; `CPU_S_PER_FOLDED_MEM_1T ≈ 0.45 ms` is valid at the 100k scale measured.
+- **Segmented-index fold no longer stalls.** `QueryNode::open` computed live doc counts with a
+  per-id `pk.lookup` across every segment — O((tombstones + tail) × segments) *serial* single-key S3
+  GETs, which turned a fold over a large tail into an hours-long stall. Now one coalesced
+  `lookup_batch` per segment. An `index --once` that timed out at 240 s returns in ~2 s.
+- **Size-tiered minor compaction cuts query fan-out.** The fold only flushed until the hard
+  `COMPACT_FANOUT` cap, so queries fanned out over up to 8 segments (measured 4). Merging the newest
+  run that still fits under the base collapsed a 20 k corpus to **2** segments; cold round-trips
+  1.23 → 0.58, cold p90 190 → 127 ms.
+- **The vector arm's `Phase::Rerank` was measuring the stage-one scan.** Split into `Phase::Scan`
+  (RaBitQ 1-bit scan) and `Phase::Rerank` (exact rescore) so traces attribute cost honestly.
+- **Stage-two rerank is bounded.** `RERANK_REFINE` caps contenders at `depth × 16` by scan estimate.
+  A no-op on structured queries (the bound already returns ~k) and holds recall@10 = 1.0 on the
+  isotropic worst case, where the wide probabilistic bound otherwise reranks the entire scanned set.
+  This also closes the old "on isotropic data the bound narrows nothing" warning.
+- **FTS: Latin terms no longer scan a duplicate posting list.** The tokenizer emitted every Latin
+  token to both fields at index *and* query time (a 15-word question → ~29 terms). Indexing already
+  puts it in `words`, so queries read `words` only: 29.4 → 14.7 terms, 1.79 → 0.75 ms/query, recall
+  identical and ranking provably unchanged. Also skips the tail index entirely when the tail is empty.
+- **`Binary` is the default codec** (`IndexOptions::default`), and a codec change re-encodes copied
+  clusters, so migration is incremental.
+- **`nprobe` is index-resolved** (`nprobe = 0` → a quarter of the clusters, floor 8, cap 64):
+  scifact `ann_recall@10` 0.8590 → 0.9627.
+- **The read path is LIST-free.** Per-query LIST replaced by a monotonic `{ns}/wal-head` pointer GET
+  (`resolve_head`, with a LIST fallback so correctness never depends on it), tail enumeration
+  constructed from sequence numbers, and tail bodies read through the immutable cache. Also fixed a
+  silent lost-write: a cold writer on a fully-GC'd namespace restarted at seq 1, at or below
+  `wal_index_cursor`, so the write was invisible to readers and never folded.
+- **Snapshot reopen reuses segment metadata across a write**, gated on a conditional manifest GET —
+  304 → rebuild only the tail, 200 → full open. (See the first open item: the *no-write* case still
+  short-circuits too early.)
+- **The disk cache mmaps instead of `fs::read`**, and both tiers are CLOCK rings — scan-resistant,
+  and 0.4–2.2 points ahead of LRU outside the thrash regime. Evidence:
+  `crates/mlake-store/tests/cache_skew.rs`.
