@@ -19,6 +19,7 @@
 
 import {
   GetObjectCommand,
+  HeadObjectCommand,
   ListObjectsV2Command,
   S3Client,
 } from "@aws-sdk/client-s3";
@@ -391,4 +392,36 @@ export async function indexQueue(): Promise<IndexQueue> {
   } catch {
     return { jobs: {}, fetchedMs };
   }
+}
+
+// ---- namespace metadata (also S3-only) --------------------------------------
+
+/**
+ * Namespace names — a namespace IS a `{name}/manifest.json` object, which is exactly how the server
+ * discovers them, so this needs no RPC and no registry: the bucket is the catalogue.
+ *
+ * Deliberately a DELIMITER listing plus one HEAD per candidate, not a full-bucket scan. Filtering
+ * every key in the bucket for a trailing `manifest.json` is correct but pathological — on a real
+ * bucket it walks millions of generation/WAL objects to find a couple of dozen manifests
+ * (measured: 26s). The delimiter list returns just the top-level prefixes, and the HEADs (issued in
+ * parallel) confirm which of them are really namespaces rather than stray directories.
+ */
+export async function listNamespaceNames(): Promise<string[]> {
+  const { client: s3, bucket } = client();
+  const candidates = (await listPrefixes(""))
+    .map((p) => p.replace(/\/$/, ""))
+    // Reserved roots (`_obs/`, `_index-queue.json`) can never be namespaces.
+    .filter((n) => n && !n.startsWith("_"));
+
+  const checked = await Promise.all(
+    candidates.map(async (name) => {
+      try {
+        await s3.send(new HeadObjectCommand({ Bucket: bucket, Key: `${name}/manifest.json` }));
+        return name;
+      } catch {
+        return null; // a prefix with no manifest is not a namespace
+      }
+    }),
+  );
+  return checked.filter((n): n is string => n !== null).sort();
 }

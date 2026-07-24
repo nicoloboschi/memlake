@@ -10,7 +10,6 @@ const TABS = [
   { slug: "wal", label: "wal" },
   { slug: "clusters", label: "clusters" },
   { slug: "objects", label: "objects" },
-  { slug: "cache", label: "cache" },
 ] as const;
 
 export function NamespaceNav({ namespace }: { namespace: string }) {
