@@ -88,37 +88,43 @@ pub async fn fold(
     // bounded without the indexer paying a full rebuild every few small writes. See
     // docs/concurrency-findings.md.
     if manifest.segments.is_empty() || manifest.segments.len() >= COMPACT_FANOUT {
-        // Auto-select in-RAM vs streaming by size — the in-RAM merge is O(N) RAM, so a corpus too
-        // big for memory uses the external-memory fold.
+        // Full rebuild: first build, or the hard fan-out cap. Merge ALL segments + tail into one
+        // fresh segment (O(corpus)). Auto-select in-RAM vs streaming by size — the in-RAM merge is
+        // O(N) RAM, so a corpus too big for memory uses the external-memory fold.
         let corpus = estimate_corpus_docs(ns).await?;
         if corpus >= streaming_threshold_docs {
             crate::streaming::index_streaming_with_budget(ns, tokenizer, opts, budget).await
         } else {
             index(ns, tokenizer, opts).await
         }
+    } else if let Some(merge_len) = minor_compact_prefix(&manifest.segments) {
+        // Recent small segments have piled up on the base: merge just that run + the tail
+        // (O(recent), not O(corpus)) so per-query fan-out stays low, instead of letting segments
+        // drift up to the cap where the O(corpus) full rebuild fires. Cheap now that the fold-time
+        // snapshot open is O(segments).
+        minor_compact(ns, tokenizer, opts, merge_len).await
     } else {
         // Steady state: flush the WAL tail into a new L0 segment and append it — O(tail).
-        // (Size-tiered `minor_compact` exists and is correctness-proven, but firing it here
-        // over-works the single indexer and regressed reads — fan-out is no longer the bottleneck,
-        // the indexer is. Left dormant for the queue-based indexer; see docs/concurrency-findings.md.)
         flush(ns, tokenizer, opts).await
     }
 }
 
-/// Segment count at which a fold compacts (merges all segments into one) instead of flushing. Keeps
-/// the per-query segment fan-out — and the roundtrip budget — a small constant (see INV-7).
+/// Hard cap: segment count at which a fold does a full O(corpus) rebuild (merges ALL segments into
+/// one) instead of flushing. The safety net; in steady state `minor_compact` (below) keeps the live
+/// segment count well under this, so the full rebuild is rare. See INV-7.
 pub const COMPACT_FANOUT: usize = 8;
 
-/// A segment with fewer than this many docs is "small" — a fold slice from a low-write interval.
-pub const SMALL_SEGMENT_DOCS: u64 = 1000;
-
-/// Compact once this many *small* segments have accumulated, just below the hard `COMPACT_FANOUT`
-/// count cap. Firing here replaces the O(corpus) full rebuild the cap would otherwise do with a
-/// cheap O(small) *minor* merge of only the small segments — a strict win. Deliberately close to
-/// the cap (not aggressive): each minor compaction still opens a snapshot and rebuilds the merged
-/// index, so firing every few folds over-works a busy single indexer (measured — it inflates the
-/// WAL tail and slows reads more than the extra fan-out costs). See docs/concurrency-findings.md.
-pub const SMALL_SEGMENT_FANOUT: usize = 7;
+/// Minimum length of the newest segment run a *minor* compaction will merge. In an object-store the
+/// per-query cost is the number of objects touched (round-trips), and every live segment adds a
+/// roughly fixed handful of per-query GETs (centroids, `pk`, `radj`, `fts`, stats, tombstones)
+/// regardless of its byte size — so the metric to minimize is the live **segment count**, not size.
+/// Firing at 2 keeps steady-state fan-out to ~2 segments (a big compacted base + one merged run of
+/// recent flushes); the merge itself reads only that run (O(recent), never the base). Not lower,
+/// because a single flush that always triggered a merge would just be write amplification (re-reading
+/// and re-writing the same recent data, plus more transient dead objects) for no fan-out gain. This
+/// is only affordable because the fold-time snapshot open is now O(segments); it used to be
+/// O(tail × segments) — the F5 stall — which is why minor compaction was previously left dormant.
+pub const MINOR_COMPACT_MIN_RUN: usize = 2;
 
 /// Flush the un-indexed WAL tail into a NEW L0 segment and append it (the LSM flush — O(tail), not
 /// O(corpus)). Deletes and re-upserts in the slice become the segment's supersede overlay, hiding
@@ -231,12 +237,77 @@ pub async fn flush(ns: &Namespace, tokenizer: &Tokenizer, opts: IndexOptions) ->
     Ok(IndexOutcome { generation: version, doc_count, published })
 }
 
-/// How many of the newest (front-of-list) segments a minor compaction should merge, or `None` if
-/// one is not warranted. Merges the newest contiguous run of SMALL segments (older/larger segments
-/// stay put — that is what keeps it O(small), not O(corpus)).
+/// How many of the newest (front-of-list) segments a minor compaction should merge, or `None` if a
+/// plain flush suffices. Size-tiered by cumulative fit under the base: the LONGEST newest prefix
+/// (length ≥ `MINOR_COMPACT_MIN_RUN`) whose combined doc count is at most the doc count of the first
+/// segment kept after it. Because that kept segment is then ≥ everything newer than it, the live
+/// segment count — and thus the per-query object/round-trip fan-out — stays bounded to ~log(corpus)
+/// (commonly just a base + one merged run = 2), and the merge only ever reads the recent run
+/// (O(recent), never the base at O(corpus)). New segments are prepended, so the run is a prefix.
 fn minor_compact_prefix(segments: &[mlake_core::Segment]) -> Option<usize> {
-    let run = segments.iter().take_while(|s| s.doc_count < SMALL_SEGMENT_DOCS).count();
-    (run >= SMALL_SEGMENT_FANOUT).then_some(run)
+    minor_run_len(segments.iter().map(|s| s.doc_count))
+}
+
+/// The doc-count core of [`minor_compact_prefix`], factored out so the tiering rule is unit-testable
+/// without building `Segment` fixtures. `doc_counts` is newest→oldest.
+fn minor_run_len(doc_counts: impl Iterator<Item = u64>) -> Option<usize> {
+    // `cum` is the doc count of the prefix strictly newer than the current segment; a run of length
+    // `k` is mergeable when it fits under `doc_counts[k]` (the base it would leave untouched). Take
+    // the longest such run so the resulting live segment count is smallest.
+    let mut best: Option<usize> = None;
+    let mut cum: u64 = 0;
+    for (k, dc) in doc_counts.enumerate() {
+        if k >= MINOR_COMPACT_MIN_RUN && cum <= dc {
+            best = Some(k);
+        }
+        cum += dc;
+    }
+    best
+}
+
+#[cfg(test)]
+mod minor_run_tests {
+    use super::{minor_run_len, MINOR_COMPACT_MIN_RUN};
+
+    fn run(counts: &[u64]) -> Option<usize> {
+        minor_run_len(counts.iter().copied())
+    }
+
+    #[test]
+    fn merges_the_small_recent_run_and_keeps_the_base() {
+        // The observed k8s end-state: 3 small flushes on a big compacted base → merge the 3, keep
+        // the base, leaving 2 live segments.
+        assert_eq!(run(&[512, 1056, 1536, 16896]), Some(3));
+    }
+
+    #[test]
+    fn a_single_flush_on_the_base_does_not_merge() {
+        // One recent flush next to the base: fan-out 2 already; a merge would be pure write
+        // amplification, so hold (MIN_RUN = 2).
+        assert_eq!(run(&[1000, 16896]), None);
+        assert_eq!(MINOR_COMPACT_MIN_RUN, 2);
+    }
+
+    #[test]
+    fn two_recent_flushes_collapse_to_keep_fan_out_low() {
+        assert_eq!(run(&[1000, 1000, 16896]), Some(2));
+    }
+
+    #[test]
+    fn pulls_in_a_mid_tier_when_the_run_still_fits_under_the_base() {
+        // 1k + 1k + 5k = 7k ≤ 16k base → collapse recent + mid together, leaving 2 segments. This is
+        // what stops mid-size segments from accumulating between a fixed ratio and the base.
+        assert_eq!(run(&[1000, 1000, 5000, 16000]), Some(3));
+    }
+
+    #[test]
+    fn no_base_yet_holds_for_the_full_rebuild_at_the_cap() {
+        // All segments comparable (no larger base to hide under): nothing to cheaply merge, so wait
+        // for the O(corpus) rebuild at COMPACT_FANOUT rather than churn.
+        assert_eq!(run(&[800, 800, 800]), None);
+        assert_eq!(run(&[]), None);
+        assert_eq!(run(&[5000]), None);
+    }
 }
 
 /// Merge the newest `merge_len` segments together with the WAL tail into ONE new L0 segment,
