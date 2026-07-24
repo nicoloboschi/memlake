@@ -95,3 +95,31 @@ pub async fn gc_with_min_age(ns: &Namespace, min_age: Duration) -> Result<GcOutc
 
     Ok(outcome)
 }
+
+/// Default retention for observability trace batches: keep the last 24h, drop older.
+pub const DEFAULT_TRACE_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Reclaim observability trace batches older than `retention`.
+///
+/// Trace objects are append-only and immutable (`_obs/traces/{node}/{ms}-{seq}.jsonl`), so unlike
+/// generation GC there is nothing to reference-check: retention is purely by TIME. This is the one
+/// thing keeping `_obs/` from growing without bound, and it is global (not per-namespace) — the
+/// indexer runs it on its periodic sweep.
+///
+/// Idempotent and safe to run concurrently on any node: deleting an already-deleted object is a
+/// no-op. Deletion uses the object's own last-modified time, so it needs no key parsing.
+pub async fn gc_traces(
+    store: &mlake_store::Store,
+    retention: Duration,
+) -> Result<usize> {
+    let cutoff = chrono::Utc::now() - chrono::Duration::from_std(retention).unwrap_or_default();
+    let mut deleted = 0usize;
+    for (path, modified) in store.list_with_age(mlake_core::OBS_TRACES_PREFIX).await? {
+        if modified > cutoff {
+            continue;
+        }
+        store.delete(&path).await?;
+        deleted += 1;
+    }
+    Ok(deleted)
+}

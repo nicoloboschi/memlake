@@ -250,8 +250,21 @@ async fn indexer(args: &[String], node: String) -> Result<()> {
         indexer_tail_flush_docs(),
         indexer_gc_interval(),
         indexer_gc_min_age(),
+        indexer_trace_retention(),
     )
     .await
+}
+
+/// How long observability trace batches are kept before the indexer expires them. Traces are
+/// append-only, so this window is what bounds `_obs/traces/`. From
+/// `MEMLAKE_INDEXER_TRACE_RETENTION_SECS`; default 24h.
+fn indexer_trace_retention() -> Duration {
+    let secs = std::env::var("MEMLAKE_INDEXER_TRACE_RETENTION_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(24 * 60 * 60);
+    Duration::from_secs(secs)
 }
 
 /// One metered index pass over the given namespaces (or all discovered), printing a single

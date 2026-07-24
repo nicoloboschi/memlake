@@ -14,6 +14,14 @@ pub mod rkyv_io;
 pub mod tombstones;
 pub mod wal;
 
+/// Reserved object-store root for observability data, shared by the serve node that writes it and
+/// the indexer that applies time-based retention to it. Trace batches are append-only immutable
+/// objects under [`OBS_TRACES_PREFIX`]; each node also overwrites one small rollup under
+/// [`OBS_ROLLUP_PREFIX`]. Both sit OUTSIDE any namespace prefix — namespace names starting with `_`
+/// are rejected so this root stays unclaimable.
+pub const OBS_TRACES_PREFIX: &str = "_obs/traces/";
+pub const OBS_ROLLUP_PREFIX: &str = "_obs/rollup/";
+
 pub use id::{EntityId, MemoryId};
 pub use rkyv_io::{rkyv_read, rkyv_write};
 pub use tombstones::SegmentTombstones;

@@ -4,7 +4,7 @@ import Link from "next/link";
 import { useCallback, useEffect, useMemo, useState } from "react";
 
 import { getJson, isAbort } from "@/lib/client";
-import { fmtBytes, fmtMs, groupDigits } from "@/lib/format";
+import { fmtMs, groupDigits } from "@/lib/format";
 import {
   Button,
   CopyableId,
@@ -30,7 +30,9 @@ interface NodeHeader {
   totals: { count: number; qps: number; p50_ms: number; p99_ms: number; cache_hit: number };
   by_action: Record<string, number>;
   by_namespace: NsRollup[];
-  records: number;
+  /** Records still buffered in memory, and records dropped because S3 wasn't draining fast enough. */
+  pending?: number;
+  dropped?: number;
 }
 interface NodeSummary {
   header: NodeHeader;
@@ -170,7 +172,14 @@ function NodeCard({ node, now }: { node: NodeSummary; now: number }) {
       }
       subtitle={
         <span className={stale ? "text-warn" : undefined}>
-          {ageLabel(age)} · ring {fmtBytes(String(node.sizeBytes))} · up {ageLabel(h.uptime_ms)}
+          {ageLabel(age)} · up {ageLabel(h.uptime_ms)}
+          {h.pending ? ` · ${groupDigits(String(h.pending))} buffered` : ""}
+          {h.dropped ? (
+            <span className="text-danger">
+              {" "}
+              · {groupDigits(String(h.dropped))} dropped (S3 not draining)
+            </span>
+          ) : null}
         </span>
       }
       actions={

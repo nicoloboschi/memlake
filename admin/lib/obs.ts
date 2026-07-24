@@ -1,19 +1,20 @@
 /**
  * Observability data source. SERVER ONLY.
  *
- * Serve pods each upload a bounded, slow-biased ring of recent traces to
- * `_obs/traces/{node_id}.jsonl` in the object store (see the server's
- * `crate::trace::TraceRing`). The admin reads that prefix DIRECTLY from S3 —
- * one object per node — so it renders a fleet-wide view without scraping
- * individual pods, which a load-balanced gRPC Service makes unreliable.
+ * Serve nodes write two things into the reserved `_obs/` root:
  *
- * Each object is JSONL: line 1 is a header (node id, heartbeat, rollups), the
- * rest are raw trace records (each carrying `namespace`, so the same objects
- * answer both "per node" and "per namespace" questions).
+ *   `_obs/rollup/{node}.json`                 one small OVERWRITTEN object per node — the fleet
+ *                                             overview (heartbeat, totals, action mix, per-ns stats)
+ *   `_obs/traces/{node}/{ms}-{seq}.jsonl`     APPEND-ONLY immutable trace batches, flushed every
+ *                                             couple of seconds; the indexer expires them past the
+ *                                             retention window (default 24h)
  *
- * Config comes from `MEMLAKE_OBS_S3_*`, falling back to the `MEMLAKE_QUERY_S3_*`
- * block the serve pods already mount (same bucket), so a deploy needs no new
- * secret — just grant the admin read access to the bucket.
+ * The admin reads these DIRECTLY from S3 — no gRPC, no pod scraping. Because batches are append-only
+ * and time-keyed, "recent traces" is just the newest N objects, and a trace id lookup is a
+ * newest-first scan; neither needs to read the whole retention window.
+ *
+ * Config comes from `MEMLAKE_OBS_S3_*`, falling back to the `MEMLAKE_QUERY_S3_*` block the serve
+ * pods already mount (same bucket), so a deploy needs no new secret — just bucket read access.
  */
 
 import {
@@ -23,6 +24,12 @@ import {
 } from "@aws-sdk/client-s3";
 
 export const OBS_TRACES_PREFIX = "_obs/traces/";
+export const OBS_ROLLUP_PREFIX = "_obs/rollup/";
+
+/** Newest batch objects read for the recent-traces list (each batch is ~one flush interval). */
+const LIST_BATCH_OBJECTS = 80;
+/** Newest batch objects scanned when hunting a specific trace id / namespace. */
+const SCAN_BATCH_OBJECTS = 400;
 
 export interface NodeTotals {
   count: number;
@@ -47,10 +54,13 @@ export interface NodeHeader {
   totals: NodeTotals;
   by_action: Record<string, number>;
   by_namespace: NsRollup[];
-  records: number;
+  /** Records still buffered in memory, and records dropped because S3 wasn't draining. */
+  pending?: number;
+  dropped?: number;
 }
 
 export type TraceRecord = {
+  id?: string;
   op?: string;
   namespace?: string;
   total_ms?: number;
@@ -61,10 +71,20 @@ export type TraceRecord = {
 
 export interface NodeSummary {
   header: NodeHeader;
-  /** Bytes of the node's trace object — a rough gauge of how full its ring is. */
+  /** Bytes of the node's rollup object (tiny) — kept for shape compatibility. */
   sizeBytes: number;
-  /** When the admin fetched this, so the UI can age the heartbeat consistently. */
   fetchedMs: number;
+}
+
+/** A light trace summary for the explorer list — no spans, so the list payload stays small. */
+export interface TraceSummary {
+  id: string;
+  node_id: string;
+  namespace: string;
+  op: string;
+  total_ms: number;
+  ts_ms: number;
+  snapshot?: { action?: string; open_ms?: number; tail_entries?: number };
 }
 
 // ---- config + client --------------------------------------------------------
@@ -85,11 +105,14 @@ function firstEnv(...keys: string[]): string | undefined {
   return undefined;
 }
 
+/** A configuration problem the UI should surface as a clear message, not a 500 stack. */
+export class ObsConfigError extends Error {}
+
 function s3Config(): S3Config {
   const bucket = firstEnv("MEMLAKE_OBS_S3_BUCKET", "MEMLAKE_QUERY_S3_BUCKET");
   if (!bucket) {
     throw new ObsConfigError(
-      "no S3 bucket configured — set MEMLAKE_OBS_S3_BUCKET (or MEMLAKE_QUERY_S3_BUCKET) so the admin can read _obs/traces/",
+      "no S3 bucket configured — set MEMLAKE_OBS_S3_BUCKET (or MEMLAKE_QUERY_S3_BUCKET) so the admin can read _obs/",
     );
   }
   return {
@@ -101,11 +124,7 @@ function s3Config(): S3Config {
   };
 }
 
-/** A configuration problem the UI should surface as a clear message, not a 500 stack. */
-export class ObsConfigError extends Error {}
-
-// Memoize the client + bucket on globalThis (the Next.js dev-reload pattern) so
-// hot reloads don't leak a client per edit.
+// Memoize on globalThis (the Next.js dev-reload pattern) so hot reloads don't leak a client.
 const g = globalThis as unknown as { __obsS3?: { client: S3Client; bucket: string } };
 
 function client(): { client: S3Client; bucket: string } {
@@ -125,159 +144,150 @@ function client(): { client: S3Client; bucket: string } {
   return g.__obsS3;
 }
 
-// ---- reads ------------------------------------------------------------------
+// ---- primitives -------------------------------------------------------------
 
-interface RawObject {
-  key: string;
-  size: number;
-  body: string;
-}
-
-/** LIST `_obs/traces/` and GET each node object. One object per serve node. */
-async function fetchNodeObjects(): Promise<RawObject[]> {
+async function listKeys(prefix: string): Promise<{ key: string; size: number }[]> {
   const { client: s3, bucket } = client();
-  const keys: { key: string; size: number }[] = [];
+  const out: { key: string; size: number }[] = [];
   let token: string | undefined;
   do {
     const page = await s3.send(
-      new ListObjectsV2Command({
-        Bucket: bucket,
-        Prefix: OBS_TRACES_PREFIX,
-        ContinuationToken: token,
-      }),
+      new ListObjectsV2Command({ Bucket: bucket, Prefix: prefix, ContinuationToken: token }),
     );
     for (const o of page.Contents ?? []) {
-      if (o.Key && o.Key.endsWith(".jsonl")) {
-        keys.push({ key: o.Key, size: o.Size ?? 0 });
-      }
+      if (o.Key) out.push({ key: o.Key, size: o.Size ?? 0 });
     }
     token = page.IsTruncated ? page.NextContinuationToken : undefined;
   } while (token);
-
-  return Promise.all(
-    keys.map(async ({ key, size }) => {
-      const res = await s3.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
-      const body = (await res.Body?.transformToString()) ?? "";
-      return { key, size, body };
-    }),
-  );
+  return out;
 }
 
-function parseHeader(body: string): NodeHeader | null {
-  const nl = body.indexOf("\n");
-  const first = nl === -1 ? body : body.slice(0, nl);
-  if (!first.trim()) return null;
-  try {
-    const h = JSON.parse(first) as NodeHeader;
-    return h.kind === "header" ? h : null;
-  } catch {
-    return null;
-  }
+async function getText(key: string): Promise<string> {
+  const { client: s3, bucket } = client();
+  const res = await s3.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
+  return (await res.Body?.transformToString()) ?? "";
 }
 
-function parseRecords(body: string): TraceRecord[] {
+/** `_obs/traces/{node}/{ms}-{seq}.jsonl` → the node id and the flush timestamp. */
+function parseBatchKey(key: string): { node: string; ms: number } | null {
+  const rest = key.slice(OBS_TRACES_PREFIX.length);
+  const slash = rest.lastIndexOf("/");
+  if (slash < 0) return null;
+  const node = rest.slice(0, slash);
+  const file = rest.slice(slash + 1);
+  const ms = Number(file.split("-")[0]);
+  if (!Number.isFinite(ms)) return null;
+  return { node, ms };
+}
+
+/** The newest batch objects, newest-first. Bounded so we never read the whole retention window. */
+async function newestBatches(
+  maxObjects: number,
+  nodeFilter?: string,
+): Promise<{ key: string; node: string; ms: number }[]> {
+  const prefix = nodeFilter ? `${OBS_TRACES_PREFIX}${nodeFilter}/` : OBS_TRACES_PREFIX;
+  const keys = await listKeys(prefix);
+  const parsed = keys
+    .filter((k) => k.key.endsWith(".jsonl"))
+    .map((k) => {
+      const p = parseBatchKey(k.key);
+      return p ? { key: k.key, node: p.node, ms: p.ms } : null;
+    })
+    .filter((x): x is { key: string; node: string; ms: number } => x !== null);
+  parsed.sort((a, b) => b.ms - a.ms);
+  return parsed.slice(0, maxObjects);
+}
+
+function parseLines(body: string): TraceRecord[] {
   const out: TraceRecord[] = [];
-  const lines = body.split("\n");
-  for (let i = 1; i < lines.length; i++) {
-    const line = lines[i];
+  for (const line of body.split("\n")) {
     if (!line.trim()) continue;
     try {
       out.push(JSON.parse(line) as TraceRecord);
     } catch {
-      // A partially-flushed line; skip it.
+      // A partially-written line; skip it.
     }
   }
   return out;
 }
 
-/** Every node's header + object size — the fleet overview. Newest-heartbeat first. */
+/** Read the newest batches and return their records, each tagged with the serving node. */
+async function readRecent(
+  maxObjects: number,
+  nodeFilter?: string,
+): Promise<(TraceRecord & { node_id: string })[]> {
+  const batches = await newestBatches(maxObjects, nodeFilter);
+  const chunks = await Promise.all(
+    batches.map(async (b) => {
+      const body = await getText(b.key).catch(() => "");
+      return parseLines(body).map((r) => ({ ...r, node_id: b.node }));
+    }),
+  );
+  const all = chunks.flat();
+  all.sort((a, b) => (b.ts_ms ?? 0) - (a.ts_ms ?? 0));
+  return all;
+}
+
+// ---- public reads -----------------------------------------------------------
+
+/** Every node's rollup — the fleet overview. Newest-heartbeat first. */
 export async function listNodes(): Promise<NodeSummary[]> {
   const now = Date.now();
-  const objs = await fetchNodeObjects();
+  const keys = (await listKeys(OBS_ROLLUP_PREFIX)).filter((k) => k.key.endsWith(".json"));
   const nodes: NodeSummary[] = [];
-  for (const o of objs) {
-    const header = parseHeader(o.body);
-    if (header) nodes.push({ header, sizeBytes: o.size, fetchedMs: now });
-  }
+  await Promise.all(
+    keys.map(async (k) => {
+      const body = await getText(k.key).catch(() => "");
+      if (!body.trim()) return;
+      try {
+        const header = JSON.parse(body) as NodeHeader;
+        if (header.node_id) nodes.push({ header, sizeBytes: k.size, fetchedMs: now });
+      } catch {
+        // A rollup mid-write; skip this pass.
+      }
+    }),
+  );
   nodes.sort((a, b) => b.header.updated_ms - a.header.updated_ms);
   return nodes;
 }
 
-/** One node's recent records, newest first, capped. */
-export async function nodeRecords(nodeId: string, limit: number): Promise<TraceRecord[]> {
-  const { client: s3, bucket } = client();
-  const key = `${OBS_TRACES_PREFIX}${nodeId}.jsonl`;
-  const res = await s3.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
-  const body = (await res.Body?.transformToString()) ?? "";
-  const recs = parseRecords(body);
-  recs.sort((a, b) => (b.ts_ms ?? 0) - (a.ts_ms ?? 0));
-  return recs.slice(0, limit);
-}
-
-/** A light trace summary for the explorer list — no spans, so the list payload stays small. */
-export interface TraceSummary {
-  id: string;
-  node_id: string;
-  namespace: string;
-  op: string;
-  total_ms: number;
-  ts_ms: number;
-  snapshot?: { action?: string; open_ms?: number; tail_entries?: number };
-}
-
-/** Recent trace summaries across ALL nodes, newest first, capped. The Traces explorer filters these
- * by namespace/service client-side; the full record (with spans) is fetched on selection by id. */
+/** Recent trace summaries across all nodes, newest first, capped. */
 export async function traceSummaries(limit: number): Promise<TraceSummary[]> {
-  const objs = await fetchNodeObjects();
-  const out: TraceSummary[] = [];
-  for (const o of objs) {
-    const header = parseHeader(o.body);
-    const nodeId = header?.node_id ?? o.key;
-    for (const r of parseRecords(o.body)) {
-      out.push({
-        id: String(r.id ?? ""),
-        node_id: nodeId,
-        namespace: r.namespace ?? "",
-        op: r.op ?? "",
-        total_ms: r.total_ms ?? 0,
-        ts_ms: r.ts_ms ?? 0,
-        snapshot: r.snapshot,
-      });
-    }
-  }
-  out.sort((a, b) => b.ts_ms - a.ts_ms);
-  return out.slice(0, limit);
+  const recs = await readRecent(LIST_BATCH_OBJECTS);
+  return recs.slice(0, limit).map((r) => ({
+    id: String(r.id ?? ""),
+    node_id: r.node_id,
+    namespace: r.namespace ?? "",
+    op: r.op ?? "",
+    total_ms: r.total_ms ?? 0,
+    ts_ms: r.ts_ms ?? 0,
+    snapshot: r.snapshot,
+  }));
 }
 
-/** The full record (with spans) for one trace id, searched across every node. `null` if it has aged
- * out of every ring. Tagged with the node that served it. */
+/** The full record (with spans) for one trace id, scanning newest batches first. */
 export async function traceById(id: string): Promise<(TraceRecord & { node_id: string }) | null> {
-  const objs = await fetchNodeObjects();
-  for (const o of objs) {
-    const header = parseHeader(o.body);
-    const nodeId = header?.node_id ?? o.key;
-    for (const r of parseRecords(o.body)) {
-      if (String(r.id ?? "") === id) return { ...r, node_id: nodeId };
+  const batches = await newestBatches(SCAN_BATCH_OBJECTS);
+  for (const b of batches) {
+    const body = await getText(b.key).catch(() => "");
+    for (const r of parseLines(body)) {
+      if (String(r.id ?? "") === id) return { ...r, node_id: b.node };
     }
   }
   return null;
 }
 
-/** Records touching `namespace` across ALL nodes, merged newest-first, capped. Each record is
- * tagged with the node it came from so the debugger sees which pod served it. */
+/** One node's recent records, newest first, capped. */
+export async function nodeRecords(nodeId: string, limit: number): Promise<TraceRecord[]> {
+  const recs = await readRecent(LIST_BATCH_OBJECTS, nodeId);
+  return recs.slice(0, limit);
+}
+
+/** Records touching `namespace` across all nodes, merged newest-first, capped. */
 export async function namespaceRecords(
   namespace: string,
   limit: number,
 ): Promise<(TraceRecord & { node_id: string })[]> {
-  const objs = await fetchNodeObjects();
-  const merged: (TraceRecord & { node_id: string })[] = [];
-  for (const o of objs) {
-    const header = parseHeader(o.body);
-    const nodeId = header?.node_id ?? o.key;
-    for (const r of parseRecords(o.body)) {
-      if (r.namespace === namespace) merged.push({ ...r, node_id: nodeId });
-    }
-  }
-  merged.sort((a, b) => (b.ts_ms ?? 0) - (a.ts_ms ?? 0));
-  return merged.slice(0, limit);
+  const recs = await readRecent(SCAN_BATCH_OBJECTS);
+  return recs.filter((r) => r.namespace === namespace).slice(0, limit);
 }

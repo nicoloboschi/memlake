@@ -25,6 +25,11 @@ use crate::{convert, objects, pb};
 /// folds itself — folding is the indexer Deployment's job, with its own memory budget and
 /// scheduling — so this just polls the cursor. If the deadline passes the write is still durable
 /// and already visible via the WAL tail; only the "it's in a segment" confirmation timed out.
+/// Trace batches uploaded concurrently per flush. A sequential PUT chain can't keep pace with a
+/// heavy trace stream; falling behind is what pushes the in-memory buffer to its hard cap (where it
+/// starts dropping records), so the uploader fans out.
+const TRACE_UPLOAD_CONCURRENCY: usize = 6;
+
 const WAIT_FOR_INDEX_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const WAIT_FOR_INDEX_POLL: std::time::Duration = std::time::Duration::from_millis(200);
 
@@ -107,8 +112,10 @@ impl MemlakeService {
         self.tracer.enabled()
     }
 
-    /// How often each node overwrites its bounded trace object in object storage.
-    const TRACE_UPLOAD_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+    /// How often each node flushes its pending trace batches. Short enough that the in-memory buffer
+    /// only ever holds a fraction of a second of traffic (so it never approaches its hard cap), long
+    /// enough that PUTs stay batched rather than per-trace.
+    const TRACE_UPLOAD_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 
     /// Start the background task that periodically uploads this node's bounded trace ring to
     /// `_obs/traces/{node_id}.jsonl` (overwrite → bounded footprint of one capped object per node).
@@ -116,21 +123,67 @@ impl MemlakeService {
     /// individual pods (which a load-balanced Service makes unreliable anyway). No-op when tracing is
     /// off. Call once at startup.
     pub fn spawn_trace_uploader(&self, node_id: String) {
-        let Some(ring) = self.tracer.ring() else { return };
+        let Some(buffer) = self.tracer.buffer() else { return };
         let store = self.store.clone();
-        let path = crate::trace::obs_traces_path(&node_id);
+        let rollup_path = crate::trace::obs_rollup_path(&node_id);
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Self::TRACE_UPLOAD_INTERVAL);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // Monotonic per-node batch counter: with the flush timestamp it makes every batch key
+            // unique AND time-ordered, even for two flushes inside the same millisecond.
+            let mut seq: u64 = 0;
             loop {
                 tick.tick().await;
-                // Render under the lock, then release it before the network PUT.
-                let body = match ring.lock() {
-                    Ok(r) => r.render(&node_id),
+
+                // Drain and PUT batches until the buffer is empty, so a burst catches up instead of
+                // accumulating. Batches go up CONCURRENTLY: a single sequential PUT chain can't keep
+                // pace with a heavy trace stream, and falling behind is what makes the buffer hit its
+                // hard cap and drop records. Each drain holds the lock only to move bytes out.
+                loop {
+                    let mut batches: Vec<(String, Vec<u8>)> = Vec::new();
+                    if let Ok(mut b) = buffer.lock() {
+                        for _ in 0..TRACE_UPLOAD_CONCURRENCY {
+                            match b.take_batch() {
+                                Some(body) if !body.is_empty() => {
+                                    let key = crate::trace::obs_batch_path(
+                                        &node_id,
+                                        crate::trace::now_ms(),
+                                        seq,
+                                    );
+                                    seq += 1;
+                                    batches.push((key, body));
+                                }
+                                _ => break,
+                            }
+                        }
+                    }
+                    if batches.is_empty() {
+                        break;
+                    }
+                    let n = batches.len();
+                    let results = futures::future::join_all(batches.into_iter().map(
+                        |(key, body)| {
+                            let store = store.clone();
+                            async move { store.put(&key, body).await }
+                        },
+                    ))
+                    .await;
+                    let failed = results.iter().filter(|r| r.is_err()).count();
+                    if failed > 0 {
+                        tracing::warn!(%node_id, failed, "trace batch upload failed");
+                    }
+                    if n < TRACE_UPLOAD_CONCURRENCY {
+                        break; // buffer drained
+                    }
+                }
+
+                // The overwritten rollup powers the fleet overview (heartbeat + cumulative stats).
+                let rollup = match buffer.lock() {
+                    Ok(b) => b.rollup_json(&node_id),
                     Err(_) => continue,
                 };
-                if let Err(e) = store.put(&path, body).await {
-                    tracing::warn!(%node_id, error = %e, "trace upload failed");
+                if let Err(e) = store.put(&rollup_path, rollup).await {
+                    tracing::warn!(%node_id, error = %e, "trace rollup upload failed");
                 }
             }
         });
@@ -1424,11 +1477,17 @@ pub async fn run_indexer(
     _tail_flush_docs: usize,
     gc_interval: std::time::Duration,
     gc_min_age: std::time::Duration,
+    trace_retention: std::time::Duration,
 ) -> anyhow::Result<()> {
     let queue = IndexQueue::new(store.clone());
     // Per-namespace GC throttle: reclaiming runs on a slower cadence than folding (dead objects are
     // min-age-gated inside `gc`, so more-frequent passes would mostly be no-op LISTs).
     let mut last_gc: HashMap<String, std::time::Instant> = HashMap::new();
+    // Observability retention is GLOBAL (not per-namespace) and purely time-based: trace batches are
+    // append-only, so nothing references them — they just expire. Same cadence as object GC.
+    let mut last_trace_gc = std::time::Instant::now()
+        .checked_sub(gc_interval)
+        .unwrap_or_else(std::time::Instant::now);
     // Due immediately, so startup populates the queue from any already-dirty namespaces (including
     // work that predates the queue).
     let mut last_reconcile = std::time::Instant::now()
@@ -1439,6 +1498,17 @@ pub async fn run_indexer(
         if last_reconcile.elapsed() >= RECONCILE_INTERVAL {
             reconcile_queue(&store, &queue, &namespaces).await;
             last_reconcile = std::time::Instant::now();
+        }
+
+        // Expire observability trace batches past the retention window. This is the only thing
+        // bounding `_obs/traces/` — the serve nodes only ever append to it.
+        if last_trace_gc.elapsed() >= gc_interval {
+            match mlake_index::gc_traces(&store, trace_retention).await {
+                Ok(n) if n > 0 => tracing::info!(deleted = n, "expired trace batches"),
+                Ok(_) => {}
+                Err(e) => tracing::warn!(error = %e, "trace retention sweep failed"),
+            }
+            last_trace_gc = std::time::Instant::now();
         }
 
         // Claim the next namespace with work. `None` ⇒ queue empty; idle briefly and re-check.
